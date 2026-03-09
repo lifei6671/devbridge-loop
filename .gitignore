@@ -21,7 +21,6 @@ profile.cov
 # vendor/
 
 # Go workspace file
-go.work
 go.work.sum
 
 # env file
@@ -30,3 +29,10 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Frontend / Tauri
+node_modules/
+dist/
+apps/dev-agent/node_modules/
+apps/dev-agent/dist/
+apps/dev-agent/src-tauri/target/

@@ -1,0 +1,39 @@
+{
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 800,
+    "editor.formatOnSave": true,
+    "[go]": {
+        "editor.defaultFormatter": "golang.go",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit",
+            "source.fixAll": "explicit"
+        }
+    },
+    "[go.mod]": {
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        }
+    },
+    "go.useLanguageServer": true,
+    "gopls": {
+        "ui.completion.usePlaceholders": true,
+        "ui.semanticTokens": true,
+        "staticcheck": true,
+        "analyses": {
+            "unusedparams": true,
+            "unusedwrite": true,
+            "nilness": true,
+            "shadow": true
+        }
+    },
+    "files.watcherExclude": {
+        "**/vendor/**": true,
+        "**/.git/**": true,
+        "**/node_modules/**": true
+    },
+    "search.exclude": {
+        "**/vendor/**": true
+    }
+}
