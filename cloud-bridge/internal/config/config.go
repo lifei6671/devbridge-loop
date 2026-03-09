@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config 包含 cloud-bridge 运行配置。
@@ -12,6 +13,8 @@ type Config struct {
 	RouteExtractorOrder []string
 	BridgePublicHost    string
 	BridgePublicPort    int
+	FallbackBackflowURL string
+	IngressTimeout      time.Duration
 }
 
 // LoadFromEnv 按环境变量加载配置，并提供默认值。
@@ -26,6 +29,8 @@ func LoadFromEnv() Config {
 		RouteExtractorOrder: order,
 		BridgePublicHost:    getenv("DEVLOOP_BRIDGE_PUBLIC_HOST", "bridge.example.internal"),
 		BridgePublicPort:    getenvInt("DEVLOOP_BRIDGE_PUBLIC_PORT", 443),
+		FallbackBackflowURL: getenv("DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL", "http://127.0.0.1:19090"),
+		IngressTimeout:      time.Duration(getenvInt("DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC", 10)) * time.Second,
 	}
 }
 

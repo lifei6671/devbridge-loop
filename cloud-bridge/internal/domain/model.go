@@ -52,6 +52,7 @@ type TunnelSession struct {
 	TunnelID        string    `json:"tunnelId"`
 	RDName          string    `json:"rdName"`
 	ConnID          string    `json:"connId"`
+	BackflowBaseURL string    `json:"backflowBaseUrl"`
 	SessionEpoch    int64     `json:"sessionEpoch"`
 	ResourceVersion int64     `json:"resourceVersion"`
 	Status          string    `json:"status"`
@@ -106,9 +107,10 @@ type TunnelEventReply struct {
 
 // HelloPayload 为 HELLO 消息载荷。
 type HelloPayload struct {
-	TunnelID string `json:"tunnelId"`
-	RDName   string `json:"rdName"`
-	ConnID   string `json:"connId"`
+	TunnelID        string `json:"tunnelId"`
+	RDName          string `json:"rdName"`
+	ConnID          string `json:"connId"`
+	BackflowBaseURL string `json:"backflowBaseUrl,omitempty"`
 }
 
 // TunnelHeartbeatPayload 为 TUNNEL_HEARTBEAT 消息载荷。

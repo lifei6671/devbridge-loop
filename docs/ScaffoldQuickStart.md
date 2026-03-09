@@ -43,6 +43,14 @@
 - 内存态注册表 + TTL 过期摘除扫描
 - 注册键模型索引：`ServiceKey / InstanceKey / EndpointKey`
 - 事件幂等骨架：`x-event-id` 去重（重复 `register/unregister` 返回成功语义，不重复增加 `resourceVersion`）
+- 已接入 tunnel client 同步链路（agent -> bridge）：
+  - 启动自动 `HELLO -> FULL_SYNC_REQUEST -> FULL_SYNC_SNAPSHOT`
+  - 注册/注销与 TTL 摘除自动投递 `REGISTER_UPSERT/REGISTER_DELETE`
+  - 定时发送 `TUNNEL_HEARTBEAT`
+  - 断线后按退避重连并复用事件幂等语义
+- 已接入本地回流转发入口：`POST /api/v1/backflow/http`
+  - 接收 bridge 回流请求并转发到本地 `targetHost:targetPort`
+  - 将回流转发超时/不可达归一为 `UPSTREAM_TIMEOUT`、`LOCAL_ENDPOINT_UNREACHABLE`
 - 协议扩展接口占位：`ProtocolAdapter` / `IngressResolver` / `Forwarder` / `EgressProxy`
 
 2. `cloud-bridge`
@@ -50,6 +58,10 @@
 - tunnel 事件入口占位：`POST /api/v1/tunnel/events`
 - 路由提取抽象：`RouteExtractor`、`RouteExtractPipeline`
 - 内置提取器：`host/header/sni`
+- 已接入 HTTP ingress 骨架：`/api/v1/ingress/http/**`
+  - 先按提取器链路解析 `(env, serviceName)`，再匹配 `(env, serviceName, protocol=http)` 路由
+  - 命中后回调 agent `POST /api/v1/backflow/http`，完成本地服务回流
+  - 回流异常统一输出：`ROUTE_NOT_FOUND/ROUTE_EXTRACT_FAILED/TUNNEL_OFFLINE`
 - 已实现同步幂等主干：`sessionEpoch/resourceVersion/eventId`
   - 重复事件：返回 `ACK + duplicate` 语义
   - 旧 epoch 事件：返回 `ERROR + STALE_EPOCH_EVENT`
@@ -84,6 +96,22 @@ cd agent-core && go run ./cmd/agent-core
 cd cloud-bridge && go run ./cmd/cloud-bridge
 ```
 
+### Makefile（推荐）
+
+```bash
+# 运行 Go 测试
+make test
+
+# 编译 Go 模块
+make build-go
+
+# 编译前端
+make build-dev-agent-ui
+
+# 一键编译（Go + 前端）
+make build-all
+```
+
 ### Tauri + React 侧
 
 ```bash
@@ -108,8 +136,15 @@ npm run tauri:dev
 - `DEVLOOP_AGENT_CORE_DIR`：Rust Host 用 `go run` 拉起 agent-core 时的工作目录
 - `DEVLOOP_AGENT_AUTO_RESTART`：是否自动重启（默认 `true`）
 - `DEVLOOP_AGENT_RESTART_BACKOFF_MS`：自动重启退避毫秒数组（默认 `500,1000,2000,5000`）
+- `DEVLOOP_TUNNEL_BRIDGE_ADDRESS`：agent 同步到 bridge 的地址（默认 `http://127.0.0.1:18080`）
+- `DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC`：tunnel 心跳间隔秒数（默认 `10`）
+- `DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS`：tunnel 重连退避毫秒数组（默认 `500,1000,2000,5000`）
+- `DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC`：agent 到 bridge 请求超时秒数（默认 `5`）
+- `DEVLOOP_TUNNEL_BACKFLOW_BASE_URL`：agent 在 HELLO 中上报的回流地址（默认按 `DEVLOOP_AGENT_HTTP_ADDR` 自动推导）
 - `DEVLOOP_BRIDGE_PUBLIC_HOST`：bridge 对外路由域名（默认 `bridge.example.internal`）
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
+- `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:19090`）
+- `DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC`：bridge 调用 agent 回流接口的超时秒数（默认 `10`）
 
 ## 事件头与 env 解析
 

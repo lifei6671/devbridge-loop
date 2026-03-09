@@ -1,25 +1,41 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/backflow"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/domain"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/routing"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
 )
 
+// BackflowHTTPCaller 抽象 bridge 到 agent 的回流调用能力。
+type BackflowHTTPCaller interface {
+	ForwardHTTP(ctx context.Context, baseURL string, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error)
+}
+
 // Handler 提供 bridge 管理面与状态查询接口。
 type Handler struct {
-	pipeline *routing.Pipeline
-	store    *store.MemoryStore
+	pipeline            *routing.Pipeline
+	store               *store.MemoryStore
+	backflowCaller      BackflowHTTPCaller
+	fallbackBackflowURL string
 }
 
 // NewHandler 创建 HTTP handler 集合。
-func NewHandler(pipeline *routing.Pipeline, store *store.MemoryStore) *Handler {
-	return &Handler{pipeline: pipeline, store: store}
+func NewHandler(pipeline *routing.Pipeline, store *store.MemoryStore, backflowCaller BackflowHTTPCaller, fallbackBackflowURL string) *Handler {
+	return &Handler{
+		pipeline:            pipeline,
+		store:               store,
+		backflowCaller:      backflowCaller,
+		fallbackBackflowURL: strings.TrimSpace(fallbackBackflowURL),
+	}
 }
 
 // Router 构建 cloud-bridge 路由表。
@@ -32,6 +48,10 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/routes", h.routes)
 	mux.HandleFunc("POST /api/v1/tunnel/events", h.tunnelEvent)
 	mux.HandleFunc("GET /api/v1/debug/route-extract", h.debugRouteExtract)
+	mux.HandleFunc("/api/v1/ingress/http", h.ingressHTTP)
+	mux.HandleFunc("/api/v1/ingress/http/", h.ingressHTTP)
+	mux.HandleFunc("/api/v1/ingress/grpc", h.ingressGRPC)
+	mux.HandleFunc("/api/v1/ingress/grpc/", h.ingressGRPC)
 
 	return mux
 }
@@ -116,6 +136,88 @@ func (h *Handler) debugRouteExtract(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
+	result, err := h.pipeline.Resolve(r.Context(), r)
+	if err != nil {
+		writeIngressError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, err.Error())
+		return
+	}
+
+	route, session, ok := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "http")
+	if !ok {
+		writeIngressError(
+			w,
+			http.StatusNotFound,
+			domain.IngressErrorRouteNotFound,
+			"route not found for env/service/protocol",
+		)
+		return
+	}
+
+	baseURL := strings.TrimSpace(session.BackflowBaseURL)
+	if baseURL == "" {
+		baseURL = h.fallbackBackflowURL
+	}
+	if baseURL == "" {
+		writeIngressError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeIngressError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, "read ingress request body failed")
+		return
+	}
+
+	forwardResp, err := h.backflowCaller.ForwardHTTP(r.Context(), baseURL, domain.BackflowHTTPRequest{
+		Method:     r.Method,
+		Path:       normalizeIngressPath(r.URL.Path),
+		RawQuery:   r.URL.RawQuery,
+		Host:       r.Host,
+		Headers:    cloneHeaders(r.Header),
+		Body:       body,
+		TargetHost: "127.0.0.1",
+		TargetPort: route.TargetPort,
+		Protocol:   "http",
+	})
+	if err != nil {
+		var backflowErr *backflow.Error
+		if errors.As(err, &backflowErr) {
+			writeIngressError(
+				w,
+				statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway),
+				firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline),
+				firstNonEmpty(backflowErr.Message, "call agent backflow failed"),
+			)
+			return
+		}
+		writeIngressError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error())
+		return
+	}
+
+	// 透传目标服务返回头时过滤 hop-by-hop 头，避免代理链路语义冲突。
+	copyResponseHeaders(w, forwardResp.Headers)
+	w.Header().Set("X-DevLoop-Route-Env", route.Env)
+	w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
+	w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
+	w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+
+	statusCode := statusOrDefault(forwardResp.StatusCode, http.StatusOK)
+	w.WriteHeader(statusCode)
+	if len(forwardResp.Body) > 0 {
+		_, _ = w.Write(forwardResp.Body)
+	}
+}
+
+func (h *Handler) ingressGRPC(w http.ResponseWriter, _ *http.Request) {
+	writeIngressError(
+		w,
+		http.StatusNotImplemented,
+		domain.IngressErrorRouteNotFound,
+		"grpc ingress scaffold is not implemented yet",
+	)
+}
+
 func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -127,4 +229,71 @@ func selectSessionEpoch(requestEpoch, rejectedEpoch int64) int64 {
 		return rejectedEpoch
 	}
 	return requestEpoch
+}
+
+func writeIngressError(w http.ResponseWriter, status int, errorCode string, message string) {
+	respondJSON(w, status, domain.BackflowHTTPResponse{
+		StatusCode: status,
+		ErrorCode:  errorCode,
+		Message:    message,
+	})
+}
+
+func normalizeIngressPath(rawPath string) string {
+	path := strings.TrimPrefix(rawPath, "/api/v1/ingress/http")
+	if strings.TrimSpace(path) == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
+}
+
+func cloneHeaders(headers http.Header) map[string][]string {
+	result := make(map[string][]string, len(headers))
+	for name, values := range headers {
+		copied := make([]string, 0, len(values))
+		for _, value := range values {
+			copied = append(copied, value)
+		}
+		result[name] = copied
+	}
+	return result
+}
+
+func copyResponseHeaders(w http.ResponseWriter, headers map[string][]string) {
+	for name, values := range headers {
+		if isHopByHopHeader(name) {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func statusOrDefault(statusCode int, fallback int) int {
+	if statusCode <= 0 {
+		return fallback
+	}
+	return statusCode
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

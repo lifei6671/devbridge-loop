@@ -227,6 +227,7 @@ func (s *MemoryStore) applyHELLOLocked(tunnelID string, event domain.TunnelEvent
 		TunnelID:        tunnelID,
 		RDName:          firstNonEmpty(strings.TrimSpace(payload.RDName), existing.RDName),
 		ConnID:          firstNonEmpty(strings.TrimSpace(payload.ConnID), event.EventID),
+		BackflowBaseURL: firstNonEmpty(strings.TrimSpace(payload.BackflowBaseURL), existing.BackflowBaseURL),
 		SessionEpoch:    event.SessionEpoch,
 		ResourceVersion: maxInt64(existing.ResourceVersion, event.ResourceVersion),
 		Status:          "connected",

@@ -143,6 +143,53 @@ func (s *MemoryStore) ListRoutes() []domain.BridgeRoute {
 	return result
 }
 
+// ResolveRouteForIngress 按 (env, serviceName, protocol) 查找一条可用路由与会话。
+func (s *MemoryStore) ResolveRouteForIngress(env, serviceName, protocol string) (domain.BridgeRoute, domain.TunnelSession, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	env = strings.TrimSpace(env)
+	serviceName = strings.TrimSpace(serviceName)
+	protocol = sanitizeProtocol(protocol)
+	if env == "" || serviceName == "" {
+		return domain.BridgeRoute{}, domain.TunnelSession{}, false
+	}
+
+	// 先筛选出候选路由，再按 tunnelId/targetPort 排序，保证回流行为可预测。
+	candidates := make([]domain.BridgeRoute, 0)
+	for _, route := range s.routes {
+		if !strings.EqualFold(route.Env, env) {
+			continue
+		}
+		if !strings.EqualFold(route.ServiceName, serviceName) {
+			continue
+		}
+		if sanitizeProtocol(route.Protocol) != protocol {
+			continue
+		}
+		candidates = append(candidates, route)
+	}
+	if len(candidates) == 0 {
+		return domain.BridgeRoute{}, domain.TunnelSession{}, false
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].TunnelID == candidates[j].TunnelID {
+			return candidates[i].TargetPort < candidates[j].TargetPort
+		}
+		return candidates[i].TunnelID < candidates[j].TunnelID
+	})
+
+	for _, candidate := range candidates {
+		session, ok := s.sessions[candidate.TunnelID]
+		if !ok {
+			continue
+		}
+		return candidate, session, true
+	}
+	return domain.BridgeRoute{}, domain.TunnelSession{}, false
+}
+
 func (s *MemoryStore) appendEventLocked(event domain.TunnelEvent) {
 	s.events = append(s.events, event)
 	if len(s.events) > maxEventHistory {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/backflow"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/config"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/httpapi"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/routing"
@@ -24,7 +25,8 @@ type App struct {
 func New(cfg config.Config) *App {
 	pipeline := routing.NewPipeline(cfg.RouteExtractorOrder)
 	stateStore := store.NewMemoryStoreWithBridge(cfg.BridgePublicHost, cfg.BridgePublicPort)
-	h := httpapi.NewHandler(pipeline, stateStore)
+	backflowClient := backflow.NewClient(cfg.IngressTimeout)
+	h := httpapi.NewHandler(pipeline, stateStore, backflowClient, cfg.FallbackBackflowURL)
 
 	log.Printf("%s", pipeline.DebugString())
 	return &App{

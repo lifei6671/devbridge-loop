@@ -107,7 +107,6 @@ func (s *MemoryStore) UpsertRegistration(reg domain.LocalRegistration, eventID s
 	s.addEndpointIndexesLocked(reg, instanceKey)
 
 	s.resourceVersion++
-	s.lastTunnelHB = now
 	s.recordProcessedEventLocked(eventID, processedEvent{action: "upsert", instanceKey: instanceKey, processedAt: now})
 	return reg, false, nil
 }
@@ -151,6 +150,27 @@ func (s *MemoryStore) DeleteRegistration(instanceID, eventID string) (deleted bo
 	s.resourceVersion++
 	s.recordProcessedEventLocked(eventID, processedEvent{action: "delete", instanceKey: instanceKey, processedAt: now})
 	return true, false, nil
+}
+
+// FindRegistrationByInstanceID 根据 instanceID 查询注册项。
+func (s *MemoryStore) FindRegistrationByInstanceID(instanceID string) (domain.LocalRegistration, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	instanceKey, ok := s.instanceIndex[strings.TrimSpace(instanceID)]
+	if !ok {
+		return domain.LocalRegistration{}, false
+	}
+	reg, exists := s.registrations[instanceKey]
+	if !exists {
+		return domain.LocalRegistration{}, false
+	}
+	return reg, true
+}
+
+// SnapshotRegistrations 返回当前注册表快照，用于 full-sync。
+func (s *MemoryStore) SnapshotRegistrations() []domain.LocalRegistration {
+	return s.ListRegistrations()
 }
 
 // ListRegistrations returns registrations sorted by env, serviceName, then instanceID.
@@ -354,23 +374,28 @@ func (s *MemoryStore) AddError(code domain.ErrorCode, message string, context ma
 	}
 }
 
-// ExpireRegistrations removes registrations whose heartbeat exceeded TTL.
-func (s *MemoryStore) ExpireRegistrations(now time.Time) []string {
+// ExpireRegistrations 删除超过 TTL 的注册项，并返回被删除的快照列表。
+func (s *MemoryStore) ExpireRegistrations(now time.Time) []domain.LocalRegistration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	removed := make([]string, 0)
+	removed := make([]domain.LocalRegistration, 0)
 	for instanceKey, reg := range s.registrations {
 		expiresAt := reg.LastHeartbeatTime.Add(time.Duration(reg.TTLSeconds) * time.Second)
 		if now.After(expiresAt) {
 			s.deleteByInstanceKeyLocked(instanceKey)
-			removed = append(removed, reg.InstanceID)
+			removed = append(removed, reg)
 		}
 	}
 	if len(removed) > 0 {
 		s.resourceVersion++
 	}
-	sort.Strings(removed)
+	sort.Slice(removed, func(i, j int) bool {
+		if removed[i].ServiceName == removed[j].ServiceName {
+			return removed[i].InstanceID < removed[j].InstanceID
+		}
+		return removed[i].ServiceName < removed[j].ServiceName
+	})
 	return removed
 }
 
@@ -391,6 +416,63 @@ func (s *MemoryStore) ReconnectTunnel() domain.TunnelState {
 		BridgeAddress:     "bridge.example.internal:443",
 		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
 	}
+}
+
+// BeginTunnelReconnect 在重连前开启新 session epoch。
+func (s *MemoryStore) BeginTunnelReconnect() domain.TunnelState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sessionEpoch++
+	s.tunnelConnected = false
+	s.lastTunnelHB = time.Now().UTC()
+
+	return domain.TunnelState{
+		Connected:         s.tunnelConnected,
+		SessionEpoch:      s.sessionEpoch,
+		ResourceVersion:   s.resourceVersion,
+		LastHeartbeatAt:   s.lastTunnelHB,
+		BridgeAddress:     "",
+		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
+	}
+}
+
+// MarkTunnelConnected 更新 tunnel 为已连接状态。
+func (s *MemoryStore) MarkTunnelConnected() domain.TunnelState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tunnelConnected = true
+	s.lastTunnelHB = time.Now().UTC()
+	return domain.TunnelState{
+		Connected:         s.tunnelConnected,
+		SessionEpoch:      s.sessionEpoch,
+		ResourceVersion:   s.resourceVersion,
+		LastHeartbeatAt:   s.lastTunnelHB,
+		BridgeAddress:     "",
+		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
+	}
+}
+
+// MarkTunnelDisconnected 更新 tunnel 为断开状态。
+func (s *MemoryStore) MarkTunnelDisconnected() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tunnelConnected = false
+}
+
+// MarkTunnelHeartbeat 刷新 tunnel 心跳时间。
+func (s *MemoryStore) MarkTunnelHeartbeat(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastTunnelHB = at.UTC()
+}
+
+// CurrentSyncMeta 返回当前 sessionEpoch 和 resourceVersion。
+func (s *MemoryStore) CurrentSyncMeta() (sessionEpoch int64, resourceVersion int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sessionEpoch, s.resourceVersion
 }
 
 func (s *MemoryStore) lookupDuplicateUpsertLocked(eventID string) (bool, domain.LocalRegistration, bool) {

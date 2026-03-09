@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,18 +13,38 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/config"
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/domain"
+	"github.com/lifei6671/devbridge-loop/agent-core/internal/forwarder"
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/store"
 )
 
+// TunnelSyncPublisher 定义 HTTP 层到 tunnel 同步层的最小能力边界。
+type TunnelSyncPublisher interface {
+	EnqueueRegisterUpsert(ctx context.Context, reg domain.LocalRegistration, sourceEventID string) error
+	EnqueueRegisterDelete(ctx context.Context, reg domain.LocalRegistration, sourceEventID string) error
+	RequestReconnect(ctx context.Context) error
+}
+
+// LocalBackflowForwarder 定义 agent 回流到本地 endpoint 的转发能力。
+type LocalBackflowForwarder interface {
+	Forward(ctx context.Context, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error)
+}
+
 // Handler implements local management and state APIs.
 type Handler struct {
-	cfg   config.Config
-	store *store.MemoryStore
+	cfg               config.Config
+	store             *store.MemoryStore
+	syncPublisher     TunnelSyncPublisher
+	backflowForwarder LocalBackflowForwarder
 }
 
 // NewHandler creates API handlers.
-func NewHandler(cfg config.Config, s *store.MemoryStore) *Handler {
-	return &Handler{cfg: cfg, store: s}
+func NewHandler(cfg config.Config, s *store.MemoryStore, publisher TunnelSyncPublisher, backflowForwarder LocalBackflowForwarder) *Handler {
+	return &Handler{
+		cfg:               cfg,
+		store:             s,
+		syncPublisher:     publisher,
+		backflowForwarder: backflowForwarder,
+	}
 }
 
 // Router builds the HTTP router for agent-core APIs.
@@ -43,6 +64,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/intercepts", h.stateIntercepts)
 	mux.HandleFunc("GET /api/v1/state/errors", h.stateErrors)
 	mux.HandleFunc("POST /api/v1/control/reconnect", h.reconnect)
+	mux.HandleFunc("POST /api/v1/backflow/http", h.backflowHTTP)
 
 	return mux
 }
@@ -92,6 +114,18 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 本地注册成功后异步投递到 tunnel 同步队列。
+	if !duplicated && h.syncPublisher != nil {
+		if err := h.syncPublisher.EnqueueRegisterUpsert(r.Context(), stored, eventID); err != nil {
+			h.store.AddError(domain.ErrorTunnelOffline, "enqueue register upsert failed", map[string]string{
+				"eventId":     eventID,
+				"serviceName": stored.ServiceName,
+				"instanceId":  stored.InstanceID,
+				"error":       err.Error(),
+			})
+		}
+	}
+
 	setEventHeaders(w, eventID, duplicated)
 	respondJSON(w, http.StatusOK, stored)
 }
@@ -123,6 +157,7 @@ func (h *Handler) unregister(w http.ResponseWriter, r *http.Request) {
 		eventID = generateID("evt")
 	}
 
+	removedReg, regExists := h.store.FindRegistrationByInstanceID(instanceID)
 	deleted, duplicated, err := h.store.DeleteRegistration(instanceID, eventID)
 	if err != nil {
 		if errors.Is(err, store.ErrInstanceNotFound) {
@@ -132,6 +167,17 @@ func (h *Handler) unregister(w http.ResponseWriter, r *http.Request) {
 		h.store.AddError(domain.ErrorRouteExtractFailed, "failed to delete registration", map[string]string{"error": err.Error(), "instanceId": instanceID})
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete registration"})
 		return
+	}
+
+	// 注销成功后向 bridge 投递删除事件，保持两侧接管关系收敛。
+	if deleted && !duplicated && regExists && h.syncPublisher != nil {
+		if err := h.syncPublisher.EnqueueRegisterDelete(r.Context(), removedReg, eventID); err != nil {
+			h.store.AddError(domain.ErrorTunnelOffline, "enqueue register delete failed", map[string]string{
+				"eventId":    eventID,
+				"instanceId": removedReg.InstanceID,
+				"error":      err.Error(),
+			})
+		}
 	}
 
 	setEventHeaders(w, eventID, duplicated)
@@ -167,7 +213,7 @@ func (h *Handler) stateSummary(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) stateTunnel(w http.ResponseWriter, _ *http.Request) {
-	state := h.store.TunnelState("bridge.example.internal:443")
+	state := h.store.TunnelState(h.cfg.Tunnel.BridgeAddress)
 	respondJSON(w, http.StatusOK, state)
 }
 
@@ -179,8 +225,65 @@ func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, h.store.ListErrors())
 }
 
-func (h *Handler) reconnect(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, http.StatusOK, h.store.ReconnectTunnel())
+func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {
+	if h.syncPublisher == nil {
+		state := h.store.ReconnectTunnel()
+		respondJSON(w, http.StatusOK, state)
+		return
+	}
+
+	if err := h.syncPublisher.RequestReconnect(r.Context()); err != nil {
+		h.store.AddError(domain.ErrorTunnelOffline, "manual reconnect failed", map[string]string{"error": err.Error()})
+		respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+
+	state := h.store.TunnelState(h.cfg.Tunnel.BridgeAddress)
+	respondJSON(w, http.StatusOK, state)
+}
+
+func (h *Handler) backflowHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.backflowForwarder == nil {
+		respondJSON(w, http.StatusNotImplemented, domain.BackflowHTTPResponse{
+			StatusCode: http.StatusNotImplemented,
+			ErrorCode:  domain.ErrorRouteExtractFailed,
+			Message:    "local backflow forwarder is not configured",
+		})
+		return
+	}
+
+	var request domain.BackflowHTTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondJSON(w, http.StatusBadRequest, domain.BackflowHTTPResponse{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  domain.ErrorRouteExtractFailed,
+			Message:    "invalid backflow payload",
+		})
+		return
+	}
+
+	if strings.TrimSpace(request.TargetHost) == "" || request.TargetPort <= 0 {
+		respondJSON(w, http.StatusBadRequest, domain.BackflowHTTPResponse{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  domain.ErrorRouteExtractFailed,
+			Message:    "targetHost/targetPort are required",
+		})
+		return
+	}
+
+	response, err := h.backflowForwarder.Forward(r.Context(), request)
+	if err != nil {
+		statusCode, errorCode, message := classifyBackflowError(err)
+		respondJSON(w, statusCode, domain.BackflowHTTPResponse{
+			StatusCode: statusCode,
+			ErrorCode:  errorCode,
+			Message:    message,
+		})
+		return
+	}
+
+	// 对 bridge 来说，调用成功即返回 200，真实业务状态码放在 payload.statusCode 中。
+	respondJSON(w, http.StatusOK, response)
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload any) {
@@ -223,4 +326,28 @@ func setEventHeaders(w http.ResponseWriter, eventID string, duplicated bool) {
 		return
 	}
 	w.Header().Set("X-Event-Deduplicated", "false")
+}
+
+func classifyBackflowError(err error) (statusCode int, errorCode domain.ErrorCode, message string) {
+	var forwardErr *forwarder.ForwardError
+	if errors.As(err, &forwardErr) {
+		switch forwardErr.Code {
+		case domain.ErrorUpstreamTimeout:
+			return http.StatusGatewayTimeout, domain.ErrorUpstreamTimeout, firstNonBlank(forwardErr.Message, "upstream timeout")
+		case domain.ErrorLocalEndpointDown:
+			return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(forwardErr.Message, "local endpoint unavailable")
+		default:
+			return http.StatusBadGateway, forwardErr.Code, firstNonBlank(forwardErr.Message, "backflow failed")
+		}
+	}
+	return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(err.Error(), "backflow failed")
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
