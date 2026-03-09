@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -16,7 +17,10 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/store"
 )
 
-const defaultEventQueueSize = 512
+const (
+	defaultEventQueueSize = 512
+	staleEpochErrorCode   = "STALE_EPOCH_EVENT"
+)
 
 type outboundEvent struct {
 	messageType domain.TunnelMessageType
@@ -36,8 +40,9 @@ type SyncManager struct {
 	tunnelID  string
 	queueSize int
 
-	eventCh     chan outboundEvent
-	reconnectCh chan reconnectRequest
+	eventCh        chan outboundEvent
+	reconnectCh    chan reconnectRequest
+	reconnectNowCh chan struct{}
 
 	mu     sync.RWMutex
 	connID string
@@ -46,13 +51,14 @@ type SyncManager struct {
 // NewSyncManager 创建同步管理器。
 func NewSyncManager(cfg config.Config, state *store.MemoryStore) *SyncManager {
 	return &SyncManager{
-		cfg:         cfg,
-		state:       state,
-		client:      NewBridgeClient(cfg.Tunnel.BridgeAddress, cfg.Tunnel.RequestTimeout),
-		tunnelID:    buildTunnelID(cfg.RDName),
-		queueSize:   defaultEventQueueSize,
-		eventCh:     make(chan outboundEvent, defaultEventQueueSize),
-		reconnectCh: make(chan reconnectRequest, 8),
+		cfg:            cfg,
+		state:          state,
+		client:         NewBridgeClient(cfg.Tunnel.BridgeAddress, cfg.Tunnel.RequestTimeout),
+		tunnelID:       buildTunnelID(cfg.RDName),
+		queueSize:      defaultEventQueueSize,
+		eventCh:        make(chan outboundEvent, defaultEventQueueSize),
+		reconnectCh:    make(chan reconnectRequest, 8),
+		reconnectNowCh: make(chan struct{}, 1),
 	}
 }
 
@@ -92,6 +98,17 @@ func (m *SyncManager) Run(ctx context.Context) {
 
 // RequestReconnect 触发一次重连流程，并等待结果。
 func (m *SyncManager) RequestReconnect(ctx context.Context) error {
+	// 无论当前是否在退避窗口，都先发一个“立即重试”信号，保证手动重连具备抢占性。
+	select {
+	case m.reconnectNowCh <- struct{}{}:
+	default:
+	}
+
+	// 如果当前已经处于重连流程，信号已送达，直接返回即可。
+	if m.state.TunnelState(m.cfg.Tunnel.BridgeAddress).Reconnecting {
+		return nil
+	}
+
 	request := reconnectRequest{result: make(chan error, 1)}
 
 	select {
@@ -234,6 +251,14 @@ func (m *SyncManager) reconnectWithBackoff(ctx context.Context) error {
 			m.state.MarkTunnelHeartbeat(time.Now().UTC())
 			return nil
 		} else {
+			if rejectedEpoch, ok := staleEpochFromError(err); ok {
+				// bridge 已有更高 epoch 时，直接快进本地 epoch，避免按 5s/10s/... 线性追赶。
+				m.state.SetSessionEpochAtLeast(rejectedEpoch)
+				sessionState = m.state.BeginTunnelReconnect()
+				epoch = sessionState.SessionEpoch
+				continue
+			}
+
 			backoff := m.backoffForAttempt(attempt)
 			attempt++
 			diagnosticError := withBridgeConnectivityHint(err, m.cfg.Tunnel.BridgeAddress)
@@ -253,6 +278,12 @@ func (m *SyncManager) reconnectWithBackoff(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-m.reconnectNowCh:
+				// 手动重连会打断当前退避等待，立即发起下一次握手尝试。
+				attempt = 0
+				sessionState = m.state.BeginTunnelReconnect()
+				epoch = sessionState.SessionEpoch
+				continue
 			case <-time.After(backoff):
 			}
 
@@ -476,4 +507,18 @@ func withBridgeConnectivityHint(err error, bridgeAddress string) string {
 		return message + " | hint: 若 cloud-bridge 运行在 WSL，请将 tunnelBridgeAddress 改为 WSL 的实际 IP:38080，或直接在 Windows 启动 cloud-bridge.exe。"
 	}
 	return message
+}
+
+func staleEpochFromError(err error) (int64, bool) {
+	var bridgeErr *BridgeReplyError
+	if !errors.As(err, &bridgeErr) {
+		return 0, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(bridgeErr.Code), staleEpochErrorCode) {
+		return 0, false
+	}
+	if bridgeErr.Reply.SessionEpoch <= 0 {
+		return 0, false
+	}
+	return bridgeErr.Reply.SessionEpoch, true
 }

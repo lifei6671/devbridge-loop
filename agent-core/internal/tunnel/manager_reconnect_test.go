@@ -110,6 +110,136 @@ func TestSyncManager_BackoffForAttemptUsesConfiguredStepsWithCap(t *testing.T) {
 	}
 }
 
+func TestSyncManager_RequestReconnectInterruptsBackoffImmediately(t *testing.T) {
+	t.Parallel()
+
+	bridgeAddr := allocateLoopbackAddr(t)
+	cfg := config.Config{
+		HTTPAddr: "127.0.0.1:19091",
+		RDName:   "rd-test",
+		EnvName:  "dev-test",
+		Registration: config.RegistrationConfig{
+			DefaultTTLSeconds: 30,
+			ScanInterval:      time.Second,
+		},
+		Tunnel: config.TunnelConfig{
+			BridgeAddress:     "http://" + bridgeAddr,
+			BackflowBaseURL:   "http://127.0.0.1:19091",
+			HeartbeatInterval: 200 * time.Millisecond,
+			ReconnectBackoff:  []time.Duration{5 * time.Second, 5 * time.Second},
+			RequestTimeout:    120 * time.Millisecond,
+		},
+		EnvResolve: config.EnvResolveConfig{
+			Order: []string{"requestHeader", "payload", "runtimeDefault", "baseFallback"},
+		},
+	}
+
+	state := store.NewMemoryStore()
+	manager := NewSyncManager(cfg, state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+
+	if err := waitReconnectPending(state, cfg.Tunnel.BridgeAddress, 2*time.Second); err != nil {
+		t.Fatalf("expected reconnect countdown state before manual trigger: %v", err)
+	}
+	beforeState := state.TunnelState(cfg.Tunnel.BridgeAddress)
+	if beforeState.ReconnectAttempt < 1 {
+		t.Fatalf("expected reconnectAttempt >= 1 before manual trigger, got %d", beforeState.ReconnectAttempt)
+	}
+	if beforeState.NextReconnectAt == nil {
+		t.Fatal("expected nextReconnectAt before manual trigger")
+	}
+	beforeNext := beforeState.NextReconnectAt.UTC()
+
+	manualCtx, manualCancel := context.WithTimeout(context.Background(), time.Second)
+	defer manualCancel()
+	if err := manager.RequestReconnect(manualCtx); err != nil {
+		t.Fatalf("manual reconnect should return quickly while reconnecting: %v", err)
+	}
+
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		current := state.TunnelState(cfg.Tunnel.BridgeAddress)
+		if current.NextReconnectAt != nil && current.NextReconnectAt.UTC().After(beforeNext) {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("sync manager did not stop after context canceled")
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t.Fatalf("manual reconnect did not reset backoff window in time: beforeNext=%s afterNext=%v", beforeNext.Format(time.RFC3339Nano), state.TunnelState(cfg.Tunnel.BridgeAddress).NextReconnectAt)
+}
+
+func TestSyncManager_FastForwardEpochOnStaleEpochReject(t *testing.T) {
+	t.Parallel()
+
+	bridgeAddr := allocateLoopbackAddr(t)
+	cfg := config.Config{
+		HTTPAddr: "127.0.0.1:19092",
+		RDName:   "rd-test",
+		EnvName:  "dev-test",
+		Registration: config.RegistrationConfig{
+			DefaultTTLSeconds: 30,
+			ScanInterval:      time.Second,
+		},
+		Tunnel: config.TunnelConfig{
+			BridgeAddress:     "http://" + bridgeAddr,
+			BackflowBaseURL:   "http://127.0.0.1:19092",
+			HeartbeatInterval: 200 * time.Millisecond,
+			ReconnectBackoff:  []time.Duration{5 * time.Second, 5 * time.Second},
+			RequestTimeout:    200 * time.Millisecond,
+		},
+		EnvResolve: config.EnvResolveConfig{
+			Order: []string{"requestHeader", "payload", "runtimeDefault", "baseFallback"},
+		},
+	}
+
+	state := store.NewMemoryStore()
+	manager := NewSyncManager(cfg, state)
+
+	server, reqCount := startMockBridgeServerRejectStaleEpoch(t, bridgeAddr, 8)
+	defer shutdownServer(t, server)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+
+	if err := waitTunnelConnected(state, cfg.Tunnel.BridgeAddress, 4*time.Second); err != nil {
+		t.Fatalf("expected tunnel to reconnect quickly after stale epoch reject: %v", err)
+	}
+	current := state.TunnelState(cfg.Tunnel.BridgeAddress)
+	if current.SessionEpoch < 9 {
+		t.Fatalf("expected sessionEpoch fast-forward to at least 9, got %d", current.SessionEpoch)
+	}
+	if got := atomic.LoadInt64(reqCount); got < 4 {
+		t.Fatalf("expected at least 4 tunnel events (1 stale + 3 success), got %d", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sync manager did not stop after context canceled")
+	}
+}
+
 func allocateLoopbackAddr(t *testing.T) string {
 	t.Helper()
 
@@ -133,6 +263,57 @@ func startMockBridgeServer(t *testing.T, addr string) (*http.Server, *int64) {
 		var message domain.TunnelMessage
 		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
 			http.Error(w, fmt.Sprintf("decode tunnel message failed: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		reply := domain.TunnelReply{
+			Type:            domain.MessageACK,
+			Status:          "accepted",
+			EventID:         message.EventID,
+			SessionEpoch:    message.SessionEpoch,
+			ResourceVersion: message.ResourceVersion,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(reply)
+	})
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+	return server, &reqCount
+}
+
+func startMockBridgeServerRejectStaleEpoch(t *testing.T, addr string, currentEpoch int64) (*http.Server, *int64) {
+	t.Helper()
+
+	var reqCount int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/tunnel/events", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&reqCount, 1)
+
+		var message domain.TunnelMessage
+		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+			http.Error(w, fmt.Sprintf("decode tunnel message failed: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if message.Type == domain.MessageHello && message.SessionEpoch <= currentEpoch {
+			reply := domain.TunnelReply{
+				Type:            domain.MessageError,
+				Status:          "rejected",
+				EventID:         message.EventID,
+				SessionEpoch:    currentEpoch,
+				ResourceVersion: 1,
+				ErrorCode:       staleEpochErrorCode,
+				Message:         fmt.Sprintf("stale epoch event: incoming=%d current=%d", message.SessionEpoch, currentEpoch),
+			}
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(reply)
 			return
 		}
 

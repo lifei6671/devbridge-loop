@@ -147,7 +147,7 @@ fn agent_runtime(
 }
 
 #[tauri::command]
-fn restart_agent_process(
+async fn restart_agent_process(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<AgentRuntime, String> {
@@ -159,6 +159,13 @@ fn restart_agent_process(
     let runtime = manager.restart_now()?;
     drop(manager);
     emit_runtime_event(&app, &runtime)?;
+
+    // 重启成功后立即触发一次 bridge 重连，避免等待下个轮询窗口才开始连接。
+    let api = state.api.clone();
+    tauri::async_runtime::spawn(async move {
+        trigger_reconnect_after_restart(api).await;
+    });
+
     Ok(runtime)
 }
 
@@ -314,6 +321,25 @@ fn emit_runtime_event(app_handle: &AppHandle, runtime: &AgentRuntime) -> Result<
     app_handle
         .emit(AGENT_RUNTIME_EVENT, runtime)
         .map_err(|err| format!("emit runtime event failed: {err}"))
+}
+
+async fn trigger_reconnect_after_restart(api: AgentApiClient) {
+    const MAX_ATTEMPTS: usize = 6;
+    let retry_interval = Duration::from_millis(300);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match api.reconnect().await {
+            Ok(_) => return,
+            Err(err) => {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    eprintln!("failed to trigger bridge reconnect after agent restart: {err}");
+                    return;
+                }
+            }
+        }
+
+        std::thread::sleep(retry_interval);
+    }
 }
 
 fn setup_tray(app: &AppHandle) -> Result<(), String> {

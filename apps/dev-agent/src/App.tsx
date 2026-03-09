@@ -50,6 +50,7 @@ import type {
 } from "@/types";
 
 type PageKey = "dashboard" | "services" | "intercepts" | "logs" | "config";
+type UiPhase = "ready" | "restarting" | "recovering";
 
 const PAGE_ITEMS: Array<{ key: PageKey; label: string; icon: ComponentType<{ className?: string }> }> = [
   { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -82,14 +83,10 @@ function formatTime(value?: string | null): string {
 
 function formatCountdown(remainingMs: number): string {
   if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
-    return "0.0s";
+    return "0s";
   }
 
-  const seconds = remainingMs / 1000;
-  if (seconds >= 10) {
-    return `${Math.ceil(seconds)}s`;
-  }
-  return `${seconds.toFixed(1)}s`;
+  return `${Math.ceil(remainingMs / 1000)}s`;
 }
 
 function renderHealthBadge(healthy: boolean): ReactElement {
@@ -121,6 +118,12 @@ function parseStringList(input: string): string[] {
   return parsed;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 export default function App(): ReactElement {
   const [activePage, setActivePage] = useState<PageKey>("dashboard");
   const [summary, setSummary] = useState<StateSummary | null>(null);
@@ -134,7 +137,7 @@ export default function App(): ReactElement {
   const [desktopConfigDraft, setDesktopConfigDraft] = useState<DesktopConfigSaveRequest | null>(null);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
-  const [restartingAgent, setRestartingAgent] = useState(false);
+  const [uiPhase, setUiPhase] = useState<UiPhase>("ready");
   const [manualReconnecting, setManualReconnecting] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
@@ -142,6 +145,7 @@ export default function App(): ReactElement {
   const [showCloseDecisionDialog, setShowCloseDecisionDialog] = useState(false);
   const [resolvingCloseDecision, setResolvingCloseDecision] = useState(false);
   const [clockMs, setClockMs] = useState(() => Date.now());
+  const phaseBusy = uiPhase !== "ready";
 
   const selectedRegistration = useMemo(() => {
     if (!selectedInstanceId) {
@@ -220,6 +224,10 @@ export default function App(): ReactElement {
         }
         return registrationData[0]?.instanceId ?? null;
       });
+
+      if (uiPhase === "recovering") {
+        setUiPhase("ready");
+      }
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -227,31 +235,52 @@ export default function App(): ReactElement {
         setManualRefreshing(false);
       }
     }
-  }, [loadDiagnostics]);
+  }, [loadDiagnostics, uiPhase]);
 
   const reconnect = useCallback(async () => {
-    if (manualReconnecting) {
+    if (manualReconnecting || phaseBusy) {
       return;
     }
 
     setManualReconnecting(true);
     setActionError("");
-    // 手动重连点击后先给出前端即时反馈，避免用户误判按钮未生效。
-    setTunnel((current) => {
-      if (!current) {
-        return current;
-      }
-      return {
-        ...current,
-        connected: false,
-        reconnecting: true,
-        reconnectAttempt: current.reconnectAttempt + 1,
-        nextReconnectAt: new Date(Date.now() + 1000).toISOString(),
-        lastReconnectError: ""
-      };
-    });
 
     try {
+      // 手动重连点击后延迟 1s 再进入联动过渡态，避免状态瞬切。
+      await delay(1000);
+
+      setSummary((current) =>
+        current
+          ? {
+              ...current,
+              bridgeStatus: "offline",
+              tunnelStatus: "disconnected",
+              registrationCount: 0,
+              activeIntercepts: 0,
+              lastUpdateAt: new Date().toISOString()
+            }
+          : current
+      );
+      setRegistrations([]);
+      setIntercepts([]);
+      setSelectedInstanceId(null);
+      setTunnel((current) => {
+        if (!current) {
+          return current;
+        }
+        return {
+          ...current,
+          connected: false,
+          reconnecting: true,
+          reconnectAttempt: 0,
+          sessionEpoch: 0,
+          resourceVersion: 0,
+          lastHeartbeatAt: "",
+          nextReconnectAt: null,
+          lastReconnectError: ""
+        };
+      });
+
       await call<TunnelState>("trigger_reconnect");
       await refresh();
     } catch (error) {
@@ -259,16 +288,49 @@ export default function App(): ReactElement {
     } finally {
       setManualReconnecting(false);
     }
-  }, [manualReconnecting, refresh]);
+  }, [manualReconnecting, phaseBusy, refresh]);
 
   const restartAgent = useCallback(async () => {
-    if (restartingAgent) {
+    if (phaseBusy) {
       return;
     }
 
-    setRestartingAgent(true);
+    setUiPhase("restarting");
     setActionError("");
-    // 在后端返回前先把卡片状态切到重启中，形成明确过渡态。
+    // 点击重启后立即把联动状态回到“初始态”，避免页面继续展示旧连接快照。
+    setSummary((current) =>
+      current
+        ? {
+            ...current,
+            agentStatus: "restarting",
+            bridgeStatus: "offline",
+            tunnelStatus: "disconnected",
+            registrationCount: 0,
+            activeIntercepts: 0,
+            lastUpdateAt: new Date().toISOString()
+          }
+        : current
+    );
+    setTunnel((current) =>
+      current
+        ? {
+            ...current,
+            connected: false,
+            reconnecting: false,
+            reconnectAttempt: 0,
+            sessionEpoch: 0,
+            resourceVersion: 0,
+            lastHeartbeatAt: "",
+            nextReconnectAt: null,
+            lastReconnectError: ""
+          }
+        : current
+    );
+    setRegistrations([]);
+    setIntercepts([]);
+    setSelectedInstanceId(null);
+
+    // 在后端返回前把 Agent 卡片切到重启中，形成明确过渡态。
     setRuntime((current) =>
       current
         ? {
@@ -282,13 +344,13 @@ export default function App(): ReactElement {
     try {
       const runtimeData = await call<AgentRuntime>("restart_agent_process");
       setRuntime(runtimeData);
+      setUiPhase("recovering");
       await refresh();
     } catch (error) {
       setActionError(String(error));
-    } finally {
-      setRestartingAgent(false);
+      setUiPhase("ready");
     }
-  }, [refresh, restartingAgent]);
+  }, [phaseBusy, refresh]);
 
   const saveDesktopConfig = useCallback(async () => {
     if (!desktopConfigDraft) {
@@ -364,14 +426,18 @@ export default function App(): ReactElement {
   );
 
   useEffect(() => {
-    // 断线重连阶段提升轮询频率，保证倒计时与状态切换更及时。
-    const intervalMs = tunnel?.reconnecting ? 1000 : 5000;
+    if (uiPhase === "restarting") {
+      return;
+    }
+
+    // 恢复阶段和断线重连阶段都提升轮询频率，尽快收敛到稳定状态。
+    const intervalMs = uiPhase === "recovering" || tunnel?.reconnecting ? 1000 : 5000;
     void refresh();
     const timer = window.setInterval(() => {
       void refresh();
     }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [refresh, tunnel?.reconnecting]);
+  }, [refresh, uiPhase, tunnel?.reconnecting]);
 
   useEffect(() => {
     // 倒计时改为 200ms 粒度，避免 5s -> 4s 的瞬时跳变看起来“闪一下”。
@@ -433,6 +499,12 @@ export default function App(): ReactElement {
   }, [clockMs, tunnel]);
 
   const bridgeCardStatus = useMemo(() => {
+    if (uiPhase === "restarting") {
+      return "offline";
+    }
+    if (uiPhase === "recovering") {
+      return tunnel?.connected ? "online" : "recovering";
+    }
     if (manualReconnecting) {
       return "manual-reconnecting";
     }
@@ -443,23 +515,35 @@ export default function App(): ReactElement {
       return "reconnecting";
     }
     return summary?.bridgeStatus ?? "unknown";
-  }, [manualReconnecting, summary?.bridgeStatus, tunnel?.connected, tunnel?.reconnecting]);
+  }, [manualReconnecting, summary?.bridgeStatus, tunnel?.connected, tunnel?.reconnecting, uiPhase]);
 
   const agentCardStatus = useMemo(() => {
-    if (restartingAgent) {
+    if (uiPhase === "restarting") {
       return "restarting";
     }
+    if (uiPhase === "recovering") {
+      return "recovering";
+    }
     return runtime?.status ?? summary?.agentStatus ?? "unknown";
-  }, [restartingAgent, runtime?.status, summary?.agentStatus]);
+  }, [uiPhase, runtime?.status, summary?.agentStatus]);
 
   const refreshProgressLabel = useMemo(() => {
+    if (uiPhase === "recovering") {
+      return "状态恢复中...";
+    }
     if (manualRefreshing) {
       return "手动刷新中...";
     }
     return "空闲";
-  }, [manualRefreshing]);
+  }, [manualRefreshing, uiPhase]);
 
   const bridgeOperationLabel = useMemo(() => {
+    if (uiPhase === "restarting") {
+      return "重启 Agent Core...";
+    }
+    if (uiPhase === "recovering") {
+      return "恢复连接中...";
+    }
     if (manualReconnecting) {
       return "手动重连中...";
     }
@@ -467,20 +551,20 @@ export default function App(): ReactElement {
       return "自动重连中...";
     }
     return "空闲";
-  }, [manualReconnecting, tunnel?.reconnecting]);
+  }, [manualReconnecting, tunnel?.reconnecting, uiPhase]);
 
   const renderDashboard = (): ReactElement => (
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       <Card
         className={cn(
           "transition-all duration-300",
-          restartingAgent && "border-amber-500/60 shadow-lg shadow-amber-900/10"
+          phaseBusy && "border-amber-500/60 shadow-lg shadow-amber-900/10"
         )}
       >
         <CardHeader className="pb-2">
           <CardDescription>Agent</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
-            <Server className={cn("h-4 w-4", restartingAgent && "animate-pulse")} />
+            <Server className={cn("h-4 w-4", phaseBusy && "animate-pulse")} />
             {agentCardStatus}
           </CardTitle>
         </CardHeader>
@@ -488,7 +572,7 @@ export default function App(): ReactElement {
           <div>pid: {runtime?.pid ?? "-"}</div>
           <div>env: {summary?.currentEnv ?? "-"}</div>
           <div>status: {agentCardStatus}</div>
-          <div>operation: {restartingAgent ? "重启 Agent Core..." : "空闲"}</div>
+          <div>operation: {uiPhase === "restarting" ? "重启 Agent Core..." : uiPhase === "recovering" ? "恢复状态中..." : "空闲"}</div>
           <div>sync: {refreshProgressLabel}</div>
           <div>restart-count: {runtime?.restartCount ?? 0}</div>
           <div className="whitespace-pre-wrap break-all">
@@ -500,13 +584,13 @@ export default function App(): ReactElement {
       <Card
         className={cn(
           "transition-all duration-300",
-          manualReconnecting && "border-amber-500/60 shadow-lg shadow-amber-900/10"
+          (manualReconnecting || phaseBusy) && "border-amber-500/60 shadow-lg shadow-amber-900/10"
         )}
       >
         <CardHeader className="pb-2">
           <CardDescription>Bridge</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
-            <Cloud className={cn("h-4 w-4", manualReconnecting && "animate-pulse")} />
+            <Cloud className={cn("h-4 w-4", (manualReconnecting || phaseBusy) && "animate-pulse")} />
             {bridgeCardStatus}
           </CardTitle>
         </CardHeader>
@@ -997,7 +1081,7 @@ export default function App(): ReactElement {
             <Button
               variant="outline"
               onClick={() => void refresh({ manual: true })}
-              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnecting}
             >
               <RefreshCcw className={cn("mr-2 h-4 w-4", manualRefreshing && "animate-spin")} />
               {manualRefreshing ? "刷新中..." : "刷新"}
@@ -1005,14 +1089,18 @@ export default function App(): ReactElement {
             <Button
               variant="outline"
               onClick={() => void restartAgent()}
-              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnecting}
             >
-              <RotateCcw className={cn("mr-2 h-4 w-4", restartingAgent && "animate-spin")} />
-              {restartingAgent ? "重启中..." : "重启 Agent Core"}
+              <RotateCcw className={cn("mr-2 h-4 w-4", phaseBusy && "animate-spin")} />
+              {uiPhase === "restarting"
+                ? "重启中..."
+                : uiPhase === "recovering"
+                  ? "恢复中..."
+                  : "重启 Agent Core"}
             </Button>
             <Button
               onClick={() => void reconnect()}
-              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnecting}
             >
               <Cable className={cn("mr-2 h-4 w-4", manualReconnecting && "animate-pulse")} />
               {manualReconnecting ? "重连中..." : "手动重连"}

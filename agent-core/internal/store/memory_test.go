@@ -196,6 +196,25 @@ func TestDiagnosticsSnapshotAggregatesSummaryErrorsAndRequests(t *testing.T) {
 	}
 }
 
+func TestSetSessionEpochAtLeast(t *testing.T) {
+	s := NewMemoryStore()
+
+	state := s.BeginTunnelReconnect()
+	if state.SessionEpoch != 1 {
+		t.Fatalf("expected sessionEpoch=1 after first reconnect begin, got %d", state.SessionEpoch)
+	}
+
+	state = s.SetSessionEpochAtLeast(8)
+	if state.SessionEpoch != 8 {
+		t.Fatalf("expected sessionEpoch fast-forward to 8, got %d", state.SessionEpoch)
+	}
+
+	state = s.SetSessionEpochAtLeast(3)
+	if state.SessionEpoch != 8 {
+		t.Fatalf("sessionEpoch should not rollback, got %d", state.SessionEpoch)
+	}
+}
+
 func sampleRegistration(env, service, instanceID string, port int) domain.LocalRegistration {
 	return domain.LocalRegistration{
 		ServiceName: service,

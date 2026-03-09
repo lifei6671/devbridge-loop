@@ -506,6 +506,21 @@ func (s *MemoryStore) BeginTunnelReconnect() domain.TunnelState {
 	return s.buildTunnelStateLocked("")
 }
 
+// SetSessionEpochAtLeast 将本地 sessionEpoch 快进到指定值（若更大），用于处理 bridge 返回的 stale-epoch 拒绝。
+func (s *MemoryStore) SetSessionEpochAtLeast(sessionEpoch int64) domain.TunnelState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sessionEpoch > s.sessionEpoch {
+		s.sessionEpoch = sessionEpoch
+	}
+	s.tunnelConnected = false
+	s.reconnecting = true
+	s.nextReconnectAt = nil
+
+	return s.buildTunnelStateLocked("")
+}
+
 // MarkTunnelReconnectPending 记录重连失败后的下一次重试窗口，供 UI 展示倒计时。
 func (s *MemoryStore) MarkTunnelReconnectPending(attempt int, nextReconnectAt time.Time, lastError string) domain.TunnelState {
 	s.mu.Lock()
