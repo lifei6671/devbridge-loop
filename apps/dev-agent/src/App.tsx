@@ -40,6 +40,7 @@ import type {
   AgentRuntime,
   DesktopConfigView,
   DesktopConfigSaveRequest,
+  DiagnosticsSnapshot,
   ErrorEntry,
   LocalRegistration,
   RequestSummary,
@@ -131,35 +132,50 @@ export default function App(): ReactElement {
     return registrations.find((item) => item.instanceId === selectedInstanceId) ?? null;
   }, [registrations, selectedInstanceId]);
 
+  const loadDiagnostics = useCallback(async (): Promise<DiagnosticsSnapshot> => {
+    try {
+      return await call<DiagnosticsSnapshot>("get_diagnostics");
+    } catch {
+      // 兼容旧版本 agent-core：若聚合接口不可用，则回退到三个独立状态接口。
+      const [summaryData, errorData, requestData] = await Promise.all([
+        call<StateSummary>("get_state_summary"),
+        call<ErrorEntry[]>("get_recent_errors"),
+        call<RequestSummary[]>("get_recent_requests")
+      ]);
+      return {
+        summary: summaryData,
+        recentErrors: errorData,
+        recentRequests: requestData,
+        generatedAt: new Date().toISOString()
+      };
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setActionError("");
     try {
       const [
-        summaryData,
+        diagnosticsData,
         tunnelData,
         registrationData,
-        errorData,
-        requestData,
         runtimeData,
         interceptData,
         desktopConfigData
       ] = await Promise.all([
-        call<StateSummary>("get_state_summary"),
+        loadDiagnostics(),
         call<TunnelState>("get_tunnel_state"),
         call<LocalRegistration[]>("get_registrations"),
-        call<ErrorEntry[]>("get_recent_errors"),
-        call<RequestSummary[]>("get_recent_requests"),
         call<AgentRuntime>("agent_runtime"),
         call<ActiveIntercept[]>("get_active_intercepts"),
         call<DesktopConfigView>("get_desktop_config")
       ]);
 
-      setSummary(summaryData);
+      setSummary(diagnosticsData.summary);
       setTunnel(tunnelData);
       setRegistrations(registrationData);
-      setErrors(errorData);
-      setRequests(requestData);
+      setErrors(diagnosticsData.recentErrors);
+      setRequests(diagnosticsData.recentRequests);
       setRuntime(runtimeData);
       setIntercepts(interceptData);
       setDesktopConfig(desktopConfigData);
@@ -186,7 +202,7 @@ export default function App(): ReactElement {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadDiagnostics]);
 
   const reconnect = useCallback(async () => {
     setActionError("");
@@ -527,7 +543,7 @@ export default function App(): ReactElement {
     <Card>
       <CardHeader>
         <CardTitle>Runtime Logs</CardTitle>
-        <CardDescription>基于 `/api/v1/state/errors` 与运行态事件的最近日志</CardDescription>
+        <CardDescription>基于 `/api/v1/state/diagnostics` 与运行态事件的最近日志</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
         {errors.length === 0 ? (

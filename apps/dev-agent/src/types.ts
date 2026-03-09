@@ -73,6 +73,13 @@ export interface RequestSummary {
   occurredAt: string;
 }
 
+export interface DiagnosticsSnapshot {
+  summary: StateSummary;
+  recentErrors: ErrorEntry[];
+  recentRequests: RequestSummary[];
+  generatedAt: string;
+}
+
 export interface AgentRuntime {
   status: string;
   pid: number | null;

@@ -40,6 +40,11 @@ async fn get_tunnel_state(state: tauri::State<'_, AppState>) -> Result<Value, St
 }
 
 #[tauri::command]
+async fn get_diagnostics(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    state.api.diagnostics().await
+}
+
+#[tauri::command]
 async fn get_registrations(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
     state.api.registrations().await
 }
@@ -178,6 +183,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state_summary,
             get_tunnel_state,
+            get_diagnostics,
             get_registrations,
             get_recent_errors,
             get_recent_requests,

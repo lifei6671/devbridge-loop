@@ -100,6 +100,10 @@ impl AgentApiClient {
         self.get_json("/api/v1/state/tunnel").await
     }
 
+    pub async fn diagnostics(&self) -> Result<Value, String> {
+        self.get_json("/api/v1/state/diagnostics").await
+    }
+
     pub async fn registrations(&self) -> Result<Vec<Value>, String> {
         self.get_json("/api/v1/registrations").await
     }

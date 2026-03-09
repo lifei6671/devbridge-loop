@@ -2,6 +2,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct AgentManager {
     child: Option<Child>,
@@ -148,6 +153,7 @@ impl AgentManager {
         if let Some(workdir) = &self.launch_plan.workdir {
             command.current_dir(workdir);
         }
+        apply_platform_spawn_options(&mut command);
 
         let child = command
             .spawn()
@@ -215,8 +221,20 @@ impl AgentManager {
 
 fn resolve_launch_plan() -> LaunchPlan {
     if let Ok(binary) = std::env::var("DEVLOOP_AGENT_BINARY") {
+        let normalized = binary.trim();
+        if !normalized.is_empty() {
+            return LaunchPlan {
+                command: normalized.to_string(),
+                args: vec![],
+                workdir: None,
+            };
+        }
+    }
+
+    // Windows 打包场景优先拉起同目录 agent-core.exe，避免依赖本机 Go 环境。
+    if let Some(binary) = default_agent_binary() {
         return LaunchPlan {
-            command: binary,
+            command: binary.display().to_string(),
             args: vec![],
             workdir: None,
         };
@@ -241,6 +259,30 @@ fn default_agent_core_dir() -> Option<PathBuf> {
         return Some(candidate);
     }
     None
+}
+
+#[cfg(windows)]
+fn default_agent_binary() -> Option<PathBuf> {
+    let exe_path = std::env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+    let candidate = exe_dir.join("agent-core.exe");
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn default_agent_binary() -> Option<PathBuf> {
+    None
+}
+
+fn apply_platform_spawn_options(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        // GUI 进程拉起 Console 子进程时默认会弹黑窗，显式禁用子进程控制台窗口。
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 fn resolve_restart_policy() -> RestartPolicy {

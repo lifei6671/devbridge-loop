@@ -12,6 +12,10 @@
 ├── cloud-bridge/               # Go cloud-bridge 骨架
 │   ├── cmd/cloud-bridge/
 │   └── internal/
+├── examples/                   # Demo 服务（order/user/inventory）
+│   ├── cmd/order-service/
+│   ├── cmd/user-service/
+│   └── cmd/inventory-service/
 ├── apps/
 │   └── dev-agent/
 │       ├── src/                # React + shadcn/ui
@@ -108,10 +112,11 @@
   - 多页面导航：`Dashboard / Services / Intercepts / Logs / Config`
   - 服务列表页：实例详情查看 + 手动注销
   - ActiveIntercept 列表页（实时读取 `/api/v1/state/intercepts`）
-  - 日志页（实时读取 `/api/v1/state/errors`）
+  - 日志页（优先读取 `/api/v1/state/diagnostics`，兼容回退到旧接口）
   - 配置页支持桌面配置加载与保存
   - 刷新 + 手动重连 + 手动重启
   - 新增命令：
+    - `get_diagnostics`
     - `get_desktop_config`
     - `save_desktop_config`
 
@@ -136,6 +141,11 @@ _, _ = adapter.Register(ctx, registry.Registration{
     },
 })
 ```
+
+5. `examples` Demo 服务
+- `order-service`：同时提供 HTTP 与 gRPC（Health）能力，并提供调用 `user-service` 的 HTTP/gRPC demo 接口
+- `user-service`：同时提供 HTTP 与 gRPC（Health）能力，并提供调用 `inventory-service` 的 HTTP/gRPC demo 接口
+- `inventory-service`：可选基础依赖服务，同时提供 HTTP 与 gRPC（Health）能力，用于 `base fallback` 联调
 
 ## 本地开发命令
 
@@ -162,6 +172,9 @@ make test
 # 编译 Go 模块
 make build-go
 
+# 编译 demo 服务（order/user/inventory）
+make build-demos
+
 # 编译前端
 make build-dev-agent-ui
 
@@ -180,6 +193,23 @@ npm run tauri:dev
 
 > 在 Linux 环境编译 Tauri 需要系统依赖（如 `pkg-config`、`glib2.0`、`gtk3`、`webkit2gtk`）。
 > 目标运行环境是 Win11 时，请在 Win11 开发机安装对应 Tauri 构建依赖后运行。
+
+### Demo 服务（P8）
+
+```bash
+# 可选：统一指定 agent-core 地址与 demo env
+export DEMO_AGENT_ADDR=127.0.0.1:19090
+export DEMO_ENV_NAME=dev-alice
+
+# 启动 inventory（可选，用于 user->inventory fallback 场景）
+make run-demo-inventory
+
+# 启动 user-service
+make run-demo-user
+
+# 启动 order-service
+make run-demo-order
+```
 
 ## 环境变量（已支持）
 
