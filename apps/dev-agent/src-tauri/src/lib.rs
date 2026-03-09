@@ -5,7 +5,8 @@ mod host_config;
 use agent_api::AgentApiClient;
 use agent_manager::{AgentManager, AgentRuntime};
 use host_config::{
-    apply_persisted_env_overrides, load_desktop_config, resolve_storage_paths,
+    apply_persisted_env_overrides, load_close_to_tray_on_close, load_desktop_config,
+    persist_close_to_tray_on_close, resolve_storage_paths,
     save_desktop_config as save_desktop_config_file, DesktopConfigSaveRequest, DesktopConfigView,
     HostStoragePaths,
 };
@@ -14,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Window};
 
 const AGENT_RUNTIME_EVENT: &str = "agent-runtime-changed";
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -22,9 +23,11 @@ const TRAY_ICON_ID: &str = "devloop-main-tray";
 const TRAY_MENU_SHOW_MAIN: &str = "tray-show-main";
 const TRAY_MENU_HIDE_MAIN: &str = "tray-hide-main";
 const TRAY_MENU_QUIT_APP: &str = "tray-quit-app";
+const WINDOW_CLOSE_INTENT_EVENT: &str = "window-close-intent";
 
 struct AppState {
     manager: Mutex<AgentManager>,
+    close_to_tray_on_close: Mutex<Option<bool>>,
     api: AgentApiClient,
     storage: HostStoragePaths,
 }
@@ -87,7 +90,40 @@ fn save_desktop_config(
     state: tauri::State<'_, AppState>,
     request: DesktopConfigSaveRequest,
 ) -> Result<DesktopConfigView, String> {
-    save_desktop_config_file(&state.storage, request)
+    let view = save_desktop_config_file(&state.storage, request)?;
+    let mut close_to_tray_on_close = state
+        .close_to_tray_on_close
+        .lock()
+        .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
+    *close_to_tray_on_close = Some(view.close_to_tray_on_close);
+    Ok(view)
+}
+
+#[tauri::command]
+fn resolve_window_close_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    action: String,
+) -> Result<(), String> {
+    let normalized = action.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "tray" | "minimize" => {
+            // 用户在首次关闭弹窗里选择最小化时，自动持久化该偏好，后续不再弹窗。
+            persist_close_to_tray_on_close(&state.storage, true)?;
+            let mut close_to_tray_on_close = state
+                .close_to_tray_on_close
+                .lock()
+                .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
+            *close_to_tray_on_close = Some(true);
+            drop(close_to_tray_on_close);
+            hide_main_window(&app)
+        }
+        "exit" => {
+            request_app_exit(&app, 0);
+            Ok(())
+        }
+        _ => Err(format!("unsupported close action: {action}")),
+    }
 }
 
 #[tauri::command]
@@ -133,10 +169,13 @@ pub fn run() {
                 return;
             }
 
-            // 主窗口关闭时不退出进程，而是隐藏到托盘，便于后台持续工作。
+            // 主窗口关闭行为支持三态：
+            // 1) 已配置最小化：直接隐藏到托盘
+            // 2) 已配置退出：直接退出应用
+            // 3) 未配置：通知前端弹出选择框
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                let _ = handle_main_window_close_requested(window);
             }
         })
         .setup(|app| {
@@ -145,10 +184,13 @@ pub fn run() {
             let storage =
                 resolve_storage_paths(app.handle()).map_err(|err| std::io::Error::other(err))?;
             apply_persisted_env_overrides(&storage).map_err(|err| std::io::Error::other(err))?;
+            let close_to_tray_on_close =
+                load_close_to_tray_on_close(&storage).map_err(|err| std::io::Error::other(err))?;
 
             // 先应用配置文件中的环境变量，再创建运行时依赖，确保启动参数与配置页一致。
             app.manage(AppState {
                 manager: Mutex::new(AgentManager::new()),
+                close_to_tray_on_close: Mutex::new(close_to_tray_on_close),
                 api: AgentApiClient::new(
                     std::env::var("DEVLOOP_AGENT_API_BASE")
                         .unwrap_or_else(|_| "http://127.0.0.1:19090".to_string()),
@@ -192,11 +234,57 @@ pub fn run() {
             trigger_reconnect,
             get_desktop_config,
             save_desktop_config,
+            resolve_window_close_action,
             agent_runtime,
             restart_agent_process
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn handle_main_window_close_requested(window: &Window) -> Result<(), String> {
+    let app = window.app_handle();
+    let close_to_tray_on_close = {
+        let state = app.state::<AppState>();
+        let close_to_tray_on_close = state
+            .close_to_tray_on_close
+            .lock()
+            .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
+        *close_to_tray_on_close
+    };
+
+    match close_to_tray_on_close {
+        Some(true) => window
+            .hide()
+            .map_err(|err| format!("hide main window failed: {err}")),
+        Some(false) => {
+            request_app_exit(&app, 0);
+            Ok(())
+        }
+        None => app
+            .emit(WINDOW_CLOSE_INTENT_EVENT, ())
+            .map_err(|err| format!("emit window close intent failed: {err}")),
+    }
+}
+
+fn request_app_exit(app: &AppHandle, code: i32) {
+    // 退出主进程前主动终止由 Host 拉起的 agent-core，避免孤儿进程残留。
+    if let Err(err) = shutdown_managed_agent(app) {
+        eprintln!("failed to shutdown managed agent-core before exit: {err}");
+    }
+    app.exit(code);
+}
+
+fn shutdown_managed_agent(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut manager = state
+        .manager
+        .lock()
+        .map_err(|_| "manager lock poisoned".to_string())?;
+    let runtime = manager.shutdown();
+    drop(manager);
+    let _ = emit_runtime_event(app, &runtime);
+    Ok(())
 }
 
 fn spawn_agent_supervisor(app_handle: AppHandle) {
@@ -259,7 +347,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
                 return;
             }
             if event.id() == TRAY_MENU_QUIT_APP {
-                app.exit(0);
+                request_app_exit(app, 0);
             }
         })
         .on_tray_icon_event(|tray, event| {

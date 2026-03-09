@@ -124,6 +124,8 @@ export default function App(): ReactElement {
   const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string>("");
+  const [showCloseDecisionDialog, setShowCloseDecisionDialog] = useState(false);
+  const [resolvingCloseDecision, setResolvingCloseDecision] = useState(false);
 
   const selectedRegistration = useMemo(() => {
     if (!selectedInstanceId) {
@@ -184,6 +186,7 @@ export default function App(): ReactElement {
         agentBinary: desktopConfigData.agentBinary,
         agentCoreDir: desktopConfigData.agentCoreDir,
         agentAutoRestart: desktopConfigData.agentAutoRestart,
+        closeToTrayOnClose: desktopConfigData.closeToTrayOnClose,
         agentRestartBackoffMs: desktopConfigData.agentRestartBackoffMs,
         envResolveOrder: desktopConfigData.envResolveOrder,
         tunnelBridgeAddress: desktopConfigData.tunnelBridgeAddress,
@@ -241,6 +244,7 @@ export default function App(): ReactElement {
         agentBinary: saved.agentBinary,
         agentCoreDir: saved.agentCoreDir,
         agentAutoRestart: saved.agentAutoRestart,
+        closeToTrayOnClose: saved.closeToTrayOnClose,
         agentRestartBackoffMs: saved.agentRestartBackoffMs,
         envResolveOrder: saved.envResolveOrder,
         tunnelBridgeAddress: saved.tunnelBridgeAddress,
@@ -281,6 +285,22 @@ export default function App(): ReactElement {
     [refresh, registrations]
   );
 
+  const resolveWindowCloseAction = useCallback(
+    async (action: "tray" | "exit") => {
+      setResolvingCloseDecision(true);
+      setActionError("");
+      try {
+        await call("resolve_window_close_action", { action });
+        setShowCloseDecisionDialog(false);
+      } catch (error) {
+        setActionError(String(error));
+      } finally {
+        setResolvingCloseDecision(false);
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => {
@@ -291,19 +311,27 @@ export default function App(): ReactElement {
 
   useEffect(() => {
     // 订阅 Rust Host 推送的进程运行态变化事件，前端无需等轮询也能实时更新。
-    let unlistenFn: (() => void) | null = null;
+    let unlistenRuntime: (() => void) | null = null;
+    let unlistenCloseIntent: (() => void) | null = null;
 
     const setupListener = async (): Promise<void> => {
-      unlistenFn = await listen<AgentRuntime>("agent-runtime-changed", (event) => {
+      unlistenRuntime = await listen<AgentRuntime>("agent-runtime-changed", (event) => {
         setRuntime(event.payload);
+      });
+      unlistenCloseIntent = await listen("window-close-intent", () => {
+        // 首次点击关闭时由 Rust Host 通知前端展示二选一弹窗。
+        setShowCloseDecisionDialog(true);
       });
     };
 
     void setupListener();
 
     return () => {
-      if (unlistenFn) {
-        unlistenFn();
+      if (unlistenRuntime) {
+        unlistenRuntime();
+      }
+      if (unlistenCloseIntent) {
+        unlistenCloseIntent();
       }
     };
   }, []);
@@ -755,6 +783,25 @@ export default function App(): ReactElement {
             agentAutoRestart
           </label>
 
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={desktopConfigDraft?.closeToTrayOnClose ?? true}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current ? { ...current, closeToTrayOnClose: event.target.checked } : current
+                )
+              }
+            />
+            closeToTrayOnClose
+          </label>
+
+          {!desktopConfig?.closeToTrayOnCloseConfigured ? (
+            <p className="text-xs text-muted-foreground">
+              首次点击窗口关闭按钮时会弹窗询问；配置保存后将按该选项直接执行。
+            </p>
+          ) : null}
+
           <Button
             variant="outline"
             size="sm"
@@ -846,6 +893,34 @@ export default function App(): ReactElement {
               {runtime.lastError}
             </CardContent>
           </Card>
+        ) : null}
+
+        {showCloseDecisionDialog ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+            <Card className="w-full max-w-md border-border/80 shadow-xl">
+              <CardHeader>
+                <CardTitle>关闭 DevLoop Agent</CardTitle>
+                <CardDescription>
+                  请选择“直接退出”或“最小化到托盘”。选择最小化后将记住该偏好。
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-wrap justify-end gap-2">
+                <Button
+                  variant="outline"
+                  disabled={resolvingCloseDecision}
+                  onClick={() => void resolveWindowCloseAction("exit")}
+                >
+                  直接退出
+                </Button>
+                <Button
+                  disabled={resolvingCloseDecision}
+                  onClick={() => void resolveWindowCloseAction("tray")}
+                >
+                  最小化到托盘
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
         ) : null}
 
         {renderPage()}

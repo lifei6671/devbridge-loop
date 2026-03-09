@@ -97,6 +97,8 @@ export interface DesktopConfigView {
   agentBinary: string | null;
   agentCoreDir: string | null;
   agentAutoRestart: boolean;
+  closeToTrayOnClose: boolean;
+  closeToTrayOnCloseConfigured: boolean;
   agentRestartBackoffMs: number[];
   envResolveOrder: string[];
   tunnelBridgeAddress: string;
@@ -114,6 +116,7 @@ export interface DesktopConfigSaveRequest {
   agentBinary: string | null;
   agentCoreDir: string | null;
   agentAutoRestart: boolean;
+  closeToTrayOnClose: boolean;
   agentRestartBackoffMs: number[];
   envResolveOrder: string[];
   tunnelBridgeAddress: string;

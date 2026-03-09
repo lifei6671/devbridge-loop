@@ -20,6 +20,7 @@ struct DesktopConfigFile {
     agent_binary: Option<String>,
     agent_core_dir: Option<String>,
     agent_auto_restart: Option<bool>,
+    close_to_tray_on_close: Option<bool>,
     agent_restart_backoff_ms: Option<Vec<u64>>,
     env_resolve_order: Option<Vec<String>>,
     tunnel_bridge_address: Option<String>,
@@ -33,6 +34,8 @@ pub struct DesktopConfigView {
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
     pub agent_auto_restart: bool,
+    pub close_to_tray_on_close: bool,
+    pub close_to_tray_on_close_configured: bool,
     pub agent_restart_backoff_ms: Vec<u64>,
     pub env_resolve_order: Vec<String>,
     pub tunnel_bridge_address: String,
@@ -52,6 +55,7 @@ pub struct DesktopConfigSaveRequest {
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
     pub agent_auto_restart: bool,
+    pub close_to_tray_on_close: bool,
     pub agent_restart_backoff_ms: Vec<u64>,
     pub env_resolve_order: Vec<String>,
     pub tunnel_bridge_address: String,
@@ -123,6 +127,11 @@ pub fn load_desktop_config(storage: &HostStoragePaths) -> Result<DesktopConfigVi
     Ok(build_view(storage, file.as_ref()))
 }
 
+pub fn load_close_to_tray_on_close(storage: &HostStoragePaths) -> Result<Option<bool>, String> {
+    let file = load_config_file(storage)?;
+    Ok(file.and_then(|item| item.close_to_tray_on_close))
+}
+
 pub fn save_desktop_config(
     storage: &HostStoragePaths,
     request: DesktopConfigSaveRequest,
@@ -132,6 +141,7 @@ pub fn save_desktop_config(
         agent_binary: normalize_optional(request.agent_binary),
         agent_core_dir: normalize_optional(request.agent_core_dir),
         agent_auto_restart: Some(request.agent_auto_restart),
+        close_to_tray_on_close: Some(request.close_to_tray_on_close),
         agent_restart_backoff_ms: Some(normalize_backoff(request.agent_restart_backoff_ms)),
         env_resolve_order: Some(normalize_env_resolve_order(request.env_resolve_order)),
         tunnel_bridge_address: normalize_required(&request.tunnel_bridge_address),
@@ -140,6 +150,26 @@ pub fn save_desktop_config(
 
     save_config_file(storage, &file)?;
     Ok(build_view(storage, Some(&file)))
+}
+
+pub fn persist_close_to_tray_on_close(
+    storage: &HostStoragePaths,
+    close_to_tray_on_close: bool,
+) -> Result<(), String> {
+    let mut file = load_config_file(storage)?.unwrap_or_else(|| DesktopConfigFile {
+        agent_api_base: None,
+        agent_binary: None,
+        agent_core_dir: None,
+        agent_auto_restart: None,
+        close_to_tray_on_close: None,
+        agent_restart_backoff_ms: None,
+        env_resolve_order: None,
+        tunnel_bridge_address: None,
+        tunnel_backflow_base_url: None,
+    });
+
+    file.close_to_tray_on_close = Some(close_to_tray_on_close);
+    save_config_file(storage, &file)
 }
 
 fn load_config_file(storage: &HostStoragePaths) -> Result<Option<DesktopConfigFile>, String> {
@@ -197,6 +227,11 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
         .or_else(|| file.and_then(|item| item.agent_auto_restart))
         .unwrap_or(true);
 
+    let close_to_tray_on_close_option = file.and_then(|item| item.close_to_tray_on_close);
+    // 该值未配置时保持“首次关闭询问”语义；配置页展示默认选中但标记为未配置。
+    let close_to_tray_on_close = close_to_tray_on_close_option.unwrap_or(true);
+    let close_to_tray_on_close_configured = close_to_tray_on_close_option.is_some();
+
     let agent_restart_backoff_ms = std::env::var("DEVLOOP_AGENT_RESTART_BACKOFF_MS")
         .ok()
         .map(parse_backoff)
@@ -230,6 +265,8 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
         agent_binary,
         agent_core_dir,
         agent_auto_restart,
+        close_to_tray_on_close,
+        close_to_tray_on_close_configured,
         agent_restart_backoff_ms,
         env_resolve_order,
         tunnel_bridge_address,

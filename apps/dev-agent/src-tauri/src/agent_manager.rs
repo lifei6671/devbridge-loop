@@ -75,6 +75,12 @@ impl AgentManager {
         Ok(self.runtime())
     }
 
+    // 应用退出前调用：若存在子进程则主动终止，避免遗留孤儿进程。
+    pub fn shutdown(&mut self) -> AgentRuntime {
+        self.stop_running_process();
+        self.runtime()
+    }
+
     // 监督循环：检测退出并按退避策略自动重启。
     // 返回 Some(runtime) 表示状态发生变化，调用方应推送给前端。
     pub fn poll_supervisor(&mut self) -> Option<AgentRuntime> {
