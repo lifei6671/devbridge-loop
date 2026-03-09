@@ -77,28 +77,30 @@ func TestSyncManager_AutoReconnectWhenBridgeStartsLater(t *testing.T) {
 	}
 }
 
-func TestSyncManager_BackoffForAttemptUsesExponentialWithCap(t *testing.T) {
+func TestSyncManager_BackoffForAttemptUsesConfiguredStepsWithCap(t *testing.T) {
 	t.Parallel()
 
 	manager := &SyncManager{
 		cfg: config.Config{
 			Tunnel: config.TunnelConfig{
 				ReconnectBackoff: []time.Duration{
-					500 * time.Millisecond,
 					5 * time.Second,
+					10 * time.Second,
+					15 * time.Second,
+					20 * time.Second,
 				},
 			},
 		},
 	}
 
-	// 指数退避序列：0.5s,1s,2s,4s,5s(cap),5s(cap)
+	// 线性阶梯序列：5s,10s,15s,20s(cap),20s(cap)
 	expected := []time.Duration{
-		500 * time.Millisecond,
-		1 * time.Second,
-		2 * time.Second,
-		4 * time.Second,
 		5 * time.Second,
-		5 * time.Second,
+		10 * time.Second,
+		15 * time.Second,
+		20 * time.Second,
+		20 * time.Second,
+		20 * time.Second,
 	}
 	for attempt, want := range expected {
 		got := manager.backoffForAttempt(attempt)

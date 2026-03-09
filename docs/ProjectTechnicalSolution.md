@@ -417,7 +417,7 @@ sequenceDiagram
 
 ### 9.2 重试规则
 
-1. tunnel 断线后指数退避重连（带最大退避上限）
+1. tunnel 断线后按阶梯退避重连（默认每次 +5s，最大 60s）
 2. 可重试同步事件必须带同一 `eventId` 重放
 3. 不可重试错误（协议解析失败、参数非法）直接返回并记录
 
@@ -434,7 +434,7 @@ agent:
   tunnel:
     bridgeAddress: "bridge.example.internal:443"
     heartbeatIntervalSec: 10
-    reconnectBackoffMs: [500, 1000, 2000, 5000]
+    reconnectBackoffMs: [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000, 50000, 55000, 60000]
   registration:
     defaultTTLSeconds: 30
     scanIntervalSec: 5
@@ -525,4 +525,3 @@ agent:
    应对：强制 `ProtocolAdapter` 抽象与协议无关层隔离
 4. 风险：联调问题难定位  
    应对：统一错误码、请求摘要、状态查询接口与 UI 可视化
-

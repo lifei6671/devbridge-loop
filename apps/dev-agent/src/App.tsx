@@ -35,6 +35,7 @@ import {
   TableHeader,
   TableRow
 } from "@/components/ui/table";
+import { cn } from "@/lib/utils";
 import type {
   ActiveIntercept,
   AgentRuntime,
@@ -79,11 +80,16 @@ function formatTime(value?: string | null): string {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
-function formatCountdown(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return "0s";
+function formatCountdown(remainingMs: number): string {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return "0.0s";
   }
-  return `${Math.ceil(seconds)}s`;
+
+  const seconds = remainingMs / 1000;
+  if (seconds >= 10) {
+    return `${Math.ceil(seconds)}s`;
+  }
+  return `${seconds.toFixed(1)}s`;
 }
 
 function renderHealthBadge(healthy: boolean): ReactElement {
@@ -127,7 +133,9 @@ export default function App(): ReactElement {
   const [desktopConfig, setDesktopConfig] = useState<DesktopConfigView | null>(null);
   const [desktopConfigDraft, setDesktopConfigDraft] = useState<DesktopConfigSaveRequest | null>(null);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [restartingAgent, setRestartingAgent] = useState(false);
+  const [manualReconnecting, setManualReconnecting] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string>("");
@@ -161,8 +169,12 @@ export default function App(): ReactElement {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refresh = useCallback(async (options?: { manual?: boolean }) => {
+    const showManualRefreshing = options?.manual ?? false;
+    if (showManualRefreshing) {
+      setManualRefreshing(true);
+    }
+
     setActionError("");
     try {
       const [
@@ -211,30 +223,72 @@ export default function App(): ReactElement {
     } catch (error) {
       setActionError(String(error));
     } finally {
-      setLoading(false);
+      if (showManualRefreshing) {
+        setManualRefreshing(false);
+      }
     }
   }, [loadDiagnostics]);
 
   const reconnect = useCallback(async () => {
+    if (manualReconnecting) {
+      return;
+    }
+
+    setManualReconnecting(true);
     setActionError("");
+    // 手动重连点击后先给出前端即时反馈，避免用户误判按钮未生效。
+    setTunnel((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        connected: false,
+        reconnecting: true,
+        reconnectAttempt: current.reconnectAttempt + 1,
+        nextReconnectAt: new Date(Date.now() + 1000).toISOString(),
+        lastReconnectError: ""
+      };
+    });
+
     try {
       await call<TunnelState>("trigger_reconnect");
       await refresh();
     } catch (error) {
       setActionError(String(error));
+    } finally {
+      setManualReconnecting(false);
     }
-  }, [refresh]);
+  }, [manualReconnecting, refresh]);
 
   const restartAgent = useCallback(async () => {
+    if (restartingAgent) {
+      return;
+    }
+
+    setRestartingAgent(true);
     setActionError("");
+    // 在后端返回前先把卡片状态切到重启中，形成明确过渡态。
+    setRuntime((current) =>
+      current
+        ? {
+            ...current,
+            status: "restarting",
+            lastError: null
+          }
+        : current
+    );
+
     try {
       const runtimeData = await call<AgentRuntime>("restart_agent_process");
       setRuntime(runtimeData);
       await refresh();
     } catch (error) {
       setActionError(String(error));
+    } finally {
+      setRestartingAgent(false);
     }
-  }, [refresh]);
+  }, [refresh, restartingAgent]);
 
   const saveDesktopConfig = useCallback(async () => {
     if (!desktopConfigDraft) {
@@ -320,10 +374,10 @@ export default function App(): ReactElement {
   }, [refresh, tunnel?.reconnecting]);
 
   useEffect(() => {
-    // Bridge 重连倒计时按秒更新，不依赖后端轮询频率。
+    // 倒计时改为 200ms 粒度，避免 5s -> 4s 的瞬时跳变看起来“闪一下”。
     const timer = window.setInterval(() => {
       setClockMs(Date.now());
-    }, 1000);
+    }, 200);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -359,7 +413,7 @@ export default function App(): ReactElement {
       return <Badge variant="outline">unknown</Badge>;
     }
     if (tunnel.connected) {
-      return <Badge>connected</Badge>;
+      return <Badge className="border-transparent bg-emerald-600 text-white">connected</Badge>;
     }
     return <Badge variant="secondary">disconnected</Badge>;
   }, [tunnel]);
@@ -374,11 +428,14 @@ export default function App(): ReactElement {
       return null;
     }
 
-    // 允许出现负值并在这里归零，避免时间同步偏差导致 UI 抖动。
-    return Math.max(0, Math.ceil((targetMs - clockMs) / 1000));
+    // 直接返回毫秒剩余值，展示层按秒/小数秒格式化，视觉上更平滑。
+    return Math.max(0, targetMs - clockMs);
   }, [clockMs, tunnel]);
 
   const bridgeCardStatus = useMemo(() => {
+    if (manualReconnecting) {
+      return "manual-reconnecting";
+    }
     if (tunnel?.connected) {
       return "online";
     }
@@ -386,22 +443,53 @@ export default function App(): ReactElement {
       return "reconnecting";
     }
     return summary?.bridgeStatus ?? "unknown";
-  }, [summary?.bridgeStatus, tunnel?.connected, tunnel?.reconnecting]);
+  }, [manualReconnecting, summary?.bridgeStatus, tunnel?.connected, tunnel?.reconnecting]);
+
+  const agentCardStatus = useMemo(() => {
+    if (restartingAgent) {
+      return "restarting";
+    }
+    return runtime?.status ?? summary?.agentStatus ?? "unknown";
+  }, [restartingAgent, runtime?.status, summary?.agentStatus]);
+
+  const refreshProgressLabel = useMemo(() => {
+    if (manualRefreshing) {
+      return "手动刷新中...";
+    }
+    return "空闲";
+  }, [manualRefreshing]);
+
+  const bridgeOperationLabel = useMemo(() => {
+    if (manualReconnecting) {
+      return "手动重连中...";
+    }
+    if (tunnel?.reconnecting) {
+      return "自动重连中...";
+    }
+    return "空闲";
+  }, [manualReconnecting, tunnel?.reconnecting]);
 
   const renderDashboard = (): ReactElement => (
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-      <Card>
+      <Card
+        className={cn(
+          "transition-all duration-300",
+          restartingAgent && "border-amber-500/60 shadow-lg shadow-amber-900/10"
+        )}
+      >
         <CardHeader className="pb-2">
           <CardDescription>Agent</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
-            <Server className="h-4 w-4" />
-            {summary?.agentStatus ?? "unknown"}
+            <Server className={cn("h-4 w-4", restartingAgent && "animate-pulse")} />
+            {agentCardStatus}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
           <div>pid: {runtime?.pid ?? "-"}</div>
           <div>env: {summary?.currentEnv ?? "-"}</div>
-          <div>status: {runtime?.status ?? "-"}</div>
+          <div>status: {agentCardStatus}</div>
+          <div>operation: {restartingAgent ? "重启 Agent Core..." : "空闲"}</div>
+          <div>sync: {refreshProgressLabel}</div>
           <div>restart-count: {runtime?.restartCount ?? 0}</div>
           <div className="whitespace-pre-wrap break-all">
             last-error: {runtime?.lastError ? runtime.lastError : "-"}
@@ -409,17 +497,23 @@ export default function App(): ReactElement {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card
+        className={cn(
+          "transition-all duration-300",
+          manualReconnecting && "border-amber-500/60 shadow-lg shadow-amber-900/10"
+        )}
+      >
         <CardHeader className="pb-2">
           <CardDescription>Bridge</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
-            <Cloud className="h-4 w-4" />
+            <Cloud className={cn("h-4 w-4", manualReconnecting && "animate-pulse")} />
             {bridgeCardStatus}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
           <div>address: {tunnel?.bridgeAddress ?? "-"}</div>
           <div>rdName: {summary?.rdName ?? "-"}</div>
+          <div>operation: {bridgeOperationLabel}</div>
           <div>reconnect-attempt: {tunnel?.reconnectAttempt ?? 0}</div>
           <div>
             next-retry:
@@ -900,17 +994,28 @@ export default function App(): ReactElement {
             </h1>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
-              <RefreshCcw className="mr-2 h-4 w-4" />
-              刷新
+            <Button
+              variant="outline"
+              onClick={() => void refresh({ manual: true })}
+              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+            >
+              <RefreshCcw className={cn("mr-2 h-4 w-4", manualRefreshing && "animate-spin")} />
+              {manualRefreshing ? "刷新中..." : "刷新"}
             </Button>
-            <Button variant="outline" onClick={() => void restartAgent()}>
-              <RotateCcw className="mr-2 h-4 w-4" />
-              重启 Agent Core
+            <Button
+              variant="outline"
+              onClick={() => void restartAgent()}
+              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+            >
+              <RotateCcw className={cn("mr-2 h-4 w-4", restartingAgent && "animate-spin")} />
+              {restartingAgent ? "重启中..." : "重启 Agent Core"}
             </Button>
-            <Button onClick={() => void reconnect()}>
-              <Cable className="mr-2 h-4 w-4" />
-              手动重连
+            <Button
+              onClick={() => void reconnect()}
+              disabled={manualRefreshing || restartingAgent || manualReconnecting}
+            >
+              <Cable className={cn("mr-2 h-4 w-4", manualReconnecting && "animate-pulse")} />
+              {manualReconnecting ? "重连中..." : "手动重连"}
             </Button>
           </div>
         </header>

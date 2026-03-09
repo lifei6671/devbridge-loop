@@ -56,6 +56,7 @@ type MemoryStore struct {
 	reconnectAttempt   int
 	nextReconnectAt    *time.Time
 	lastReconnectError string
+	tunnelReconnectMS  []int
 }
 
 // NewMemoryStore constructs an in-memory runtime state store.
@@ -69,7 +70,36 @@ func NewMemoryStore() *MemoryStore {
 		recentReqs:      make([]domain.RequestSummary, 0, maxRequestSummaries),
 		processedEvents: make(map[string]processedEvent),
 		processedOrder:  make([]string, 0, maxProcessedEventID),
+		tunnelReconnectMS: []int{
+			5000, 10000, 15000, 20000, 25000, 30000,
+			35000, 40000, 45000, 50000, 55000, 60000,
+		},
 	}
+}
+
+// SetTunnelReconnectBackoff 设置 tunnel 重连退避毫秒数组，用于状态接口回传给 UI。
+func (s *MemoryStore) SetTunnelReconnectBackoff(backoff []time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normalized := make([]int, 0, len(backoff))
+	for _, value := range backoff {
+		if value <= 0 {
+			continue
+		}
+		millis := int(value / time.Millisecond)
+		if millis <= 0 {
+			continue
+		}
+		normalized = append(normalized, millis)
+	}
+	if len(normalized) == 0 {
+		normalized = []int{
+			5000, 10000, 15000, 20000, 25000, 30000,
+			35000, 40000, 45000, 50000, 55000, 60000,
+		}
+	}
+	s.tunnelReconnectMS = normalized
 }
 
 // UpsertRegistration creates or updates one registration and bumps resourceVersion on non-duplicate events.
@@ -554,7 +584,7 @@ func (s *MemoryStore) buildTunnelStateLocked(bridgeAddress string) domain.Tunnel
 		NextReconnectAt:    nextReconnectAt,
 		LastReconnectError: s.lastReconnectError,
 		BridgeAddress:      bridgeAddress,
-		ReconnectBackoffM:  []int{500, 1000, 2000, 5000},
+		ReconnectBackoffM:  slices.Clone(s.tunnelReconnectMS),
 	}
 }
 

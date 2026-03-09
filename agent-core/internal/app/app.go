@@ -27,6 +27,8 @@ type App struct {
 // New 构建 App 运行时依赖。
 func New(cfg config.Config) *App {
 	stateStore := store.NewMemoryStore()
+	// 将运行时重连退避配置回写到状态存储，确保 UI 展示与真实重试策略一致。
+	stateStore.SetTunnelReconnectBackoff(cfg.Tunnel.ReconnectBackoff)
 	syncManager := tunnel.NewSyncManager(cfg, stateStore)
 	backflowForwarder := forwarder.NewHTTPForwarder(cfg.Tunnel.RequestTimeout)
 	h := httpapi.NewHandler(cfg, stateStore, syncManager, backflowForwarder)

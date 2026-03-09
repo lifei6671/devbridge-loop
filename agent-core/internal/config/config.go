@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const defaultTunnelReconnectBackoffEnv = "5000,10000,15000,20000,25000,30000,35000,40000,45000,50000,55000,60000"
+
 // Config defines the runtime configuration for agent-core.
 type Config struct {
 	HTTPAddr string
@@ -52,7 +54,7 @@ func LoadFromEnv() Config {
 			BridgeAddress:     getenv("DEVLOOP_TUNNEL_BRIDGE_ADDRESS", "http://127.0.0.1:38080"),
 			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"))),
 			HeartbeatInterval: time.Duration(getenvInt("DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC", 10)) * time.Second,
-			ReconnectBackoff:  parseDurationListMillis(getenv("DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS", "500,1000,2000,5000")),
+			ReconnectBackoff:  parseDurationListMillis(getenv("DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS", defaultTunnelReconnectBackoffEnv)),
 			RequestTimeout:    time.Duration(getenvInt("DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC", 5)) * time.Second,
 		},
 		EnvResolve: EnvResolveConfig{
@@ -69,7 +71,7 @@ func LoadFromEnv() Config {
 		cfg.Tunnel.HeartbeatInterval = 10 * time.Second
 	}
 	if len(cfg.Tunnel.ReconnectBackoff) == 0 {
-		cfg.Tunnel.ReconnectBackoff = []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second, 5 * time.Second}
+		cfg.Tunnel.ReconnectBackoff = defaultTunnelReconnectBackoff()
 	}
 	if cfg.Tunnel.RequestTimeout <= 0 {
 		cfg.Tunnel.RequestTimeout = 5 * time.Second
@@ -110,6 +112,23 @@ func parseDurationListMillis(value string) []time.Duration {
 		result = append(result, time.Duration(millis)*time.Millisecond)
 	}
 	return result
+}
+
+func defaultTunnelReconnectBackoff() []time.Duration {
+	return []time.Duration{
+		5 * time.Second,
+		10 * time.Second,
+		15 * time.Second,
+		20 * time.Second,
+		25 * time.Second,
+		30 * time.Second,
+		35 * time.Second,
+		40 * time.Second,
+		45 * time.Second,
+		50 * time.Second,
+		55 * time.Second,
+		60 * time.Second,
+	}
 }
 
 func defaultBackflowBaseURL(httpAddr string) string {

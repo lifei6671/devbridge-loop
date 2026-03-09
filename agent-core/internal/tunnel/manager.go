@@ -199,8 +199,19 @@ func (m *SyncManager) sendHeartbeat(ctx context.Context) error {
 		TunnelID: m.tunnelID,
 		ConnID:   m.currentConnID(),
 	}
-	_, err := m.sendMessage(ctx, domain.MessageTunnelHeartbeat, generateEventID("evt-hb"), payload, 0)
-	return err
+	if _, err := m.sendMessage(ctx, domain.MessageTunnelHeartbeat, generateEventID("evt-hb"), payload, 0); err != nil {
+		// 心跳失败不能只记日志，否则 UI 会长期停留在 online；这里立即切断连接态并进入重连流程。
+		m.state.MarkTunnelDisconnected()
+		if reconnectErr := m.reconnectWithBackoff(ctx); reconnectErr != nil {
+			return fmt.Errorf("reconnect after heartbeat failure: %w", reconnectErr)
+		}
+		// 重连成功后补发一次心跳，尽快刷新 bridge 侧会话活跃时间。
+		if _, retryErr := m.sendMessage(ctx, domain.MessageTunnelHeartbeat, generateEventID("evt-hb"), payload, 0); retryErr != nil {
+			m.state.MarkTunnelDisconnected()
+			return fmt.Errorf("retry heartbeat send failed: %w", retryErr)
+		}
+	}
+	return nil
 }
 
 func (m *SyncManager) ensureConnected(ctx context.Context) error {
@@ -352,40 +363,46 @@ func (m *SyncManager) sendMessage(
 }
 
 func (m *SyncManager) backoffForAttempt(attempt int) time.Duration {
-	// 采用指数退避（base * 2^attempt）并受 max 上限约束，避免 bridge 长时间不可达时过载重试。
-	base, max := m.reconnectBackoffBounds()
+	backoffList := normalizeReconnectBackoffList(m.cfg.Tunnel.ReconnectBackoff)
 	if attempt <= 0 {
-		return base
+		return backoffList[0]
 	}
 
-	backoff := base
-	for i := 0; i < attempt; i++ {
-		// 到达上限后保持固定，兼容“指数增长 + 最大退避”的设计约束。
-		if backoff >= max/2 {
-			return max
-		}
-		backoff *= 2
+	// 退避时长按数组逐级增长，超过数组长度后固定在最后一个值（默认封顶 60s）。
+	index := attempt
+	if index >= len(backoffList) {
+		index = len(backoffList) - 1
 	}
-	if backoff > max {
-		return max
-	}
-	return backoff
+	return backoffList[index]
 }
 
-func (m *SyncManager) reconnectBackoffBounds() (time.Duration, time.Duration) {
-	if len(m.cfg.Tunnel.ReconnectBackoff) == 0 {
-		return 500 * time.Millisecond, 5 * time.Second
+func normalizeReconnectBackoffList(values []time.Duration) []time.Duration {
+	normalized := make([]time.Duration, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		normalized = append(normalized, value)
+	}
+	if len(normalized) > 0 {
+		return normalized
 	}
 
-	base := m.cfg.Tunnel.ReconnectBackoff[0]
-	max := m.cfg.Tunnel.ReconnectBackoff[len(m.cfg.Tunnel.ReconnectBackoff)-1]
-	if base <= 0 {
-		base = 500 * time.Millisecond
+	// 兜底默认值与配置层保持一致：5s 起步，每次 +5s，最大 60s。
+	return []time.Duration{
+		5 * time.Second,
+		10 * time.Second,
+		15 * time.Second,
+		20 * time.Second,
+		25 * time.Second,
+		30 * time.Second,
+		35 * time.Second,
+		40 * time.Second,
+		45 * time.Second,
+		50 * time.Second,
+		55 * time.Second,
+		60 * time.Second,
 	}
-	if max < base {
-		max = base
-	}
-	return base, max
 }
 
 func (m *SyncManager) currentConnID() string {
