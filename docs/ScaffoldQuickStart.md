@@ -54,8 +54,10 @@
 3. `dev-agent` 桌面端
 - Rust Host：
   - 启动时拉起 Go Agent Core 子进程（可通过环境变量覆盖）
+  - 后台监督循环（2s）：进程退出检测 + 自动重启 + 退避重试
+  - 向前端推送 `agent-runtime-changed` 事件，实现运行态实时刷新
   - 调用 Go 本地 HTTP API
-  - 暴露 Tauri commands 给前端
+  - 暴露 Tauri commands 给前端（含 `restart_agent_process` 手动重启）
 - React Dashboard：
   - Agent/Bridge/Tunnel 状态卡片
   - 本地注册列表
@@ -99,6 +101,8 @@ npm run tauri:dev
 - `DEVLOOP_AGENT_API_BASE`：Rust Host 调用 agent-core 的 base URL
 - `DEVLOOP_AGENT_BINARY`：Rust Host 直接拉起的 agent-core 二进制路径
 - `DEVLOOP_AGENT_CORE_DIR`：Rust Host 用 `go run` 拉起 agent-core 时的工作目录
+- `DEVLOOP_AGENT_AUTO_RESTART`：是否自动重启（默认 `true`）
+- `DEVLOOP_AGENT_RESTART_BACKOFF_MS`：自动重启退避毫秒数组（默认 `500,1000,2000,5000`）
 
 ## 事件头与 env 解析
 
@@ -111,3 +115,9 @@ npm run tauri:dev
   2. 请求体 `env`
   3. 运行时默认 `DEVLOOP_ENV_NAME`
   4. `base`
+
+## 前端运行态事件
+
+- 事件名：`agent-runtime-changed`
+- 触发时机：首次启动、监督循环检测到状态变化、手动重启
+- 事件负载：`status/pid/lastError/restartCount/restartAttempt/nextRestartAt` 等运行态字段

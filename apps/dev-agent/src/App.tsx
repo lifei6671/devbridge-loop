@@ -1,12 +1,40 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, Cable, Cloud, RefreshCcw, Server, Zap } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
+import {
+  AlertTriangle,
+  Cable,
+  Cloud,
+  RefreshCcw,
+  RotateCcw,
+  Server,
+  Zap
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { AgentRuntime, ErrorEntry, LocalRegistration, StateSummary, TunnelState } from "@/types";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle
+} from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow
+} from "@/components/ui/table";
+import type {
+  AgentRuntime,
+  ErrorEntry,
+  LocalRegistration,
+  StateSummary,
+  TunnelState
+} from "@/types";
 
 async function call<T>(command: string): Promise<T> {
   return invoke<T>(command);
@@ -54,6 +82,17 @@ export default function App(): React.ReactElement {
     }
   }, [refresh]);
 
+  const restartAgent = useCallback(async () => {
+    setActionError("");
+    try {
+      const runtimeData = await call<AgentRuntime>("restart_agent_process");
+      setRuntime(runtimeData);
+      await refresh();
+    } catch (error) {
+      setActionError(String(error));
+    }
+  }, [refresh]);
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => {
@@ -61,6 +100,25 @@ export default function App(): React.ReactElement {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    // 订阅 Rust Host 推送的进程运行态变化事件，前端无需等轮询也能实时更新。
+    let unlistenFn: (() => void) | null = null;
+
+    const setupListener = async (): Promise<void> => {
+      unlistenFn = await listen<AgentRuntime>("agent-runtime-changed", (event) => {
+        setRuntime(event.payload);
+      });
+    };
+
+    void setupListener();
+
+    return () => {
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, []);
 
   const tunnelBadge = useMemo(() => {
     if (!tunnel) {
@@ -77,13 +135,21 @@ export default function App(): React.ReactElement {
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 pb-8 pt-6 sm:px-6 lg:px-8">
         <header className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-muted-foreground">DevLoop Phase One</p>
-            <h1 className="mt-1 font-mono text-2xl font-semibold tracking-tight">dev-agent control surface</h1>
+            <p className="text-xs uppercase tracking-[0.28em] text-muted-foreground">
+              DevLoop Phase One
+            </p>
+            <h1 className="mt-1 font-mono text-2xl font-semibold tracking-tight">
+              dev-agent control surface
+            </h1>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
               <RefreshCcw className="mr-2 h-4 w-4" />
               刷新
+            </Button>
+            <Button variant="outline" onClick={() => void restartAgent()}>
+              <RotateCcw className="mr-2 h-4 w-4" />
+              重启 Agent Core
             </Button>
             <Button onClick={() => void reconnect()}>
               <Cable className="mr-2 h-4 w-4" />
@@ -101,6 +167,15 @@ export default function App(): React.ReactElement {
           </Card>
         ) : null}
 
+        {runtime?.lastError ? (
+          <Card className="border-amber-500/40 bg-amber-100/40">
+            <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
+              <AlertTriangle className="h-4 w-4" />
+              {runtime.lastError}
+            </CardContent>
+          </Card>
+        ) : null}
+
         <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <Card>
             <CardHeader className="pb-2">
@@ -111,7 +186,10 @@ export default function App(): React.ReactElement {
               </CardTitle>
             </CardHeader>
             <CardContent className="text-sm text-muted-foreground">
-              pid: {runtime?.pid ?? "-"} | env: {summary?.currentEnv ?? "-"}
+              <div>pid: {runtime?.pid ?? "-"}</div>
+              <div>env: {summary?.currentEnv ?? "-"}</div>
+              <div>status: {runtime?.status ?? "-"}</div>
+              <div>restart-count: {runtime?.restartCount ?? 0}</div>
             </CardContent>
           </Card>
 
@@ -144,7 +222,9 @@ export default function App(): React.ReactElement {
           <Card>
             <CardHeader className="pb-2">
               <CardDescription>Registration</CardDescription>
-              <CardTitle className="text-base">{summary?.registrationCount ?? 0} active</CardTitle>
+              <CardTitle className="text-base">
+                {summary?.registrationCount ?? 0} active
+              </CardTitle>
             </CardHeader>
             <CardContent className="text-sm text-muted-foreground">
               intercepts: {summary?.activeIntercepts ?? 0}
@@ -187,7 +267,8 @@ export default function App(): React.ReactElement {
                         <TableCell>
                           {item.endpoints.map((endpoint) => (
                             <div key={`${endpoint.protocol}-${endpoint.targetPort}`}>
-                              {endpoint.protocol}:{endpoint.targetHost}:{endpoint.targetPort}
+                              {endpoint.protocol}:{endpoint.targetHost}:
+                              {endpoint.targetPort}
                             </div>
                           ))}
                         </TableCell>
@@ -210,7 +291,10 @@ export default function App(): React.ReactElement {
                 <p className="text-sm text-muted-foreground">当前无错误</p>
               ) : (
                 errors.slice(0, 8).map((entry) => (
-                  <div key={`${entry.code}-${entry.occurredAt}`} className="rounded-md border border-border/60 p-3">
+                  <div
+                    key={`${entry.code}-${entry.occurredAt}`}
+                    className="rounded-md border border-border/60 p-3"
+                  >
                     <p className="font-mono text-xs text-primary">{entry.code}</p>
                     <p className="mt-1 text-sm">{entry.message}</p>
                     <p className="mt-1 text-xs text-muted-foreground">{entry.occurredAt}</p>

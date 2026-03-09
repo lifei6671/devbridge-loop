@@ -50,4 +50,8 @@ export interface AgentRuntime {
   command: string;
   startedAt: string | null;
   lastError: string | null;
+  autoRestart: boolean;
+  restartCount: number;
+  restartAttempt: number;
+  nextRestartAt: string | null;
 }
