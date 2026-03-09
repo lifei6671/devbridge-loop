@@ -91,7 +91,7 @@ function formatCountdown(remainingMs: number): string {
 
 function renderHealthBadge(healthy: boolean): ReactElement {
   if (healthy) {
-    return <Badge>healthy</Badge>;
+    return <Badge className="border-transparent bg-emerald-600 text-white">healthy</Badge>;
   }
   return <Badge variant="secondary">unhealthy</Badge>;
 }
@@ -138,6 +138,7 @@ export default function App(): ReactElement {
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const [uiPhase, setUiPhase] = useState<UiPhase>("ready");
+  const [manualReconnectPending, setManualReconnectPending] = useState(false);
   const [manualReconnecting, setManualReconnecting] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
@@ -238,16 +239,18 @@ export default function App(): ReactElement {
   }, [loadDiagnostics, uiPhase]);
 
   const reconnect = useCallback(async () => {
-    if (manualReconnecting || phaseBusy) {
+    if (manualReconnectPending || manualReconnecting || phaseBusy) {
       return;
     }
 
-    setManualReconnecting(true);
+    setManualReconnectPending(true);
     setActionError("");
 
     try {
       // 手动重连点击后延迟 1s 再进入联动过渡态，避免状态瞬切。
       await delay(1000);
+      setManualReconnectPending(false);
+      setManualReconnecting(true);
 
       setSummary((current) =>
         current
@@ -286,9 +289,10 @@ export default function App(): ReactElement {
     } catch (error) {
       setActionError(String(error));
     } finally {
+      setManualReconnectPending(false);
       setManualReconnecting(false);
     }
-  }, [manualReconnecting, phaseBusy, refresh]);
+  }, [manualReconnectPending, manualReconnecting, phaseBusy, refresh]);
 
   const restartAgent = useCallback(async () => {
     if (phaseBusy) {
@@ -544,6 +548,9 @@ export default function App(): ReactElement {
     if (uiPhase === "recovering") {
       return "恢复连接中...";
     }
+    if (manualReconnectPending) {
+      return "1s 后手动重连...";
+    }
     if (manualReconnecting) {
       return "手动重连中...";
     }
@@ -551,7 +558,7 @@ export default function App(): ReactElement {
       return "自动重连中...";
     }
     return "空闲";
-  }, [manualReconnecting, tunnel?.reconnecting, uiPhase]);
+  }, [manualReconnectPending, manualReconnecting, tunnel?.reconnecting, uiPhase]);
 
   const renderDashboard = (): ReactElement => (
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -584,13 +591,13 @@ export default function App(): ReactElement {
       <Card
         className={cn(
           "transition-all duration-300",
-          (manualReconnecting || phaseBusy) && "border-amber-500/60 shadow-lg shadow-amber-900/10"
+          (manualReconnectPending || manualReconnecting || phaseBusy) && "border-amber-500/60 shadow-lg shadow-amber-900/10"
         )}
       >
         <CardHeader className="pb-2">
           <CardDescription>Bridge</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
-            <Cloud className={cn("h-4 w-4", (manualReconnecting || phaseBusy) && "animate-pulse")} />
+            <Cloud className={cn("h-4 w-4", (manualReconnectPending || manualReconnecting || phaseBusy) && "animate-pulse")} />
             {bridgeCardStatus}
           </CardTitle>
         </CardHeader>
@@ -1066,8 +1073,8 @@ export default function App(): ReactElement {
   };
 
   return (
-    <div className="min-h-screen bg-app-gradient text-foreground">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 pb-8 pt-6 sm:px-6 lg:px-8">
+    <div className="h-screen w-screen overflow-hidden bg-app-gradient text-foreground">
+      <div className="flex h-full w-full flex-col gap-6 overflow-auto px-4 pb-6 pt-6 sm:px-6 lg:px-8">
         <header className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.28em] text-muted-foreground">
@@ -1081,7 +1088,7 @@ export default function App(): ReactElement {
             <Button
               variant="outline"
               onClick={() => void refresh({ manual: true })}
-              disabled={manualRefreshing || phaseBusy || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
             >
               <RefreshCcw className={cn("mr-2 h-4 w-4", manualRefreshing && "animate-spin")} />
               {manualRefreshing ? "刷新中..." : "刷新"}
@@ -1089,7 +1096,7 @@ export default function App(): ReactElement {
             <Button
               variant="outline"
               onClick={() => void restartAgent()}
-              disabled={manualRefreshing || phaseBusy || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
             >
               <RotateCcw className={cn("mr-2 h-4 w-4", phaseBusy && "animate-spin")} />
               {uiPhase === "restarting"
@@ -1100,10 +1107,10 @@ export default function App(): ReactElement {
             </Button>
             <Button
               onClick={() => void reconnect()}
-              disabled={manualRefreshing || phaseBusy || manualReconnecting}
+              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
             >
-              <Cable className={cn("mr-2 h-4 w-4", manualReconnecting && "animate-pulse")} />
-              {manualReconnecting ? "重连中..." : "手动重连"}
+              <Cable className={cn("mr-2 h-4 w-4", (manualReconnectPending || manualReconnecting) && "animate-pulse")} />
+              {manualReconnectPending ? "准备重连..." : manualReconnecting ? "重连中..." : "手动重连"}
             </Button>
           </div>
         </header>
