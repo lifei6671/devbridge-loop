@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/domain"
 )
@@ -121,6 +122,77 @@ func TestDiscoverDevPriorityAndBaseFallback(t *testing.T) {
 	}
 	if fallbackResult.RouteTarget.TargetPort != 31080 {
 		t.Fatalf("expected base target port 31080, got %d", fallbackResult.RouteTarget.TargetPort)
+	}
+}
+
+func TestDiagnosticsSnapshotAggregatesSummaryErrorsAndRequests(t *testing.T) {
+	s := NewMemoryStore()
+	reg := sampleRegistration("dev-alice", "order-service", "inst-order", 18081)
+	if _, _, err := s.UpsertRegistration(reg, "evt-diag-upsert"); err != nil {
+		t.Fatalf("upsert returned error: %v", err)
+	}
+
+	s.AddError(domain.ErrorTunnelOffline, "tunnel disconnected", map[string]string{"step": "heartbeat"})
+	s.AddError(domain.ErrorUpstreamTimeout, "upstream timeout", map[string]string{"service": "payment"})
+
+	s.AddRequestSummary(domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "http",
+		ServiceName:  "user-service",
+		RequestedEnv: "dev-alice",
+		ResolvedEnv:  "dev-alice",
+		Resolution:   "dev-priority",
+		Upstream:     "http://bridge.example.internal",
+		StatusCode:   200,
+		Result:       "success",
+		LatencyMs:    18,
+		OccurredAt:   time.Now().UTC().Add(-2 * time.Second),
+	})
+	s.AddRequestSummary(domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "grpc",
+		ServiceName:  "payment-service",
+		RequestedEnv: "dev-alice",
+		ResolvedEnv:  "base",
+		Resolution:   "base-fallback",
+		Upstream:     "grpc://base.payment.internal:50051",
+		StatusCode:   503,
+		Result:       "error",
+		ErrorCode:    domain.ErrorUpstreamTimeout,
+		LatencyMs:    1200,
+		OccurredAt:   time.Now().UTC().Add(-1 * time.Second),
+	})
+
+	diagnostics := s.Diagnostics("alice", "dev-alice", 30, 5*time.Second)
+
+	if diagnostics.Summary.RegistrationCount != 1 {
+		t.Fatalf("unexpected registration count: %d", diagnostics.Summary.RegistrationCount)
+	}
+	if diagnostics.Summary.CurrentEnv != "dev-alice" {
+		t.Fatalf("unexpected current env: %s", diagnostics.Summary.CurrentEnv)
+	}
+	if diagnostics.Summary.RDName != "alice" {
+		t.Fatalf("unexpected rd name: %s", diagnostics.Summary.RDName)
+	}
+	if diagnostics.Summary.TunnelStatus != "disconnected" {
+		t.Fatalf("unexpected tunnel status: %s", diagnostics.Summary.TunnelStatus)
+	}
+
+	if len(diagnostics.RecentErrors) != 2 {
+		t.Fatalf("unexpected recent errors size: %d", len(diagnostics.RecentErrors))
+	}
+	if diagnostics.RecentErrors[0].Code != domain.ErrorUpstreamTimeout {
+		t.Fatalf("expected newest error at first position, got %s", diagnostics.RecentErrors[0].Code)
+	}
+
+	if len(diagnostics.RecentRequests) != 2 {
+		t.Fatalf("unexpected recent requests size: %d", len(diagnostics.RecentRequests))
+	}
+	if diagnostics.RecentRequests[0].ServiceName != "payment-service" {
+		t.Fatalf("expected newest request at first position, got %s", diagnostics.RecentRequests[0].ServiceName)
+	}
+	if diagnostics.GeneratedAt.IsZero() {
+		t.Fatalf("generatedAt should be set")
 	}
 }
 

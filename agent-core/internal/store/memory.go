@@ -276,11 +276,37 @@ func resolutionForEnv(resolved, requested string) string {
 	return "base-fallback"
 }
 
-// Summary returns aggregate state for UI.
+// Summary 返回 UI 所需的状态摘要。
 func (s *MemoryStore) Summary(rdName, envName string, defaultTTLSeconds int, scanInterval time.Duration) domain.StateSummary {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	return s.buildSummaryLocked(time.Now().UTC(), rdName, envName, defaultTTLSeconds, scanInterval)
+}
+
+// Diagnostics 返回聚合诊断快照，避免 UI 侧多接口拼装造成时间窗不一致。
+func (s *MemoryStore) Diagnostics(rdName, envName string, defaultTTLSeconds int, scanInterval time.Duration) domain.DiagnosticsSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now().UTC()
+	recentErrors := slices.Clone(s.recentErrors)
+	recentRequests := slices.Clone(s.recentReqs)
+
+	// 统一在 store 层做倒序，保证所有调用方拿到的都是“最近优先”语义。
+	slices.Reverse(recentErrors)
+	slices.Reverse(recentRequests)
+
+	return domain.DiagnosticsSnapshot{
+		Summary:        s.buildSummaryLocked(now, rdName, envName, defaultTTLSeconds, scanInterval),
+		RecentErrors:   recentErrors,
+		RecentRequests: recentRequests,
+		GeneratedAt:    now,
+	}
+}
+
+// buildSummaryLocked 在持锁上下文内构建状态摘要，避免重复拼装逻辑。
+func (s *MemoryStore) buildSummaryLocked(now time.Time, rdName, envName string, defaultTTLSeconds int, scanInterval time.Duration) domain.StateSummary {
 	tunnelStatus := "disconnected"
 	bridgeStatus := "offline"
 	if s.tunnelConnected {
@@ -296,7 +322,7 @@ func (s *MemoryStore) Summary(rdName, envName string, defaultTTLSeconds int, sca
 		RDName:              rdName,
 		RegistrationCount:   len(s.registrations),
 		ActiveIntercepts:    len(s.endpointIndex),
-		LastUpdateAt:        time.Now().UTC(),
+		LastUpdateAt:        now,
 		DefaultTTLSeconds:   defaultTTLSeconds,
 		ScanIntervalSeconds: int(scanInterval / time.Second),
 	}

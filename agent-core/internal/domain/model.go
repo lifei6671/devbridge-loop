@@ -94,6 +94,14 @@ type StateSummary struct {
 	ScanIntervalSeconds int       `json:"scanIntervalSeconds"`
 }
 
+// DiagnosticsSnapshot 聚合状态摘要、最近错误、最近请求，供 UI 一次性拉取诊断数据。
+type DiagnosticsSnapshot struct {
+	Summary        StateSummary     `json:"summary"`
+	RecentErrors   []ErrorEntry     `json:"recentErrors"`
+	RecentRequests []RequestSummary `json:"recentRequests"`
+	GeneratedAt    time.Time        `json:"generatedAt"`
+}
+
 // ErrorEntry stores recent runtime errors for diagnostics.
 type ErrorEntry struct {
 	Code       ErrorCode         `json:"code"`

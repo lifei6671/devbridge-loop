@@ -85,6 +85,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/intercepts", h.stateIntercepts)
 	mux.HandleFunc("GET /api/v1/state/errors", h.stateErrors)
 	mux.HandleFunc("GET /api/v1/state/requests", h.stateRequests)
+	mux.HandleFunc("GET /api/v1/state/diagnostics", h.stateDiagnostics)
 	mux.HandleFunc("POST /api/v1/control/reconnect", h.reconnect)
 	mux.HandleFunc("POST /api/v1/backflow/http", h.backflowHTTP)
 	mux.HandleFunc("POST /api/v1/backflow/grpc", h.backflowGRPC)
@@ -537,6 +538,16 @@ func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) stateRequests(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, h.store.ListRequestSummaries())
+}
+
+func (h *Handler) stateDiagnostics(w http.ResponseWriter, _ *http.Request) {
+	diagnostics := h.store.Diagnostics(
+		h.cfg.RDName,
+		h.cfg.EnvName,
+		h.cfg.Registration.DefaultTTLSeconds,
+		h.cfg.Registration.ScanInterval,
+	)
+	respondJSON(w, http.StatusOK, diagnostics)
 }
 
 func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {

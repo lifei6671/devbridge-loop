@@ -42,6 +42,7 @@
   - `GET /api/v1/state/intercepts`
   - `GET /api/v1/state/errors`
   - `GET /api/v1/state/requests`
+  - `GET /api/v1/state/diagnostics`（聚合 summary/errors/requests）
   - `POST /api/v1/control/reconnect`
 - 内存态注册表 + TTL 过期摘除扫描
 - 注册键模型索引：`ServiceKey / InstanceKey / EndpointKey`
@@ -95,6 +96,8 @@
 
 3. `dev-agent` 桌面端
 - Rust Host：
+  - 主窗口关闭时隐藏到系统托盘（不直接退出进程）
+  - 系统托盘菜单支持：显示主窗口、隐藏到托盘、退出应用
   - 启动时拉起 Go Agent Core 子进程（可通过环境变量覆盖）
   - 后台监督循环（2s）：进程退出检测 + 自动重启 + 退避重试
   - 向前端推送 `agent-runtime-changed` 事件，实现运行态实时刷新
