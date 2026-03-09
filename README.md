@@ -352,10 +352,10 @@ Agent 接收后会自动同步到 Bridge。
 agent:
   rd_name: lifeilin
   env_name: dev-lifeilin
-  bridge_addr: bridge.example.com:18080
+  bridge_addr: bridge.example.com:38080
   auth_token: your-token
   http_proxy_listen: 127.0.0.1:16080
-  grpc_proxy_listen: 127.0.0.1:19090
+  grpc_proxy_listen: 127.0.0.1:39090
   auto_reconnect: true
   log_level: info
 ```
@@ -364,7 +364,7 @@ agent:
 
 ```yaml
 bridge:
-  listen_addr: 0.0.0.0:18080
+  listen_addr: 0.0.0.0:38080
   admin_addr: 0.0.0.0:18081
   heartbeat_timeout: 30s
   idle_timeout: 60s

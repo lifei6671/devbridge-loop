@@ -79,6 +79,13 @@ function formatTime(value?: string | null): string {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function formatCountdown(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "0s";
+  }
+  return `${Math.ceil(seconds)}s`;
+}
+
 function renderHealthBadge(healthy: boolean): ReactElement {
   if (healthy) {
     return <Badge>healthy</Badge>;
@@ -126,6 +133,7 @@ export default function App(): ReactElement {
   const [actionError, setActionError] = useState<string>("");
   const [showCloseDecisionDialog, setShowCloseDecisionDialog] = useState(false);
   const [resolvingCloseDecision, setResolvingCloseDecision] = useState(false);
+  const [clockMs, setClockMs] = useState(() => Date.now());
 
   const selectedRegistration = useMemo(() => {
     if (!selectedInstanceId) {
@@ -302,12 +310,22 @@ export default function App(): ReactElement {
   );
 
   useEffect(() => {
+    // 断线重连阶段提升轮询频率，保证倒计时与状态切换更及时。
+    const intervalMs = tunnel?.reconnecting ? 1000 : 5000;
     void refresh();
     const timer = window.setInterval(() => {
       void refresh();
-    }, 5000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, tunnel?.reconnecting]);
+
+  useEffect(() => {
+    // Bridge 重连倒计时按秒更新，不依赖后端轮询频率。
+    const timer = window.setInterval(() => {
+      setClockMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     // 订阅 Rust Host 推送的进程运行态变化事件，前端无需等轮询也能实时更新。
@@ -346,6 +364,30 @@ export default function App(): ReactElement {
     return <Badge variant="secondary">disconnected</Badge>;
   }, [tunnel]);
 
+  const reconnectCountdown = useMemo(() => {
+    if (!tunnel || tunnel.connected || !tunnel.nextReconnectAt) {
+      return null;
+    }
+
+    const targetMs = Date.parse(tunnel.nextReconnectAt);
+    if (Number.isNaN(targetMs)) {
+      return null;
+    }
+
+    // 允许出现负值并在这里归零，避免时间同步偏差导致 UI 抖动。
+    return Math.max(0, Math.ceil((targetMs - clockMs) / 1000));
+  }, [clockMs, tunnel]);
+
+  const bridgeCardStatus = useMemo(() => {
+    if (tunnel?.connected) {
+      return "online";
+    }
+    if (tunnel?.reconnecting) {
+      return "reconnecting";
+    }
+    return summary?.bridgeStatus ?? "unknown";
+  }, [summary?.bridgeStatus, tunnel?.connected, tunnel?.reconnecting]);
+
   const renderDashboard = (): ReactElement => (
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
       <Card>
@@ -361,6 +403,9 @@ export default function App(): ReactElement {
           <div>env: {summary?.currentEnv ?? "-"}</div>
           <div>status: {runtime?.status ?? "-"}</div>
           <div>restart-count: {runtime?.restartCount ?? 0}</div>
+          <div className="whitespace-pre-wrap break-all">
+            last-error: {runtime?.lastError ? runtime.lastError : "-"}
+          </div>
         </CardContent>
       </Card>
 
@@ -369,12 +414,22 @@ export default function App(): ReactElement {
           <CardDescription>Bridge</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
             <Cloud className="h-4 w-4" />
-            {summary?.bridgeStatus ?? "unknown"}
+            {bridgeCardStatus}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
           <div>address: {tunnel?.bridgeAddress ?? "-"}</div>
           <div>rdName: {summary?.rdName ?? "-"}</div>
+          <div>reconnect-attempt: {tunnel?.reconnectAttempt ?? 0}</div>
+          <div>
+            next-retry:
+            {reconnectCountdown !== null
+              ? ` ${formatCountdown(reconnectCountdown)}`
+              : ` ${formatTime(tunnel?.nextReconnectAt)}`}
+          </div>
+          <div className="whitespace-pre-wrap break-all">
+            last-error: {tunnel?.lastReconnectError ? tunnel.lastReconnectError : "-"}
+          </div>
         </CardContent>
       </Card>
 

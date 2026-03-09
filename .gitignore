@@ -40,3 +40,6 @@ apps/dev-agent/dist/
 apps/dev-agent/src-tauri/target/
 apps/dev-agent/src-tauri/gen/
 bin/
+
+.idea/
+.DS_Store

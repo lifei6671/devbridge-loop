@@ -30,8 +30,9 @@ func (e *BridgeReplyError) Error() string {
 
 // BridgeClient 负责向 cloud-bridge 发送 tunnel 同步事件。
 type BridgeClient struct {
-	eventEndpoint string
-	httpClient    *http.Client
+	eventEndpoint  string
+	healthEndpoint string
+	httpClient     *http.Client
 }
 
 // NewBridgeClient 构建 bridge API 客户端。
@@ -40,7 +41,8 @@ func NewBridgeClient(bridgeAddress string, timeout time.Duration) *BridgeClient 
 		timeout = 5 * time.Second
 	}
 	return &BridgeClient{
-		eventEndpoint: buildEventEndpoint(bridgeAddress),
+		eventEndpoint:  buildEventEndpoint(bridgeAddress),
+		healthEndpoint: buildHealthEndpoint(bridgeAddress),
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
@@ -62,7 +64,12 @@ func (c *BridgeClient) SendEvent(ctx context.Context, message domain.TunnelMessa
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return domain.TunnelReply{}, fmt.Errorf("send bridge request: %w", err)
+		// 失败时补一条 healthz 探测结果，帮助定位“端口通但协议不可用/进程异常”的场景。
+		diagnostic := c.probeHealthEndpoint()
+		if diagnostic == "" {
+			return domain.TunnelReply{}, fmt.Errorf("send bridge request: %w", err)
+		}
+		return domain.TunnelReply{}, fmt.Errorf("send bridge request: %w | %s", err, diagnostic)
 	}
 	defer resp.Body.Close()
 
@@ -100,7 +107,7 @@ func (c *BridgeClient) SendEvent(ctx context.Context, message domain.TunnelMessa
 func buildEventEndpoint(bridgeAddress string) string {
 	address := strings.TrimSpace(bridgeAddress)
 	if address == "" {
-		address = "http://127.0.0.1:18080"
+		address = "http://127.0.0.1:38080"
 	}
 	if !strings.Contains(address, "://") {
 		address = "http://" + address
@@ -108,7 +115,7 @@ func buildEventEndpoint(bridgeAddress string) string {
 
 	parsed, err := url.Parse(address)
 	if err != nil {
-		return "http://127.0.0.1:18080/api/v1/tunnel/events"
+		return "http://127.0.0.1:38080/api/v1/tunnel/events"
 	}
 	path := strings.TrimRight(parsed.Path, "/")
 	if strings.HasSuffix(path, "/api/v1/tunnel/events") {
@@ -119,6 +126,52 @@ func buildEventEndpoint(bridgeAddress string) string {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String()
+}
+
+func buildHealthEndpoint(bridgeAddress string) string {
+	address := strings.TrimSpace(bridgeAddress)
+	if address == "" {
+		address = "http://127.0.0.1:38080"
+	}
+	if !strings.Contains(address, "://") {
+		address = "http://" + address
+	}
+
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return "http://127.0.0.1:38080/healthz"
+	}
+	parsed.Path = "/healthz"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func (c *BridgeClient) probeHealthEndpoint() string {
+	req, err := http.NewRequest(http.MethodGet, c.healthEndpoint, nil)
+	if err != nil {
+		return fmt.Sprintf("healthz probe build request failed: %v", err)
+	}
+
+	// 使用独立短超时客户端，避免重连主链路被诊断请求长时间阻塞。
+	probeClient := &http.Client{
+		Timeout: 1200 * time.Millisecond,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return fmt.Sprintf("healthz probe failed (%s): %v", c.healthEndpoint, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 160))
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		trimmed = "<empty>"
+	}
+	return fmt.Sprintf("healthz probe status=%d body=%q (%s)", resp.StatusCode, trimmed, c.healthEndpoint)
 }
 
 func firstNonEmpty(values ...string) string {

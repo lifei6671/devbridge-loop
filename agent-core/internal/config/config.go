@@ -41,7 +41,7 @@ type EnvResolveConfig struct {
 // LoadFromEnv loads config from environment variables with sane defaults.
 func LoadFromEnv() Config {
 	cfg := Config{
-		HTTPAddr: getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:19090"),
+		HTTPAddr: getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"),
 		RDName:   getenv("DEVLOOP_RD_NAME", "unknown-rd"),
 		EnvName:  getenv("DEVLOOP_ENV_NAME", "dev-default"),
 		Registration: RegistrationConfig{
@@ -49,8 +49,8 @@ func LoadFromEnv() Config {
 			ScanInterval:      time.Duration(getenvInt("DEVLOOP_SCAN_INTERVAL_SECONDS", 5)) * time.Second,
 		},
 		Tunnel: TunnelConfig{
-			BridgeAddress:     getenv("DEVLOOP_TUNNEL_BRIDGE_ADDRESS", "http://127.0.0.1:18080"),
-			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:19090"))),
+			BridgeAddress:     getenv("DEVLOOP_TUNNEL_BRIDGE_ADDRESS", "http://127.0.0.1:38080"),
+			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"))),
 			HeartbeatInterval: time.Duration(getenvInt("DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC", 10)) * time.Second,
 			ReconnectBackoff:  parseDurationListMillis(getenv("DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS", "500,1000,2000,5000")),
 			RequestTimeout:    time.Duration(getenvInt("DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC", 5)) * time.Second,
@@ -115,7 +115,7 @@ func parseDurationListMillis(value string) []time.Duration {
 func defaultBackflowBaseURL(httpAddr string) string {
 	value := strings.TrimSpace(httpAddr)
 	if value == "" {
-		return "http://127.0.0.1:19090"
+		return "http://127.0.0.1:39090"
 	}
 	if strings.Contains(value, "://") {
 		return value

@@ -1,4 +1,6 @@
 use serde::Serialize;
+use std::io;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime};
@@ -63,7 +65,10 @@ impl AgentManager {
     pub fn ensure_started(&mut self) -> Result<AgentRuntime, String> {
         let _ = self.check_process_exit();
         if self.child.is_none() {
-            self.spawn_process("initial-start")?;
+            if let Err(err) = self.spawn_process("initial-start") {
+                self.last_error = Some(err.clone());
+                return Err(err);
+            }
         }
         Ok(self.runtime())
     }
@@ -71,7 +76,10 @@ impl AgentManager {
     // 手动重启进程：先尝试结束旧进程，再立即拉起新进程。
     pub fn restart_now(&mut self) -> Result<AgentRuntime, String> {
         self.stop_running_process();
-        self.spawn_process("manual-restart")?;
+        if let Err(err) = self.spawn_process("manual-restart") {
+            self.last_error = Some(err.clone());
+            return Err(err);
+        }
         Ok(self.runtime())
     }
 
@@ -154,6 +162,8 @@ impl AgentManager {
 
     // 实际拉起子进程，并在成功后重置重启窗口。
     fn spawn_process(&mut self, reason: &str) -> Result<(), String> {
+        validate_agent_http_addr_before_spawn()?;
+
         let mut command = Command::new(&self.launch_plan.command);
         command.args(&self.launch_plan.args);
         if let Some(workdir) = &self.launch_plan.workdir {
@@ -319,6 +329,112 @@ fn parse_backoff(value: String) -> Vec<u64> {
         return vec![500, 1000, 2000, 5000];
     }
     parsed
+}
+
+fn validate_agent_http_addr_before_spawn() -> Result<(), String> {
+    let raw_addr =
+        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:39090".to_string());
+    let listen_addr = normalize_http_addr_to_socket(&raw_addr);
+
+    if listen_addr.is_empty() {
+        return Err(format!(
+            "DEVLOOP_AGENT_HTTP_ADDR 配置无效: {raw_addr}，期望 host:port 格式"
+        ));
+    }
+
+    // 启动前先做一次端口探测，避免子进程起不来却只看到笼统的 exit code。
+    match TcpListener::bind(&listen_addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            Err(build_addr_in_use_error(&listen_addr))
+        }
+        Err(err) => Err(format!(
+            "校验 agent-core 监听地址失败（{listen_addr}）: {err}"
+        )),
+    }
+}
+
+fn normalize_http_addr_to_socket(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    without_scheme
+        .split('/')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn build_addr_in_use_error(listen_addr: &str) -> String {
+    // 错误信息优先给出冲突端口；在 Windows 上额外补充 PID，便于用户直接排查占用进程。
+    let pid_suffix = extract_port(listen_addr)
+        .and_then(find_listening_pid_for_port)
+        .map(|pid| format!("（PID: {pid}）"))
+        .unwrap_or_default();
+
+    format!(
+        "agent-core 监听地址 {listen_addr} 已被占用{pid_suffix}，请释放端口或修改 DEVLOOP_AGENT_HTTP_ADDR"
+    )
+}
+
+fn extract_port(listen_addr: &str) -> Option<u16> {
+    listen_addr
+        .rsplit_once(':')
+        .and_then(|(_, port_text)| port_text.trim().parse::<u16>().ok())
+}
+
+#[cfg(windows)]
+fn find_listening_pid_for_port(port: u16) -> Option<u32> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 5 {
+            continue;
+        }
+
+        let is_tcp = columns[0].eq_ignore_ascii_case("tcp");
+        let state = columns[3].to_ascii_lowercase();
+        if !is_tcp || !state.contains("listen") {
+            continue;
+        }
+
+        // netstat 的本地地址可能是 127.0.0.1:39090 或 [::]:39090，这里统一按最后一个冒号提取端口。
+        if !matches_netstat_port(columns[1], port) {
+            continue;
+        }
+
+        if let Ok(pid) = columns[4].parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn find_listening_pid_for_port(_port: u16) -> Option<u32> {
+    None
+}
+
+#[cfg(windows)]
+fn matches_netstat_port(addr: &str, expected: u16) -> bool {
+    addr.rsplit_once(':')
+        .and_then(|(_, port_text)| port_text.parse::<u16>().ok())
+        == Some(expected)
 }
 
 fn system_time_to_string(value: SystemTime) -> Option<String> {

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultAgentBaseURL = "http://127.0.0.1:19090"
+	defaultAgentBaseURL = "http://127.0.0.1:39090"
 )
 
 // AgentOptions 定义 agent registry 适配器初始化参数。

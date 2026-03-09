@@ -191,7 +191,7 @@ func (c *Client) doJSONRequest(ctx context.Context, method string, path string, 
 func normalizeBaseURL(baseURL string) string {
 	trimmed := strings.TrimSpace(baseURL)
 	if trimmed == "" {
-		return "http://127.0.0.1:19090"
+		return "http://127.0.0.1:39090"
 	}
 	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
 		return strings.TrimRight(trimmed, "/")

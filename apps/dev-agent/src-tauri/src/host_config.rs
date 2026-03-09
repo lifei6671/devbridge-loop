@@ -194,7 +194,7 @@ fn save_config_file(storage: &HostStoragePaths, file: &DesktopConfigFile) -> Res
 
 fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> DesktopConfigView {
     let agent_http_addr =
-        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:19090".to_string());
+        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:39090".to_string());
     let default_api_base =
         if agent_http_addr.starts_with("http://") || agent_http_addr.starts_with("https://") {
             agent_http_addr.clone()
@@ -249,16 +249,16 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     let tunnel_bridge_address = first_non_blank(
         std::env::var("DEVLOOP_TUNNEL_BRIDGE_ADDRESS").ok(),
         file.and_then(|item| item.tunnel_bridge_address.clone()),
-        Some("http://127.0.0.1:18080".to_string()),
+        Some("http://127.0.0.1:38080".to_string()),
     )
-    .unwrap_or_else(|| "http://127.0.0.1:18080".to_string());
+    .unwrap_or_else(|| "http://127.0.0.1:38080".to_string());
 
     let tunnel_backflow_base_url = first_non_blank(
         std::env::var("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL").ok(),
         file.and_then(|item| item.tunnel_backflow_base_url.clone()),
         Some(default_api_base),
     )
-    .unwrap_or_else(|| "http://127.0.0.1:19090".to_string());
+    .unwrap_or_else(|| "http://127.0.0.1:39090".to_string());
 
     DesktopConfigView {
         agent_api_base,

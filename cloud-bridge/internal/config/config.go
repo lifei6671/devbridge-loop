@@ -25,11 +25,11 @@ func LoadFromEnv() Config {
 	}
 
 	return Config{
-		HTTPAddr:            getenv("DEVLOOP_BRIDGE_HTTP_ADDR", "0.0.0.0:18080"),
+		HTTPAddr:            getenv("DEVLOOP_BRIDGE_HTTP_ADDR", "0.0.0.0:38080"),
 		RouteExtractorOrder: order,
 		BridgePublicHost:    getenv("DEVLOOP_BRIDGE_PUBLIC_HOST", "bridge.example.internal"),
 		BridgePublicPort:    getenvInt("DEVLOOP_BRIDGE_PUBLIC_PORT", 443),
-		FallbackBackflowURL: getenv("DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL", "http://127.0.0.1:19090"),
+		FallbackBackflowURL: getenv("DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL", "http://127.0.0.1:39090"),
 		IngressTimeout:      time.Duration(getenvInt("DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC", 10)) * time.Second,
 	}
 }

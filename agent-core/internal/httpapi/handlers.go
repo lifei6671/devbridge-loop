@@ -557,7 +557,16 @@ func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.syncPublisher.RequestReconnect(r.Context()); err != nil {
+	// 手动重连接口需要尽快返回前端，避免在 bridge 长时间不可达时页面“无响应”。
+	reconnectCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	if err := h.syncPublisher.RequestReconnect(reconnectCtx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			state := h.store.TunnelState(h.cfg.Tunnel.BridgeAddress)
+			respondJSON(w, http.StatusAccepted, state)
+			return
+		}
 		h.store.AddError(domain.ErrorTunnelOffline, "manual reconnect failed", map[string]string{"error": err.Error()})
 		respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
@@ -817,7 +826,7 @@ func (h *Handler) executeEgressHTTP(
 func buildBridgeIngressURL(bridgeAddress string, path string, rawQuery string) (string, error) {
 	address := strings.TrimSpace(bridgeAddress)
 	if address == "" {
-		address = "http://127.0.0.1:18080"
+		address = "http://127.0.0.1:38080"
 	}
 	if !strings.Contains(address, "://") {
 		address = "http://" + address

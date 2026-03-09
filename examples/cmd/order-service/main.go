@@ -26,7 +26,7 @@ const (
 	grpcHealthService    = "order.v1.OrderService"
 	defaultHTTPAddr      = "127.0.0.1:18101"
 	defaultGRPCAddr      = "127.0.0.1:19101"
-	defaultAgentAddr     = "127.0.0.1:19090"
+	defaultAgentAddr     = "127.0.0.1:39090"
 	defaultEnvName       = "base"
 	defaultTTLSeconds    = 30
 	defaultHeartbeatSec  = 10

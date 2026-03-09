@@ -13,9 +13,13 @@ export interface StateSummary {
 
 export interface TunnelState {
   connected: boolean;
+  reconnecting: boolean;
+  reconnectAttempt: number;
   sessionEpoch: number;
   resourceVersion: number;
   lastHeartbeatAt: string;
+  nextReconnectAt: string | null;
+  lastReconnectError: string;
   bridgeAddress: string;
   reconnectBackoffMs: number[];
 }

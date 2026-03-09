@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +47,8 @@ func NewHandler(pipeline *routing.Pipeline, store *store.MemoryStore, backflowCa
 func (h *Handler) Router() http.Handler {
 	mux := http.NewServeMux()
 
+	// Go 1.26 下 `GET /` 会与无方法前缀的 ingress 路由产生模式冲突，改为仅匹配根路径。
+	mux.HandleFunc("GET /{$}", h.healthz)
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /api/v1/state/sessions", h.sessions)
 	mux.HandleFunc("GET /api/v1/state/intercepts", h.intercepts)
@@ -60,6 +65,7 @@ func (h *Handler) Router() http.Handler {
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, _ *http.Request) {
+	slog.Info("healthz", "status", "ok")
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -81,6 +87,27 @@ func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
 	var event domain.TunnelEvent
+	defer func() {
+		// 避免单次异常导致连接被强制关闭，尽量返回可诊断错误给 agent。
+		if recovered := recover(); recovered != nil {
+			h.store.AddError(domain.SyncErrorInvalidPayload, "panic while processing tunnel event", map[string]string{
+				"eventId":      strings.TrimSpace(event.EventID),
+				"type":         strings.TrimSpace(event.Type),
+				"sessionEpoch": strconv.FormatInt(event.SessionEpoch, 10),
+				"panic":        fmt.Sprintf("%v", recovered),
+			})
+			slog.Error("panic while processing tunnel event", "panic", recovered, "stack", string(debug.Stack()))
+			respondJSON(w, http.StatusInternalServerError, domain.TunnelEventReply{
+				Type:         domain.TunnelMessageError,
+				Status:       domain.EventStatusRejected,
+				EventID:      strings.TrimSpace(event.EventID),
+				SessionEpoch: event.SessionEpoch,
+				ErrorCode:    domain.SyncErrorInvalidPayload,
+				Message:      fmt.Sprintf("bridge panic: %v", recovered),
+			})
+		}
+	}()
+
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
 		h.store.AddError(domain.SyncErrorInvalidPayload, "invalid tunnel event payload", map[string]string{
 			"error": err.Error(),

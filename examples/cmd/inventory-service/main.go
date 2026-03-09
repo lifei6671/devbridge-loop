@@ -26,7 +26,7 @@ const (
 	grpcHealthService    = "inventory.v1.InventoryService"
 	defaultHTTPAddr      = "127.0.0.1:18103"
 	defaultGRPCAddr      = "127.0.0.1:19103"
-	defaultAgentAddr     = "127.0.0.1:19090"
+	defaultAgentAddr     = "127.0.0.1:39090"
 	defaultEnvName       = "base"
 	defaultTTLSeconds    = 30
 	defaultHeartbeatSec  = 10

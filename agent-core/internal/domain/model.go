@@ -72,12 +72,16 @@ type DiscoverResponse struct {
 
 // TunnelState is surfaced to UI/Rust host.
 type TunnelState struct {
-	Connected         bool      `json:"connected"`
-	SessionEpoch      int64     `json:"sessionEpoch"`
-	ResourceVersion   int64     `json:"resourceVersion"`
-	LastHeartbeatAt   time.Time `json:"lastHeartbeatAt"`
-	BridgeAddress     string    `json:"bridgeAddress"`
-	ReconnectBackoffM []int     `json:"reconnectBackoffMs"`
+	Connected          bool       `json:"connected"`
+	Reconnecting       bool       `json:"reconnecting"`
+	ReconnectAttempt   int        `json:"reconnectAttempt"`
+	SessionEpoch       int64      `json:"sessionEpoch"`
+	ResourceVersion    int64      `json:"resourceVersion"`
+	LastHeartbeatAt    time.Time  `json:"lastHeartbeatAt"`
+	NextReconnectAt    *time.Time `json:"nextReconnectAt"`
+	LastReconnectError string     `json:"lastReconnectError"`
+	BridgeAddress      string     `json:"bridgeAddress"`
+	ReconnectBackoffM  []int      `json:"reconnectBackoffMs"`
 }
 
 // StateSummary aggregates key runtime state for UI.

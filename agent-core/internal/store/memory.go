@@ -48,10 +48,14 @@ type MemoryStore struct {
 	processedEvents map[string]processedEvent
 	processedOrder  []string
 
-	resourceVersion int64
-	sessionEpoch    int64
-	tunnelConnected bool
-	lastTunnelHB    time.Time
+	resourceVersion    int64
+	sessionEpoch       int64
+	tunnelConnected    bool
+	lastTunnelHB       time.Time
+	reconnecting       bool
+	reconnectAttempt   int
+	nextReconnectAt    *time.Time
+	lastReconnectError string
 }
 
 // NewMemoryStore constructs an in-memory runtime state store.
@@ -333,14 +337,7 @@ func (s *MemoryStore) TunnelState(bridgeAddress string) domain.TunnelState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return domain.TunnelState{
-		Connected:         s.tunnelConnected,
-		SessionEpoch:      s.sessionEpoch,
-		ResourceVersion:   s.resourceVersion,
-		LastHeartbeatAt:   s.lastTunnelHB,
-		BridgeAddress:     bridgeAddress,
-		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
-	}
+	return s.buildTunnelStateLocked(bridgeAddress)
 }
 
 // ListActiveIntercepts provides derived active intercept list.
@@ -456,16 +453,13 @@ func (s *MemoryStore) ReconnectTunnel() domain.TunnelState {
 
 	s.sessionEpoch++
 	s.tunnelConnected = true
+	s.reconnecting = false
+	s.reconnectAttempt = 0
+	s.nextReconnectAt = nil
+	s.lastReconnectError = ""
 	s.lastTunnelHB = time.Now().UTC()
 
-	return domain.TunnelState{
-		Connected:         s.tunnelConnected,
-		SessionEpoch:      s.sessionEpoch,
-		ResourceVersion:   s.resourceVersion,
-		LastHeartbeatAt:   s.lastTunnelHB,
-		BridgeAddress:     "bridge.example.internal:443",
-		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
-	}
+	return s.buildTunnelStateLocked("bridge.example.internal:443")
 }
 
 // BeginTunnelReconnect 在重连前开启新 session epoch。
@@ -475,16 +469,34 @@ func (s *MemoryStore) BeginTunnelReconnect() domain.TunnelState {
 
 	s.sessionEpoch++
 	s.tunnelConnected = false
-	s.lastTunnelHB = time.Now().UTC()
+	s.reconnecting = true
+	// 开始新一轮重连时清空倒计时，直到拿到本轮失败退避窗口再写入下一次重试点。
+	s.nextReconnectAt = nil
 
-	return domain.TunnelState{
-		Connected:         s.tunnelConnected,
-		SessionEpoch:      s.sessionEpoch,
-		ResourceVersion:   s.resourceVersion,
-		LastHeartbeatAt:   s.lastTunnelHB,
-		BridgeAddress:     "",
-		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
+	return s.buildTunnelStateLocked("")
+}
+
+// MarkTunnelReconnectPending 记录重连失败后的下一次重试窗口，供 UI 展示倒计时。
+func (s *MemoryStore) MarkTunnelReconnectPending(attempt int, nextReconnectAt time.Time, lastError string) domain.TunnelState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tunnelConnected = false
+	s.reconnecting = true
+	if attempt < 0 {
+		attempt = 0
 	}
+	s.reconnectAttempt = attempt
+
+	if !nextReconnectAt.IsZero() {
+		value := nextReconnectAt.UTC()
+		s.nextReconnectAt = &value
+	} else {
+		s.nextReconnectAt = nil
+	}
+
+	s.lastReconnectError = strings.TrimSpace(lastError)
+	return s.buildTunnelStateLocked("")
 }
 
 // MarkTunnelConnected 更新 tunnel 为已连接状态。
@@ -493,15 +505,12 @@ func (s *MemoryStore) MarkTunnelConnected() domain.TunnelState {
 	defer s.mu.Unlock()
 
 	s.tunnelConnected = true
+	s.reconnecting = false
+	s.reconnectAttempt = 0
+	s.nextReconnectAt = nil
+	s.lastReconnectError = ""
 	s.lastTunnelHB = time.Now().UTC()
-	return domain.TunnelState{
-		Connected:         s.tunnelConnected,
-		SessionEpoch:      s.sessionEpoch,
-		ResourceVersion:   s.resourceVersion,
-		LastHeartbeatAt:   s.lastTunnelHB,
-		BridgeAddress:     "",
-		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
-	}
+	return s.buildTunnelStateLocked("")
 }
 
 // MarkTunnelDisconnected 更新 tunnel 为断开状态。
@@ -509,6 +518,9 @@ func (s *MemoryStore) MarkTunnelDisconnected() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tunnelConnected = false
+	s.reconnecting = false
+	s.reconnectAttempt = 0
+	s.nextReconnectAt = nil
 }
 
 // MarkTunnelHeartbeat 刷新 tunnel 心跳时间。
@@ -523,6 +535,27 @@ func (s *MemoryStore) CurrentSyncMeta() (sessionEpoch int64, resourceVersion int
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sessionEpoch, s.resourceVersion
+}
+
+func (s *MemoryStore) buildTunnelStateLocked(bridgeAddress string) domain.TunnelState {
+	var nextReconnectAt *time.Time
+	if s.nextReconnectAt != nil {
+		value := s.nextReconnectAt.UTC()
+		nextReconnectAt = &value
+	}
+
+	return domain.TunnelState{
+		Connected:          s.tunnelConnected,
+		Reconnecting:       s.reconnecting,
+		ReconnectAttempt:   s.reconnectAttempt,
+		SessionEpoch:       s.sessionEpoch,
+		ResourceVersion:    s.resourceVersion,
+		LastHeartbeatAt:    s.lastTunnelHB,
+		NextReconnectAt:    nextReconnectAt,
+		LastReconnectError: s.lastReconnectError,
+		BridgeAddress:      bridgeAddress,
+		ReconnectBackoffM:  []int{500, 1000, 2000, 5000},
+	}
 }
 
 func (s *MemoryStore) lookupDuplicateUpsertLocked(eventID string) (bool, domain.LocalRegistration, bool) {

@@ -193,7 +193,7 @@ pub fn run() {
                 close_to_tray_on_close: Mutex::new(close_to_tray_on_close),
                 api: AgentApiClient::new(
                     std::env::var("DEVLOOP_AGENT_API_BASE")
-                        .unwrap_or_else(|_| "http://127.0.0.1:19090".to_string()),
+                        .unwrap_or_else(|_| "http://127.0.0.1:39090".to_string()),
                 ),
                 storage,
             });
@@ -277,12 +277,14 @@ fn request_app_exit(app: &AppHandle, code: i32) {
 
 fn shutdown_managed_agent(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut manager = state
+    let mut agent_manager = state
         .manager
         .lock()
         .map_err(|_| "manager lock poisoned".to_string())?;
-    let runtime = manager.shutdown();
-    drop(manager);
+    let runtime = agent_manager.shutdown();
+    drop(agent_manager);
+
+    // 退出前推送一次 agent 运行态，确保前端最后一帧状态一致。
     let _ = emit_runtime_event(app, &runtime);
     Ok(())
 }

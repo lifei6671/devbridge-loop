@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -211,7 +212,7 @@ func (m *SyncManager) ensureConnected(ctx context.Context) error {
 }
 
 func (m *SyncManager) reconnectWithBackoff(ctx context.Context) error {
-	// 每一轮重连流程只提升一次 epoch，符合“新建连接后 epoch+1”的约束。
+	// 每次重连尝试都推进 epoch，避免 bridge 保留更高 epoch 会话时陷入永久冲突。
 	sessionState := m.state.BeginTunnelReconnect()
 	epoch := sessionState.SessionEpoch
 
@@ -221,17 +222,32 @@ func (m *SyncManager) reconnectWithBackoff(ctx context.Context) error {
 			m.state.MarkTunnelConnected()
 			m.state.MarkTunnelHeartbeat(time.Now().UTC())
 			return nil
-		}
+		} else {
+			backoff := m.backoffForAttempt(attempt)
+			attempt++
+			diagnosticError := withBridgeConnectivityHint(err, m.cfg.Tunnel.BridgeAddress)
 
-		m.state.MarkTunnelDisconnected()
+			// 记录下一次重试时间，供 UI 以秒级倒计时展示“自动重连中”。
+			nextRetryAt := time.Now().UTC().Add(backoff)
+			m.state.MarkTunnelReconnectPending(attempt, nextRetryAt, diagnosticError)
+			// 将失败原因写入运行态错误，便于 UI 和日志快速定位“连不上 bridge”的具体原因。
+			m.state.AddError(domain.ErrorTunnelOffline, "tunnel reconnect attempt failed", map[string]string{
+				"attempt":       fmt.Sprintf("%d", attempt),
+				"sessionEpoch":  fmt.Sprintf("%d", epoch),
+				"bridgeAddress": m.cfg.Tunnel.BridgeAddress,
+				"nextRetryAt":   nextRetryAt.Format(time.RFC3339Nano),
+				"error":         diagnosticError,
+			})
 
-		backoff := m.backoffForAttempt(attempt)
-		attempt++
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
+			// 下一次尝试前切换到更新 epoch，防止被 bridge 以 stale-epoch 持续拒绝。
+			sessionState = m.state.BeginTunnelReconnect()
+			epoch = sessionState.SessionEpoch
 		}
 	}
 }
@@ -336,13 +352,40 @@ func (m *SyncManager) sendMessage(
 }
 
 func (m *SyncManager) backoffForAttempt(attempt int) time.Duration {
+	// 采用指数退避（base * 2^attempt）并受 max 上限约束，避免 bridge 长时间不可达时过载重试。
+	base, max := m.reconnectBackoffBounds()
+	if attempt <= 0 {
+		return base
+	}
+
+	backoff := base
+	for i := 0; i < attempt; i++ {
+		// 到达上限后保持固定，兼容“指数增长 + 最大退避”的设计约束。
+		if backoff >= max/2 {
+			return max
+		}
+		backoff *= 2
+	}
+	if backoff > max {
+		return max
+	}
+	return backoff
+}
+
+func (m *SyncManager) reconnectBackoffBounds() (time.Duration, time.Duration) {
 	if len(m.cfg.Tunnel.ReconnectBackoff) == 0 {
-		return 1 * time.Second
+		return 500 * time.Millisecond, 5 * time.Second
 	}
-	if attempt >= len(m.cfg.Tunnel.ReconnectBackoff) {
-		return m.cfg.Tunnel.ReconnectBackoff[len(m.cfg.Tunnel.ReconnectBackoff)-1]
+
+	base := m.cfg.Tunnel.ReconnectBackoff[0]
+	max := m.cfg.Tunnel.ReconnectBackoff[len(m.cfg.Tunnel.ReconnectBackoff)-1]
+	if base <= 0 {
+		base = 500 * time.Millisecond
 	}
-	return m.cfg.Tunnel.ReconnectBackoff[attempt]
+	if max < base {
+		max = base
+	}
+	return base, max
 }
 
 func (m *SyncManager) currentConnID() string {
@@ -393,4 +436,27 @@ func sanitizeID(value string) string {
 		return "unknown"
 	}
 	return value
+}
+
+func withBridgeConnectivityHint(err error, bridgeAddress string) string {
+	if err == nil {
+		return ""
+	}
+
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		return ""
+	}
+	if runtime.GOOS != "windows" {
+		return message
+	}
+
+	// Windows 下若 bridge 实际跑在 WSL，127.0.0.1 往往不可直连，需要改成 WSL IP。
+	lowerMessage := strings.ToLower(message)
+	lowerAddress := strings.ToLower(strings.TrimSpace(bridgeAddress))
+	if strings.Contains(lowerMessage, "connection refused") &&
+		(strings.Contains(lowerAddress, "127.0.0.1") || strings.Contains(lowerAddress, "localhost")) {
+		return message + " | hint: 若 cloud-bridge 运行在 WSL，请将 tunnelBridgeAddress 改为 WSL 的实际 IP:38080，或直接在 Windows 启动 cloud-bridge.exe。"
+	}
+	return message
 }

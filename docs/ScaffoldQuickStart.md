@@ -127,7 +127,7 @@
 ```go
 adapter, err := registry.NewAdapter(registry.Options{
     Type:       registry.RegistryTypeAgent,
-    AgentAddr:  "127.0.0.1:19090",
+    AgentAddr:  "127.0.0.1:39090",
     RuntimeEnv: "dev-alice",
 })
 if err != nil {
@@ -198,7 +198,7 @@ npm run tauri:dev
 
 ```bash
 # 可选：统一指定 agent-core 地址与 demo env
-export DEMO_AGENT_ADDR=127.0.0.1:19090
+export DEMO_AGENT_ADDR=127.0.0.1:39090
 export DEMO_ENV_NAME=dev-alice
 
 # 启动 inventory（可选，用于 user->inventory fallback 场景）
@@ -213,7 +213,7 @@ make run-demo-order
 
 ## 环境变量（已支持）
 
-- `DEVLOOP_AGENT_HTTP_ADDR`：Go Agent Core HTTP 地址，默认 `127.0.0.1:19090`
+- `DEVLOOP_AGENT_HTTP_ADDR`：Go Agent Core HTTP 地址，默认 `127.0.0.1:39090`
 - `DEVLOOP_RD_NAME`：当前研发人员标识
 - `DEVLOOP_ENV_NAME`：当前默认 env
 - `DEVLOOP_ENV_RESOLVE_ORDER`：env 解析优先级（默认 `requestHeader,payload,runtimeDefault,baseFallback`）
@@ -224,14 +224,14 @@ make run-demo-order
 - `DEVLOOP_AGENT_CORE_DIR`：Rust Host 用 `go run` 拉起 agent-core 时的工作目录
 - `DEVLOOP_AGENT_AUTO_RESTART`：是否自动重启（默认 `true`）
 - `DEVLOOP_AGENT_RESTART_BACKOFF_MS`：自动重启退避毫秒数组（默认 `500,1000,2000,5000`）
-- `DEVLOOP_TUNNEL_BRIDGE_ADDRESS`：agent 同步到 bridge 的地址（默认 `http://127.0.0.1:18080`）
+- `DEVLOOP_TUNNEL_BRIDGE_ADDRESS`：agent 同步到 bridge 的地址（默认 `http://127.0.0.1:38080`）
 - `DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC`：tunnel 心跳间隔秒数（默认 `10`）
 - `DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS`：tunnel 重连退避毫秒数组（默认 `500,1000,2000,5000`）
 - `DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC`：agent 到 bridge 请求超时秒数（默认 `5`）
 - `DEVLOOP_TUNNEL_BACKFLOW_BASE_URL`：agent 在 HELLO 中上报的回流地址（默认按 `DEVLOOP_AGENT_HTTP_ADDR` 自动推导）
 - `DEVLOOP_BRIDGE_PUBLIC_HOST`：bridge 对外路由域名（默认 `bridge.example.internal`）
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
-- `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:19090`）
+- `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:39090`）
 - `DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC`：bridge 调用 agent 回流接口的超时秒数（默认 `10`）
 
 ## 桌面配置持久化
