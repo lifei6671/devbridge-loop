@@ -68,6 +68,10 @@
   - 命中 dev 时走本地 discover 目标；未命中时按 `baseAddress` fallback
   - 同样透传 `x-env/X-Env` metadata，并写入 `state/requests` 摘要
 - 协议扩展接口占位：`ProtocolAdapter` / `IngressResolver` / `Forwarder` / `EgressProxy`
+- 新增业务侧 registry 适配层（Go）：
+  - 包路径：`agent-core/pkg/registry`
+  - 提供 `registry type=agent` 工厂与适配器
+  - 已实现：`Register / Heartbeat / Unregister / Discover`
 
 2. `cloud-bridge`
 - 状态 API：`sessions/intercepts/routes/errors`
@@ -104,6 +108,28 @@
   - 日志页（实时读取 `/api/v1/state/errors`）
   - 配置页（Rust Host 运行配置 + Agent 运行配置）
   - 刷新 + 手动重连 + 手动重启
+
+4. 业务系统 `registry=agent` 接入（Go）
+- 适配器包：`agent-core/pkg/registry`
+- 示例：
+
+```go
+adapter, err := registry.NewAdapter(registry.Options{
+    Type:       registry.RegistryTypeAgent,
+    AgentAddr:  "127.0.0.1:19090",
+    RuntimeEnv: "dev-alice",
+})
+if err != nil {
+    panic(err)
+}
+
+_, _ = adapter.Register(ctx, registry.Registration{
+    ServiceName: "user-service",
+    Endpoints: []registry.Endpoint{
+        {Protocol: "http", TargetHost: "127.0.0.1", TargetPort: 18080},
+    },
+})
+```
 
 ## 本地开发命令
 
