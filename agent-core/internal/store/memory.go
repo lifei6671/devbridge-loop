@@ -14,6 +14,7 @@ import (
 
 const (
 	maxErrorEntries     = 50
+	maxRequestSummaries = 200
 	maxProcessedEventID = 2048
 )
 
@@ -42,6 +43,7 @@ type MemoryStore struct {
 	endpointIndex map[string]string                   // EndpointKey.String() -> InstanceKey.String()
 
 	recentErrors []domain.ErrorEntry
+	recentReqs   []domain.RequestSummary
 
 	processedEvents map[string]processedEvent
 	processedOrder  []string
@@ -60,6 +62,7 @@ func NewMemoryStore() *MemoryStore {
 		serviceIndex:    make(map[string]map[string]struct{}),
 		endpointIndex:   make(map[string]string),
 		recentErrors:    make([]domain.ErrorEntry, 0, maxErrorEntries),
+		recentReqs:      make([]domain.RequestSummary, 0, maxRequestSummaries),
 		processedEvents: make(map[string]processedEvent),
 		processedOrder:  make([]string, 0, maxProcessedEventID),
 	}
@@ -358,6 +361,16 @@ func (s *MemoryStore) ListErrors() []domain.ErrorEntry {
 	return result
 }
 
+// ListRequestSummaries 返回最近请求摘要，按时间倒序。
+func (s *MemoryStore) ListRequestSummaries() []domain.RequestSummary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := slices.Clone(s.recentReqs)
+	slices.Reverse(result)
+	return result
+}
+
 // AddError stores one error entry.
 func (s *MemoryStore) AddError(code domain.ErrorCode, message string, context map[string]string) {
 	s.mu.Lock()
@@ -371,6 +384,17 @@ func (s *MemoryStore) AddError(code domain.ErrorCode, message string, context ma
 	})
 	if len(s.recentErrors) > maxErrorEntries {
 		s.recentErrors = s.recentErrors[len(s.recentErrors)-maxErrorEntries:]
+	}
+}
+
+// AddRequestSummary 记录一条请求摘要，超过上限时淘汰最旧数据。
+func (s *MemoryStore) AddRequestSummary(summary domain.RequestSummary) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.recentReqs = append(s.recentReqs, summary)
+	if len(s.recentReqs) > maxRequestSummaries {
+		s.recentReqs = s.recentReqs[len(s.recentReqs)-maxRequestSummaries:]
 	}
 }
 

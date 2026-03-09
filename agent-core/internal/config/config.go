@@ -15,6 +15,7 @@ type Config struct {
 
 	Registration RegistrationConfig
 	Tunnel       TunnelConfig
+	EnvResolve   EnvResolveConfig
 }
 
 // RegistrationConfig contains registration lifecycle settings.
@@ -30,6 +31,11 @@ type TunnelConfig struct {
 	HeartbeatInterval time.Duration
 	ReconnectBackoff  []time.Duration
 	RequestTimeout    time.Duration
+}
+
+// EnvResolveConfig defines env resolution order for discover/egress requests.
+type EnvResolveConfig struct {
+	Order []string
 }
 
 // LoadFromEnv loads config from environment variables with sane defaults.
@@ -49,6 +55,9 @@ func LoadFromEnv() Config {
 			ReconnectBackoff:  parseDurationListMillis(getenv("DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS", "500,1000,2000,5000")),
 			RequestTimeout:    time.Duration(getenvInt("DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC", 5)) * time.Second,
 		},
+		EnvResolve: EnvResolveConfig{
+			Order: parseResolveOrder(getenv("DEVLOOP_ENV_RESOLVE_ORDER", "requestHeader,payload,runtimeDefault,baseFallback")),
+		},
 	}
 	if cfg.Registration.DefaultTTLSeconds <= 0 {
 		cfg.Registration.DefaultTTLSeconds = 30
@@ -64,6 +73,9 @@ func LoadFromEnv() Config {
 	}
 	if cfg.Tunnel.RequestTimeout <= 0 {
 		cfg.Tunnel.RequestTimeout = 5 * time.Second
+	}
+	if len(cfg.EnvResolve.Order) == 0 {
+		cfg.EnvResolve.Order = []string{"requestHeader", "payload", "runtimeDefault", "baseFallback"}
 	}
 	return cfg
 }
@@ -112,4 +124,38 @@ func defaultBackflowBaseURL(httpAddr string) string {
 		value = "127.0.0.1" + value
 	}
 	return "http://" + value
+}
+
+func parseResolveOrder(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{})
+
+	for _, part := range parts {
+		key := normalizeResolveToken(part)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, key)
+	}
+	return result
+}
+
+func normalizeResolveToken(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "requestheader", "header", "x-env":
+		return "requestHeader"
+	case "payload", "body":
+		return "payload"
+	case "runtimedefault", "runtime", "defaultenv":
+		return "runtimeDefault"
+	case "basefallback", "base":
+		return "baseFallback"
+	default:
+		return ""
+	}
 }

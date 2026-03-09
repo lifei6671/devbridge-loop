@@ -13,6 +13,7 @@ import (
 const (
 	maxEventHistory          = 256
 	maxProcessedEventHistory = 4096
+	maxErrorHistory          = 200
 )
 
 // EventRejectError 表示 tunnel 事件被业务规则拒绝。
@@ -48,9 +49,11 @@ type MemoryStore struct {
 	intercepts map[string]domain.ActiveIntercept
 	routes     map[string]domain.BridgeRoute
 	events     []domain.TunnelEvent
+	errors     []domain.ErrorEntry
 
 	processedEvents map[string]processedEventRecord
 	processedOrder  []string
+	errorCounters   map[string]int
 }
 
 // NewMemoryStore 创建默认配置的内存存储。
@@ -74,8 +77,10 @@ func NewMemoryStoreWithBridge(bridgeHost string, bridgePort int) *MemoryStore {
 		intercepts:      map[string]domain.ActiveIntercept{},
 		routes:          map[string]domain.BridgeRoute{},
 		events:          make([]domain.TunnelEvent, 0, maxEventHistory),
+		errors:          make([]domain.ErrorEntry, 0, maxErrorHistory),
 		processedEvents: map[string]processedEventRecord{},
 		processedOrder:  make([]string, 0, maxProcessedEventHistory),
+		errorCounters:   map[string]int{},
 	}
 }
 
@@ -141,6 +146,79 @@ func (s *MemoryStore) ListRoutes() []domain.BridgeRoute {
 		return result[i].ServiceName < result[j].ServiceName
 	})
 	return result
+}
+
+// AddError 记录一条 bridge 错误并更新按错误码聚合统计。
+func (s *MemoryStore) AddError(code string, message string, context map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normalizedCode := strings.TrimSpace(code)
+	if normalizedCode == "" {
+		normalizedCode = "UNKNOWN_ERROR"
+	}
+
+	// 拷贝上下文避免外部 map 后续被修改，导致历史诊断数据漂移。
+	copiedContext := make(map[string]string, len(context))
+	for key, value := range context {
+		copiedContext[key] = value
+	}
+
+	s.errors = append(s.errors, domain.ErrorEntry{
+		Code:       normalizedCode,
+		Message:    strings.TrimSpace(message),
+		Context:    copiedContext,
+		OccurredAt: time.Now().UTC(),
+	})
+	if len(s.errors) > maxErrorHistory {
+		s.errors = s.errors[len(s.errors)-maxErrorHistory:]
+	}
+	s.errorCounters[normalizedCode]++
+}
+
+// ListErrorStats 返回 bridge 错误统计快照（总数、按错误码聚合、最近错误）。
+func (s *MemoryStore) ListErrorStats() domain.ErrorStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	byCode := make([]domain.ErrorCodeStat, 0, len(s.errorCounters))
+	total := 0
+	for code, count := range s.errorCounters {
+		byCode = append(byCode, domain.ErrorCodeStat{
+			Code:  code,
+			Count: count,
+		})
+		total += count
+	}
+	sort.Slice(byCode, func(i, j int) bool {
+		if byCode[i].Count == byCode[j].Count {
+			return byCode[i].Code < byCode[j].Code
+		}
+		return byCode[i].Count > byCode[j].Count
+	})
+
+	// 最近错误按时间倒序返回，方便 UI 直接展示“最新在上”。
+	recent := make([]domain.ErrorEntry, 0, len(s.errors))
+	for i := len(s.errors) - 1; i >= 0; i-- {
+		entry := s.errors[i]
+		copiedContext := make(map[string]string, len(entry.Context))
+		for key, value := range entry.Context {
+			copiedContext[key] = value
+		}
+		recent = append(recent, domain.ErrorEntry{
+			Code:       entry.Code,
+			Message:    entry.Message,
+			Context:    copiedContext,
+			OccurredAt: entry.OccurredAt,
+		})
+	}
+
+	return domain.ErrorStats{
+		Total:      total,
+		UniqueCode: len(byCode),
+		ByCode:     byCode,
+		Recent:     recent,
+	}
 }
 
 // ResolveRouteForIngress 按 (env, serviceName, protocol) 查找一条可用路由与会话。

@@ -67,6 +67,31 @@ impl AgentApiClient {
             .map_err(|err| format!("decode response failed: {err}"))
     }
 
+    pub async fn delete_json<T>(&self, path: &str) -> Result<T, String>
+    where
+        T: DeserializeOwned,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .http
+            .delete(url)
+            .send()
+            .await
+            .map_err(|err| format!("agent request failed: {err}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "agent request failed with status {}",
+                response.status()
+            ));
+        }
+
+        response
+            .json::<T>()
+            .await
+            .map_err(|err| format!("decode response failed: {err}"))
+    }
+
     pub async fn state_summary(&self) -> Result<Value, String> {
         self.get_json("/api/v1/state/summary").await
     }
@@ -81,6 +106,19 @@ impl AgentApiClient {
 
     pub async fn recent_errors(&self) -> Result<Vec<Value>, String> {
         self.get_json("/api/v1/state/errors").await
+    }
+
+    pub async fn recent_requests(&self) -> Result<Vec<Value>, String> {
+        self.get_json("/api/v1/state/requests").await
+    }
+
+    pub async fn active_intercepts(&self) -> Result<Vec<Value>, String> {
+        self.get_json("/api/v1/state/intercepts").await
+    }
+
+    pub async fn unregister_registration(&self, instance_id: &str) -> Result<Value, String> {
+        let path = format!("/api/v1/registrations/{}", instance_id);
+        self.delete_json(&path).await
     }
 
     pub async fn reconnect(&self) -> Result<Value, String> {

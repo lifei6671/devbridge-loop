@@ -105,6 +105,28 @@ type TunnelEventReply struct {
 	Message         string `json:"message,omitempty"`
 }
 
+// ErrorEntry 表示一条 bridge 运行时错误记录。
+type ErrorEntry struct {
+	Code       string            `json:"code"`
+	Message    string            `json:"message"`
+	Context    map[string]string `json:"context"`
+	OccurredAt time.Time         `json:"occurredAt"`
+}
+
+// ErrorCodeStat 表示按错误码聚合后的统计项。
+type ErrorCodeStat struct {
+	Code  string `json:"code"`
+	Count int    `json:"count"`
+}
+
+// ErrorStats 描述 bridge 错误统计快照。
+type ErrorStats struct {
+	Total      int             `json:"total"`
+	UniqueCode int             `json:"uniqueCode"`
+	ByCode     []ErrorCodeStat `json:"byCode"`
+	Recent     []ErrorEntry    `json:"recent"`
+}
+
 // HelloPayload 为 HELLO 消息载荷。
 type HelloPayload struct {
 	TunnelID        string `json:"tunnelId"`

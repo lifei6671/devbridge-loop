@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ComponentType, ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   Cable,
   Cloud,
+  Eye,
+  LayoutDashboard,
+  ListTree,
   RefreshCcw,
   RotateCcw,
   Server,
+  Settings,
+  ShieldCheck,
+  Trash2,
   Zap
 } from "lucide-react";
 
@@ -29,42 +36,116 @@ import {
   TableRow
 } from "@/components/ui/table";
 import type {
+  ActiveIntercept,
   AgentRuntime,
+  DesktopConfigView,
   ErrorEntry,
   LocalRegistration,
+  RequestSummary,
   StateSummary,
   TunnelState
 } from "@/types";
 
-async function call<T>(command: string): Promise<T> {
-  return invoke<T>(command);
+type PageKey = "dashboard" | "services" | "intercepts" | "logs" | "config";
+
+const PAGE_ITEMS: Array<{ key: PageKey; label: string; icon: ComponentType<{ className?: string }> }> = [
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { key: "services", label: "Services", icon: ListTree },
+  { key: "intercepts", label: "Intercepts", icon: ShieldCheck },
+  { key: "logs", label: "Logs", icon: AlertTriangle },
+  { key: "config", label: "Config", icon: Settings }
+];
+
+async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  return invoke<T>(command, args);
 }
 
-export default function App(): React.ReactElement {
+function formatTime(value?: string | null): string {
+  if (!value) {
+    return "-";
+  }
+
+  // AgentRuntime 的时间戳是秒级字符串，其他接口通常是 RFC3339，统一在这里兼容。
+  const unixSeconds = Number(value);
+  const date = Number.isFinite(unixSeconds) && /^\d+$/.test(value)
+    ? new Date(unixSeconds * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function renderHealthBadge(healthy: boolean): ReactElement {
+  if (healthy) {
+    return <Badge>healthy</Badge>;
+  }
+  return <Badge variant="secondary">unhealthy</Badge>;
+}
+
+export default function App(): ReactElement {
+  const [activePage, setActivePage] = useState<PageKey>("dashboard");
   const [summary, setSummary] = useState<StateSummary | null>(null);
   const [tunnel, setTunnel] = useState<TunnelState | null>(null);
   const [registrations, setRegistrations] = useState<LocalRegistration[]>([]);
   const [errors, setErrors] = useState<ErrorEntry[]>([]);
+  const [requests, setRequests] = useState<RequestSummary[]>([]);
   const [runtime, setRuntime] = useState<AgentRuntime | null>(null);
+  const [intercepts, setIntercepts] = useState<ActiveIntercept[]>([]);
+  const [desktopConfig, setDesktopConfig] = useState<DesktopConfigView | null>(null);
+  const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string>("");
+
+  const selectedRegistration = useMemo(() => {
+    if (!selectedInstanceId) {
+      return null;
+    }
+    return registrations.find((item) => item.instanceId === selectedInstanceId) ?? null;
+  }, [registrations, selectedInstanceId]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setActionError("");
     try {
-      const [summaryData, tunnelData, regData, errorData, runtimeData] = await Promise.all([
+      const [
+        summaryData,
+        tunnelData,
+        registrationData,
+        errorData,
+        requestData,
+        runtimeData,
+        interceptData,
+        desktopConfigData
+      ] = await Promise.all([
         call<StateSummary>("get_state_summary"),
         call<TunnelState>("get_tunnel_state"),
         call<LocalRegistration[]>("get_registrations"),
         call<ErrorEntry[]>("get_recent_errors"),
-        call<AgentRuntime>("agent_runtime")
+        call<RequestSummary[]>("get_recent_requests"),
+        call<AgentRuntime>("agent_runtime"),
+        call<ActiveIntercept[]>("get_active_intercepts"),
+        call<DesktopConfigView>("get_desktop_config")
       ]);
+
       setSummary(summaryData);
       setTunnel(tunnelData);
-      setRegistrations(regData);
+      setRegistrations(registrationData);
       setErrors(errorData);
+      setRequests(requestData);
       setRuntime(runtimeData);
+      setIntercepts(interceptData);
+      setDesktopConfig(desktopConfigData);
+
+      // 当前选中的实例如果被删除，则回退到列表首项，保证详情页始终有有效目标。
+      setSelectedInstanceId((current) => {
+        if (current && registrationData.some((item) => item.instanceId === current)) {
+          return current;
+        }
+        return registrationData[0]?.instanceId ?? null;
+      });
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -92,6 +173,34 @@ export default function App(): React.ReactElement {
       setActionError(String(error));
     }
   }, [refresh]);
+
+  const unregisterRegistration = useCallback(
+    async (instanceId: string) => {
+      const target = registrations.find((item) => item.instanceId === instanceId);
+      if (!target) {
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `确认注销实例 ${target.instanceId}（${target.serviceName}/${target.env}）吗？`
+      );
+      if (!confirmed) {
+        return;
+      }
+
+      setUnregisteringId(instanceId);
+      setActionError("");
+      try {
+        await call("unregister_registration", { instanceId });
+        await refresh();
+      } catch (error) {
+        setActionError(String(error));
+      } finally {
+        setUnregisteringId(null);
+      }
+    },
+    [refresh, registrations]
+  );
 
   useEffect(() => {
     void refresh();
@@ -130,6 +239,362 @@ export default function App(): React.ReactElement {
     return <Badge variant="secondary">disconnected</Badge>;
   }, [tunnel]);
 
+  const renderDashboard = (): ReactElement => (
+    <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardDescription>Agent</CardDescription>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Server className="h-4 w-4" />
+            {summary?.agentStatus ?? "unknown"}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1 text-sm text-muted-foreground">
+          <div>pid: {runtime?.pid ?? "-"}</div>
+          <div>env: {summary?.currentEnv ?? "-"}</div>
+          <div>status: {runtime?.status ?? "-"}</div>
+          <div>restart-count: {runtime?.restartCount ?? 0}</div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardDescription>Bridge</CardDescription>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Cloud className="h-4 w-4" />
+            {summary?.bridgeStatus ?? "unknown"}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1 text-sm text-muted-foreground">
+          <div>address: {tunnel?.bridgeAddress ?? "-"}</div>
+          <div>rdName: {summary?.rdName ?? "-"}</div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardDescription>Tunnel</CardDescription>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Zap className="h-4 w-4" />
+            {tunnelBadge}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1 text-sm text-muted-foreground">
+          <div>epoch: {tunnel?.sessionEpoch ?? 0}</div>
+          <div>resourceVersion: {tunnel?.resourceVersion ?? 0}</div>
+          <div>lastHeartbeat: {formatTime(tunnel?.lastHeartbeatAt)}</div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-2">
+          <CardDescription>Registration</CardDescription>
+          <CardTitle className="text-base">{summary?.registrationCount ?? 0} active</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1 text-sm text-muted-foreground">
+          <div>intercepts: {summary?.activeIntercepts ?? 0}</div>
+          <div>errors(50): {errors.length}</div>
+          <div>requests(200): {requests.length}</div>
+        </CardContent>
+      </Card>
+    </section>
+  );
+
+  const renderServices = (): ReactElement => (
+    <section className="grid gap-4 xl:grid-cols-3">
+      <Card className="xl:col-span-2">
+        <CardHeader>
+          <CardTitle>Local Services</CardTitle>
+          <CardDescription>
+            实时读取 `/api/v1/registrations`，支持手动注销与详情查看。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Service</TableHead>
+                <TableHead>Env</TableHead>
+                <TableHead>Instance</TableHead>
+                <TableHead>Endpoints</TableHead>
+                <TableHead>Healthy</TableHead>
+                <TableHead>Register</TableHead>
+                <TableHead>操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {registrations.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={7} className="text-center text-muted-foreground">
+                    暂无本地注册项
+                  </TableCell>
+                </TableRow>
+              ) : (
+                registrations.map((item) => (
+                  <TableRow
+                    key={item.instanceId}
+                    className={item.instanceId === selectedInstanceId ? "bg-muted/30" : ""}
+                  >
+                    <TableCell className="font-semibold">{item.serviceName}</TableCell>
+                    <TableCell>{item.env}</TableCell>
+                    <TableCell className="font-mono text-xs">{item.instanceId}</TableCell>
+                    <TableCell>
+                      {item.endpoints.map((endpoint) => (
+                        <div key={`${endpoint.protocol}-${endpoint.targetPort}`}>
+                          {endpoint.protocol}:{endpoint.targetHost}:{endpoint.targetPort}
+                        </div>
+                      ))}
+                    </TableCell>
+                    <TableCell>{renderHealthBadge(item.healthy)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {formatTime(item.registerTime)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setSelectedInstanceId(item.instanceId)}
+                        >
+                          <Eye className="mr-1 h-3.5 w-3.5" />
+                          详情
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={unregisteringId === item.instanceId}
+                          onClick={() => void unregisterRegistration(item.instanceId)}
+                        >
+                          <Trash2 className="mr-1 h-3.5 w-3.5" />
+                          注销
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Service Detail</CardTitle>
+          <CardDescription>当前选中实例的详细状态</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          {!selectedRegistration ? (
+            <p className="text-muted-foreground">请在左侧选择实例查看详情</p>
+          ) : (
+            <>
+              <div className="font-semibold">
+                {selectedRegistration.serviceName} / {selectedRegistration.env}
+              </div>
+              <div className="text-muted-foreground">instance: {selectedRegistration.instanceId}</div>
+              <div>healthy: {selectedRegistration.healthy ? "true" : "false"}</div>
+              <div>ttlSeconds: {selectedRegistration.ttlSeconds}</div>
+              <div>registerTime: {formatTime(selectedRegistration.registerTime)}</div>
+              <div>lastHeartbeat: {formatTime(selectedRegistration.lastHeartbeatTime)}</div>
+              <div className="space-y-1 rounded-md border border-border/60 p-2">
+                <div className="font-medium">metadata</div>
+                <pre className="overflow-x-auto text-xs text-muted-foreground">
+                  {JSON.stringify(selectedRegistration.metadata ?? {}, null, 2)}
+                </pre>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </section>
+  );
+
+  const renderIntercepts = (): ReactElement => (
+    <Card>
+      <CardHeader>
+        <CardTitle>Active Intercepts</CardTitle>
+        <CardDescription>读取 `/api/v1/state/intercepts` 的实时接管关系</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Env</TableHead>
+              <TableHead>Service</TableHead>
+              <TableHead>Protocol</TableHead>
+              <TableHead>Instance</TableHead>
+              <TableHead>Tunnel</TableHead>
+              <TableHead>TargetPort</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>UpdatedAt</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {intercepts.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={8} className="text-center text-muted-foreground">
+                  当前无接管关系
+                </TableCell>
+              </TableRow>
+            ) : (
+              intercepts.map((item) => (
+                <TableRow
+                  key={`${item.env}-${item.serviceName}-${item.protocol}-${item.instanceId}-${item.targetPort}`}
+                >
+                  <TableCell>{item.env}</TableCell>
+                  <TableCell>{item.serviceName}</TableCell>
+                  <TableCell>{item.protocol}</TableCell>
+                  <TableCell className="font-mono text-xs">{item.instanceId}</TableCell>
+                  <TableCell className="font-mono text-xs">{item.tunnelId}</TableCell>
+                  <TableCell>{item.targetPort}</TableCell>
+                  <TableCell>{item.status}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {formatTime(item.updatedAt)}
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+
+  const renderLogs = (): ReactElement => (
+    <Card>
+      <CardHeader>
+        <CardTitle>Runtime Logs</CardTitle>
+        <CardDescription>基于 `/api/v1/state/errors` 与运行态事件的最近日志</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {errors.length === 0 ? (
+          <p className="text-sm text-muted-foreground">当前无错误日志</p>
+        ) : (
+          errors.map((entry) => (
+            <div
+              key={`${entry.code}-${entry.occurredAt}-${entry.message}`}
+              className="rounded-md border border-border/60 p-3"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <Badge variant="outline">{entry.code}</Badge>
+                <span className="text-xs text-muted-foreground">{formatTime(entry.occurredAt)}</span>
+              </div>
+              <p className="mt-2 text-sm">{entry.message}</p>
+              <pre className="mt-2 overflow-x-auto text-xs text-muted-foreground">
+                {JSON.stringify(entry.context ?? {}, null, 2)}
+              </pre>
+            </div>
+          ))
+        )}
+
+        <div className="h-px w-full bg-border/70" />
+
+        <div className="space-y-2">
+          <p className="text-sm font-semibold">Recent Requests</p>
+          {requests.length === 0 ? (
+            <p className="text-sm text-muted-foreground">当前无请求摘要</p>
+          ) : (
+            requests.map((entry) => (
+              <div
+                key={`${entry.direction}-${entry.serviceName}-${entry.occurredAt}-${entry.latencyMs}`}
+                className="rounded-md border border-border/60 p-3"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline">{entry.direction}</Badge>
+                  <Badge variant="secondary">{entry.protocol}</Badge>
+                  <span className="text-sm font-medium">{entry.serviceName}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {entry.requestedEnv || "-"} → {entry.resolvedEnv || "-"} ({entry.resolution})
+                  </span>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                  <span>upstream: {entry.upstream || "-"}</span>
+                  <span>status: {entry.statusCode}</span>
+                  <span>latency: {entry.latencyMs}ms</span>
+                  <span>result: {entry.result}</span>
+                  <span>{formatTime(entry.occurredAt)}</span>
+                </div>
+                {entry.errorCode || entry.message ? (
+                  <p className="mt-2 text-xs text-amber-900">
+                    {entry.errorCode ? `${entry.errorCode}: ` : ""}
+                    {entry.message ?? ""}
+                  </p>
+                ) : null}
+              </div>
+            ))
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderConfig = (): ReactElement => (
+    <section className="grid gap-4 xl:grid-cols-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>Desktop Host Config</CardTitle>
+          <CardDescription>由 Rust Host `get_desktop_config` 返回</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          <div>platform: {desktopConfig?.platform ?? "-"}</div>
+          <div>arch: {desktopConfig?.arch ?? "-"}</div>
+          <div>agentApiBase: {desktopConfig?.agentApiBase ?? "-"}</div>
+          <div>agentBinary: {desktopConfig?.agentBinary ?? "-"}</div>
+          <div>agentCoreDir: {desktopConfig?.agentCoreDir ?? "-"}</div>
+          <div>autoRestart: {desktopConfig?.agentAutoRestart ? "true" : "false"}</div>
+          <div>
+            restartBackoffMs:{" "}
+            {(desktopConfig?.agentRestartBackoffMs ?? []).join(", ") || "-"}
+          </div>
+          <div>
+            envResolveOrder: {(desktopConfig?.envResolveOrder ?? []).join(" > ") || "-"}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Agent Runtime Config</CardTitle>
+          <CardDescription>由 Go 状态接口与运行态接口组合展示</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          <div>currentEnv: {summary?.currentEnv ?? "-"}</div>
+          <div>rdName: {summary?.rdName ?? "-"}</div>
+          <div>bridgeAddress: {tunnel?.bridgeAddress ?? "-"}</div>
+          <div>
+            reconnectBackoffMs: {(tunnel?.reconnectBackoffMs ?? []).join(", ") || "-"}
+          </div>
+          <div>command: {runtime?.command ?? "-"}</div>
+          <div>startedAt: {formatTime(runtime?.startedAt)}</div>
+          <div>nextRestartAt: {formatTime(runtime?.nextRestartAt)}</div>
+          <div>
+            tunnelBackflowBaseUrl: {desktopConfig?.tunnelBackflowBaseUrl ?? "-"}
+          </div>
+          <div>
+            tunnelBridgeAddress: {desktopConfig?.tunnelBridgeAddress ?? "-"}
+          </div>
+        </CardContent>
+      </Card>
+    </section>
+  );
+
+  const renderPage = (): ReactElement => {
+    switch (activePage) {
+      case "dashboard":
+        return renderDashboard();
+      case "services":
+        return renderServices();
+      case "intercepts":
+        return renderIntercepts();
+      case "logs":
+        return renderLogs();
+      case "config":
+        return renderConfig();
+      default:
+        return renderDashboard();
+    }
+  };
+
   return (
     <div className="min-h-screen bg-app-gradient text-foreground">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 pb-8 pt-6 sm:px-6 lg:px-8">
@@ -158,6 +623,23 @@ export default function App(): React.ReactElement {
           </div>
         </header>
 
+        <nav className="flex flex-wrap gap-2">
+          {PAGE_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Button
+                key={item.key}
+                variant={activePage === item.key ? "default" : "outline"}
+                size="sm"
+                onClick={() => setActivePage(item.key)}
+              >
+                <Icon className="mr-2 h-4 w-4" />
+                {item.label}
+              </Button>
+            );
+          })}
+        </nav>
+
         {actionError ? (
           <Card className="border-amber-500/40 bg-amber-100/40">
             <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
@@ -176,134 +658,7 @@ export default function App(): React.ReactElement {
           </Card>
         ) : null}
 
-        <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardDescription>Agent</CardDescription>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Server className="h-4 w-4" />
-                {summary?.agentStatus ?? "unknown"}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              <div>pid: {runtime?.pid ?? "-"}</div>
-              <div>env: {summary?.currentEnv ?? "-"}</div>
-              <div>status: {runtime?.status ?? "-"}</div>
-              <div>restart-count: {runtime?.restartCount ?? 0}</div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardDescription>Bridge</CardDescription>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Cloud className="h-4 w-4" />
-                {summary?.bridgeStatus ?? "unknown"}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              {tunnel?.bridgeAddress ?? "bridge.example.internal:443"}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardDescription>Tunnel</CardDescription>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Zap className="h-4 w-4" />
-                {tunnelBadge}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              epoch: {tunnel?.sessionEpoch ?? 0} | rv: {tunnel?.resourceVersion ?? 0}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardDescription>Registration</CardDescription>
-              <CardTitle className="text-base">
-                {summary?.registrationCount ?? 0} active
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              intercepts: {summary?.activeIntercepts ?? 0}
-            </CardContent>
-          </Card>
-        </section>
-
-        <section className="grid gap-4 xl:grid-cols-3">
-          <Card className="xl:col-span-2">
-            <CardHeader>
-              <CardTitle>Local Registrations</CardTitle>
-              <CardDescription>
-                支持多实例多端口。来自 `/api/v1/registrations` 的实时内存态。
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Service</TableHead>
-                    <TableHead>Env</TableHead>
-                    <TableHead>Instance</TableHead>
-                    <TableHead>Endpoints</TableHead>
-                    <TableHead>TTL</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {registrations.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={5} className="text-center text-muted-foreground">
-                        暂无本地注册项
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    registrations.map((item) => (
-                      <TableRow key={item.instanceId}>
-                        <TableCell className="font-semibold">{item.serviceName}</TableCell>
-                        <TableCell>{item.env}</TableCell>
-                        <TableCell className="font-mono text-xs">{item.instanceId}</TableCell>
-                        <TableCell>
-                          {item.endpoints.map((endpoint) => (
-                            <div key={`${endpoint.protocol}-${endpoint.targetPort}`}>
-                              {endpoint.protocol}:{endpoint.targetHost}:
-                              {endpoint.targetPort}
-                            </div>
-                          ))}
-                        </TableCell>
-                        <TableCell>{item.ttlSeconds}s</TableCell>
-                      </TableRow>
-                    ))
-                  )}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Recent Errors</CardTitle>
-              <CardDescription>统一错误模型（最近 50 条）</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {errors.length === 0 ? (
-                <p className="text-sm text-muted-foreground">当前无错误</p>
-              ) : (
-                errors.slice(0, 8).map((entry) => (
-                  <div
-                    key={`${entry.code}-${entry.occurredAt}`}
-                    className="rounded-md border border-border/60 p-3"
-                  >
-                    <p className="font-mono text-xs text-primary">{entry.code}</p>
-                    <p className="mt-1 text-sm">{entry.message}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">{entry.occurredAt}</p>
-                  </div>
-                ))
-              )}
-            </CardContent>
-          </Card>
-        </section>
+        {renderPage()}
       </div>
     </div>
   );

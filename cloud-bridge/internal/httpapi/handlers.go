@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/sessions", h.sessions)
 	mux.HandleFunc("GET /api/v1/state/intercepts", h.intercepts)
 	mux.HandleFunc("GET /api/v1/state/routes", h.routes)
+	mux.HandleFunc("GET /api/v1/state/errors", h.stateErrors)
 	mux.HandleFunc("POST /api/v1/tunnel/events", h.tunnelEvent)
 	mux.HandleFunc("GET /api/v1/debug/route-extract", h.debugRouteExtract)
 	mux.HandleFunc("/api/v1/ingress/http", h.ingressHTTP)
@@ -72,9 +74,16 @@ func (h *Handler) routes(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, h.store.ListRoutes())
 }
 
+func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, h.store.ListErrorStats())
+}
+
 func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
 	var event domain.TunnelEvent
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		h.store.AddError(domain.SyncErrorInvalidPayload, "invalid tunnel event payload", map[string]string{
+			"error": err.Error(),
+		})
 		respondJSON(w, http.StatusBadRequest, domain.TunnelEventReply{
 			Type:         domain.TunnelMessageError,
 			Status:       domain.EventStatusRejected,
@@ -93,6 +102,11 @@ func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var reject *store.EventRejectError
 		if errors.As(err, &reject) {
+			h.store.AddError(reject.Code, reject.Message, map[string]string{
+				"eventId":      strings.TrimSpace(event.EventID),
+				"type":         strings.TrimSpace(event.Type),
+				"sessionEpoch": strconv.FormatInt(event.SessionEpoch, 10),
+			})
 			respondJSON(w, reject.StatusCode, domain.TunnelEventReply{
 				Type:            domain.TunnelMessageError,
 				Status:          domain.EventStatusRejected,
@@ -106,6 +120,12 @@ func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		h.store.AddError(domain.SyncErrorInvalidPayload, "process tunnel event failed", map[string]string{
+			"eventId":      strings.TrimSpace(event.EventID),
+			"type":         strings.TrimSpace(event.Type),
+			"sessionEpoch": strconv.FormatInt(event.SessionEpoch, 10),
+			"error":        err.Error(),
+		})
 		respondJSON(w, http.StatusInternalServerError, domain.TunnelEventReply{
 			Type:         domain.TunnelMessageError,
 			Status:       domain.EventStatusRejected,
@@ -139,12 +159,22 @@ func (h *Handler) debugRouteExtract(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 	result, err := h.pipeline.Resolve(r.Context(), r)
 	if err != nil {
+		h.store.AddError(domain.IngressErrorRouteExtractFailed, "resolve ingress route failed", map[string]string{
+			"host":  strings.TrimSpace(r.Host),
+			"path":  strings.TrimSpace(r.URL.Path),
+			"error": err.Error(),
+		})
 		writeIngressError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, err.Error())
 		return
 	}
 
 	route, session, ok := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "http")
 	if !ok {
+		h.store.AddError(domain.IngressErrorRouteNotFound, "ingress route not found", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "http",
+		})
 		writeIngressError(
 			w,
 			http.StatusNotFound,
@@ -159,12 +189,21 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 		baseURL = h.fallbackBackflowURL
 	}
 	if baseURL == "" {
+		h.store.AddError(domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", map[string]string{
+			"env":         strings.TrimSpace(route.Env),
+			"serviceName": strings.TrimSpace(route.ServiceName),
+			"tunnelId":    strings.TrimSpace(route.TunnelID),
+		})
 		writeIngressError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable")
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.store.AddError(domain.IngressErrorRouteExtractFailed, "read ingress request body failed", map[string]string{
+			"path":  strings.TrimSpace(r.URL.Path),
+			"error": err.Error(),
+		})
 		writeIngressError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, "read ingress request body failed")
 		return
 	}
@@ -183,6 +222,12 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var backflowErr *backflow.Error
 		if errors.As(err, &backflowErr) {
+			h.store.AddError(firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline), firstNonEmpty(backflowErr.Message, "call agent backflow failed"), map[string]string{
+				"env":         strings.TrimSpace(route.Env),
+				"serviceName": strings.TrimSpace(route.ServiceName),
+				"tunnelId":    strings.TrimSpace(route.TunnelID),
+				"baseURL":     strings.TrimSpace(baseURL),
+			})
 			writeIngressError(
 				w,
 				statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway),
@@ -191,6 +236,13 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 			return
 		}
+		h.store.AddError(domain.IngressErrorTunnelOffline, "call agent backflow failed", map[string]string{
+			"env":         strings.TrimSpace(route.Env),
+			"serviceName": strings.TrimSpace(route.ServiceName),
+			"tunnelId":    strings.TrimSpace(route.TunnelID),
+			"baseURL":     strings.TrimSpace(baseURL),
+			"error":       err.Error(),
+		})
 		writeIngressError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error())
 		return
 	}
@@ -210,6 +262,9 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ingressGRPC(w http.ResponseWriter, _ *http.Request) {
+	h.store.AddError("INGRESS_GRPC_NOT_IMPLEMENTED", "grpc ingress scaffold is not implemented yet", map[string]string{
+		"protocol": "grpc",
+	})
 	writeIngressError(
 		w,
 		http.StatusNotImplemented,

@@ -21,7 +21,7 @@
 
 ## 版本约束
 
-- Go：`1.26.0`（`go.work`、`agent-core/go.mod`、`cloud-bridge/go.mod` 已固定）
+- Go：`1.26.0`（`agent-core/go.mod`、`cloud-bridge/go.mod` 已固定）
 - Tauri：`v2`
 - UI：`React + TypeScript + shadcn/ui`
 
@@ -34,11 +34,14 @@
   - `DELETE /api/v1/registrations/{instanceId}`
   - `GET /api/v1/registrations`
   - `POST /api/v1/discover`
+  - `POST /api/v1/egress/http`
+  - `POST /api/v1/egress/grpc`
 - 状态面 API：
   - `GET /api/v1/state/summary`
   - `GET /api/v1/state/tunnel`
   - `GET /api/v1/state/intercepts`
   - `GET /api/v1/state/errors`
+  - `GET /api/v1/state/requests`
   - `POST /api/v1/control/reconnect`
 - 内存态注册表 + TTL 过期摘除扫描
 - 注册键模型索引：`ServiceKey / InstanceKey / EndpointKey`
@@ -51,10 +54,20 @@
 - 已接入本地回流转发入口：`POST /api/v1/backflow/http`
   - 接收 bridge 回流请求并转发到本地 `targetHost:targetPort`
   - 将回流转发超时/不可达归一为 `UPSTREAM_TIMEOUT`、`LOCAL_ENDPOINT_UNREACHABLE`
+- 已接入 HTTP 出口代理：`POST /api/v1/egress/http`
+  - 先执行 `discover`（dev 优先、base fallback）
+  - 命中 dev 时自动代理到 bridge ingress（并透传 `x-env/X-Env`）
+  - 未命中 dev 时按请求中的 `baseUrl` 走 base fallback
+  - 请求摘要写入 `GET /api/v1/state/requests`，供诊断与 UI 展示
+- 已接入 gRPC 出口代理：`POST /api/v1/egress/grpc`
+  - 与 HTTP 出口链路完全分离，独立处理 `discover` 与目标选择
+  - 当前 MVP 支持 gRPC Health Check 调用（`Health/Check`）
+  - 命中 dev 时走本地 discover 目标；未命中时按 `baseAddress` fallback
+  - 同样透传 `x-env/X-Env` metadata，并写入 `state/requests` 摘要
 - 协议扩展接口占位：`ProtocolAdapter` / `IngressResolver` / `Forwarder` / `EgressProxy`
 
 2. `cloud-bridge`
-- 状态 API：`sessions/intercepts/routes`
+- 状态 API：`sessions/intercepts/routes/errors`
 - tunnel 事件入口占位：`POST /api/v1/tunnel/events`
 - 路由提取抽象：`RouteExtractor`、`RouteExtractPipeline`
 - 内置提取器：`host/header/sni`
@@ -67,6 +80,8 @@
   - 旧 epoch 事件：返回 `ERROR + STALE_EPOCH_EVENT`
   - 新 epoch 增量事件：要求先 `HELLO` 建连
   - `FULL_SYNC_SNAPSHOT`：清空 tunnel 旧状态后重建 intercept/route
+- 新增错误统计：`GET /api/v1/state/errors`
+  - 返回错误总量、按错误码聚合统计、最近错误列表（倒序）
 
 3. `dev-agent` 桌面端
 - Rust Host：
@@ -77,17 +92,21 @@
   - 暴露 Tauri commands 给前端（含 `restart_agent_process` 手动重启）
 - React Dashboard：
   - Agent/Bridge/Tunnel 状态卡片
-  - 本地注册列表
-  - 最近错误列表
-  - 刷新 + 手动重连
+  - 多页面导航：`Dashboard / Services / Intercepts / Logs / Config`
+  - 服务列表页：实例详情查看 + 手动注销
+  - ActiveIntercept 列表页（实时读取 `/api/v1/state/intercepts`）
+  - 日志页（实时读取 `/api/v1/state/errors`）
+  - 配置页（Rust Host 运行配置 + Agent 运行配置）
+  - 刷新 + 手动重连 + 手动重启
 
 ## 本地开发命令
 
 ### Go 侧
 
 ```bash
-# 在仓库根目录
-go test ./agent-core/... ./cloud-bridge/...
+# 在各模块目录运行测试
+cd agent-core && go test ./...
+cd cloud-bridge && go test ./...
 
 # 启动 agent-core
 cd agent-core && go run ./cmd/agent-core
@@ -129,6 +148,7 @@ npm run tauri:dev
 - `DEVLOOP_AGENT_HTTP_ADDR`：Go Agent Core HTTP 地址，默认 `127.0.0.1:19090`
 - `DEVLOOP_RD_NAME`：当前研发人员标识
 - `DEVLOOP_ENV_NAME`：当前默认 env
+- `DEVLOOP_ENV_RESOLVE_ORDER`：env 解析优先级（默认 `requestHeader,payload,runtimeDefault,baseFallback`）
 - `DEVLOOP_DEFAULT_TTL_SECONDS`：注册默认 TTL
 - `DEVLOOP_SCAN_INTERVAL_SECONDS`：TTL 扫描周期（秒）
 - `DEVLOOP_AGENT_API_BASE`：Rust Host 调用 agent-core 的 base URL

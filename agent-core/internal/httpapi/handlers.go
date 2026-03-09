@@ -1,13 +1,18 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +20,12 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/domain"
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/forwarder"
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/store"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	grpc_health_v1 "google.golang.org/grpc/health/grpc_health_v1"
+	grpcmetadata "google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // TunnelSyncPublisher 定义 HTTP 层到 tunnel 同步层的最小能力边界。
@@ -35,15 +46,23 @@ type Handler struct {
 	store             *store.MemoryStore
 	syncPublisher     TunnelSyncPublisher
 	backflowForwarder LocalBackflowForwarder
+	egressHTTPClient  *http.Client
 }
 
 // NewHandler creates API handlers.
 func NewHandler(cfg config.Config, s *store.MemoryStore, publisher TunnelSyncPublisher, backflowForwarder LocalBackflowForwarder) *Handler {
+	timeout := cfg.Tunnel.RequestTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	return &Handler{
 		cfg:               cfg,
 		store:             s,
 		syncPublisher:     publisher,
 		backflowForwarder: backflowForwarder,
+		egressHTTPClient: &http.Client{
+			Timeout: timeout,
+		},
 	}
 }
 
@@ -58,11 +77,14 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/registrations/{instanceId}", h.unregister)
 	mux.HandleFunc("GET /api/v1/registrations", h.listRegistrations)
 	mux.HandleFunc("POST /api/v1/discover", h.discover)
+	mux.HandleFunc("POST /api/v1/egress/http", h.egressHTTP)
+	mux.HandleFunc("POST /api/v1/egress/grpc", h.egressGRPC)
 
 	mux.HandleFunc("GET /api/v1/state/summary", h.stateSummary)
 	mux.HandleFunc("GET /api/v1/state/tunnel", h.stateTunnel)
 	mux.HandleFunc("GET /api/v1/state/intercepts", h.stateIntercepts)
 	mux.HandleFunc("GET /api/v1/state/errors", h.stateErrors)
+	mux.HandleFunc("GET /api/v1/state/requests", h.stateRequests)
 	mux.HandleFunc("POST /api/v1/control/reconnect", h.reconnect)
 	mux.HandleFunc("POST /api/v1/backflow/http", h.backflowHTTP)
 
@@ -202,9 +224,296 @@ func (h *Handler) discover(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "serviceName and protocol are required"})
 		return
 	}
-	request.Env = resolveDiscoverEnv(r, request.Env)
+	request.Env = h.resolveDiscoverEnv(r, request.Env)
 	result := h.store.Discover(request, h.cfg.EnvName)
 	respondJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) egressHTTP(w http.ResponseWriter, r *http.Request) {
+	var request domain.EgressHTTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondJSON(w, http.StatusBadRequest, domain.EgressHTTPResponse{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  domain.ErrorRouteExtractFailed,
+			Message:    "invalid egress payload",
+		})
+		return
+	}
+	if strings.TrimSpace(request.ServiceName) == "" {
+		respondJSON(w, http.StatusBadRequest, domain.EgressHTTPResponse{
+			StatusCode: http.StatusBadRequest,
+			ErrorCode:  domain.ErrorRouteExtractFailed,
+			Message:    "serviceName is required",
+		})
+		return
+	}
+
+	request.Env = h.resolveDiscoverEnv(r, request.Env)
+	discoverResult := h.store.Discover(domain.DiscoverRequest{
+		ServiceName: request.ServiceName,
+		Env:         request.Env,
+		Protocol:    "http",
+	}, h.cfg.EnvName)
+
+	resolvedEnv := firstNonBlank(discoverResult.ResolvedEnv, "base")
+	resolution := firstNonBlank(discoverResult.Resolution, "base-fallback")
+	startedAt := time.Now().UTC()
+
+	headers := cloneHeadersForEgress(request.Headers)
+	// 出口代理统一透传 env，保证 bridge 与上游都拿到一致上下文。
+	headers.Set("x-env", resolvedEnv)
+	headers.Set("X-Env", resolvedEnv)
+
+	method := strings.ToUpper(strings.TrimSpace(request.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	path := normalizeProxyPath(request.Path)
+
+	targetURL := ""
+	hostOverride := ""
+	upstream := "base"
+
+	// dev 命中走 bridge ingress；否则走 base fallback（通过 baseUrl）。
+	if discoverResult.Matched && strings.EqualFold(discoverResult.Resolution, "dev-priority") {
+		upstream = "bridge"
+		headers.Set("x-service-name", strings.TrimSpace(request.ServiceName))
+		headers.Set("X-Service-Name", strings.TrimSpace(request.ServiceName))
+		hostOverride = fmt.Sprintf("%s.%s.internal", sanitizeHostSegment(request.ServiceName), sanitizeHostSegment(resolvedEnv))
+
+		urlValue, err := buildBridgeIngressURL(h.cfg.Tunnel.BridgeAddress, path, request.RawQuery)
+		if err != nil {
+			respondJSON(w, http.StatusBadRequest, domain.EgressHTTPResponse{
+				StatusCode:  http.StatusBadRequest,
+				ResolvedEnv: resolvedEnv,
+				Resolution:  resolution,
+				Upstream:    upstream,
+				ErrorCode:   domain.ErrorRouteExtractFailed,
+				Message:     err.Error(),
+			})
+			return
+		}
+		targetURL = urlValue
+	} else {
+		urlValue, err := buildDirectTargetURL(request.BaseURL, path, request.RawQuery)
+		if err != nil {
+			message := "base fallback requires baseUrl"
+			recordEgressSummary(h.store, domain.RequestSummary{
+				Direction:    "egress",
+				Protocol:     "http",
+				ServiceName:  strings.TrimSpace(request.ServiceName),
+				RequestedEnv: strings.TrimSpace(request.Env),
+				ResolvedEnv:  resolvedEnv,
+				Resolution:   resolution,
+				Upstream:     upstream,
+				Result:       "error",
+				ErrorCode:    domain.ErrorRouteNotFound,
+				Message:      message,
+				LatencyMs:    elapsedMS(startedAt),
+				OccurredAt:   time.Now().UTC(),
+			})
+			respondJSON(w, http.StatusNotFound, domain.EgressHTTPResponse{
+				StatusCode:  http.StatusNotFound,
+				ResolvedEnv: resolvedEnv,
+				Resolution:  resolution,
+				Upstream:    upstream,
+				ErrorCode:   domain.ErrorRouteNotFound,
+				Message:     message,
+			})
+			return
+		}
+		targetURL = urlValue
+	}
+
+	result, err := h.executeEgressHTTP(r.Context(), method, targetURL, headers, request.Body, hostOverride)
+	if err != nil {
+		statusCode, errorCode, message := classifyEgressError(err, upstream)
+		recordEgressSummary(h.store, domain.RequestSummary{
+			Direction:    "egress",
+			Protocol:     "http",
+			ServiceName:  strings.TrimSpace(request.ServiceName),
+			RequestedEnv: strings.TrimSpace(request.Env),
+			ResolvedEnv:  resolvedEnv,
+			Resolution:   resolution,
+			Upstream:     upstream,
+			StatusCode:   statusCode,
+			Result:       "error",
+			ErrorCode:    errorCode,
+			Message:      message,
+			LatencyMs:    elapsedMS(startedAt),
+			OccurredAt:   time.Now().UTC(),
+		})
+		h.store.AddError(errorCode, "egress proxy failed", map[string]string{
+			"serviceName": strings.TrimSpace(request.ServiceName),
+			"resolution":  resolution,
+			"upstream":    upstream,
+			"error":       message,
+		})
+		respondJSON(w, statusCode, domain.EgressHTTPResponse{
+			StatusCode:  statusCode,
+			ResolvedEnv: resolvedEnv,
+			Resolution:  resolution,
+			Upstream:    upstream,
+			ErrorCode:   errorCode,
+			Message:     message,
+		})
+		return
+	}
+
+	recordEgressSummary(h.store, domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "http",
+		ServiceName:  strings.TrimSpace(request.ServiceName),
+		RequestedEnv: strings.TrimSpace(request.Env),
+		ResolvedEnv:  resolvedEnv,
+		Resolution:   resolution,
+		Upstream:     upstream,
+		StatusCode:   result.StatusCode,
+		Result:       "success",
+		LatencyMs:    elapsedMS(startedAt),
+		OccurredAt:   time.Now().UTC(),
+	})
+
+	// 返回真实上游状态码，同时通过头部暴露命中语义给调用方。
+	copyHTTPHeaders(w, result.Headers)
+	w.Header().Set("X-DevLoop-Resolution", resolution)
+	w.Header().Set("X-DevLoop-Resolved-Env", resolvedEnv)
+	w.Header().Set("X-DevLoop-Upstream", upstream)
+	w.WriteHeader(result.StatusCode)
+	if len(result.Body) > 0 {
+		_, _ = w.Write(result.Body)
+	}
+}
+
+func (h *Handler) egressGRPC(w http.ResponseWriter, r *http.Request) {
+	var request domain.EgressGRPCRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondJSON(w, http.StatusBadRequest, domain.EgressGRPCResponse{
+			Status:       "error",
+			ErrorCode:    domain.ErrorRouteExtractFailed,
+			Message:      "invalid egress grpc payload",
+			ObservedTime: time.Now().UTC(),
+		})
+		return
+	}
+	if strings.TrimSpace(request.ServiceName) == "" {
+		respondJSON(w, http.StatusBadRequest, domain.EgressGRPCResponse{
+			Status:       "error",
+			ErrorCode:    domain.ErrorRouteExtractFailed,
+			Message:      "serviceName is required",
+			ObservedTime: time.Now().UTC(),
+		})
+		return
+	}
+
+	request.Env = h.resolveDiscoverEnv(r, request.Env)
+	discoverResult := h.store.Discover(domain.DiscoverRequest{
+		ServiceName: request.ServiceName,
+		Env:         request.Env,
+		Protocol:    "grpc",
+	}, h.cfg.EnvName)
+	resolvedEnv := firstNonBlank(discoverResult.ResolvedEnv, "base")
+	resolution := firstNonBlank(discoverResult.Resolution, "base-fallback")
+	startedAt := time.Now().UTC()
+
+	target, upstream, err := resolveGRPCTarget(discoverResult, request.BaseAddress)
+	if err != nil {
+		latency := elapsedMS(startedAt)
+		now := time.Now().UTC()
+		recordEgressSummary(h.store, domain.RequestSummary{
+			Direction:    "egress",
+			Protocol:     "grpc",
+			ServiceName:  strings.TrimSpace(request.ServiceName),
+			RequestedEnv: strings.TrimSpace(request.Env),
+			ResolvedEnv:  resolvedEnv,
+			Resolution:   resolution,
+			Upstream:     "base",
+			StatusCode:   http.StatusNotFound,
+			Result:       "error",
+			ErrorCode:    domain.ErrorRouteNotFound,
+			Message:      err.Error(),
+			LatencyMs:    latency,
+			OccurredAt:   now,
+		})
+		respondJSON(w, http.StatusNotFound, domain.EgressGRPCResponse{
+			Status:       "error",
+			ResolvedEnv:  resolvedEnv,
+			Resolution:   resolution,
+			Upstream:     "base",
+			Target:       "",
+			LatencyMs:    latency,
+			ErrorCode:    domain.ErrorRouteNotFound,
+			Message:      err.Error(),
+			ObservedTime: now,
+		})
+		return
+	}
+
+	statusValue, grpcErr := h.executeGRPCHealthCheck(r.Context(), target, resolvedEnv, request)
+	latency := elapsedMS(startedAt)
+	now := time.Now().UTC()
+
+	if grpcErr != nil {
+		errorCode, message := classifyGRPCError(grpcErr, upstream)
+		recordEgressSummary(h.store, domain.RequestSummary{
+			Direction:    "egress",
+			Protocol:     "grpc",
+			ServiceName:  strings.TrimSpace(request.ServiceName),
+			RequestedEnv: strings.TrimSpace(request.Env),
+			ResolvedEnv:  resolvedEnv,
+			Resolution:   resolution,
+			Upstream:     upstream,
+			StatusCode:   http.StatusBadGateway,
+			Result:       "error",
+			ErrorCode:    errorCode,
+			Message:      message,
+			LatencyMs:    latency,
+			OccurredAt:   now,
+		})
+		h.store.AddError(errorCode, "grpc egress proxy failed", map[string]string{
+			"serviceName": strings.TrimSpace(request.ServiceName),
+			"target":      target,
+			"upstream":    upstream,
+			"error":       message,
+		})
+		respondJSON(w, http.StatusBadGateway, domain.EgressGRPCResponse{
+			Status:       "error",
+			ResolvedEnv:  resolvedEnv,
+			Resolution:   resolution,
+			Upstream:     upstream,
+			Target:       target,
+			LatencyMs:    latency,
+			ErrorCode:    errorCode,
+			Message:      message,
+			ObservedTime: now,
+		})
+		return
+	}
+
+	recordEgressSummary(h.store, domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "grpc",
+		ServiceName:  strings.TrimSpace(request.ServiceName),
+		RequestedEnv: strings.TrimSpace(request.Env),
+		ResolvedEnv:  resolvedEnv,
+		Resolution:   resolution,
+		Upstream:     upstream,
+		StatusCode:   http.StatusOK,
+		Result:       "success",
+		Message:      statusValue,
+		LatencyMs:    latency,
+		OccurredAt:   now,
+	})
+
+	respondJSON(w, http.StatusOK, domain.EgressGRPCResponse{
+		Status:       statusValue,
+		ResolvedEnv:  resolvedEnv,
+		Resolution:   resolution,
+		Upstream:     upstream,
+		Target:       target,
+		LatencyMs:    latency,
+		ObservedTime: now,
+	})
 }
 
 func (h *Handler) stateSummary(w http.ResponseWriter, _ *http.Request) {
@@ -223,6 +532,10 @@ func (h *Handler) stateIntercepts(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, http.StatusOK, h.store.ListErrors())
+}
+
+func (h *Handler) stateRequests(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, h.store.ListRequestSummaries())
 }
 
 func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {
@@ -308,15 +621,39 @@ func eventIDFromRequest(r *http.Request) string {
 	return eventID
 }
 
-func resolveDiscoverEnv(r *http.Request, payloadEnv string) string {
-	headerEnv := strings.TrimSpace(r.Header.Get("x-env"))
-	if headerEnv == "" {
-		headerEnv = strings.TrimSpace(r.Header.Get("X-Env"))
+func (h *Handler) resolveDiscoverEnv(r *http.Request, payloadEnv string) string {
+	headerEnv := firstNonBlank(
+		strings.TrimSpace(r.Header.Get("x-env")),
+		strings.TrimSpace(r.Header.Get("X-Env")),
+	)
+	payloadEnv = strings.TrimSpace(payloadEnv)
+	runtimeEnv := strings.TrimSpace(h.cfg.EnvName)
+	order := h.cfg.EnvResolve.Order
+	if len(order) == 0 {
+		order = []string{"requestHeader", "payload", "runtimeDefault", "baseFallback"}
 	}
-	if headerEnv != "" {
-		return headerEnv
+
+	// 统一按配置优先级解析 env，HTTP 与 gRPC 出口、discover 共用同一策略。
+	for _, item := range order {
+		switch strings.TrimSpace(item) {
+		case "requestHeader":
+			if headerEnv != "" {
+				return headerEnv
+			}
+		case "payload":
+			if payloadEnv != "" {
+				return payloadEnv
+			}
+		case "runtimeDefault":
+			if runtimeEnv != "" {
+				return runtimeEnv
+			}
+		case "baseFallback":
+			return "base"
+		}
 	}
-	return strings.TrimSpace(payloadEnv)
+
+	return firstNonBlank(headerEnv, payloadEnv, runtimeEnv, "base")
 }
 
 func setEventHeaders(w http.ResponseWriter, eventID string, duplicated bool) {
@@ -350,4 +687,271 @@ func firstNonBlank(values ...string) string {
 		}
 	}
 	return ""
+}
+
+type outboundHTTPResult struct {
+	StatusCode int
+	Headers    map[string][]string
+	Body       []byte
+}
+
+func (h *Handler) executeEgressHTTP(
+	ctx context.Context,
+	method string,
+	targetURL string,
+	headers http.Header,
+	body []byte,
+	hostOverride string,
+) (outboundHTTPResult, error) {
+	request, err := http.NewRequestWithContext(ctx, method, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return outboundHTTPResult{}, err
+	}
+	if strings.TrimSpace(hostOverride) != "" {
+		request.Host = strings.TrimSpace(hostOverride)
+	}
+	for name, values := range headers {
+		if isHopByHopHeader(name) {
+			continue
+		}
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+
+	response, err := h.egressHTTPClient.Do(request)
+	if err != nil {
+		return outboundHTTPResult{}, err
+	}
+	defer response.Body.Close()
+
+	respBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return outboundHTTPResult{}, err
+	}
+
+	return outboundHTTPResult{
+		StatusCode: response.StatusCode,
+		Headers:    cloneHeaderMap(response.Header),
+		Body:       respBody,
+	}, nil
+}
+
+func buildBridgeIngressURL(bridgeAddress string, path string, rawQuery string) (string, error) {
+	address := strings.TrimSpace(bridgeAddress)
+	if address == "" {
+		address = "http://127.0.0.1:18080"
+	}
+	if !strings.Contains(address, "://") {
+		address = "http://" + address
+	}
+
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return "", fmt.Errorf("invalid bridge address: %w", err)
+	}
+	basePath := strings.TrimRight(parsed.Path, "/")
+	parsed.Path = basePath + "/api/v1/ingress/http" + normalizeProxyPath(path)
+	parsed.RawQuery = strings.TrimSpace(rawQuery)
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func buildDirectTargetURL(baseURL string, path string, rawQuery string) (string, error) {
+	address := strings.TrimSpace(baseURL)
+	if address == "" {
+		return "", fmt.Errorf("baseUrl is required")
+	}
+	if !strings.Contains(address, "://") {
+		address = "http://" + address
+	}
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return "", fmt.Errorf("invalid baseUrl: %w", err)
+	}
+	basePath := strings.TrimRight(parsed.Path, "/")
+	parsed.Path = basePath + normalizeProxyPath(path)
+	parsed.RawQuery = strings.TrimSpace(rawQuery)
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func normalizeProxyPath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		return "/" + trimmed
+	}
+	return trimmed
+}
+
+func sanitizeHostSegment(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	normalized = strings.ReplaceAll(normalized, "/", "-")
+	normalized = strings.ReplaceAll(normalized, " ", "-")
+	if normalized == "" {
+		return "unknown"
+	}
+	return normalized
+}
+
+func classifyEgressError(err error, upstream string) (int, domain.ErrorCode, string) {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Timeout() {
+		return http.StatusGatewayTimeout, domain.ErrorUpstreamTimeout, firstNonBlank(urlErr.Error(), "upstream timeout")
+	}
+
+	if strings.EqualFold(upstream, "bridge") {
+		return http.StatusBadGateway, domain.ErrorTunnelOffline, firstNonBlank(err.Error(), "bridge is unavailable")
+	}
+	return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(err.Error(), "base upstream is unavailable")
+}
+
+func cloneHeadersForEgress(headers map[string][]string) http.Header {
+	result := make(http.Header, len(headers))
+	for name, values := range headers {
+		copied := make([]string, 0, len(values))
+		for _, value := range values {
+			copied = append(copied, value)
+		}
+		result[name] = copied
+	}
+	return result
+}
+
+func cloneHeaderMap(headers http.Header) map[string][]string {
+	result := make(map[string][]string, len(headers))
+	for name, values := range headers {
+		copied := make([]string, 0, len(values))
+		for _, value := range values {
+			copied = append(copied, value)
+		}
+		result[name] = copied
+	}
+	return result
+}
+
+func copyHTTPHeaders(w http.ResponseWriter, headers map[string][]string) {
+	for name, values := range headers {
+		if isHopByHopHeader(name) {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func elapsedMS(startedAt time.Time) int64 {
+	return time.Since(startedAt).Milliseconds()
+}
+
+func recordEgressSummary(stateStore *store.MemoryStore, summary domain.RequestSummary) {
+	// 请求摘要统一在这一处落库，避免遗漏字段导致 UI 展示不一致。
+	stateStore.AddRequestSummary(summary)
+}
+
+func resolveGRPCTarget(discoverResult domain.DiscoverResponse, baseAddress string) (target string, upstream string, err error) {
+	// dev 命中时直接走 discover 返回的 grpc route target；否则走 base fallback。
+	if discoverResult.Matched && strings.EqualFold(discoverResult.Resolution, "dev-priority") {
+		if discoverResult.RouteTarget.TargetPort <= 0 {
+			return "", "", fmt.Errorf("grpc discover target is missing targetPort")
+		}
+		host := firstNonBlank(discoverResult.RouteTarget.TargetHost, "127.0.0.1")
+		return net.JoinHostPort(host, strconv.Itoa(discoverResult.RouteTarget.TargetPort)), "dev", nil
+	}
+
+	address := strings.TrimSpace(baseAddress)
+	if address == "" {
+		return "", "", fmt.Errorf("base fallback requires baseAddress")
+	}
+	if strings.Contains(address, "://") {
+		parsed, parseErr := url.Parse(address)
+		if parseErr != nil {
+			return "", "", fmt.Errorf("invalid baseAddress: %w", parseErr)
+		}
+		if strings.TrimSpace(parsed.Host) == "" {
+			return "", "", fmt.Errorf("invalid baseAddress: missing host")
+		}
+		return parsed.Host, "base", nil
+	}
+	return address, "base", nil
+}
+
+func (h *Handler) executeGRPCHealthCheck(
+	ctx context.Context,
+	target string,
+	resolvedEnv string,
+	request domain.EgressGRPCRequest,
+) (string, error) {
+	timeout := h.cfg.Tunnel.RequestTimeout
+	if request.TimeoutMs > 0 {
+		timeout = time.Duration(request.TimeoutMs) * time.Millisecond
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		callCtx,
+		target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	// gRPC 出口链路与 HTTP 保持一致，统一透传 x-env 上下文。
+	callCtx = grpcmetadata.NewOutgoingContext(callCtx, grpcmetadata.Pairs(
+		"x-env", resolvedEnv,
+		"X-Env", resolvedEnv,
+	))
+
+	client := grpc_health_v1.NewHealthClient(conn)
+	reply, err := client.Check(callCtx, &grpc_health_v1.HealthCheckRequest{
+		Service: strings.TrimSpace(request.HealthService),
+	})
+	if err != nil {
+		return "", err
+	}
+	return reply.GetStatus().String(), nil
+}
+
+func classifyGRPCError(err error, upstream string) (domain.ErrorCode, string) {
+	status, ok := grpcstatus.FromError(err)
+	if !ok {
+		if strings.EqualFold(upstream, "dev") {
+			return domain.ErrorTunnelOffline, firstNonBlank(err.Error(), "grpc target unavailable")
+		}
+		return domain.ErrorLocalEndpointDown, firstNonBlank(err.Error(), "base grpc upstream unavailable")
+	}
+
+	switch status.Code() {
+	case codes.DeadlineExceeded:
+		return domain.ErrorUpstreamTimeout, firstNonBlank(status.Message(), "grpc upstream timeout")
+	case codes.Unavailable:
+		if strings.EqualFold(upstream, "dev") {
+			return domain.ErrorTunnelOffline, firstNonBlank(status.Message(), "dev grpc target unavailable")
+		}
+		return domain.ErrorLocalEndpointDown, firstNonBlank(status.Message(), "base grpc upstream unavailable")
+	default:
+		return domain.ErrorRouteExtractFailed, firstNonBlank(status.Message(), status.Code().String())
+	}
 }

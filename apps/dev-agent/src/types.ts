@@ -31,10 +31,23 @@ export interface LocalRegistration {
   serviceName: string;
   env: string;
   instanceId: string;
+  metadata?: Record<string, string>;
   healthy: boolean;
+  registerTime?: string;
   lastHeartbeatTime: string;
   ttlSeconds: number;
   endpoints: LocalEndpoint[];
+}
+
+export interface ActiveIntercept {
+  env: string;
+  serviceName: string;
+  protocol: string;
+  tunnelId: string;
+  instanceId: string;
+  targetPort: number;
+  status: string;
+  updatedAt: string;
 }
 
 export interface ErrorEntry {
@@ -42,6 +55,22 @@ export interface ErrorEntry {
   message: string;
   occurredAt: string;
   context: Record<string, string>;
+}
+
+export interface RequestSummary {
+  direction: string;
+  protocol: string;
+  serviceName: string;
+  requestedEnv: string;
+  resolvedEnv: string;
+  resolution: string;
+  upstream: string;
+  statusCode: number;
+  result: string;
+  errorCode?: string;
+  message?: string;
+  latencyMs: number;
+  occurredAt: string;
 }
 
 export interface AgentRuntime {
@@ -54,4 +83,17 @@ export interface AgentRuntime {
   restartCount: number;
   restartAttempt: number;
   nextRestartAt: string | null;
+}
+
+export interface DesktopConfigView {
+  agentApiBase: string;
+  agentBinary: string | null;
+  agentCoreDir: string | null;
+  agentAutoRestart: boolean;
+  agentRestartBackoffMs: number[];
+  envResolveOrder: string[];
+  tunnelBridgeAddress: string;
+  tunnelBackflowBaseUrl: string;
+  platform: string;
+  arch: string;
 }
