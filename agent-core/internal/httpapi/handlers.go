@@ -87,6 +87,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/requests", h.stateRequests)
 	mux.HandleFunc("POST /api/v1/control/reconnect", h.reconnect)
 	mux.HandleFunc("POST /api/v1/backflow/http", h.backflowHTTP)
+	mux.HandleFunc("POST /api/v1/backflow/grpc", h.backflowGRPC)
 
 	return mux
 }
@@ -599,6 +600,55 @@ func (h *Handler) backflowHTTP(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, response)
 }
 
+func (h *Handler) backflowGRPC(w http.ResponseWriter, r *http.Request) {
+	var request domain.BackflowGRPCRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondJSON(w, http.StatusBadRequest, domain.BackflowGRPCResponse{
+			Status:    "error",
+			ErrorCode: domain.ErrorRouteExtractFailed,
+			Message:   "invalid backflow grpc payload",
+		})
+		return
+	}
+
+	targetHost := strings.TrimSpace(request.TargetHost)
+	if targetHost == "" || request.TargetPort <= 0 {
+		respondJSON(w, http.StatusBadRequest, domain.BackflowGRPCResponse{
+			Status:    "error",
+			ErrorCode: domain.ErrorRouteExtractFailed,
+			Message:   "targetHost/targetPort are required",
+		})
+		return
+	}
+
+	target := net.JoinHostPort(targetHost, strconv.Itoa(request.TargetPort))
+	resolvedEnv := firstNonBlank(strings.TrimSpace(request.Env), strings.TrimSpace(h.cfg.EnvName), "base")
+	startedAt := time.Now().UTC()
+
+	// gRPC 回流与出口代理共用同一执行器，保持超时和 metadata 透传行为一致。
+	statusValue, err := h.executeGRPCHealthCheck(r.Context(), target, resolvedEnv, domain.EgressGRPCRequest{
+		HealthService: strings.TrimSpace(request.HealthService),
+		TimeoutMs:     request.TimeoutMs,
+	})
+	if err != nil {
+		statusCode, errorCode, message := classifyBackflowGRPCError(err)
+		respondJSON(w, statusCode, domain.BackflowGRPCResponse{
+			Status:    "error",
+			Target:    target,
+			LatencyMs: elapsedMS(startedAt),
+			ErrorCode: errorCode,
+			Message:   message,
+		})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, domain.BackflowGRPCResponse{
+		Status:    statusValue,
+		Target:    target,
+		LatencyMs: elapsedMS(startedAt),
+	})
+}
+
 func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -678,6 +728,22 @@ func classifyBackflowError(err error) (statusCode int, errorCode domain.ErrorCod
 		}
 	}
 	return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(err.Error(), "backflow failed")
+}
+
+func classifyBackflowGRPCError(err error) (statusCode int, errorCode domain.ErrorCode, message string) {
+	status, ok := grpcstatus.FromError(err)
+	if !ok {
+		return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(err.Error(), "grpc backflow failed")
+	}
+
+	switch status.Code() {
+	case codes.DeadlineExceeded:
+		return http.StatusGatewayTimeout, domain.ErrorUpstreamTimeout, firstNonBlank(status.Message(), "grpc upstream timeout")
+	case codes.Unavailable:
+		return http.StatusBadGateway, domain.ErrorLocalEndpointDown, firstNonBlank(status.Message(), "grpc local endpoint unavailable")
+	default:
+		return http.StatusBadGateway, domain.ErrorRouteExtractFailed, firstNonBlank(status.Message(), status.Code().String())
+	}
 }
 
 func firstNonBlank(values ...string) string {

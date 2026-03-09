@@ -19,6 +19,7 @@ import (
 // BackflowHTTPCaller 抽象 bridge 到 agent 的回流调用能力。
 type BackflowHTTPCaller interface {
 	ForwardHTTP(ctx context.Context, baseURL string, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error)
+	ForwardGRPC(ctx context.Context, baseURL string, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error)
 }
 
 // Handler 提供 bridge 管理面与状态查询接口。
@@ -261,16 +262,108 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) ingressGRPC(w http.ResponseWriter, _ *http.Request) {
-	h.store.AddError("INGRESS_GRPC_NOT_IMPLEMENTED", "grpc ingress scaffold is not implemented yet", map[string]string{
-		"protocol": "grpc",
+func (h *Handler) ingressGRPC(w http.ResponseWriter, r *http.Request) {
+	result, err := h.pipeline.Resolve(r.Context(), r)
+	if err != nil {
+		h.store.AddError(domain.IngressErrorRouteExtractFailed, "resolve grpc ingress route failed", map[string]string{
+			"host":  strings.TrimSpace(r.Host),
+			"path":  strings.TrimSpace(r.URL.Path),
+			"error": err.Error(),
+		})
+		writeIngressGRPCError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, err.Error(), "")
+		return
+	}
+
+	route, session, ok := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "grpc")
+	if !ok {
+		h.store.AddError(domain.IngressErrorRouteNotFound, "grpc ingress route not found", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "grpc",
+		})
+		writeIngressGRPCError(
+			w,
+			http.StatusNotFound,
+			domain.IngressErrorRouteNotFound,
+			"route not found for env/service/protocol",
+			"",
+		)
+		return
+	}
+
+	baseURL := strings.TrimSpace(session.BackflowBaseURL)
+	if baseURL == "" {
+		baseURL = h.fallbackBackflowURL
+	}
+	if baseURL == "" {
+		h.store.AddError(domain.IngressErrorTunnelOffline, "grpc backflow endpoint is unavailable", map[string]string{
+			"env":         strings.TrimSpace(route.Env),
+			"serviceName": strings.TrimSpace(route.ServiceName),
+			"tunnelId":    strings.TrimSpace(route.TunnelID),
+		})
+		writeIngressGRPCError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", "")
+		return
+	}
+
+	var request domain.IngressGRPCRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		h.store.AddError(domain.IngressErrorRouteExtractFailed, "decode grpc ingress payload failed", map[string]string{
+			"path":  strings.TrimSpace(r.URL.Path),
+			"error": err.Error(),
+		})
+		writeIngressGRPCError(w, http.StatusBadRequest, domain.IngressErrorRouteExtractFailed, "invalid grpc ingress payload", "")
+		return
+	}
+
+	startedAt := time.Now().UTC()
+	forwardResp, err := h.backflowCaller.ForwardGRPC(r.Context(), baseURL, domain.BackflowGRPCRequest{
+		TargetHost:    "127.0.0.1",
+		TargetPort:    route.TargetPort,
+		Env:           route.Env,
+		HealthService: strings.TrimSpace(request.HealthService),
+		TimeoutMs:     request.TimeoutMs,
 	})
-	writeIngressError(
-		w,
-		http.StatusNotImplemented,
-		domain.IngressErrorRouteNotFound,
-		"grpc ingress scaffold is not implemented yet",
-	)
+	if err != nil {
+		var backflowErr *backflow.Error
+		if errors.As(err, &backflowErr) {
+			errorCode := firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline)
+			message := firstNonEmpty(backflowErr.Message, "call agent grpc backflow failed")
+			h.store.AddError(errorCode, message, map[string]string{
+				"env":         strings.TrimSpace(route.Env),
+				"serviceName": strings.TrimSpace(route.ServiceName),
+				"tunnelId":    strings.TrimSpace(route.TunnelID),
+				"baseURL":     strings.TrimSpace(baseURL),
+			})
+			writeIngressGRPCError(w, statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway), errorCode, message, "")
+			return
+		}
+		h.store.AddError(domain.IngressErrorTunnelOffline, "call agent grpc backflow failed", map[string]string{
+			"env":         strings.TrimSpace(route.Env),
+			"serviceName": strings.TrimSpace(route.ServiceName),
+			"tunnelId":    strings.TrimSpace(route.TunnelID),
+			"baseURL":     strings.TrimSpace(baseURL),
+			"error":       err.Error(),
+		})
+		writeIngressGRPCError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error(), "")
+		return
+	}
+
+	// gRPC ingress 返回 JSON 结果，同时通过响应头暴露命中路由，便于调试和观测。
+	w.Header().Set("X-DevLoop-Route-Env", route.Env)
+	w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
+	w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
+	w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+	respondJSON(w, http.StatusOK, domain.IngressGRPCResponse{
+		Status:      firstNonEmpty(forwardResp.Status, "UNKNOWN"),
+		ResolvedEnv: route.Env,
+		ServiceName: route.ServiceName,
+		Protocol:    route.Protocol,
+		TunnelID:    route.TunnelID,
+		Target:      firstNonEmpty(forwardResp.Target, "127.0.0.1:"+strconv.Itoa(route.TargetPort)),
+		LatencyMs:   maxInt64Value(forwardResp.LatencyMs, time.Since(startedAt).Milliseconds()),
+		ErrorCode:   "",
+		Message:     "",
+	})
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload any) {
@@ -291,6 +384,20 @@ func writeIngressError(w http.ResponseWriter, status int, errorCode string, mess
 		StatusCode: status,
 		ErrorCode:  errorCode,
 		Message:    message,
+	})
+}
+
+func writeIngressGRPCError(w http.ResponseWriter, status int, errorCode string, message string, target string) {
+	respondJSON(w, status, domain.IngressGRPCResponse{
+		Status:      "error",
+		ResolvedEnv: "",
+		ServiceName: "",
+		Protocol:    "grpc",
+		TunnelID:    "",
+		Target:      strings.TrimSpace(target),
+		LatencyMs:   0,
+		ErrorCode:   strings.TrimSpace(errorCode),
+		Message:     strings.TrimSpace(message),
 	})
 }
 
@@ -351,4 +458,11 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func maxInt64Value(a int64, b int64) int64 {
+	if a >= b {
+		return a
+	}
+	return b
 }

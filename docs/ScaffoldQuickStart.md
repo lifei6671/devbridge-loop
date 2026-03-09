@@ -54,6 +54,9 @@
 - 已接入本地回流转发入口：`POST /api/v1/backflow/http`
   - 接收 bridge 回流请求并转发到本地 `targetHost:targetPort`
   - 将回流转发超时/不可达归一为 `UPSTREAM_TIMEOUT`、`LOCAL_ENDPOINT_UNREACHABLE`
+- 已接入本地 gRPC 回流入口：`POST /api/v1/backflow/grpc`
+  - 接收 bridge gRPC 回流请求并对本地目标执行 Health Check
+  - 回流失败统一映射为 `UPSTREAM_TIMEOUT`、`LOCAL_ENDPOINT_UNREACHABLE`
 - 已接入 HTTP 出口代理：`POST /api/v1/egress/http`
   - 先执行 `discover`（dev 优先、base fallback）
   - 命中 dev 时自动代理到 bridge ingress（并透传 `x-env/X-Env`）
@@ -75,6 +78,9 @@
   - 先按提取器链路解析 `(env, serviceName)`，再匹配 `(env, serviceName, protocol=http)` 路由
   - 命中后回调 agent `POST /api/v1/backflow/http`，完成本地服务回流
   - 回流异常统一输出：`ROUTE_NOT_FOUND/ROUTE_EXTRACT_FAILED/TUNNEL_OFFLINE`
+- 已接入 gRPC ingress MVP：`/api/v1/ingress/grpc`
+  - 先按提取器链路解析 `(env, serviceName)`，再匹配 `(env, serviceName, protocol=grpc)` 路由
+  - 通过 agent `POST /api/v1/backflow/grpc` 执行本地 gRPC Health Check 回流
 - 已实现同步幂等主干：`sessionEpoch/resourceVersion/eventId`
   - 重复事件：返回 `ACK + duplicate` 语义
   - 旧 epoch 事件：返回 `ERROR + STALE_EPOCH_EVENT`

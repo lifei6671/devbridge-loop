@@ -45,7 +45,7 @@ func NewClient(timeout time.Duration) *Client {
 
 // ForwardHTTP 调用 agent 的 /api/v1/backflow/http 完成回流。
 func (c *Client) ForwardHTTP(ctx context.Context, baseURL string, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error) {
-	endpoint, err := buildBackflowEndpoint(baseURL)
+	endpoint, err := buildBackflowEndpoint(baseURL, "/api/v1/backflow/http")
 	if err != nil {
 		return domain.BackflowHTTPResponse{}, &Error{
 			StatusCode: http.StatusServiceUnavailable,
@@ -98,7 +98,58 @@ func (c *Client) ForwardHTTP(ctx context.Context, baseURL string, request domain
 	return payload, nil
 }
 
-func buildBackflowEndpoint(baseURL string) (string, error) {
+// ForwardGRPC 调用 agent 的 /api/v1/backflow/grpc 完成 gRPC 回流（一期先支持 health check）。
+func (c *Client) ForwardGRPC(ctx context.Context, baseURL string, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error) {
+	endpoint, err := buildBackflowEndpoint(baseURL, "/api/v1/backflow/grpc")
+	if err != nil {
+		return domain.BackflowGRPCResponse{}, &Error{
+			StatusCode: http.StatusServiceUnavailable,
+			ErrorCode:  domain.IngressErrorTunnelOffline,
+			Message:    err.Error(),
+		}
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return domain.BackflowGRPCResponse{}, fmt.Errorf("encode grpc backflow request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return domain.BackflowGRPCResponse{}, fmt.Errorf("create grpc backflow request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return domain.BackflowGRPCResponse{}, fmt.Errorf("send grpc backflow request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return domain.BackflowGRPCResponse{}, fmt.Errorf("read grpc backflow response: %w", err)
+	}
+
+	var payload domain.BackflowGRPCResponse
+	if len(respBytes) > 0 {
+		if err := json.Unmarshal(respBytes, &payload); err != nil {
+			return domain.BackflowGRPCResponse{}, fmt.Errorf("decode grpc backflow response: %w", err)
+		}
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return payload, &Error{
+			StatusCode: resp.StatusCode,
+			ErrorCode:  firstNonEmpty(payload.ErrorCode, domain.IngressErrorTunnelOffline),
+			Message:    firstNonEmpty(payload.Message, fmt.Sprintf("agent grpc backflow status code %d", resp.StatusCode)),
+		}
+	}
+
+	return payload, nil
+}
+
+func buildBackflowEndpoint(baseURL string, suffix string) (string, error) {
 	trimmed := strings.TrimSpace(baseURL)
 	if trimmed == "" {
 		return "", fmt.Errorf("backflow base url is empty")
@@ -112,11 +163,12 @@ func buildBackflowEndpoint(baseURL string) (string, error) {
 		return "", fmt.Errorf("parse backflow base url: %w", err)
 	}
 
+	normalizedSuffix := "/" + strings.TrimPrefix(strings.TrimSpace(suffix), "/")
 	path := strings.TrimRight(parsed.Path, "/")
-	if strings.HasSuffix(path, "/api/v1/backflow/http") {
+	if strings.HasSuffix(path, normalizedSuffix) {
 		parsed.Path = path
 	} else {
-		parsed.Path = path + "/api/v1/backflow/http"
+		parsed.Path = path + normalizedSuffix
 	}
 	parsed.RawQuery = ""
 	parsed.Fragment = ""

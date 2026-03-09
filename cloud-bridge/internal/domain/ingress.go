@@ -34,3 +34,40 @@ type BackflowHTTPResponse struct {
 	ErrorCode  string              `json:"errorCode,omitempty"`
 	Message    string              `json:"message,omitempty"`
 }
+
+// IngressGRPCRequest 描述进入 bridge 的 gRPC ingress 请求体（一期先支持 health check 语义）。
+type IngressGRPCRequest struct {
+	HealthService string `json:"healthService,omitempty"`
+	TimeoutMs     int    `json:"timeoutMs,omitempty"`
+}
+
+// IngressGRPCResponse 描述 gRPC ingress 回流结果。
+type IngressGRPCResponse struct {
+	Status      string `json:"status"`
+	ResolvedEnv string `json:"resolvedEnv"`
+	ServiceName string `json:"serviceName"`
+	Protocol    string `json:"protocol"`
+	TunnelID    string `json:"tunnelId"`
+	Target      string `json:"target"`
+	LatencyMs   int64  `json:"latencyMs"`
+	ErrorCode   string `json:"errorCode,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
+// BackflowGRPCRequest 描述 bridge 发给 agent 的 gRPC 回流请求。
+type BackflowGRPCRequest struct {
+	TargetHost    string `json:"targetHost"`
+	TargetPort    int    `json:"targetPort"`
+	Env           string `json:"env,omitempty"`
+	HealthService string `json:"healthService,omitempty"`
+	TimeoutMs     int    `json:"timeoutMs,omitempty"`
+}
+
+// BackflowGRPCResponse 描述 agent 回传给 bridge 的 gRPC 回流结果。
+type BackflowGRPCResponse struct {
+	Status    string `json:"status"`
+	Target    string `json:"target"`
+	LatencyMs int64  `json:"latencyMs"`
+	ErrorCode string `json:"errorCode,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
