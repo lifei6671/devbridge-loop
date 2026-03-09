@@ -50,6 +50,11 @@
 - tunnel 事件入口占位：`POST /api/v1/tunnel/events`
 - 路由提取抽象：`RouteExtractor`、`RouteExtractPipeline`
 - 内置提取器：`host/header/sni`
+- 已实现同步幂等主干：`sessionEpoch/resourceVersion/eventId`
+  - 重复事件：返回 `ACK + duplicate` 语义
+  - 旧 epoch 事件：返回 `ERROR + STALE_EPOCH_EVENT`
+  - 新 epoch 增量事件：要求先 `HELLO` 建连
+  - `FULL_SYNC_SNAPSHOT`：清空 tunnel 旧状态后重建 intercept/route
 
 3. `dev-agent` 桌面端
 - Rust Host：
@@ -103,6 +108,8 @@ npm run tauri:dev
 - `DEVLOOP_AGENT_CORE_DIR`：Rust Host 用 `go run` 拉起 agent-core 时的工作目录
 - `DEVLOOP_AGENT_AUTO_RESTART`：是否自动重启（默认 `true`）
 - `DEVLOOP_AGENT_RESTART_BACKOFF_MS`：自动重启退避毫秒数组（默认 `500,1000,2000,5000`）
+- `DEVLOOP_BRIDGE_PUBLIC_HOST`：bridge 对外路由域名（默认 `bridge.example.internal`）
+- `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
 
 ## 事件头与 env 解析
 
@@ -121,3 +128,12 @@ npm run tauri:dev
 - 事件名：`agent-runtime-changed`
 - 触发时机：首次启动、监督循环检测到状态变化、手动重启
 - 事件负载：`status/pid/lastError/restartCount/restartAttempt/nextRestartAt` 等运行态字段
+
+## Tunnel 事件回包
+
+- `POST /api/v1/tunnel/events` 返回统一 `ACK/ERROR` 结构：
+  - `type`: `ACK` 或 `ERROR`
+  - `status`: `accepted/duplicate/rejected`
+  - `eventId/sessionEpoch/resourceVersion`
+  - `deduplicated`
+  - `errorCode/message`（仅 `ERROR`）

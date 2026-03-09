@@ -14,16 +14,16 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
 )
 
-// App wires cloud-bridge transport and state.
+// App 负责组装 cloud-bridge 的传输层和运行态依赖。
 type App struct {
 	cfg    config.Config
 	server *http.Server
 }
 
-// New constructs cloud-bridge app.
+// New 构造 cloud-bridge 应用实例。
 func New(cfg config.Config) *App {
 	pipeline := routing.NewPipeline(cfg.RouteExtractorOrder)
-	stateStore := store.NewMemoryStore()
+	stateStore := store.NewMemoryStoreWithBridge(cfg.BridgePublicHost, cfg.BridgePublicPort)
 	h := httpapi.NewHandler(pipeline, stateStore)
 
 	log.Printf("%s", pipeline.DebugString())
@@ -37,7 +37,7 @@ func New(cfg config.Config) *App {
 	}
 }
 
-// Run starts cloud-bridge until context cancellation.
+// Run 启动 cloud-bridge，并在收到退出信号后平滑关闭。
 func (a *App) Run(ctx context.Context) error {
 	errorCh := make(chan error, 1)
 	go func() {

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -10,18 +11,18 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
 )
 
-// Handler provides bridge admin/status endpoints.
+// Handler 提供 bridge 管理面与状态查询接口。
 type Handler struct {
 	pipeline *routing.Pipeline
 	store    *store.MemoryStore
 }
 
-// NewHandler creates bridge handlers.
+// NewHandler 创建 HTTP handler 集合。
 func NewHandler(pipeline *routing.Pipeline, store *store.MemoryStore) *Handler {
 	return &Handler{pipeline: pipeline, store: store}
 }
 
-// Router builds cloud-bridge API router.
+// Router 构建 cloud-bridge 路由表。
 func (h *Handler) Router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -54,14 +55,53 @@ func (h *Handler) routes(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
 	var event domain.TunnelEvent
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid payload"})
+		respondJSON(w, http.StatusBadRequest, domain.TunnelEventReply{
+			Type:         domain.TunnelMessageError,
+			Status:       domain.EventStatusRejected,
+			ErrorCode:    domain.SyncErrorInvalidPayload,
+			Message:      "invalid payload",
+			EventID:      "",
+			SessionEpoch: 0,
+		})
 		return
 	}
 	if event.SentAt.IsZero() {
 		event.SentAt = time.Now().UTC()
 	}
-	h.store.RecordEvent(event)
-	respondJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+
+	reply, err := h.store.ProcessTunnelEvent(event)
+	if err != nil {
+		var reject *store.EventRejectError
+		if errors.As(err, &reject) {
+			respondJSON(w, reject.StatusCode, domain.TunnelEventReply{
+				Type:            domain.TunnelMessageError,
+				Status:          domain.EventStatusRejected,
+				EventID:         event.EventID,
+				SessionEpoch:    selectSessionEpoch(event.SessionEpoch, reject.SessionEpoch),
+				ResourceVersion: reject.ResourceVersion,
+				Deduplicated:    false,
+				ErrorCode:       reject.Code,
+				Message:         reject.Message,
+			})
+			return
+		}
+
+		respondJSON(w, http.StatusInternalServerError, domain.TunnelEventReply{
+			Type:         domain.TunnelMessageError,
+			Status:       domain.EventStatusRejected,
+			EventID:      event.EventID,
+			SessionEpoch: event.SessionEpoch,
+			ErrorCode:    domain.SyncErrorInvalidPayload,
+			Message:      err.Error(),
+		})
+		return
+	}
+
+	statusCode := http.StatusAccepted
+	if reply.Status == domain.EventStatusDuplicate {
+		statusCode = http.StatusOK
+	}
+	respondJSON(w, statusCode, reply)
 }
 
 func (h *Handler) debugRouteExtract(w http.ResponseWriter, r *http.Request) {
@@ -80,4 +120,11 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func selectSessionEpoch(requestEpoch, rejectedEpoch int64) int64 {
+	if rejectedEpoch > 0 {
+		return rejectedEpoch
+	}
+	return requestEpoch
 }
