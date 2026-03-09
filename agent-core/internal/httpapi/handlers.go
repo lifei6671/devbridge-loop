@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -63,7 +64,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(payload.InstanceID) == "" {
-		payload.InstanceID = generateInstanceID()
+		payload.InstanceID = generateID("inst")
 	}
 	if strings.TrimSpace(payload.Env) == "" {
 		payload.Env = h.cfg.EnvName
@@ -71,16 +72,27 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	if payload.TTLSeconds <= 0 {
 		payload.TTLSeconds = h.cfg.Registration.DefaultTTLSeconds
 	}
-	for i := range payload.Endpoints {
-		if strings.TrimSpace(payload.Endpoints[i].TargetHost) == "" {
-			payload.Endpoints[i].TargetHost = "127.0.0.1"
-		}
-		if strings.TrimSpace(payload.Endpoints[i].Status) == "" {
-			payload.Endpoints[i].Status = "active"
-		}
+
+	eventID := eventIDFromRequest(r)
+	if eventID == "" {
+		eventID = generateID("evt")
 	}
 
-	stored := h.store.UpsertRegistration(payload)
+	stored, duplicated, err := h.store.UpsertRegistration(payload, eventID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrInvalidRegistration):
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		case errors.Is(err, store.ErrInstanceConflict):
+			respondJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		default:
+			h.store.AddError(domain.ErrorRouteExtractFailed, "failed to upsert registration", map[string]string{"error": err.Error()})
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to upsert registration"})
+		}
+		return
+	}
+
+	setEventHeaders(w, eventID, duplicated)
 	respondJSON(w, http.StatusOK, stored)
 }
 
@@ -105,11 +117,29 @@ func (h *Handler) unregister(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "instanceId is required"})
 		return
 	}
-	if !h.store.DeleteRegistration(instanceID) {
-		respondJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("instance %s not found", instanceID)})
+
+	eventID := eventIDFromRequest(r)
+	if eventID == "" {
+		eventID = generateID("evt")
+	}
+
+	deleted, duplicated, err := h.store.DeleteRegistration(instanceID, eventID)
+	if err != nil {
+		if errors.Is(err, store.ErrInstanceNotFound) {
+			respondJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		h.store.AddError(domain.ErrorRouteExtractFailed, "failed to delete registration", map[string]string{"error": err.Error(), "instanceId": instanceID})
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete registration"})
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]string{"result": "deleted", "instanceId": instanceID})
+
+	setEventHeaders(w, eventID, duplicated)
+	if deleted {
+		respondJSON(w, http.StatusOK, map[string]string{"result": "deleted", "instanceId": instanceID})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"result": "duplicate-ignored", "instanceId": instanceID})
 }
 
 func (h *Handler) listRegistrations(w http.ResponseWriter, _ *http.Request) {
@@ -126,6 +156,7 @@ func (h *Handler) discover(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "serviceName and protocol are required"})
 		return
 	}
+	request.Env = resolveDiscoverEnv(r, request.Env)
 	result := h.store.Discover(request, h.cfg.EnvName)
 	respondJSON(w, http.StatusOK, result)
 }
@@ -158,10 +189,38 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func generateInstanceID() string {
+func generateID(prefix string) string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("inst-%d", time.Now().UnixNano())
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 	}
-	return fmt.Sprintf("inst-%s", hex.EncodeToString(buf))
+	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(buf))
+}
+
+func eventIDFromRequest(r *http.Request) string {
+	eventID := strings.TrimSpace(r.Header.Get("x-event-id"))
+	if eventID == "" {
+		eventID = strings.TrimSpace(r.Header.Get("X-Event-Id"))
+	}
+	return eventID
+}
+
+func resolveDiscoverEnv(r *http.Request, payloadEnv string) string {
+	headerEnv := strings.TrimSpace(r.Header.Get("x-env"))
+	if headerEnv == "" {
+		headerEnv = strings.TrimSpace(r.Header.Get("X-Env"))
+	}
+	if headerEnv != "" {
+		return headerEnv
+	}
+	return strings.TrimSpace(payloadEnv)
+}
+
+func setEventHeaders(w http.ResponseWriter, eventID string, duplicated bool) {
+	w.Header().Set("X-Event-Id", eventID)
+	if duplicated {
+		w.Header().Set("X-Event-Deduplicated", "true")
+		return
+	}
+	w.Header().Set("X-Event-Deduplicated", "false")
 }

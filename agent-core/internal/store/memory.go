@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -11,14 +12,40 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/internal/domain"
 )
 
-const maxErrorEntries = 50
+const (
+	maxErrorEntries     = 50
+	maxProcessedEventID = 2048
+)
+
+var (
+	// ErrInvalidRegistration indicates malformed registration payload.
+	ErrInvalidRegistration = errors.New("invalid registration")
+	// ErrInstanceNotFound indicates target instance does not exist.
+	ErrInstanceNotFound = errors.New("instance not found")
+	// ErrInstanceConflict indicates one instance ID attempts to bind another service/env.
+	ErrInstanceConflict = errors.New("instance id already bound to another env/service")
+)
+
+type processedEvent struct {
+	action      string
+	instanceKey string
+	processedAt time.Time
+}
 
 // MemoryStore stores agent runtime state in memory only.
 type MemoryStore struct {
 	mu sync.RWMutex
 
-	registrations   map[string]domain.LocalRegistration
-	recentErrors    []domain.ErrorEntry
+	registrations map[string]domain.LocalRegistration // InstanceKey.String() -> registration
+	instanceIndex map[string]string                   // instanceID -> InstanceKey.String()
+	serviceIndex  map[string]map[string]struct{}      // ServiceKey.String() -> set(InstanceKey.String())
+	endpointIndex map[string]string                   // EndpointKey.String() -> InstanceKey.String()
+
+	recentErrors []domain.ErrorEntry
+
+	processedEvents map[string]processedEvent
+	processedOrder  []string
+
 	resourceVersion int64
 	sessionEpoch    int64
 	tunnelConnected bool
@@ -28,37 +55,61 @@ type MemoryStore struct {
 // NewMemoryStore constructs an in-memory runtime state store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		registrations: make(map[string]domain.LocalRegistration),
-		recentErrors:  make([]domain.ErrorEntry, 0, maxErrorEntries),
+		registrations:   make(map[string]domain.LocalRegistration),
+		instanceIndex:   make(map[string]string),
+		serviceIndex:    make(map[string]map[string]struct{}),
+		endpointIndex:   make(map[string]string),
+		recentErrors:    make([]domain.ErrorEntry, 0, maxErrorEntries),
+		processedEvents: make(map[string]processedEvent),
+		processedOrder:  make([]string, 0, maxProcessedEventID),
 	}
 }
 
-// UpsertRegistration creates or updates one registration and bumps resourceVersion.
-func (s *MemoryStore) UpsertRegistration(reg domain.LocalRegistration) domain.LocalRegistration {
+// UpsertRegistration creates or updates one registration and bumps resourceVersion on non-duplicate events.
+func (s *MemoryStore) UpsertRegistration(reg domain.LocalRegistration, eventID string) (domain.LocalRegistration, bool, error) {
 	now := time.Now().UTC()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if duplicated, existing, ok := s.lookupDuplicateUpsertLocked(eventID); ok {
+		return existing, duplicated, nil
+	}
+
+	reg = normalizeRegistration(reg)
+	if err := validateRegistration(reg); err != nil {
+		return domain.LocalRegistration{}, false, err
+	}
+
+	instanceKey := domain.NewInstanceKey(reg.Env, reg.ServiceName, reg.InstanceID).String()
+	if existingInstanceKey, ok := s.instanceIndex[reg.InstanceID]; ok && existingInstanceKey != instanceKey {
+		return domain.LocalRegistration{}, false, fmt.Errorf("%w: instanceId=%s existing=%s target=%s", ErrInstanceConflict, reg.InstanceID, existingInstanceKey, instanceKey)
+	}
+
+	existing, hasExisting := s.registrations[instanceKey]
+	if hasExisting {
+		s.removeEndpointIndexesLocked(existing)
+		if reg.RegisterTime.IsZero() {
+			reg.RegisterTime = existing.RegisterTime
+		}
+	}
 	if reg.RegisterTime.IsZero() {
 		reg.RegisterTime = now
 	}
-	reg.LastHeartbeatTime = now
-	if reg.TTLSeconds <= 0 {
-		reg.TTLSeconds = 30
-	}
-	if reg.Metadata == nil {
-		reg.Metadata = map[string]string{}
-	}
-	if len(reg.Endpoints) == 0 {
-		reg.Endpoints = []domain.LocalEndpoint{}
-	}
-	reg.Healthy = true
 
-	s.registrations[reg.InstanceID] = reg
+	reg.LastHeartbeatTime = now
+	reg.Healthy = true
+	reg.Endpoints = uniqueNormalizedEndpoints(reg)
+
+	s.registrations[instanceKey] = reg
+	s.instanceIndex[reg.InstanceID] = instanceKey
+	s.addServiceIndexLocked(reg, instanceKey)
+	s.addEndpointIndexesLocked(reg, instanceKey)
+
 	s.resourceVersion++
 	s.lastTunnelHB = now
-	return reg
+	s.recordProcessedEventLocked(eventID, processedEvent{action: "upsert", instanceKey: instanceKey, processedAt: now})
+	return reg, false, nil
 }
 
 // Heartbeat updates heartbeat timestamp for one registration.
@@ -68,29 +119,41 @@ func (s *MemoryStore) Heartbeat(instanceID string) (domain.LocalRegistration, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	reg, ok := s.registrations[instanceID]
+	instanceKey, ok := s.instanceIndex[strings.TrimSpace(instanceID)]
 	if !ok {
-		return domain.LocalRegistration{}, fmt.Errorf("instance %s not found", instanceID)
+		return domain.LocalRegistration{}, fmt.Errorf("%w: %s", ErrInstanceNotFound, instanceID)
 	}
+
+	reg := s.registrations[instanceKey]
 	reg.LastHeartbeatTime = now
 	reg.Healthy = true
-	s.registrations[instanceID] = reg
+	s.registrations[instanceKey] = reg
 	return reg, nil
 }
 
-// DeleteRegistration removes one registration and bumps resourceVersion.
-func (s *MemoryStore) DeleteRegistration(instanceID string) bool {
+// DeleteRegistration removes one registration and bumps resourceVersion on non-duplicate events.
+func (s *MemoryStore) DeleteRegistration(instanceID, eventID string) (deleted bool, duplicated bool, err error) {
+	now := time.Now().UTC()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.registrations[instanceID]; !ok {
-		return false
+
+	if duplicated, ok := s.lookupDuplicateDeleteLocked(eventID); ok {
+		return false, duplicated, nil
 	}
-	delete(s.registrations, instanceID)
+
+	instanceKey, ok := s.instanceIndex[strings.TrimSpace(instanceID)]
+	if !ok {
+		return false, false, fmt.Errorf("%w: %s", ErrInstanceNotFound, instanceID)
+	}
+
+	s.deleteByInstanceKeyLocked(instanceKey)
 	s.resourceVersion++
-	return true
+	s.recordProcessedEventLocked(eventID, processedEvent{action: "delete", instanceKey: instanceKey, processedAt: now})
+	return true, false, nil
 }
 
-// ListRegistrations returns registrations sorted by serviceName then instanceID.
+// ListRegistrations returns registrations sorted by env, serviceName, then instanceID.
 func (s *MemoryStore) ListRegistrations() []domain.LocalRegistration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -100,10 +163,13 @@ func (s *MemoryStore) ListRegistrations() []domain.LocalRegistration {
 		result = append(result, reg)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].ServiceName == result[j].ServiceName {
-			return result[i].InstanceID < result[j].InstanceID
+		if result[i].Env == result[j].Env {
+			if result[i].ServiceName == result[j].ServiceName {
+				return result[i].InstanceID < result[j].InstanceID
+			}
+			return result[i].ServiceName < result[j].ServiceName
 		}
-		return result[i].ServiceName < result[j].ServiceName
+		return result[i].Env < result[j].Env
 	})
 	return result
 }
@@ -115,38 +181,50 @@ func (s *MemoryStore) Discover(req domain.DiscoverRequest, runtimeEnv string) do
 
 	requestedEnv := strings.TrimSpace(req.Env)
 	if requestedEnv == "" {
-		requestedEnv = runtimeEnv
+		requestedEnv = strings.TrimSpace(runtimeEnv)
 	}
 	if requestedEnv == "" {
 		requestedEnv = "base"
 	}
 
+	protocol := strings.ToLower(strings.TrimSpace(req.Protocol))
 	lookupOrder := []string{requestedEnv}
 	if !strings.EqualFold(requestedEnv, "base") {
 		lookupOrder = append(lookupOrder, "base")
 	}
 
 	for _, env := range lookupOrder {
-		for _, reg := range s.registrations {
-			if !reg.Healthy || reg.ServiceName != req.ServiceName || reg.Env != env {
+		serviceKey := domain.NewServiceKey(env, req.ServiceName).String()
+		instances, ok := s.serviceIndex[serviceKey]
+		if !ok || len(instances) == 0 {
+			continue
+		}
+
+		instanceKeys := make([]string, 0, len(instances))
+		for instanceKey := range instances {
+			instanceKeys = append(instanceKeys, instanceKey)
+		}
+		sort.Strings(instanceKeys)
+
+		for _, instanceKey := range instanceKeys {
+			reg, exists := s.registrations[instanceKey]
+			if !exists || !reg.Healthy {
 				continue
 			}
 			for _, endpoint := range reg.Endpoints {
-				if !strings.EqualFold(endpoint.Protocol, req.Protocol) {
+				if strings.ToLower(endpoint.Protocol) != protocol {
 					continue
 				}
+				endpointKey := domain.NewEndpointKey(reg.Env, reg.ServiceName, reg.InstanceID, endpoint.Protocol, endpoint.ListenPort).String()
 				return domain.DiscoverResponse{
-					Matched:     true,
-					ResolvedEnv: env,
-					Resolution:  resolutionForEnv(env, requestedEnv),
-					RouteTarget: domain.RouteTarget{
-						Env:         env,
-						ServiceName: reg.ServiceName,
-						Protocol:    endpoint.Protocol,
-						TargetHost:  endpoint.TargetHost,
-						TargetPort:  endpoint.TargetPort,
-					},
+					Matched:      true,
+					ResolvedEnv:  env,
+					Resolution:   resolutionForEnv(env, requestedEnv),
+					RouteTarget:  buildRouteTarget(reg, endpoint),
 					ResourceHint: fmt.Sprintf("resourceVersion=%d", s.resourceVersion),
+					ServiceKey:   serviceKey,
+					InstanceKey:  instanceKey,
+					EndpointKey:  endpointKey,
 				}
 			}
 		}
@@ -158,17 +236,18 @@ func (s *MemoryStore) Discover(req domain.DiscoverRequest, runtimeEnv string) do
 		Resolution:  "base-fallback",
 		RouteTarget: domain.RouteTarget{
 			Env:         "base",
-			ServiceName: req.ServiceName,
-			Protocol:    req.Protocol,
+			ServiceName: strings.TrimSpace(req.ServiceName),
+			Protocol:    protocol,
 			TargetHost:  "",
 			TargetPort:  0,
 		},
 		ResourceHint: fmt.Sprintf("resourceVersion=%d", s.resourceVersion),
+		ServiceKey:   domain.NewServiceKey("base", req.ServiceName).String(),
 	}
 }
 
 func resolutionForEnv(resolved, requested string) string {
-	if resolved == requested {
+	if strings.EqualFold(resolved, requested) {
 		return "dev-priority"
 	}
 	return "base-fallback"
@@ -193,7 +272,7 @@ func (s *MemoryStore) Summary(rdName, envName string, defaultTTLSeconds int, sca
 		CurrentEnv:          envName,
 		RDName:              rdName,
 		RegistrationCount:   len(s.registrations),
-		ActiveIntercepts:    len(s.registrations),
+		ActiveIntercepts:    len(s.endpointIndex),
 		LastUpdateAt:        time.Now().UTC(),
 		DefaultTTLSeconds:   defaultTTLSeconds,
 		ScanIntervalSeconds: int(scanInterval / time.Second),
@@ -220,9 +299,10 @@ func (s *MemoryStore) ListActiveIntercepts() []domain.ActiveIntercept {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result := make([]domain.ActiveIntercept, 0, len(s.registrations))
+	result := make([]domain.ActiveIntercept, 0, len(s.endpointIndex))
 	now := time.Now().UTC()
-	for _, reg := range s.registrations {
+	for instanceKey := range s.registrations {
+		reg := s.registrations[instanceKey]
 		for _, endpoint := range reg.Endpoints {
 			result = append(result, domain.ActiveIntercept{
 				Env:         reg.Env,
@@ -238,7 +318,10 @@ func (s *MemoryStore) ListActiveIntercepts() []domain.ActiveIntercept {
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].ServiceName == result[j].ServiceName {
-			return result[i].InstanceID < result[j].InstanceID
+			if result[i].Env == result[j].Env {
+				return result[i].InstanceID < result[j].InstanceID
+			}
+			return result[i].Env < result[j].Env
 		}
 		return result[i].ServiceName < result[j].ServiceName
 	})
@@ -277,16 +360,17 @@ func (s *MemoryStore) ExpireRegistrations(now time.Time) []string {
 	defer s.mu.Unlock()
 
 	removed := make([]string, 0)
-	for id, reg := range s.registrations {
+	for instanceKey, reg := range s.registrations {
 		expiresAt := reg.LastHeartbeatTime.Add(time.Duration(reg.TTLSeconds) * time.Second)
 		if now.After(expiresAt) {
-			delete(s.registrations, id)
-			removed = append(removed, id)
+			s.deleteByInstanceKeyLocked(instanceKey)
+			removed = append(removed, reg.InstanceID)
 		}
 	}
 	if len(removed) > 0 {
 		s.resourceVersion++
 	}
+	sort.Strings(removed)
 	return removed
 }
 
@@ -306,5 +390,182 @@ func (s *MemoryStore) ReconnectTunnel() domain.TunnelState {
 		LastHeartbeatAt:   s.lastTunnelHB,
 		BridgeAddress:     "bridge.example.internal:443",
 		ReconnectBackoffM: []int{500, 1000, 2000, 5000},
+	}
+}
+
+func (s *MemoryStore) lookupDuplicateUpsertLocked(eventID string) (bool, domain.LocalRegistration, bool) {
+	if eventID == "" {
+		return false, domain.LocalRegistration{}, false
+	}
+	event, ok := s.processedEvents[eventID]
+	if !ok {
+		return false, domain.LocalRegistration{}, false
+	}
+	if event.action != "upsert" {
+		return true, domain.LocalRegistration{}, true
+	}
+	reg, exists := s.registrations[event.instanceKey]
+	if !exists {
+		return true, domain.LocalRegistration{}, true
+	}
+	return true, reg, true
+}
+
+func (s *MemoryStore) lookupDuplicateDeleteLocked(eventID string) (bool, bool) {
+	if eventID == "" {
+		return false, false
+	}
+	if _, ok := s.processedEvents[eventID]; !ok {
+		return false, false
+	}
+	return true, true
+}
+
+func (s *MemoryStore) addServiceIndexLocked(reg domain.LocalRegistration, instanceKey string) {
+	serviceKey := domain.NewServiceKey(reg.Env, reg.ServiceName).String()
+	instances, ok := s.serviceIndex[serviceKey]
+	if !ok {
+		instances = make(map[string]struct{})
+		s.serviceIndex[serviceKey] = instances
+	}
+	instances[instanceKey] = struct{}{}
+}
+
+func (s *MemoryStore) addEndpointIndexesLocked(reg domain.LocalRegistration, instanceKey string) {
+	for _, endpoint := range reg.Endpoints {
+		endpointKey := domain.NewEndpointKey(reg.Env, reg.ServiceName, reg.InstanceID, endpoint.Protocol, endpoint.ListenPort).String()
+		s.endpointIndex[endpointKey] = instanceKey
+	}
+}
+
+func (s *MemoryStore) removeEndpointIndexesLocked(reg domain.LocalRegistration) {
+	for _, endpoint := range reg.Endpoints {
+		endpointKey := domain.NewEndpointKey(reg.Env, reg.ServiceName, reg.InstanceID, endpoint.Protocol, endpoint.ListenPort).String()
+		delete(s.endpointIndex, endpointKey)
+	}
+}
+
+func (s *MemoryStore) deleteByInstanceKeyLocked(instanceKey string) {
+	reg, ok := s.registrations[instanceKey]
+	if !ok {
+		return
+	}
+
+	s.removeEndpointIndexesLocked(reg)
+
+	serviceKey := domain.NewServiceKey(reg.Env, reg.ServiceName).String()
+	if instances, exists := s.serviceIndex[serviceKey]; exists {
+		delete(instances, instanceKey)
+		if len(instances) == 0 {
+			delete(s.serviceIndex, serviceKey)
+		}
+	}
+
+	delete(s.instanceIndex, reg.InstanceID)
+	delete(s.registrations, instanceKey)
+}
+
+func (s *MemoryStore) recordProcessedEventLocked(eventID string, event processedEvent) {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return
+	}
+	if _, exists := s.processedEvents[eventID]; !exists {
+		s.processedOrder = append(s.processedOrder, eventID)
+	}
+	s.processedEvents[eventID] = event
+
+	if len(s.processedOrder) <= maxProcessedEventID {
+		return
+	}
+	oldest := s.processedOrder[0]
+	s.processedOrder = s.processedOrder[1:]
+	delete(s.processedEvents, oldest)
+}
+
+func validateRegistration(reg domain.LocalRegistration) error {
+	if strings.TrimSpace(reg.ServiceName) == "" || strings.TrimSpace(reg.Env) == "" || strings.TrimSpace(reg.InstanceID) == "" {
+		return fmt.Errorf("%w: serviceName/env/instanceId are required", ErrInvalidRegistration)
+	}
+	for _, endpoint := range reg.Endpoints {
+		if strings.TrimSpace(endpoint.Protocol) == "" {
+			return fmt.Errorf("%w: endpoint.protocol is required", ErrInvalidRegistration)
+		}
+		if endpoint.TargetPort <= 0 {
+			return fmt.Errorf("%w: endpoint.targetPort must be positive", ErrInvalidRegistration)
+		}
+	}
+	return nil
+}
+
+func normalizeRegistration(reg domain.LocalRegistration) domain.LocalRegistration {
+	reg.ServiceName = strings.TrimSpace(reg.ServiceName)
+	reg.Env = strings.TrimSpace(reg.Env)
+	reg.InstanceID = strings.TrimSpace(reg.InstanceID)
+	if reg.Metadata == nil {
+		reg.Metadata = map[string]string{}
+	}
+	if reg.TTLSeconds <= 0 {
+		reg.TTLSeconds = 30
+	}
+	if reg.Endpoints == nil {
+		reg.Endpoints = []domain.LocalEndpoint{}
+	}
+	return reg
+}
+
+func uniqueNormalizedEndpoints(reg domain.LocalRegistration) []domain.LocalEndpoint {
+	if len(reg.Endpoints) == 0 {
+		return []domain.LocalEndpoint{}
+	}
+	result := make([]domain.LocalEndpoint, 0, len(reg.Endpoints))
+	seen := make(map[string]struct{})
+	for _, endpoint := range reg.Endpoints {
+		normalized := normalizeEndpoint(endpoint)
+		key := fmt.Sprintf("%s|%d", normalized.Protocol, normalized.ListenPort)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, normalized)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Protocol == result[j].Protocol {
+			return result[i].ListenPort < result[j].ListenPort
+		}
+		return result[i].Protocol < result[j].Protocol
+	})
+	return result
+}
+
+func normalizeEndpoint(endpoint domain.LocalEndpoint) domain.LocalEndpoint {
+	endpoint.Protocol = strings.ToLower(strings.TrimSpace(endpoint.Protocol))
+	endpoint.ListenHost = strings.TrimSpace(endpoint.ListenHost)
+	endpoint.TargetHost = strings.TrimSpace(endpoint.TargetHost)
+	endpoint.Status = strings.TrimSpace(endpoint.Status)
+
+	if endpoint.TargetHost == "" {
+		endpoint.TargetHost = "127.0.0.1"
+	}
+	if endpoint.ListenHost == "" {
+		endpoint.ListenHost = "127.0.0.1"
+	}
+	if endpoint.ListenPort <= 0 {
+		endpoint.ListenPort = endpoint.TargetPort
+	}
+	if endpoint.Status == "" {
+		endpoint.Status = "active"
+	}
+	return endpoint
+}
+
+func buildRouteTarget(reg domain.LocalRegistration, endpoint domain.LocalEndpoint) domain.RouteTarget {
+	return domain.RouteTarget{
+		Env:         reg.Env,
+		ServiceName: reg.ServiceName,
+		Protocol:    endpoint.Protocol,
+		TargetHost:  endpoint.TargetHost,
+		TargetPort:  endpoint.TargetPort,
 	}
 }

@@ -65,6 +65,9 @@ type DiscoverResponse struct {
 	Resolution   string      `json:"resolution"`
 	RouteTarget  RouteTarget `json:"routeTarget"`
 	ResourceHint string      `json:"resourceHint"`
+	ServiceKey   string      `json:"serviceKey,omitempty"`
+	InstanceKey  string      `json:"instanceKey,omitempty"`
+	EndpointKey  string      `json:"endpointKey,omitempty"`
 }
 
 // TunnelState is surfaced to UI/Rust host.

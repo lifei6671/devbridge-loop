@@ -41,6 +41,8 @@
   - `GET /api/v1/state/errors`
   - `POST /api/v1/control/reconnect`
 - 内存态注册表 + TTL 过期摘除扫描
+- 注册键模型索引：`ServiceKey / InstanceKey / EndpointKey`
+- 事件幂等骨架：`x-event-id` 去重（重复 `register/unregister` 返回成功语义，不重复增加 `resourceVersion`）
 - 协议扩展接口占位：`ProtocolAdapter` / `IngressResolver` / `Forwarder` / `EgressProxy`
 
 2. `cloud-bridge`
@@ -97,3 +99,15 @@ npm run tauri:dev
 - `DEVLOOP_AGENT_API_BASE`：Rust Host 调用 agent-core 的 base URL
 - `DEVLOOP_AGENT_BINARY`：Rust Host 直接拉起的 agent-core 二进制路径
 - `DEVLOOP_AGENT_CORE_DIR`：Rust Host 用 `go run` 拉起 agent-core 时的工作目录
+
+## 事件头与 env 解析
+
+- `POST /api/v1/registrations`、`DELETE /api/v1/registrations/{instanceId}` 支持请求头：`x-event-id`（兼容 `X-Event-Id`）
+- 响应头：
+  - `X-Event-Id`
+  - `X-Event-Deduplicated`（`true/false`）
+- `POST /api/v1/discover` 的 env 解析顺序：
+  1. `x-env` / `X-Env`
+  2. 请求体 `env`
+  3. 运行时默认 `DEVLOOP_ENV_NAME`
+  4. `base`
