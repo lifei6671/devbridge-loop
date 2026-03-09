@@ -96,4 +96,19 @@ export interface DesktopConfigView {
   tunnelBackflowBaseUrl: string;
   platform: string;
   arch: string;
+  configDir: string;
+  logDir: string;
+  configFile: string;
+  configLoaded: boolean;
+}
+
+export interface DesktopConfigSaveRequest {
+  agentApiBase: string;
+  agentBinary: string | null;
+  agentCoreDir: string | null;
+  agentAutoRestart: boolean;
+  agentRestartBackoffMs: number[];
+  envResolveOrder: string[];
+  tunnelBridgeAddress: string;
+  tunnelBackflowBaseUrl: string;
 }

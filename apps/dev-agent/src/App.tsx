@@ -39,6 +39,7 @@ import type {
   ActiveIntercept,
   AgentRuntime,
   DesktopConfigView,
+  DesktopConfigSaveRequest,
   ErrorEntry,
   LocalRegistration,
   RequestSummary,
@@ -84,6 +85,28 @@ function renderHealthBadge(healthy: boolean): ReactElement {
   return <Badge variant="secondary">unhealthy</Badge>;
 }
 
+function parseNumberList(input: string): number[] {
+  const parsed = input
+    .split(",")
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isFinite(item) && item > 0);
+  if (parsed.length === 0) {
+    return [500, 1000, 2000, 5000];
+  }
+  return parsed;
+}
+
+function parseStringList(input: string): string[] {
+  const parsed = input
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  if (parsed.length === 0) {
+    return ["requestHeader", "payload", "runtimeDefault", "baseFallback"];
+  }
+  return parsed;
+}
+
 export default function App(): ReactElement {
   const [activePage, setActivePage] = useState<PageKey>("dashboard");
   const [summary, setSummary] = useState<StateSummary | null>(null);
@@ -94,8 +117,10 @@ export default function App(): ReactElement {
   const [runtime, setRuntime] = useState<AgentRuntime | null>(null);
   const [intercepts, setIntercepts] = useState<ActiveIntercept[]>([]);
   const [desktopConfig, setDesktopConfig] = useState<DesktopConfigView | null>(null);
+  const [desktopConfigDraft, setDesktopConfigDraft] = useState<DesktopConfigSaveRequest | null>(null);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string>("");
 
@@ -138,6 +163,16 @@ export default function App(): ReactElement {
       setRuntime(runtimeData);
       setIntercepts(interceptData);
       setDesktopConfig(desktopConfigData);
+      setDesktopConfigDraft({
+        agentApiBase: desktopConfigData.agentApiBase,
+        agentBinary: desktopConfigData.agentBinary,
+        agentCoreDir: desktopConfigData.agentCoreDir,
+        agentAutoRestart: desktopConfigData.agentAutoRestart,
+        agentRestartBackoffMs: desktopConfigData.agentRestartBackoffMs,
+        envResolveOrder: desktopConfigData.envResolveOrder,
+        tunnelBridgeAddress: desktopConfigData.tunnelBridgeAddress,
+        tunnelBackflowBaseUrl: desktopConfigData.tunnelBackflowBaseUrl
+      });
 
       // 当前选中的实例如果被删除，则回退到列表首项，保证详情页始终有有效目标。
       setSelectedInstanceId((current) => {
@@ -173,6 +208,34 @@ export default function App(): ReactElement {
       setActionError(String(error));
     }
   }, [refresh]);
+
+  const saveDesktopConfig = useCallback(async () => {
+    if (!desktopConfigDraft) {
+      return;
+    }
+    setSavingConfig(true);
+    setActionError("");
+    try {
+      const saved = await call<DesktopConfigView>("save_desktop_config", {
+        request: desktopConfigDraft
+      });
+      setDesktopConfig(saved);
+      setDesktopConfigDraft({
+        agentApiBase: saved.agentApiBase,
+        agentBinary: saved.agentBinary,
+        agentCoreDir: saved.agentCoreDir,
+        agentAutoRestart: saved.agentAutoRestart,
+        agentRestartBackoffMs: saved.agentRestartBackoffMs,
+        envResolveOrder: saved.envResolveOrder,
+        tunnelBridgeAddress: saved.tunnelBridgeAddress,
+        tunnelBackflowBaseUrl: saved.tunnelBackflowBaseUrl
+      });
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setSavingConfig(false);
+    }
+  }, [desktopConfigDraft]);
 
   const unregisterRegistration = useCallback(
     async (instanceId: string) => {
@@ -533,46 +596,157 @@ export default function App(): ReactElement {
       <Card>
         <CardHeader>
           <CardTitle>Desktop Host Config</CardTitle>
-          <CardDescription>由 Rust Host `get_desktop_config` 返回</CardDescription>
+          <CardDescription>本地配置目录与配置文件状态</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
+          <div>configLoaded: {desktopConfig?.configLoaded ? "true" : "false"}</div>
+          <div>configDir: {desktopConfig?.configDir ?? "-"}</div>
+          <div>logDir: {desktopConfig?.logDir ?? "-"}</div>
+          <div>configFile: {desktopConfig?.configFile ?? "-"}</div>
+          <div className="h-px w-full bg-border/70" />
           <div>platform: {desktopConfig?.platform ?? "-"}</div>
           <div>arch: {desktopConfig?.arch ?? "-"}</div>
-          <div>agentApiBase: {desktopConfig?.agentApiBase ?? "-"}</div>
-          <div>agentBinary: {desktopConfig?.agentBinary ?? "-"}</div>
-          <div>agentCoreDir: {desktopConfig?.agentCoreDir ?? "-"}</div>
-          <div>autoRestart: {desktopConfig?.agentAutoRestart ? "true" : "false"}</div>
-          <div>
-            restartBackoffMs:{" "}
-            {(desktopConfig?.agentRestartBackoffMs ?? []).join(", ") || "-"}
-          </div>
-          <div>
-            envResolveOrder: {(desktopConfig?.envResolveOrder ?? []).join(" > ") || "-"}
-          </div>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Agent Runtime Config</CardTitle>
-          <CardDescription>由 Go 状态接口与运行态接口组合展示</CardDescription>
+          <CardTitle>Desktop Config Editor</CardTitle>
+          <CardDescription>基础配置加载与保存（保存后重启桌面端生效）</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
-          <div>currentEnv: {summary?.currentEnv ?? "-"}</div>
-          <div>rdName: {summary?.rdName ?? "-"}</div>
-          <div>bridgeAddress: {tunnel?.bridgeAddress ?? "-"}</div>
-          <div>
-            reconnectBackoffMs: {(tunnel?.reconnectBackoffMs ?? []).join(", ") || "-"}
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">agentApiBase</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.agentApiBase ?? ""}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current ? { ...current, agentApiBase: event.target.value } : current
+                )
+              }
+            />
           </div>
-          <div>command: {runtime?.command ?? "-"}</div>
-          <div>startedAt: {formatTime(runtime?.startedAt)}</div>
-          <div>nextRestartAt: {formatTime(runtime?.nextRestartAt)}</div>
-          <div>
-            tunnelBackflowBaseUrl: {desktopConfig?.tunnelBackflowBaseUrl ?? "-"}
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">agentBinary</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.agentBinary ?? ""}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        agentBinary: event.target.value.trim() === "" ? null : event.target.value
+                      }
+                    : current
+                )
+              }
+            />
           </div>
-          <div>
-            tunnelBridgeAddress: {desktopConfig?.tunnelBridgeAddress ?? "-"}
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">agentCoreDir</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.agentCoreDir ?? ""}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        agentCoreDir: event.target.value.trim() === "" ? null : event.target.value
+                      }
+                    : current
+                )
+              }
+            />
           </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">agentRestartBackoffMs (csv)</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={(desktopConfigDraft?.agentRestartBackoffMs ?? []).join(",")}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        agentRestartBackoffMs: parseNumberList(event.target.value)
+                      }
+                    : current
+                )
+              }
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">envResolveOrder (csv)</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={(desktopConfigDraft?.envResolveOrder ?? []).join(",")}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        envResolveOrder: parseStringList(event.target.value)
+                      }
+                    : current
+                )
+              }
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">tunnelBridgeAddress</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.tunnelBridgeAddress ?? ""}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current ? { ...current, tunnelBridgeAddress: event.target.value } : current
+                )
+              }
+            />
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">tunnelBackflowBaseUrl</label>
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.tunnelBackflowBaseUrl ?? ""}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current ? { ...current, tunnelBackflowBaseUrl: event.target.value } : current
+                )
+              }
+            />
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={desktopConfigDraft?.agentAutoRestart ?? true}
+              onChange={(event) =>
+                setDesktopConfigDraft((current) =>
+                  current ? { ...current, agentAutoRestart: event.target.checked } : current
+                )
+              }
+            />
+            agentAutoRestart
+          </label>
+
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={savingConfig || !desktopConfigDraft}
+            onClick={() => void saveDesktopConfig()}
+          >
+            保存配置
+          </Button>
         </CardContent>
       </Card>
     </section>

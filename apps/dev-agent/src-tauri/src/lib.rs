@@ -1,34 +1,32 @@
 mod agent_api;
 mod agent_manager;
+mod host_config;
 
 use agent_api::AgentApiClient;
 use agent_manager::{AgentManager, AgentRuntime};
-use serde::Serialize;
+use host_config::{
+    apply_persisted_env_overrides, load_desktop_config, resolve_storage_paths,
+    save_desktop_config as save_desktop_config_file, DesktopConfigSaveRequest, DesktopConfigView,
+    HostStoragePaths,
+};
 use serde_json::Value;
 use std::sync::Mutex;
 use std::time::Duration;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 
 const AGENT_RUNTIME_EVENT: &str = "agent-runtime-changed";
+const MAIN_WINDOW_LABEL: &str = "main";
+const TRAY_ICON_ID: &str = "devloop-main-tray";
+const TRAY_MENU_SHOW_MAIN: &str = "tray-show-main";
+const TRAY_MENU_HIDE_MAIN: &str = "tray-hide-main";
+const TRAY_MENU_QUIT_APP: &str = "tray-quit-app";
 
 struct AppState {
     manager: Mutex<AgentManager>,
     api: AgentApiClient,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DesktopConfigView {
-    agent_api_base: String,
-    agent_binary: Option<String>,
-    agent_core_dir: Option<String>,
-    agent_auto_restart: bool,
-    agent_restart_backoff_ms: Vec<u64>,
-    env_resolve_order: Vec<String>,
-    tunnel_bridge_address: String,
-    tunnel_backflow_base_url: String,
-    platform: String,
-    arch: String,
+    storage: HostStoragePaths,
 }
 
 #[tauri::command]
@@ -75,40 +73,16 @@ async fn trigger_reconnect(state: tauri::State<'_, AppState>) -> Result<Value, S
 }
 
 #[tauri::command]
-fn get_desktop_config() -> DesktopConfigView {
-    let agent_http_addr =
-        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:19090".to_string());
-    let default_api_base =
-        if agent_http_addr.starts_with("http://") || agent_http_addr.starts_with("https://") {
-            agent_http_addr.clone()
-        } else {
-            format!("http://{}", agent_http_addr)
-        };
+fn get_desktop_config(state: tauri::State<'_, AppState>) -> Result<DesktopConfigView, String> {
+    load_desktop_config(&state.storage)
+}
 
-    // 配置页统一读取运行时环境变量，保证 UI 展示的是实际启动参数。
-    DesktopConfigView {
-        agent_api_base: std::env::var("DEVLOOP_AGENT_API_BASE").unwrap_or(default_api_base.clone()),
-        agent_binary: std::env::var("DEVLOOP_AGENT_BINARY").ok(),
-        agent_core_dir: std::env::var("DEVLOOP_AGENT_CORE_DIR").ok(),
-        agent_auto_restart: parse_auto_restart(
-            std::env::var("DEVLOOP_AGENT_AUTO_RESTART").unwrap_or_else(|_| "true".to_string()),
-        ),
-        agent_restart_backoff_ms: parse_backoff(
-            std::env::var("DEVLOOP_AGENT_RESTART_BACKOFF_MS")
-                .unwrap_or_else(|_| "500,1000,2000,5000".to_string()),
-        ),
-        env_resolve_order: parse_env_resolve_order(
-            std::env::var("DEVLOOP_ENV_RESOLVE_ORDER").unwrap_or_else(|_| {
-                "requestHeader,payload,runtimeDefault,baseFallback".to_string()
-            }),
-        ),
-        tunnel_bridge_address: std::env::var("DEVLOOP_TUNNEL_BRIDGE_ADDRESS")
-            .unwrap_or_else(|_| "http://127.0.0.1:18080".to_string()),
-        tunnel_backflow_base_url: std::env::var("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL")
-            .unwrap_or(default_api_base),
-        platform: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-    }
+#[tauri::command]
+fn save_desktop_config(
+    state: tauri::State<'_, AppState>,
+    request: DesktopConfigSaveRequest,
+) -> Result<DesktopConfigView, String> {
+    save_desktop_config_file(&state.storage, request)
 }
 
 #[tauri::command]
@@ -148,17 +122,35 @@ fn restart_agent_process(
 }
 
 pub fn run() {
-    let state = AppState {
-        manager: Mutex::new(AgentManager::new()),
-        api: AgentApiClient::new(
-            std::env::var("DEVLOOP_AGENT_API_BASE")
-                .unwrap_or_else(|_| "http://127.0.0.1:19090".to_string()),
-        ),
-    };
-
     tauri::Builder::default()
-        .manage(state)
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+
+            // 主窗口关闭时不退出进程，而是隐藏到托盘，便于后台持续工作。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
+            setup_tray(app.handle()).map_err(|err| std::io::Error::other(err))?;
+
+            let storage =
+                resolve_storage_paths(app.handle()).map_err(|err| std::io::Error::other(err))?;
+            apply_persisted_env_overrides(&storage).map_err(|err| std::io::Error::other(err))?;
+
+            // 先应用配置文件中的环境变量，再创建运行时依赖，确保启动参数与配置页一致。
+            app.manage(AppState {
+                manager: Mutex::new(AgentManager::new()),
+                api: AgentApiClient::new(
+                    std::env::var("DEVLOOP_AGENT_API_BASE")
+                        .unwrap_or_else(|_| "http://127.0.0.1:19090".to_string()),
+                ),
+                storage,
+            });
+
             // 启动阶段先拉起 agent-core，再向前端推送首个运行态快照。
             let startup_runtime = {
                 let state = app.state::<AppState>();
@@ -193,6 +185,7 @@ pub fn run() {
             unregister_registration,
             trigger_reconnect,
             get_desktop_config,
+            save_desktop_config,
             agent_runtime,
             restart_agent_process
         ])
@@ -227,37 +220,83 @@ fn emit_runtime_event(app_handle: &AppHandle, runtime: &AgentRuntime) -> Result<
         .map_err(|err| format!("emit runtime event failed: {err}"))
 }
 
-fn parse_auto_restart(value: String) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+fn setup_tray(app: &AppHandle) -> Result<(), String> {
+    // 托盘菜单提供主窗口显隐和完整退出两个核心操作，避免误关窗口导致进程退出。
+    let show_main = MenuItem::with_id(app, TRAY_MENU_SHOW_MAIN, "显示主窗口", true, None::<&str>)
+        .map_err(|err| format!("create tray menu item(show) failed: {err}"))?;
+    let hide_main = MenuItem::with_id(app, TRAY_MENU_HIDE_MAIN, "隐藏到托盘", true, None::<&str>)
+        .map_err(|err| format!("create tray menu item(hide) failed: {err}"))?;
+    let quit_app = MenuItem::with_id(
+        app,
+        TRAY_MENU_QUIT_APP,
+        "退出 DevLoop Agent",
+        true,
+        None::<&str>,
+    )
+    .map_err(|err| format!("create tray menu item(quit) failed: {err}"))?;
+    let separator = PredefinedMenuItem::separator(app)
+        .map_err(|err| format!("create tray menu separator failed: {err}"))?;
+    let tray_menu = Menu::with_items(app, &[&show_main, &hide_main, &separator, &quit_app])
+        .map_err(|err| format!("create tray menu failed: {err}"))?;
+
+    let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
+        .menu(&tray_menu)
+        .tooltip("DevLoop Agent")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id() == TRAY_MENU_SHOW_MAIN {
+                let _ = show_main_window(app);
+                return;
+            }
+            if event.id() == TRAY_MENU_HIDE_MAIN {
+                let _ = hide_main_window(app);
+                return;
+            }
+            if event.id() == TRAY_MENU_QUIT_APP {
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            // 左键抬起时恢复主窗口，右键仍用于弹出菜单。
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let _ = show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray_builder = tray_builder.icon(icon);
+    }
+
+    tray_builder
+        .build(app)
+        .map_err(|err| format!("build tray icon failed: {err}"))?;
+    Ok(())
 }
 
-fn parse_backoff(value: String) -> Vec<u64> {
-    let parsed = value
-        .split(',')
-        .filter_map(|item| item.trim().parse::<u64>().ok())
-        .filter(|item| *item > 0)
-        .collect::<Vec<_>>();
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| format!("main window not found: {MAIN_WINDOW_LABEL}"))?;
 
-    if parsed.is_empty() {
-        return vec![500, 1000, 2000, 5000];
-    }
-    parsed
+    // 恢复窗口时尽量取消最小化并聚焦；聚焦失败不影响显示。
+    window
+        .show()
+        .map_err(|err| format!("show main window failed: {err}"))?;
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(())
 }
 
-fn parse_env_resolve_order(value: String) -> Vec<String> {
-    let parsed = value
-        .split(',')
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-        .collect::<Vec<_>>();
-    if parsed.is_empty() {
-        return vec![
-            "requestHeader".to_string(),
-            "payload".to_string(),
-            "runtimeDefault".to_string(),
-            "baseFallback".to_string(),
-        ];
-    }
-    parsed
+fn hide_main_window(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    window
+        .hide()
+        .map_err(|err| format!("hide main window failed: {err}"))
 }

@@ -97,11 +97,15 @@ pub fn apply_persisted_env_overrides(storage: &HostStoragePaths) -> Result<(), S
         "DEVLOOP_AGENT_RESTART_BACKOFF_MS",
         file.agent_restart_backoff_ms
             .as_ref()
-            .map(|values| join_u64(values)),
+            .map(|values| join_u64(values))
+            .as_deref(),
     );
     set_env_if_absent(
         "DEVLOOP_ENV_RESOLVE_ORDER",
-        file.env_resolve_order.as_ref().map(|values| values.join(",")),
+        file.env_resolve_order
+            .as_ref()
+            .map(|values| values.join(","))
+            .as_deref(),
     );
     set_env_if_absent(
         "DEVLOOP_TUNNEL_BRIDGE_ADDRESS",
@@ -239,14 +243,11 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     }
 }
 
-fn set_env_if_absent<V>(key: &str, value: V)
-where
-    V: Into<Option<String>>,
-{
+fn set_env_if_absent(key: &str, value: Option<&str>) {
     if std::env::var_os(key).is_some() {
         return;
     }
-    if let Some(value) = value.into() {
+    if let Some(value) = value {
         let normalized = value.trim();
         if !normalized.is_empty() {
             std::env::set_var(key, normalized);

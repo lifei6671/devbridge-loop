@@ -106,8 +106,11 @@
   - 服务列表页：实例详情查看 + 手动注销
   - ActiveIntercept 列表页（实时读取 `/api/v1/state/intercepts`）
   - 日志页（实时读取 `/api/v1/state/errors`）
-  - 配置页（Rust Host 运行配置 + Agent 运行配置）
+  - 配置页支持桌面配置加载与保存
   - 刷新 + 手动重连 + 手动重启
+  - 新增命令：
+    - `get_desktop_config`
+    - `save_desktop_config`
 
 4. 业务系统 `registry=agent` 接入（Go）
 - 适配器包：`agent-core/pkg/registry`
@@ -197,6 +200,15 @@ npm run tauri:dev
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
 - `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:19090`）
 - `DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC`：bridge 调用 agent 回流接口的超时秒数（默认 `10`）
+
+## 桌面配置持久化
+
+- Rust Host 启动后会自动创建配置目录与日志目录，并加载 `desktop-config.json`
+- 配置文件路径通过 `get_desktop_config` 返回：
+  - `configDir`
+  - `logDir`
+  - `configFile`
+- 当前实现优先级：环境变量 > 配置文件 > 默认值
 
 ## 事件头与 env 解析
 
