@@ -79,6 +79,7 @@ type BridgeRoute struct {
 	Env         string `json:"env"`
 	ServiceName string `json:"serviceName"`
 	Protocol    string `json:"protocol"`
+	InstanceID  string `json:"instanceId"`
 	BridgeHost  string `json:"bridgeHost"`
 	BridgePort  int    `json:"bridgePort"`
 	TunnelID    string `json:"tunnelId"`

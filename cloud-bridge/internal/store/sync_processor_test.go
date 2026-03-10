@@ -207,3 +207,86 @@ func TestProcessTunnelEventFullSyncAndIncrementalDelete(t *testing.T) {
 		t.Fatalf("unexpected route bridge address: %+v", routes[0])
 	}
 }
+
+func TestProcessTunnelEventRegisterDeleteByInstanceID(t *testing.T) {
+	s := NewMemoryStoreWithBridge("bridge.devloop.internal", 8443)
+
+	_, err := s.ProcessTunnelEvent(domain.TunnelEvent{
+		Type:            domain.TunnelMessageHELLO,
+		SessionEpoch:    1,
+		ResourceVersion: 1,
+		EventID:         "evt-hello-instance-delete",
+		Payload: map[string]any{
+			"tunnelId": "tunnel-instance-delete",
+		},
+	})
+	if err != nil {
+		t.Fatalf("HELLO should succeed: %v", err)
+	}
+
+	_, err = s.ProcessTunnelEvent(domain.TunnelEvent{
+		Type:            domain.TunnelMessageRegisterUpsert,
+		SessionEpoch:    1,
+		ResourceVersion: 2,
+		EventID:         "evt-upsert-inst-a",
+		Payload: map[string]any{
+			"tunnelId":    "tunnel-instance-delete",
+			"env":         "dev-a",
+			"serviceName": "user",
+			"protocol":    "http",
+			"instanceId":  "inst-a",
+			"targetPort":  18080,
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert inst-a should succeed: %v", err)
+	}
+
+	_, err = s.ProcessTunnelEvent(domain.TunnelEvent{
+		Type:            domain.TunnelMessageRegisterUpsert,
+		SessionEpoch:    1,
+		ResourceVersion: 3,
+		EventID:         "evt-upsert-inst-b",
+		Payload: map[string]any{
+			"tunnelId":    "tunnel-instance-delete",
+			"env":         "dev-a",
+			"serviceName": "user",
+			"protocol":    "http",
+			"instanceId":  "inst-b",
+			"targetPort":  18080,
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert inst-b should succeed: %v", err)
+	}
+
+	routes := s.ListRoutes()
+	if len(routes) != 2 {
+		t.Fatalf("expected 2 routes before delete, got %d", len(routes))
+	}
+
+	_, err = s.ProcessTunnelEvent(domain.TunnelEvent{
+		Type:            domain.TunnelMessageRegisterDelete,
+		SessionEpoch:    1,
+		ResourceVersion: 4,
+		EventID:         "evt-delete-inst-a",
+		Payload: map[string]any{
+			"tunnelId":    "tunnel-instance-delete",
+			"env":         "dev-a",
+			"serviceName": "user",
+			"protocol":    "http",
+			"instanceId":  "inst-a",
+		},
+	})
+	if err != nil {
+		t.Fatalf("delete inst-a should succeed: %v", err)
+	}
+
+	routes = s.ListRoutes()
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route after instance delete, got %d", len(routes))
+	}
+	if routes[0].InstanceID != "inst-b" {
+		t.Fatalf("unexpected remaining route after instance delete: %+v", routes[0])
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -137,6 +138,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/config/file", h.withAdminAuth(h.adminSaveConfigFile))
 	mux.HandleFunc("GET /api/v1/admin/config/model", h.withAdminAuth(h.adminGetConfigModel))
 	mux.HandleFunc("POST /api/v1/admin/config/model", h.withAdminAuth(h.adminSaveConfigModel))
+	mux.HandleFunc("POST /api/v1/admin/discovery/test", h.withAdminAuth(h.adminTestDiscoveryBackend))
 	mux.HandleFunc("/api/v1/ingress/http", h.ingressHTTP)
 	mux.HandleFunc("/api/v1/ingress/http/", h.ingressHTTP)
 	mux.HandleFunc("/api/v1/ingress/grpc", h.ingressGRPC)
@@ -345,6 +347,175 @@ func (h *Handler) adminSaveConfigModel(w http.ResponseWriter, r *http.Request) {
 		"restarting": true,
 		"message":    "config saved, bridge is restarting",
 	})
+}
+
+func (h *Handler) adminTestDiscoveryBackend(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Backend   string                      `json:"backend"`
+		TimeoutMs int                         `json:"timeoutMs"`
+		Discovery config.AdminDiscoveryConfig `json:"discovery"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   "invalid payload",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	backend := normalizeDiscoveryBackendForAdmin(request.Backend, request.Discovery.Backends)
+	if backend == "local" {
+		// local 发现仅依赖本地文件，不涉及远端网络连通性。
+		respondJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":      false,
+			"backend": backend,
+			"message": "local 发现依赖本地配置文件，不需要远端连通性测试",
+		})
+		return
+	}
+
+	timeoutMs := request.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = request.Discovery.TimeoutMs
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 2000
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	// 使用与生产发现器相同的请求路径做探测，避免“能连端口但 API 不通”的误判。
+	message, err := probeDiscoveryBackend(ctx, backend, request.Discovery, timeoutMs)
+	if err != nil {
+		respondJSON(w, http.StatusBadGateway, map[string]any{
+			"ok":      false,
+			"backend": backend,
+			"message": err.Error(),
+		})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"backend": backend,
+		"message": message,
+	})
+}
+
+func probeDiscoveryBackend(ctx context.Context, backend string, cfg config.AdminDiscoveryConfig, timeoutMs int) (string, error) {
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	query := discovery.Query{
+		Env:         "base",
+		ServiceName: "__devloop_probe__",
+		Protocol:    "http",
+	}
+
+	// 仅测试连通性：即便未命中实例/键值，只要 API 请求成功就判定可达。
+	switch backend {
+	case "nacos":
+		addr, err := normalizeDiscoveryProbeAddress(cfg.Nacos.Addr)
+		if err != nil {
+			return "", fmt.Errorf("nacos 地址无效: %w", err)
+		}
+		resolver := discovery.NewNacosResolver(discovery.NacosConfig{
+			ServerAddr:     addr,
+			Namespace:      cfg.Nacos.Namespace,
+			Group:          cfg.Nacos.Group,
+			ServicePattern: cfg.Nacos.ServicePattern,
+			Username:       cfg.Nacos.Username,
+			Password:       cfg.Nacos.Password,
+			Timeout:        timeout,
+		})
+		if _, _, err := resolver.Resolve(ctx, query); err != nil {
+			return "", fmt.Errorf("nacos 连通失败: %w", err)
+		}
+		return "nacos 连通成功（未命中实例也视为连通）", nil
+	case "etcd":
+		endpoints := make([]string, 0, len(cfg.Etcd.Endpoints))
+		for _, endpoint := range cfg.Etcd.Endpoints {
+			normalized, err := normalizeDiscoveryProbeAddress(endpoint)
+			if err != nil {
+				return "", fmt.Errorf("etcd endpoint 无效(%s): %w", endpoint, err)
+			}
+			endpoints = append(endpoints, normalized)
+		}
+		if len(endpoints) == 0 {
+			return "", fmt.Errorf("etcd endpoints 不能为空")
+		}
+		resolver := discovery.NewEtcdResolver(discovery.EtcdConfig{
+			Endpoints: endpoints,
+			KeyPrefix: cfg.Etcd.KeyPrefix,
+			Timeout:   timeout,
+		})
+		if _, _, err := resolver.Resolve(ctx, query); err != nil {
+			return "", fmt.Errorf("etcd 连通失败: %w", err)
+		}
+		return "etcd 连通成功（未命中键值也视为连通）", nil
+	case "consul":
+		addr, err := normalizeDiscoveryProbeAddress(cfg.Consul.Addr)
+		if err != nil {
+			return "", fmt.Errorf("consul 地址无效: %w", err)
+		}
+		resolver := discovery.NewConsulResolver(discovery.ConsulConfig{
+			Addr:           addr,
+			Datacenter:     cfg.Consul.Datacenter,
+			ServicePattern: cfg.Consul.ServicePattern,
+			Timeout:        timeout,
+		})
+		if _, _, err := resolver.Resolve(ctx, query); err != nil {
+			return "", fmt.Errorf("consul 连通失败: %w", err)
+		}
+		return "consul 连通成功（未命中实例也视为连通）", nil
+	default:
+		return "", fmt.Errorf("unsupported backend: %s", backend)
+	}
+}
+
+func normalizeDiscoveryBackendForAdmin(primary string, candidates []string) string {
+	if backend := normalizeDiscoveryBackend(primary); backend != "" {
+		return backend
+	}
+	for _, candidate := range candidates {
+		if backend := normalizeDiscoveryBackend(candidate); backend != "" {
+			return backend
+		}
+	}
+	return "local"
+}
+
+func normalizeDiscoveryBackend(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "local":
+		return "local"
+	case "nacos":
+		return "nacos"
+	case "etcd":
+		return "etcd"
+	case "consul":
+		return "consul"
+	default:
+		return ""
+	}
+}
+
+func normalizeDiscoveryProbeAddress(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("address is empty")
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "http://" + trimmed
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("host is empty")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
@@ -945,7 +1116,12 @@ const adminConfigPageHTML = `<!doctype html>
       gap:12px;
     }
     .section{display:none}
-    .section.active{display:block}
+    /* 各菜单分区统一使用纵向间距，避免多面板边框黏连。 */
+    .section.active{
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+    }
     .panel{
       border:1px solid var(--line);
       border-radius:14px;
@@ -1043,6 +1219,93 @@ const adminConfigPageHTML = `<!doctype html>
     .message.ok{color:var(--ok)}
     .message.err{color:var(--err)}
     .hidden{display:none !important}
+    .meta-inline{
+      display:flex;
+      gap:14px;
+      flex-wrap:wrap;
+      align-items:center;
+      font-size:12px;
+      color:var(--muted);
+      font-weight:700;
+    }
+    .table-wrap{
+      width:100%;
+      overflow:auto;
+      border:1px solid var(--line);
+      border-radius:10px;
+      background:#fff;
+    }
+    .simple-table{
+      width:100%;
+      border-collapse:collapse;
+      min-width:860px;
+      font-size:12px;
+    }
+    .simple-table th,
+    .simple-table td{
+      border-bottom:1px solid var(--line);
+      padding:8px 9px;
+      text-align:left;
+      white-space:nowrap;
+      vertical-align:top;
+    }
+    .simple-table th{
+      position:sticky;
+      top:0;
+      background:#f8fafc;
+      color:#374151;
+      z-index:1;
+    }
+    .simple-table tr:last-child td{
+      border-bottom:none;
+    }
+    .empty-text{
+      color:var(--muted);
+      text-align:center;
+    }
+    .log-panel{
+      border:1px solid var(--line);
+      border-radius:10px;
+      background:#fff;
+      padding:10px;
+    }
+    .log-list{
+      margin:0;
+      padding:0;
+      list-style:none;
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      max-height:220px;
+      overflow:auto;
+    }
+    .log-item{
+      display:grid;
+      grid-template-columns:auto auto 1fr;
+      gap:8px;
+      align-items:start;
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:6px 8px;
+      font-size:12px;
+      background:#fafbff;
+    }
+    .log-time{
+      color:var(--muted);
+      font-family:"JetBrains Mono","Fira Code","Consolas",monospace;
+      white-space:nowrap;
+    }
+    .log-tag{
+      font-weight:800;
+      white-space:nowrap;
+    }
+    .log-tag.ok{color:var(--ok)}
+    .log-tag.err{color:var(--err)}
+    .log-tag.info{color:#1d4ed8}
+    .log-message{
+      color:var(--text);
+      word-break:break-word;
+    }
     @media (max-width:980px){
       .layout{grid-template-columns:1fr}
       .sidebar{position:static}
@@ -1060,6 +1323,7 @@ const adminConfigPageHTML = `<!doctype html>
       </div>
       <div class="menu">
         <button class="menu-item active" data-section="basic">基础设置</button>
+        <button class="menu-item" data-section="tunnel">隧道看板</button>
         <button class="menu-item" data-section="auth">控制台认证</button>
         <button class="menu-item" data-section="protocol">协议设置</button>
         <button class="menu-item" data-section="discovery">服务发现</button>
@@ -1108,6 +1372,62 @@ const adminConfigPageHTML = `<!doctype html>
           </div>
         </section>
 
+        <section id="section-tunnel" class="section">
+          <div class="panel">
+            <h3>AgentCore 连接与隧道状态</h3>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <div class="meta-inline">
+                <span id="tunnelSummary">连接中的 AgentCore: 0/0</span>
+                <span id="tunnelResourceSummary">接管: 0 | 路由: 0</span>
+                <span id="tunnelLastRefresh">最后刷新: -</span>
+              </div>
+              <button id="refreshTunnelBtn" class="btn-secondary" type="button">刷新隧道信息</button>
+            </div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="simple-table">
+                <thead>
+                  <tr>
+                    <th>rdName</th>
+                    <th>tunnelId</th>
+                    <th>connId</th>
+                    <th>状态</th>
+                    <th>sessionEpoch</th>
+                    <th>resourceVersion</th>
+                    <th>最后心跳</th>
+                    <th>接管数</th>
+                    <th>路由数</th>
+                    <th>backflowBaseUrl</th>
+                  </tr>
+                </thead>
+                <tbody id="tunnelSessionRows">
+                  <tr><td colspan="10" class="empty-text">暂无连接中的 AgentCore</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <h3>隧道路由明细</h3>
+            <div class="table-wrap">
+              <table class="simple-table">
+                <thead>
+                  <tr>
+                    <th>env</th>
+                    <th>service</th>
+                    <th>protocol</th>
+                    <th>instanceId</th>
+                    <th>tunnelId</th>
+                    <th>targetPort</th>
+                    <th>bridge出口</th>
+                  </tr>
+                </thead>
+                <tbody id="tunnelRouteRows">
+                  <tr><td colspan="7" class="empty-text">暂无隧道路由</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
         <section id="section-protocol" class="section">
           <div class="panel">
             <h3>同步协议</h3>
@@ -1129,16 +1449,20 @@ const adminConfigPageHTML = `<!doctype html>
 
         <section id="section-discovery" class="section">
           <div class="panel">
-            <h3>发现总开关</h3>
-            <div class="chips">
-              <label class="chip"><input id="backendLocal" type="checkbox" />local</label>
-              <label class="chip"><input id="backendNacos" type="checkbox" />nacos</label>
-              <label class="chip"><input id="backendEtcd" type="checkbox" />etcd</label>
-              <label class="chip"><input id="backendConsul" type="checkbox" />consul</label>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <h3 style="margin:0">发现总开关（单选）</h3>
+              <button id="testDiscoveryBtn" class="btn-secondary" type="button">测试连通性</button>
             </div>
+            <div class="chips">
+              <label class="chip"><input id="backendLocal" name="discoveryBackend" type="radio" value="local" />local</label>
+              <label class="chip"><input id="backendNacos" name="discoveryBackend" type="radio" value="nacos" />nacos</label>
+              <label class="chip"><input id="backendEtcd" name="discoveryBackend" type="radio" value="etcd" />etcd</label>
+              <label class="chip"><input id="backendConsul" name="discoveryBackend" type="radio" value="consul" />consul</label>
+            </div>
+            <div id="discoveryTestResult" class="message" style="margin-top:8px"></div>
             <div class="grid" style="margin-top:10px">
               <div class="field"><label>发现超时(ms)</label><input id="discoveryTimeoutMs" type="number" min="1" /></div>
-              <div class="field"><label>local 配置文件</label><input id="discoveryLocalFile" placeholder="./bridge-config.yaml" /></div>
+              <div id="localFileField" class="field"><label>local 配置文件</label><input id="discoveryLocalFile" placeholder="./bridge-config.yaml" /></div>
             </div>
           </div>
           <div id="nacosPanel" class="panel">
@@ -1165,6 +1489,17 @@ const adminConfigPageHTML = `<!doctype html>
               <div class="field"><label>地址</label><input id="consulAddr" placeholder="127.0.0.1:8500" /></div>
               <div class="field"><label>Datacenter</label><input id="consulDatacenter" /></div>
               <div class="field"><label>Service Pattern</label><input id="consulServicePattern" placeholder="${service}" /></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <h3 style="margin:0">连通性日志</h3>
+              <button id="clearDiscoveryLogBtn" class="btn-secondary" type="button">清空日志</button>
+            </div>
+            <div class="log-panel" style="margin-top:10px">
+              <ul id="discoveryTestLogs" class="log-list">
+                <li class="empty-text">暂无测试记录</li>
+              </ul>
             </div>
           </div>
         </section>
@@ -1203,6 +1538,16 @@ const adminConfigPageHTML = `<!doctype html>
       addRouteBtn: document.getElementById('addRouteBtn'),
       routeRows: document.getElementById('routeRows'),
       routeTpl: document.getElementById('routeRowTpl'),
+      refreshTunnelBtn: document.getElementById('refreshTunnelBtn'),
+      tunnelSessionRows: document.getElementById('tunnelSessionRows'),
+      tunnelRouteRows: document.getElementById('tunnelRouteRows'),
+      tunnelSummary: document.getElementById('tunnelSummary'),
+      tunnelResourceSummary: document.getElementById('tunnelResourceSummary'),
+      tunnelLastRefresh: document.getElementById('tunnelLastRefresh'),
+      testDiscoveryBtn: document.getElementById('testDiscoveryBtn'),
+      discoveryTestResult: document.getElementById('discoveryTestResult'),
+      discoveryTestLogs: document.getElementById('discoveryTestLogs'),
+      clearDiscoveryLogBtn: document.getElementById('clearDiscoveryLogBtn'),
     };
     let currentPath = '';
 
@@ -1227,6 +1572,10 @@ const adminConfigPageHTML = `<!doctype html>
         const section = btn.dataset.section;
         document.querySelectorAll('.section').forEach((s)=>s.classList.remove('active'));
         text('section-' + section).classList.add('active');
+        // 切到“隧道看板”时立即刷新一次，避免看到历史缓存数据。
+        if(section === 'tunnel'){
+          loadTunnelDashboard(true);
+        }
       });
     });
 
@@ -1238,14 +1587,44 @@ const adminConfigPageHTML = `<!doctype html>
       const showDetail = checked('adminAuthEnabled');
       text('adminAuthDetail').classList.toggle('hidden', !showDetail);
     }
+    function getSelectedDiscoveryBackend(){
+      const selected = document.querySelector('input[name="discoveryBackend"]:checked');
+      return selected?.value || 'local';
+    }
+    function setSelectedDiscoveryBackend(backend){
+      const normalized = ['local','nacos','etcd','consul'].includes(String(backend || '').toLowerCase())
+        ? String(backend).toLowerCase()
+        : 'local';
+      setChecked('backendLocal', normalized === 'local');
+      setChecked('backendNacos', normalized === 'nacos');
+      setChecked('backendEtcd', normalized === 'etcd');
+      setChecked('backendConsul', normalized === 'consul');
+    }
     function updateDiscoveryVisibility(){
-      text('nacosPanel').classList.toggle('hidden', !checked('backendNacos'));
-      text('etcdPanel').classList.toggle('hidden', !checked('backendEtcd'));
-      text('consulPanel').classList.toggle('hidden', !checked('backendConsul'));
+      const selected = getSelectedDiscoveryBackend();
+      text('nacosPanel').classList.toggle('hidden', selected !== 'nacos');
+      text('etcdPanel').classList.toggle('hidden', selected !== 'etcd');
+      text('consulPanel').classList.toggle('hidden', selected !== 'consul');
+      text('localFileField').classList.toggle('hidden', selected !== 'local');
+      setDiscoveryTestMessage('');
+      updateDiscoveryTestButtonState();
+    }
+    function updateDiscoveryTestButtonState(){
+      const selected = getSelectedDiscoveryBackend();
+      if(!dom.testDiscoveryBtn){
+        return;
+      }
+      if(selected === 'local'){
+        dom.testDiscoveryBtn.disabled = true;
+        dom.testDiscoveryBtn.textContent = '本地无需测试';
+        return;
+      }
+      dom.testDiscoveryBtn.disabled = false;
+      dom.testDiscoveryBtn.textContent = '测试连通性';
     }
     text('syncMasque').addEventListener('change', updateProtocolVisibility);
     text('adminAuthEnabled').addEventListener('change', updateAdminAuthVisibility);
-    ['backendNacos','backendEtcd','backendConsul'].forEach((id)=>{
+    ['backendLocal','backendNacos','backendEtcd','backendConsul'].forEach((id)=>{
       text(id).addEventListener('change', updateDiscoveryVisibility);
     });
 
@@ -1281,11 +1660,8 @@ const adminConfigPageHTML = `<!doctype html>
       text('masqueAuthMode').value = model.masque?.authMode || 'psk';
       text('masquePsk').value = model.masque?.psk || '';
 
-      const backends = new Set(model.discovery?.backends || []);
-      setChecked('backendLocal', backends.has('local'));
-      setChecked('backendNacos', backends.has('nacos'));
-      setChecked('backendEtcd', backends.has('etcd'));
-      setChecked('backendConsul', backends.has('consul'));
+      const selectedBackend = (model.discovery?.backends || [])[0] || 'local';
+      setSelectedDiscoveryBackend(selectedBackend);
       text('discoveryTimeoutMs').value = model.discovery?.timeoutMs || '';
       text('discoveryLocalFile').value = model.discovery?.localFile || '';
 
@@ -1314,18 +1690,157 @@ const adminConfigPageHTML = `<!doctype html>
       return String(input || '').split(',').map(v=>v.trim()).filter(Boolean);
     }
 
+    function escapeHTML(value){
+      return String(value ?? '').replace(/[&<>"']/g, (char)=>{
+        return ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[char] || char;
+      });
+    }
+
+    function formatTime(value){
+      if(!value){
+        return '-';
+      }
+      const date = new Date(value);
+      if(Number.isNaN(date.getTime())){
+        return String(value);
+      }
+      return date.toLocaleString('zh-CN', { hour12:false });
+    }
+
+    function setTunnelRefreshLoading(loading){
+      if(!dom.refreshTunnelBtn){
+        return;
+      }
+      dom.refreshTunnelBtn.disabled = !!loading;
+      dom.refreshTunnelBtn.textContent = loading ? '刷新中...' : '刷新隧道信息';
+    }
+
+    function countByTunnel(items){
+      const counter = {};
+      (Array.isArray(items) ? items : []).forEach((item)=>{
+        const tunnelId = String(item?.tunnelId || '').trim();
+        if(!tunnelId){
+          return;
+        }
+        counter[tunnelId] = (counter[tunnelId] || 0) + 1;
+      });
+      return counter;
+    }
+
+    function renderTunnelSessionTable(sessions, intercepts, routes){
+      const rows = Array.isArray(sessions) ? sessions.slice() : [];
+      const interceptCount = countByTunnel(intercepts);
+      const routeCount = countByTunnel(routes);
+
+      rows.sort((a, b)=>{
+        return String(b?.connectedAt || '').localeCompare(String(a?.connectedAt || ''));
+      });
+
+      if(rows.length === 0){
+        dom.tunnelSessionRows.innerHTML = '<tr><td colspan="10" class="empty-text">暂无连接中的 AgentCore</td></tr>';
+        return;
+      }
+
+      dom.tunnelSessionRows.innerHTML = rows.map((session)=>{
+        const tunnelId = String(session?.tunnelId || '').trim();
+        return '<tr>' +
+          '<td>' + escapeHTML(session?.rdName || '-') + '</td>' +
+          '<td>' + escapeHTML(tunnelId || '-') + '</td>' +
+          '<td>' + escapeHTML(session?.connId || '-') + '</td>' +
+          '<td>' + escapeHTML(session?.status || '-') + '</td>' +
+          '<td>' + escapeHTML(session?.sessionEpoch || 0) + '</td>' +
+          '<td>' + escapeHTML(session?.resourceVersion || 0) + '</td>' +
+          '<td>' + escapeHTML(formatTime(session?.lastHeartbeatAt)) + '</td>' +
+          '<td>' + escapeHTML(interceptCount[tunnelId] || 0) + '</td>' +
+          '<td>' + escapeHTML(routeCount[tunnelId] || 0) + '</td>' +
+          '<td>' + escapeHTML(session?.backflowBaseUrl || '-') + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function renderTunnelRouteTable(routes){
+      const rows = Array.isArray(routes) ? routes.slice() : [];
+      rows.sort((a, b)=>{
+        const left = [a?.env, a?.serviceName, a?.protocol, a?.instanceId].map((value)=>String(value || '')).join('|');
+        const right = [b?.env, b?.serviceName, b?.protocol, b?.instanceId].map((value)=>String(value || '')).join('|');
+        return left.localeCompare(right);
+      });
+
+      if(rows.length === 0){
+        dom.tunnelRouteRows.innerHTML = '<tr><td colspan="7" class="empty-text">暂无隧道路由</td></tr>';
+        return;
+      }
+
+      dom.tunnelRouteRows.innerHTML = rows.map((route)=>{
+        const bridgeAddress = String(route?.bridgeHost || '-') + ':' + String(route?.bridgePort || '-');
+        return '<tr>' +
+          '<td>' + escapeHTML(route?.env || '-') + '</td>' +
+          '<td>' + escapeHTML(route?.serviceName || '-') + '</td>' +
+          '<td>' + escapeHTML(route?.protocol || '-') + '</td>' +
+          '<td>' + escapeHTML(route?.instanceId || '-') + '</td>' +
+          '<td>' + escapeHTML(route?.tunnelId || '-') + '</td>' +
+          '<td>' + escapeHTML(route?.targetPort || 0) + '</td>' +
+          '<td>' + escapeHTML(bridgeAddress) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function renderTunnelSummary(sessions, intercepts, routes){
+      const sessionList = Array.isArray(sessions) ? sessions : [];
+      const connected = sessionList.filter((session)=>{
+        return String(session?.status || '').toLowerCase() === 'connected';
+      }).length;
+      const interceptCount = Array.isArray(intercepts) ? intercepts.length : 0;
+      const routeCount = Array.isArray(routes) ? routes.length : 0;
+
+      dom.tunnelSummary.textContent = '连接中的 AgentCore: ' + connected + '/' + sessionList.length;
+      dom.tunnelResourceSummary.textContent = '接管: ' + interceptCount + ' | 路由: ' + routeCount;
+      dom.tunnelLastRefresh.textContent = '最后刷新: ' + formatTime(new Date().toISOString());
+    }
+
+    async function loadTunnelDashboard(silent){
+      if(!silent){
+        setTunnelRefreshLoading(true);
+      }
+      try{
+        const [sessionResp, interceptResp, routeResp] = await Promise.all([
+          fetch('/api/v1/state/sessions', { cache:'no-store' }),
+          fetch('/api/v1/state/intercepts', { cache:'no-store' }),
+          fetch('/api/v1/state/routes', { cache:'no-store' }),
+        ]);
+
+        if(sessionResp.status === 401 || interceptResp.status === 401 || routeResp.status === 401){
+          throw new Error('认证失败，请刷新页面后重新登录。');
+        }
+        if(!sessionResp.ok || !interceptResp.ok || !routeResp.ok){
+          throw new Error('读取隧道状态失败。');
+        }
+
+        const [sessions, intercepts, routes] = await Promise.all([
+          sessionResp.json(),
+          interceptResp.json(),
+          routeResp.json(),
+        ]);
+
+        renderTunnelSummary(sessions, intercepts, routes);
+        renderTunnelSessionTable(sessions, intercepts, routes);
+        renderTunnelRouteTable(routes);
+      }catch(err){
+        if(!silent){
+          setMessage('加载隧道信息失败: ' + (err.message || err), 'err');
+        }
+      }finally{
+        if(!silent){
+          setTunnelRefreshLoading(false);
+        }
+      }
+    }
+
     function collectModel(){
       const tunnelSyncProtocols = [];
       if (checked('syncHttp')) tunnelSyncProtocols.push('http');
       if (checked('syncMasque')) tunnelSyncProtocols.push('masque');
       if (tunnelSyncProtocols.length === 0) tunnelSyncProtocols.push('masque');
-
-      const backends = [];
-      if (checked('backendLocal')) backends.push('local');
-      if (checked('backendNacos')) backends.push('nacos');
-      if (checked('backendEtcd')) backends.push('etcd');
-      if (checked('backendConsul')) backends.push('consul');
-      if (backends.length === 0) backends.push('local');
 
       const routes = Array.from(dom.routeRows.querySelectorAll('.route-row')).map((row)=>{
         return {
@@ -1361,30 +1876,140 @@ const adminConfigPageHTML = `<!doctype html>
           fallbackBackflowUrl: text('fallbackBackflowUrl').value.trim(),
           timeoutSec: Number(text('ingressTimeoutSec').value || 0),
         },
-        discovery: {
-          backends,
-          timeoutMs: Number(text('discoveryTimeoutMs').value || 0),
-          localFile: text('discoveryLocalFile').value.trim(),
-          nacos: {
-            addr: text('nacosAddr').value.trim(),
-            namespace: text('nacosNamespace').value.trim(),
-            group: text('nacosGroup').value.trim(),
-            servicePattern: text('nacosServicePattern').value.trim(),
-            username: text('nacosUsername').value.trim(),
-            password: text('nacosPassword').value,
-          },
-          etcd: {
-            endpoints: splitList(text('etcdEndpoints').value),
-            keyPrefix: text('etcdKeyPrefix').value.trim(),
-          },
-          consul: {
-            addr: text('consulAddr').value.trim(),
-            datacenter: text('consulDatacenter').value.trim(),
-            servicePattern: text('consulServicePattern').value.trim(),
-          }
-        },
+        discovery: collectDiscoveryModel(),
         routes,
       };
+    }
+
+    function collectDiscoveryModel(){
+      return {
+        backends: [getSelectedDiscoveryBackend()],
+        timeoutMs: Number(text('discoveryTimeoutMs').value || 0),
+        localFile: text('discoveryLocalFile').value.trim(),
+        nacos: {
+          addr: text('nacosAddr').value.trim(),
+          namespace: text('nacosNamespace').value.trim(),
+          group: text('nacosGroup').value.trim(),
+          servicePattern: text('nacosServicePattern').value.trim(),
+          username: text('nacosUsername').value.trim(),
+          password: text('nacosPassword').value,
+        },
+        etcd: {
+          endpoints: splitList(text('etcdEndpoints').value),
+          keyPrefix: text('etcdKeyPrefix').value.trim(),
+        },
+        consul: {
+          addr: text('consulAddr').value.trim(),
+          datacenter: text('consulDatacenter').value.trim(),
+          servicePattern: text('consulServicePattern').value.trim(),
+        }
+      };
+    }
+
+    function setDiscoveryTestMessage(message, type){
+      if(!dom.discoveryTestResult){
+        return;
+      }
+      dom.discoveryTestResult.textContent = message || '';
+      dom.discoveryTestResult.className = 'message' + (type ? ' ' + type : '');
+    }
+
+    function clearDiscoveryTestLogs(){
+      if(!dom.discoveryTestLogs){
+        return;
+      }
+      dom.discoveryTestLogs.innerHTML = '<li class="empty-text">暂无测试记录</li>';
+    }
+
+    function appendDiscoveryTestLog(level, backend, message){
+      if(!dom.discoveryTestLogs){
+        return;
+      }
+      // 首次写入时移除占位提示，后续按时间倒序插入最新记录。
+      const placeholder = dom.discoveryTestLogs.querySelector('.empty-text');
+      if(placeholder){
+        dom.discoveryTestLogs.innerHTML = '';
+      }
+
+      const item = document.createElement('li');
+      item.className = 'log-item';
+
+      const timeElement = document.createElement('span');
+      timeElement.className = 'log-time';
+      timeElement.textContent = formatTime(new Date().toISOString());
+
+      const tagElement = document.createElement('span');
+      tagElement.className = 'log-tag ' + (level || 'info');
+      const normalizedBackend = String(backend || '').trim() || 'unknown';
+      tagElement.textContent = '[' + normalizedBackend + ']';
+
+      const messageElement = document.createElement('span');
+      messageElement.className = 'log-message';
+      messageElement.textContent = message || '-';
+
+      item.appendChild(timeElement);
+      item.appendChild(tagElement);
+      item.appendChild(messageElement);
+
+      dom.discoveryTestLogs.prepend(item);
+      while(dom.discoveryTestLogs.children.length > 30){
+        dom.discoveryTestLogs.removeChild(dom.discoveryTestLogs.lastChild);
+      }
+    }
+
+    function setDiscoveryTesting(loading){
+      const selected = getSelectedDiscoveryBackend();
+      if(!dom.testDiscoveryBtn){
+        return;
+      }
+      if(selected === 'local'){
+        dom.testDiscoveryBtn.disabled = true;
+        dom.testDiscoveryBtn.textContent = '本地无需测试';
+        return;
+      }
+      dom.testDiscoveryBtn.disabled = !!loading;
+      dom.testDiscoveryBtn.textContent = loading ? '测试中...' : '测试连通性';
+    }
+
+    async function testDiscoveryConnectivity(){
+      const backend = getSelectedDiscoveryBackend();
+      if(backend === 'local'){
+        const localMessage = 'local 通过本地配置文件生效，无需远端连通性测试。';
+        setDiscoveryTestMessage(localMessage, 'ok');
+        appendDiscoveryTestLog('info', backend, localMessage);
+        return;
+      }
+      setDiscoveryTesting(true);
+      setDiscoveryTestMessage('');
+      appendDiscoveryTestLog('info', backend, '开始测试连通性...');
+      try{
+        const payload = {
+          backend,
+          timeoutMs: Number(text('discoveryTimeoutMs').value || 0),
+          discovery: collectDiscoveryModel(),
+        };
+        const resp = await fetch('/api/v1/admin/discovery/test', {
+          method:'POST',
+          headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if(resp.status === 401){
+          throw new Error('认证失败，请刷新页面后重新登录。');
+        }
+        const data = await resp.json();
+        if(!resp.ok){
+          throw new Error(data.message || '服务发现连通性测试失败');
+        }
+        const okMessage = data.message || '连通性测试通过。';
+        setDiscoveryTestMessage(okMessage, 'ok');
+        appendDiscoveryTestLog('ok', backend, okMessage);
+      }catch(err){
+        const errorMessage = '测试失败: ' + (err.message || err);
+        setDiscoveryTestMessage(errorMessage, 'err');
+        appendDiscoveryTestLog('err', backend, errorMessage);
+      }finally{
+        setDiscoveryTesting(false);
+      }
     }
 
     async function waitBridgeRecovered(){
@@ -1453,7 +2078,19 @@ const adminConfigPageHTML = `<!doctype html>
 
     dom.reloadBtn.addEventListener('click', loadModel);
     dom.saveBtn.addEventListener('click', saveModel);
+    dom.refreshTunnelBtn.addEventListener('click', ()=> loadTunnelDashboard(false));
+    dom.testDiscoveryBtn.addEventListener('click', testDiscoveryConnectivity);
+    dom.clearDiscoveryLogBtn.addEventListener('click', clearDiscoveryTestLogs);
+    // 仅在隧道看板激活时轮询，兼顾实时性和后台请求负载。
+    setInterval(()=>{
+      const activeSection = document.querySelector('.menu-item.active')?.dataset?.section;
+      if(activeSection === 'tunnel'){
+        loadTunnelDashboard(true);
+      }
+    }, 5000);
     updateAdminAuthVisibility();
+    updateDiscoveryTestButtonState();
+    loadTunnelDashboard(true);
     loadModel();
   </script>
 </body>

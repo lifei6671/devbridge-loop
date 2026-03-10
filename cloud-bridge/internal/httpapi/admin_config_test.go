@@ -218,3 +218,75 @@ func TestAdminRouteAllowWhenAuthPassed(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
 	}
 }
+
+func TestAdminDiscoveryConnectivityTestNacos(t *testing.T) {
+	editor := &mockConfigEditor{
+		path:    "/tmp/bridge.yaml",
+		content: "httpAddr: 0.0.0.0:38080\n",
+	}
+	var calledPath string
+	nacosServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calledPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"hosts":[]}`))
+	}))
+	defer nacosServer.Close()
+
+	handler := NewHandler(
+		routing.NewPipeline([]string{"host"}),
+		store.NewMemoryStore(),
+		&mockBackflowCaller{},
+		"",
+		WithConfigEditor(editor),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "http://bridge.internal/api/v1/admin/discovery/test", strings.NewReader(`{
+  "backend":"nacos",
+  "timeoutMs":1500,
+  "discovery":{
+    "backends":["nacos"],
+    "timeoutMs":1500,
+    "nacos":{"addr":"`+nacosServer.URL+`","namespace":"","group":"DEFAULT_GROUP","servicePattern":"${service}","username":"","password":""},
+    "etcd":{"endpoints":[],"keyPrefix":"/devloop/services"},
+    "consul":{"addr":"","datacenter":"","servicePattern":"${service}"}
+  }
+}`))
+	resp := httptest.NewRecorder()
+	handler.Router().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if calledPath != "/nacos/v1/ns/instance/list" {
+		t.Fatalf("unexpected nacos request path: %s", calledPath)
+	}
+	if !strings.Contains(resp.Body.String(), `"ok":true`) {
+		t.Fatalf("unexpected response body: %s", resp.Body.String())
+	}
+}
+
+func TestAdminDiscoveryConnectivityTestLocalNotSupported(t *testing.T) {
+	editor := &mockConfigEditor{
+		path:    "/tmp/bridge.yaml",
+		content: "httpAddr: 0.0.0.0:38080\n",
+	}
+	handler := NewHandler(
+		routing.NewPipeline([]string{"host"}),
+		store.NewMemoryStore(),
+		&mockBackflowCaller{},
+		"",
+		WithConfigEditor(editor),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "http://bridge.internal/api/v1/admin/discovery/test", strings.NewReader(`{
+  "backend":"local",
+  "discovery":{"backends":["local"]}
+}`))
+	resp := httptest.NewRecorder()
+	handler.Router().ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "不需要远端连通性测试") {
+		t.Fatalf("unexpected response body: %s", resp.Body.String())
+	}
+}

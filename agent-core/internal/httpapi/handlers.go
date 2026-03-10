@@ -120,6 +120,9 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		payload.TTLSeconds = h.cfg.Registration.DefaultTTLSeconds
 	}
 
+	// 记录更新前快照，用于计算“被移除的 endpoint”并同步 DELETE 给 bridge。
+	previousReg, hasPreviousReg := h.store.FindRegistrationByInstanceID(payload.InstanceID)
+
 	eventID := eventIDFromRequest(r)
 	if eventID == "" {
 		eventID = generateID("evt")
@@ -141,6 +144,27 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 
 	// 本地注册成功后异步投递到 tunnel 同步队列。
 	if !duplicated && h.syncPublisher != nil {
+		// 先删除“这次更新中被移除的 endpoint”，避免 bridge 保留过期路由。
+		if hasPreviousReg {
+			removedEndpoints := diffRemovedRegistrationEndpoints(previousReg.Endpoints, stored.Endpoints)
+			if len(removedEndpoints) > 0 {
+				if err := h.syncPublisher.EnqueueRegisterDelete(r.Context(), domain.LocalRegistration{
+					ServiceName: previousReg.ServiceName,
+					Env:         previousReg.Env,
+					InstanceID:  previousReg.InstanceID,
+					Endpoints:   removedEndpoints,
+				}, eventID); err != nil {
+					h.store.AddError(domain.ErrorTunnelOffline, "enqueue register delete for removed endpoint failed", map[string]string{
+						"eventId":     eventID,
+						"serviceName": previousReg.ServiceName,
+						"instanceId":  previousReg.InstanceID,
+						"error":       err.Error(),
+					})
+				}
+			}
+		}
+
+		// 再发送当前注册全量 endpoint 的 UPSERT，保证 bridge 与本地注册最终一致。
 		if err := h.syncPublisher.EnqueueRegisterUpsert(r.Context(), stored, eventID); err != nil {
 			h.store.AddError(domain.ErrorTunnelOffline, "enqueue register upsert failed", map[string]string{
 				"eventId":     eventID,
@@ -747,6 +771,30 @@ func setEventHeaders(w http.ResponseWriter, eventID string, duplicated bool) {
 		return
 	}
 	w.Header().Set("X-Event-Deduplicated", "false")
+}
+
+func diffRemovedRegistrationEndpoints(previous, current []domain.LocalEndpoint) []domain.LocalEndpoint {
+	if len(previous) == 0 {
+		return nil
+	}
+
+	currentSet := make(map[string]struct{}, len(current))
+	for _, endpoint := range current {
+		currentSet[endpointSyncKey(endpoint)] = struct{}{}
+	}
+
+	removed := make([]domain.LocalEndpoint, 0, len(previous))
+	for _, endpoint := range previous {
+		if _, exists := currentSet[endpointSyncKey(endpoint)]; exists {
+			continue
+		}
+		removed = append(removed, endpoint)
+	}
+	return removed
+}
+
+func endpointSyncKey(endpoint domain.LocalEndpoint) string {
+	return fmt.Sprintf("%s|%d", strings.ToLower(strings.TrimSpace(endpoint.Protocol)), endpoint.TargetPort)
 }
 
 func classifyBackflowError(err error) (statusCode int, errorCode domain.ErrorCode, message string) {

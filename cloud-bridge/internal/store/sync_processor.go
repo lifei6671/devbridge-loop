@@ -392,6 +392,10 @@ func (s *MemoryStore) applyRegisterDeleteLocked(tunnelID string, event domain.Tu
 		if !strings.EqualFold(route.Env, payload.Env) || !strings.EqualFold(route.ServiceName, payload.ServiceName) || !strings.EqualFold(route.Protocol, payload.Protocol) {
 			continue
 		}
+		// instanceId 存在时做精确删除，避免误删同服务下其他实例路由。
+		if strings.TrimSpace(payload.InstanceID) != "" && route.InstanceID != strings.TrimSpace(payload.InstanceID) {
+			continue
+		}
 		if payload.TargetPort > 0 && route.TargetPort != payload.TargetPort {
 			continue
 		}
@@ -458,6 +462,7 @@ func (s *MemoryStore) upsertInterceptAndRouteLocked(tunnelID string, payload dom
 		Env:         env,
 		ServiceName: serviceName,
 		Protocol:    protocol,
+		InstanceID:  instanceID,
 		BridgeHost:  bridgeHost,
 		BridgePort:  bridgePort,
 		TunnelID:    tunnelID,
