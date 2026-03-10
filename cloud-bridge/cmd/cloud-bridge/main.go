@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -17,8 +18,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("cloud-bridge starting on %s", cfg.HTTPAddr)
+	slog.Info("cloud-bridge process started", "httpAddr", cfg.HTTPAddr)
 	if err := a.Run(ctx); err != nil {
-		log.Fatalf("cloud-bridge exited with error: %v", err)
+		slog.Error("cloud-bridge exited with error", "error", err)
+		os.Exit(1)
 	}
 }

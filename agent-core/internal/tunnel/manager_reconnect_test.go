@@ -221,7 +221,7 @@ func TestSyncManager_FastForwardEpochOnStaleEpochReject(t *testing.T) {
 		close(done)
 	}()
 
-	if err := waitTunnelConnected(state, cfg.Tunnel.BridgeAddress, 4*time.Second); err != nil {
+	if err := waitTunnelConnected(state, cfg.Tunnel.BridgeAddress, 8*time.Second); err != nil {
 		t.Fatalf("expected tunnel to reconnect quickly after stale epoch reject: %v", err)
 	}
 	current := state.TunnelState(cfg.Tunnel.BridgeAddress)

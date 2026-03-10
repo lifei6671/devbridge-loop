@@ -30,6 +30,11 @@ type RegistrationConfig struct {
 type TunnelConfig struct {
 	BridgeAddress     string
 	BackflowBaseURL   string
+	SyncProtocol      string
+	MasqueAuthMode    string
+	MasquePSK         string
+	MasqueProxyURL    string
+	MasqueTargetAddr  string
 	HeartbeatInterval time.Duration
 	ReconnectBackoff  []time.Duration
 	RequestTimeout    time.Duration
@@ -53,6 +58,11 @@ func LoadFromEnv() Config {
 		Tunnel: TunnelConfig{
 			BridgeAddress:     getenv("DEVLOOP_TUNNEL_BRIDGE_ADDRESS", "http://127.0.0.1:38080"),
 			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"))),
+			SyncProtocol:      normalizeTunnelSyncProtocol(getenv("DEVLOOP_TUNNEL_SYNC_PROTOCOL", "http")),
+			MasqueAuthMode:    normalizeMasqueAuthMode(getenv("DEVLOOP_TUNNEL_MASQUE_AUTH_MODE", "psk")),
+			MasquePSK:         getenv("DEVLOOP_TUNNEL_MASQUE_PSK", "devloop-masque-default-psk"),
+			MasqueProxyURL:    getenv("DEVLOOP_TUNNEL_MASQUE_PROXY_URL", ""),
+			MasqueTargetAddr:  getenv("DEVLOOP_TUNNEL_MASQUE_TARGET_ADDR", "127.0.0.1:39081"),
 			HeartbeatInterval: time.Duration(getenvInt("DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC", 10)) * time.Second,
 			ReconnectBackoff:  parseDurationListMillis(getenv("DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS", defaultTunnelReconnectBackoffEnv)),
 			RequestTimeout:    time.Duration(getenvInt("DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC", 5)) * time.Second,
@@ -72,6 +82,14 @@ func LoadFromEnv() Config {
 	}
 	if len(cfg.Tunnel.ReconnectBackoff) == 0 {
 		cfg.Tunnel.ReconnectBackoff = defaultTunnelReconnectBackoff()
+	}
+	cfg.Tunnel.SyncProtocol = normalizeTunnelSyncProtocol(cfg.Tunnel.SyncProtocol)
+	cfg.Tunnel.MasqueAuthMode = normalizeMasqueAuthMode(cfg.Tunnel.MasqueAuthMode)
+	if strings.TrimSpace(cfg.Tunnel.MasquePSK) == "" {
+		cfg.Tunnel.MasquePSK = "devloop-masque-default-psk"
+	}
+	if strings.TrimSpace(cfg.Tunnel.MasqueTargetAddr) == "" {
+		cfg.Tunnel.MasqueTargetAddr = "127.0.0.1:39081"
 	}
 	if cfg.Tunnel.RequestTimeout <= 0 {
 		cfg.Tunnel.RequestTimeout = 5 * time.Second
@@ -176,5 +194,23 @@ func normalizeResolveToken(value string) string {
 		return "baseFallback"
 	default:
 		return ""
+	}
+}
+
+func normalizeTunnelSyncProtocol(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "masque":
+		return "masque"
+	default:
+		return "http"
+	}
+}
+
+func normalizeMasqueAuthMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "ecdh":
+		return "ecdh"
+	default:
+		return "psk"
 	}
 }

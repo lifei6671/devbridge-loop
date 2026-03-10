@@ -104,6 +104,11 @@ func (c *BridgeClient) SendEvent(ctx context.Context, message domain.TunnelMessa
 	return reply, nil
 }
 
+// Close 为协议抽象统一接口保留，HTTP 模式无需额外释放资源。
+func (c *BridgeClient) Close() error {
+	return nil
+}
+
 func buildEventEndpoint(bridgeAddress string) string {
 	address := strings.TrimSpace(bridgeAddress)
 	if address == "" {

@@ -45,6 +45,8 @@ const (
 	SyncErrorEpochTransition = "EPOCH_TRANSITION_REQUIRES_HELLO"
 	// SyncErrorUnsupportedType 表示不支持的消息类型。
 	SyncErrorUnsupportedType = "UNSUPPORTED_MESSAGE_TYPE"
+	// SyncErrorProtocolDisabled 表示当前 tunnel 同步协议在 bridge 端未启用。
+	SyncErrorProtocolDisabled = "TUNNEL_PROTOCOL_DISABLED"
 )
 
 // TunnelSession 描述一条 agent 到 bridge 的会话状态。

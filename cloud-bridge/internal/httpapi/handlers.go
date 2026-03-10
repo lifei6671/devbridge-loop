@@ -31,16 +31,39 @@ type Handler struct {
 	store               *store.MemoryStore
 	backflowCaller      BackflowHTTPCaller
 	fallbackBackflowURL string
+	httpTunnelSyncOn    bool
+}
+
+// HandlerOption 允许按需扩展 Handler 行为，不影响已有调用方。
+type HandlerOption func(*Handler)
+
+// WithTunnelEventHTTPEnabled 控制是否启用 HTTP tunnel 事件入口。
+func WithTunnelEventHTTPEnabled(enabled bool) HandlerOption {
+	return func(h *Handler) {
+		h.httpTunnelSyncOn = enabled
+	}
 }
 
 // NewHandler 创建 HTTP handler 集合。
-func NewHandler(pipeline *routing.Pipeline, store *store.MemoryStore, backflowCaller BackflowHTTPCaller, fallbackBackflowURL string) *Handler {
-	return &Handler{
+func NewHandler(
+	pipeline *routing.Pipeline,
+	store *store.MemoryStore,
+	backflowCaller BackflowHTTPCaller,
+	fallbackBackflowURL string,
+	options ...HandlerOption,
+) *Handler {
+	h := &Handler{
 		pipeline:            pipeline,
 		store:               store,
 		backflowCaller:      backflowCaller,
 		fallbackBackflowURL: strings.TrimSpace(fallbackBackflowURL),
+		// 默认向后兼容：若上层未显式配置，HTTP tunnel 事件入口保持开启。
+		httpTunnelSyncOn: true,
 	}
+	for _, option := range options {
+		option(h)
+	}
+	return h
 }
 
 // Router 构建 cloud-bridge 路由表。
@@ -86,6 +109,22 @@ func (h *Handler) stateErrors(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) tunnelEvent(w http.ResponseWriter, r *http.Request) {
+	// 当 bridge 未启用 HTTP tunnel 协议时，显式拒绝该入口请求。
+	if !h.httpTunnelSyncOn {
+		h.store.AddError(domain.SyncErrorProtocolDisabled, "http tunnel sync protocol is disabled", map[string]string{
+			"path": strings.TrimSpace(r.URL.Path),
+		})
+		respondJSON(w, http.StatusServiceUnavailable, domain.TunnelEventReply{
+			Type:         domain.TunnelMessageError,
+			Status:       domain.EventStatusRejected,
+			ErrorCode:    domain.SyncErrorProtocolDisabled,
+			Message:      "http tunnel sync protocol is disabled",
+			EventID:      "",
+			SessionEpoch: 0,
+		})
+		return
+	}
+
 	var event domain.TunnelEvent
 	defer func() {
 		// 避免单次异常导致连接被强制关闭，尽量返回可诊断错误给 agent。

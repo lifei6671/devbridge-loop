@@ -225,10 +225,17 @@ make run-demo-order
 - `DEVLOOP_AGENT_AUTO_RESTART`：是否自动重启（默认 `true`）
 - `DEVLOOP_AGENT_RESTART_BACKOFF_MS`：自动重启退避毫秒数组（默认 `500,1000,2000,5000`）
 - `DEVLOOP_TUNNEL_BRIDGE_ADDRESS`：agent 同步到 bridge 的地址（默认 `http://127.0.0.1:38080`）
+- `DEVLOOP_TUNNEL_SYNC_PROTOCOL`：tunnel 同步协议（`http` / `masque`，默认 `http`）
 - `DEVLOOP_TUNNEL_HEARTBEAT_INTERVAL_SEC`：tunnel 心跳间隔秒数（默认 `10`）
 - `DEVLOOP_TUNNEL_RECONNECT_BACKOFF_MS`：tunnel 重连退避毫秒数组（默认 `5000,10000,15000,20000,25000,30000,35000,40000,45000,50000,55000,60000`）
 - `DEVLOOP_TUNNEL_REQUEST_TIMEOUT_SEC`：agent 到 bridge 请求超时秒数（默认 `5`）
 - `DEVLOOP_TUNNEL_BACKFLOW_BASE_URL`：agent 在 HELLO 中上报的回流地址（默认按 `DEVLOOP_AGENT_HTTP_ADDR` 自动推导）
+- `DEVLOOP_TUNNEL_MASQUE_AUTH_MODE`：MASQUE 鉴权模式（`psk` / `ecdh`，默认 `psk`）
+- `DEVLOOP_TUNNEL_MASQUE_PSK`：MASQUE 预共享密钥（默认硬编码 `devloop-masque-default-psk`）
+- `DEVLOOP_TUNNEL_MASQUE_PROXY_URL`：agent 侧 MASQUE 代理 URI 模板（默认按 `tunnelBridgeAddress` 自动推导）
+- `DEVLOOP_TUNNEL_MASQUE_TARGET_ADDR`：agent 侧 CONNECT-UDP 目标地址（默认 `127.0.0.1:39081`）
+- `DEVLOOP_BRIDGE_MASQUE_ADDR`：bridge 侧 MASQUE（HTTP/3 over QUIC）监听地址（默认复用 `DEVLOOP_BRIDGE_HTTP_ADDR` 端口）
+- `DEVLOOP_BRIDGE_MASQUE_TUNNEL_UDP_ADDR`：bridge 内部 tunnel datagram UDP 地址（默认 `127.0.0.1:39081`）
 - `DEVLOOP_BRIDGE_PUBLIC_HOST`：bridge 对外路由域名（默认 `bridge.example.internal`）
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
 - `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:39090`）
@@ -242,6 +249,12 @@ make run-demo-order
   - `logDir`
   - `configFile`
 - 当前实现优先级：环境变量 > 配置文件 > 默认值
+- 配置页已支持 tunnel 协议参数持久化：
+  - `tunnelSyncProtocol`（`http` / `masque`）
+  - `tunnelMasqueAuthMode`（`psk` / `ecdh`）
+  - `tunnelMasquePsk`
+  - `tunnelMasqueProxyUrl`
+  - `tunnelMasqueTargetAddr`
 
 ## 事件头与 env 解析
 

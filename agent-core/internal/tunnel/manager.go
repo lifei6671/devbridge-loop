@@ -36,7 +36,8 @@ type reconnectRequest struct {
 type SyncManager struct {
 	cfg       config.Config
 	state     *store.MemoryStore
-	client    *BridgeClient
+	client    EventClient
+	protocol  string
 	tunnelID  string
 	queueSize int
 
@@ -50,10 +51,22 @@ type SyncManager struct {
 
 // NewSyncManager 创建同步管理器。
 func NewSyncManager(cfg config.Config, state *store.MemoryStore) *SyncManager {
+	protocol := resolveRuntimeTunnelProtocol(cfg.Tunnel.SyncProtocol)
+	client, err := NewEventClient(cfg)
+	if err != nil {
+		state.AddError(domain.ErrorTunnelOffline, "init tunnel transport failed, fallback to http", map[string]string{
+			"protocol": cfg.Tunnel.SyncProtocol,
+			"error":    err.Error(),
+		})
+		client = NewBridgeClient(cfg.Tunnel.BridgeAddress, cfg.Tunnel.RequestTimeout)
+		protocol = tunnelSyncProtocolHTTP
+	}
+
 	return &SyncManager{
 		cfg:            cfg,
 		state:          state,
-		client:         NewBridgeClient(cfg.Tunnel.BridgeAddress, cfg.Tunnel.RequestTimeout),
+		client:         client,
+		protocol:       protocol,
 		tunnelID:       buildTunnelID(cfg.RDName),
 		queueSize:      defaultEventQueueSize,
 		eventCh:        make(chan outboundEvent, defaultEventQueueSize),
@@ -64,6 +77,14 @@ func NewSyncManager(cfg config.Config, state *store.MemoryStore) *SyncManager {
 
 // Run 启动同步循环：定时心跳、增量事件、手动重连。
 func (m *SyncManager) Run(ctx context.Context) {
+	defer func() {
+		if err := m.client.Close(); err != nil {
+			m.state.AddError(domain.ErrorTunnelOffline, "close tunnel transport failed", map[string]string{
+				"error": err.Error(),
+			})
+		}
+	}()
+
 	if err := m.reconnectWithBackoff(ctx); err != nil {
 		m.state.AddError(domain.ErrorTunnelOffline, "initial tunnel reconnect failed", map[string]string{"error": err.Error()})
 	}
@@ -123,6 +144,14 @@ func (m *SyncManager) RequestReconnect(ctx context.Context) error {
 	case err := <-request.result:
 		return err
 	}
+}
+
+// CurrentProtocol 返回当前同步链路实际使用的协议名称（http / masque）。
+func (m *SyncManager) CurrentProtocol() string {
+	if m.protocol == tunnelSyncProtocolMasque {
+		return tunnelSyncProtocolMasque
+	}
+	return tunnelSyncProtocolHTTP
 }
 
 // EnqueueRegisterUpsert 推送 REGISTER_UPSERT 事件（按 endpoint 拆分）。
@@ -507,6 +536,13 @@ func withBridgeConnectivityHint(err error, bridgeAddress string) string {
 		return message + " | hint: 若 cloud-bridge 运行在 WSL，请将 tunnelBridgeAddress 改为 WSL 的实际 IP:38080，或直接在 Windows 启动 cloud-bridge.exe。"
 	}
 	return message
+}
+
+func resolveRuntimeTunnelProtocol(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), tunnelSyncProtocolMasque) {
+		return tunnelSyncProtocolMasque
+	}
+	return tunnelSyncProtocolHTTP
 }
 
 func staleEpochFromError(err error) (int64, bool) {

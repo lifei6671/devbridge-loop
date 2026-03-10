@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentType, ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   Cable,
+  CheckCircle2,
   Cloud,
   Eye,
   LayoutDashboard,
   ListTree,
+  LoaderCircle,
   RefreshCcw,
   RotateCcw,
   Server,
@@ -51,6 +53,13 @@ import type {
 
 type PageKey = "dashboard" | "services" | "intercepts" | "logs" | "config";
 type UiPhase = "ready" | "restarting" | "recovering";
+type ToastLevel = "success" | "error";
+
+interface AppToast {
+  id: number;
+  level: ToastLevel;
+  message: string;
+}
 
 const PAGE_ITEMS: Array<{ key: PageKey; label: string; icon: ComponentType<{ className?: string }> }> = [
   { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -124,6 +133,25 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+function buildDesktopConfigDraft(view: DesktopConfigView): DesktopConfigSaveRequest {
+  return {
+    agentApiBase: view.agentApiBase,
+    agentBinary: view.agentBinary,
+    agentCoreDir: view.agentCoreDir,
+    agentAutoRestart: view.agentAutoRestart,
+    closeToTrayOnClose: view.closeToTrayOnClose,
+    agentRestartBackoffMs: view.agentRestartBackoffMs,
+    envResolveOrder: view.envResolveOrder,
+    tunnelBridgeAddress: view.tunnelBridgeAddress,
+    tunnelBackflowBaseUrl: view.tunnelBackflowBaseUrl,
+    tunnelSyncProtocol: view.tunnelSyncProtocol,
+    tunnelMasqueAuthMode: view.tunnelMasqueAuthMode,
+    tunnelMasquePsk: view.tunnelMasquePsk,
+    tunnelMasqueProxyUrl: view.tunnelMasqueProxyUrl,
+    tunnelMasqueTargetAddr: view.tunnelMasqueTargetAddr
+  };
+}
+
 export default function App(): ReactElement {
   const [activePage, setActivePage] = useState<PageKey>("dashboard");
   const [summary, setSummary] = useState<StateSummary | null>(null);
@@ -135,6 +163,7 @@ export default function App(): ReactElement {
   const [intercepts, setIntercepts] = useState<ActiveIntercept[]>([]);
   const [desktopConfig, setDesktopConfig] = useState<DesktopConfigView | null>(null);
   const [desktopConfigDraft, setDesktopConfigDraft] = useState<DesktopConfigSaveRequest | null>(null);
+  const [desktopConfigDraftDirty, setDesktopConfigDraftDirty] = useState(false);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const [uiPhase, setUiPhase] = useState<UiPhase>("ready");
@@ -143,10 +172,34 @@ export default function App(): ReactElement {
   const [savingConfig, setSavingConfig] = useState(false);
   const [unregisteringId, setUnregisteringId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string>("");
+  const [toast, setToast] = useState<AppToast | null>(null);
   const [showCloseDecisionDialog, setShowCloseDecisionDialog] = useState(false);
   const [resolvingCloseDecision, setResolvingCloseDecision] = useState(false);
   const [clockMs, setClockMs] = useState(() => Date.now());
+  const desktopConfigDraftDirtyRef = useRef(false);
   const phaseBusy = uiPhase !== "ready";
+
+  const markDesktopConfigDraftDirty = useCallback((dirty: boolean) => {
+    desktopConfigDraftDirtyRef.current = dirty;
+    setDesktopConfigDraftDirty(dirty);
+  }, []);
+
+  const patchDesktopConfigDraft = useCallback(
+    (patch: Partial<DesktopConfigSaveRequest>) => {
+      // 配置编辑一旦发生，先锁定草稿，避免后台轮询覆盖用户输入。
+      markDesktopConfigDraftDirty(true);
+      setDesktopConfigDraft((current) => (current ? { ...current, ...patch } : current));
+    },
+    [markDesktopConfigDraftDirty]
+  );
+
+  const showToast = useCallback((message: string, level: ToastLevel = "success") => {
+    setToast({
+      id: Date.now(),
+      level,
+      message
+    });
+  }, []);
 
   const selectedRegistration = useMemo(() => {
     if (!selectedInstanceId) {
@@ -206,17 +259,14 @@ export default function App(): ReactElement {
       setRuntime(runtimeData);
       setIntercepts(interceptData);
       setDesktopConfig(desktopConfigData);
-      setDesktopConfigDraft({
-        agentApiBase: desktopConfigData.agentApiBase,
-        agentBinary: desktopConfigData.agentBinary,
-        agentCoreDir: desktopConfigData.agentCoreDir,
-        agentAutoRestart: desktopConfigData.agentAutoRestart,
-        closeToTrayOnClose: desktopConfigData.closeToTrayOnClose,
-        agentRestartBackoffMs: desktopConfigData.agentRestartBackoffMs,
-        envResolveOrder: desktopConfigData.envResolveOrder,
-        tunnelBridgeAddress: desktopConfigData.tunnelBridgeAddress,
-        tunnelBackflowBaseUrl: desktopConfigData.tunnelBackflowBaseUrl
-      });
+      const nextDraft = buildDesktopConfigDraft(desktopConfigData);
+      if (desktopConfigDraftDirtyRef.current) {
+        // 用户正在编辑时，轮询仅更新只读状态，不回写配置草稿。
+        setDesktopConfigDraft((current) => current ?? nextDraft);
+      } else {
+        setDesktopConfigDraft(nextDraft);
+        markDesktopConfigDraftDirty(false);
+      }
 
       // 当前选中的实例如果被删除，则回退到列表首项，保证详情页始终有有效目标。
       setSelectedInstanceId((current) => {
@@ -236,7 +286,7 @@ export default function App(): ReactElement {
         setManualRefreshing(false);
       }
     }
-  }, [loadDiagnostics, uiPhase]);
+  }, [loadDiagnostics, markDesktopConfigDraftDirty, uiPhase]);
 
   const reconnect = useCallback(async () => {
     if (manualReconnectPending || manualReconnecting || phaseBusy) {
@@ -367,23 +417,17 @@ export default function App(): ReactElement {
         request: desktopConfigDraft
       });
       setDesktopConfig(saved);
-      setDesktopConfigDraft({
-        agentApiBase: saved.agentApiBase,
-        agentBinary: saved.agentBinary,
-        agentCoreDir: saved.agentCoreDir,
-        agentAutoRestart: saved.agentAutoRestart,
-        closeToTrayOnClose: saved.closeToTrayOnClose,
-        agentRestartBackoffMs: saved.agentRestartBackoffMs,
-        envResolveOrder: saved.envResolveOrder,
-        tunnelBridgeAddress: saved.tunnelBridgeAddress,
-        tunnelBackflowBaseUrl: saved.tunnelBackflowBaseUrl
-      });
+      setDesktopConfigDraft(buildDesktopConfigDraft(saved));
+      // 保存成功后解锁草稿覆盖，后续轮询可继续同步后台配置。
+      markDesktopConfigDraftDirty(false);
+      showToast("配置保存成功，重启桌面端后生效。", "success");
     } catch (error) {
       setActionError(String(error));
+      showToast("配置保存失败，请检查输入并重试。", "error");
     } finally {
       setSavingConfig(false);
     }
-  }, [desktopConfigDraft]);
+  }, [desktopConfigDraft, markDesktopConfigDraftDirty, showToast]);
 
   const unregisterRegistration = useCallback(
     async (instanceId: string) => {
@@ -442,6 +486,31 @@ export default function App(): ReactElement {
     }, intervalMs);
     return () => window.clearInterval(timer);
   }, [refresh, uiPhase, tunnel?.reconnecting]);
+
+  useEffect(() => {
+    if (!desktopConfig || !desktopConfigDraft) {
+      return;
+    }
+
+    // 通过与“后端基线配置”对比自动判定脏状态，用户撤销修改后可自动解锁轮询覆盖。
+    const baselineDraft = buildDesktopConfigDraft(desktopConfig);
+    const dirty = JSON.stringify(baselineDraft) !== JSON.stringify(desktopConfigDraft);
+    if (desktopConfigDraftDirtyRef.current !== dirty) {
+      markDesktopConfigDraftDirty(dirty);
+    }
+  }, [desktopConfig, desktopConfigDraft, markDesktopConfigDraftDirty]);
+
+  useEffect(() => {
+    if (!toast) {
+      return;
+    }
+
+    // Toast 自动消失，避免用户手动关闭带来的额外交互负担。
+    const timer = window.setTimeout(() => {
+      setToast((current) => (current?.id === toast.id ? null : current));
+    }, 2600);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   useEffect(() => {
     // 倒计时改为 200ms 粒度，避免 5s -> 4s 的瞬时跳变看起来“闪一下”。
@@ -627,6 +696,7 @@ export default function App(): ReactElement {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
+          <div>protocol: {tunnel?.protocol ?? "-"}</div>
           <div>epoch: {tunnel?.sessionEpoch ?? 0}</div>
           <div>resourceVersion: {tunnel?.resourceVersion ?? 0}</div>
           <div>lastHeartbeat: {formatTime(tunnel?.lastHeartbeatAt)}</div>
@@ -899,16 +969,18 @@ export default function App(): ReactElement {
           <CardDescription>基础配置加载与保存（保存后重启桌面端生效）</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
+          {desktopConfigDraftDirty ? (
+            <p className="text-xs text-amber-900">
+              检测到未保存的配置修改，后台轮询不会覆盖当前表单。
+            </p>
+          ) : null}
+
           <div className="space-y-1">
             <label className="text-xs text-muted-foreground">agentApiBase</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentApiBase ?? ""}
-              onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current ? { ...current, agentApiBase: event.target.value } : current
-                )
-              }
+              onChange={(event) => patchDesktopConfigDraft({ agentApiBase: event.target.value })}
             />
           </div>
 
@@ -918,14 +990,9 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentBinary ?? ""}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current
-                    ? {
-                        ...current,
-                        agentBinary: event.target.value.trim() === "" ? null : event.target.value
-                      }
-                    : current
-                )
+                patchDesktopConfigDraft({
+                  agentBinary: event.target.value.trim() === "" ? null : event.target.value
+                })
               }
             />
           </div>
@@ -936,14 +1003,9 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentCoreDir ?? ""}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current
-                    ? {
-                        ...current,
-                        agentCoreDir: event.target.value.trim() === "" ? null : event.target.value
-                      }
-                    : current
-                )
+                patchDesktopConfigDraft({
+                  agentCoreDir: event.target.value.trim() === "" ? null : event.target.value
+                })
               }
             />
           </div>
@@ -954,14 +1016,9 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={(desktopConfigDraft?.agentRestartBackoffMs ?? []).join(",")}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current
-                    ? {
-                        ...current,
-                        agentRestartBackoffMs: parseNumberList(event.target.value)
-                      }
-                    : current
-                )
+                patchDesktopConfigDraft({
+                  agentRestartBackoffMs: parseNumberList(event.target.value)
+                })
               }
             />
           </div>
@@ -972,14 +1029,9 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={(desktopConfigDraft?.envResolveOrder ?? []).join(",")}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current
-                    ? {
-                        ...current,
-                        envResolveOrder: parseStringList(event.target.value)
-                      }
-                    : current
-                )
+                patchDesktopConfigDraft({
+                  envResolveOrder: parseStringList(event.target.value)
+                })
               }
             />
           </div>
@@ -990,9 +1042,7 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.tunnelBridgeAddress ?? ""}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current ? { ...current, tunnelBridgeAddress: event.target.value } : current
-                )
+                patchDesktopConfigDraft({ tunnelBridgeAddress: event.target.value })
               }
             />
           </div>
@@ -1003,21 +1053,92 @@ export default function App(): ReactElement {
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.tunnelBackflowBaseUrl ?? ""}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current ? { ...current, tunnelBackflowBaseUrl: event.target.value } : current
-                )
+                patchDesktopConfigDraft({ tunnelBackflowBaseUrl: event.target.value })
               }
             />
           </div>
+
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">tunnelSyncProtocol</label>
+            <select
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.tunnelSyncProtocol ?? "http"}
+              onChange={(event) =>
+                patchDesktopConfigDraft({ tunnelSyncProtocol: event.target.value })
+              }
+            >
+              <option value="http">http</option>
+              <option value="masque">masque</option>
+            </select>
+          </div>
+
+          {/* 仅在 MASQUE 模式展示扩展参数，避免 HTTP 模式下出现无关配置噪音。 */}
+          {desktopConfigDraft?.tunnelSyncProtocol === "masque" ? (
+            <>
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">tunnelMasqueAuthMode</label>
+                <select
+                  className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+                  value={desktopConfigDraft.tunnelMasqueAuthMode}
+                  onChange={(event) =>
+                    patchDesktopConfigDraft({
+                      tunnelMasqueAuthMode: event.target.value
+                    })
+                  }
+                >
+                  <option value="psk">psk</option>
+                  <option value="ecdh">ecdh</option>
+                </select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">tunnelMasquePsk</label>
+                <input
+                  className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+                  value={desktopConfigDraft.tunnelMasquePsk}
+                  onChange={(event) =>
+                    patchDesktopConfigDraft({
+                      tunnelMasquePsk: event.target.value
+                    })
+                  }
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">tunnelMasqueProxyUrl</label>
+                <input
+                  className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+                  placeholder="留空按 tunnelBridgeAddress 自动推导"
+                  value={desktopConfigDraft.tunnelMasqueProxyUrl}
+                  onChange={(event) =>
+                    patchDesktopConfigDraft({
+                      tunnelMasqueProxyUrl: event.target.value
+                    })
+                  }
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">tunnelMasqueTargetAddr</label>
+                <input
+                  className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+                  value={desktopConfigDraft.tunnelMasqueTargetAddr}
+                  onChange={(event) =>
+                    patchDesktopConfigDraft({
+                      tunnelMasqueTargetAddr: event.target.value
+                    })
+                  }
+                />
+              </div>
+            </>
+          ) : null}
 
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
             <input
               type="checkbox"
               checked={desktopConfigDraft?.agentAutoRestart ?? true}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current ? { ...current, agentAutoRestart: event.target.checked } : current
-                )
+                patchDesktopConfigDraft({ agentAutoRestart: event.target.checked })
               }
             />
             agentAutoRestart
@@ -1028,9 +1149,7 @@ export default function App(): ReactElement {
               type="checkbox"
               checked={desktopConfigDraft?.closeToTrayOnClose ?? true}
               onChange={(event) =>
-                setDesktopConfigDraft((current) =>
-                  current ? { ...current, closeToTrayOnClose: event.target.checked } : current
-                )
+                patchDesktopConfigDraft({ closeToTrayOnClose: event.target.checked })
               }
             />
             closeToTrayOnClose
@@ -1048,7 +1167,8 @@ export default function App(): ReactElement {
             disabled={savingConfig || !desktopConfigDraft}
             onClick={() => void saveDesktopConfig()}
           >
-            保存配置
+            <LoaderCircle className={cn("mr-2 h-4 w-4", savingConfig && "animate-spin")} />
+            {savingConfig ? "保存中..." : "保存配置"}
           </Button>
         </CardContent>
       </Card>
@@ -1175,6 +1295,26 @@ export default function App(): ReactElement {
                 </Button>
               </CardContent>
             </Card>
+          </div>
+        ) : null}
+
+        {toast ? (
+          <div className="fixed bottom-6 right-6 z-50">
+            <div
+              className={cn(
+                "flex max-w-sm items-center gap-2 rounded-md border px-3 py-2 text-sm shadow-xl transition-all duration-300",
+                toast.level === "success"
+                  ? "border-emerald-500/40 bg-emerald-100/95 text-emerald-950"
+                  : "border-amber-500/40 bg-amber-100/95 text-amber-950"
+              )}
+            >
+              {toast.level === "success" ? (
+                <CheckCircle2 className="h-4 w-4" />
+              ) : (
+                <AlertTriangle className="h-4 w-4" />
+              )}
+              <span>{toast.message}</span>
+            </div>
           </div>
         ) : null}
 

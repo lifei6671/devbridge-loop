@@ -33,6 +33,7 @@ type TunnelSyncPublisher interface {
 	EnqueueRegisterUpsert(ctx context.Context, reg domain.LocalRegistration, sourceEventID string) error
 	EnqueueRegisterDelete(ctx context.Context, reg domain.LocalRegistration, sourceEventID string) error
 	RequestReconnect(ctx context.Context) error
+	CurrentProtocol() string
 }
 
 // LocalBackflowForwarder 定义 agent 回流到本地 endpoint 的转发能力。
@@ -525,6 +526,8 @@ func (h *Handler) stateSummary(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) stateTunnel(w http.ResponseWriter, _ *http.Request) {
 	state := h.store.TunnelState(h.cfg.Tunnel.BridgeAddress)
+	// tunnel 卡片展示“当前实际传输协议”：优先使用同步管理器运行态，其次退回配置值。
+	state.Protocol = h.currentTunnelProtocol()
 	respondJSON(w, http.StatusOK, state)
 }
 
@@ -548,6 +551,17 @@ func (h *Handler) stateDiagnostics(w http.ResponseWriter, _ *http.Request) {
 		h.cfg.Registration.ScanInterval,
 	)
 	respondJSON(w, http.StatusOK, diagnostics)
+}
+
+func (h *Handler) currentTunnelProtocol() string {
+	protocol := strings.ToLower(strings.TrimSpace(h.cfg.Tunnel.SyncProtocol))
+	if h.syncPublisher != nil {
+		protocol = strings.ToLower(strings.TrimSpace(h.syncPublisher.CurrentProtocol()))
+	}
+	if protocol == "masque" {
+		return "masque"
+	}
+	return "http"
 }
 
 func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -212,9 +213,17 @@ func (s *MemoryStore) applyHELLOLocked(tunnelID string, event domain.TunnelEvent
 	}
 
 	existing, exists := s.sessions[tunnelID]
+	nextConnID := firstNonEmpty(strings.TrimSpace(payload.ConnID), event.EventID)
 
 	// 新 epoch 握手成功后必须清理旧拦截，避免旧路由继续暴露。
 	if exists && event.SessionEpoch > existing.SessionEpoch {
+		slog.Info("tunnel connection disconnected",
+			"tunnelId", tunnelID,
+			"rdName", strings.TrimSpace(existing.RDName),
+			"connId", strings.TrimSpace(existing.ConnID),
+			"sessionEpoch", existing.SessionEpoch,
+			"reason", "replaced-by-newer-epoch",
+		)
 		s.clearTunnelStateLocked(tunnelID)
 	}
 
@@ -226,13 +235,41 @@ func (s *MemoryStore) applyHELLOLocked(tunnelID string, event domain.TunnelEvent
 	s.sessions[tunnelID] = domain.TunnelSession{
 		TunnelID:        tunnelID,
 		RDName:          firstNonEmpty(strings.TrimSpace(payload.RDName), existing.RDName),
-		ConnID:          firstNonEmpty(strings.TrimSpace(payload.ConnID), event.EventID),
+		ConnID:          nextConnID,
 		BackflowBaseURL: firstNonEmpty(strings.TrimSpace(payload.BackflowBaseURL), existing.BackflowBaseURL),
 		SessionEpoch:    event.SessionEpoch,
 		ResourceVersion: maxInt64(existing.ResourceVersion, event.ResourceVersion),
 		Status:          "connected",
 		LastHeartbeatAt: now,
 		ConnectedAt:     connectedAt,
+	}
+
+	// 打印连接建立日志；同 epoch connId 变化视作连接切换，便于排查断线重连抖动。
+	switch {
+	case !exists:
+		slog.Info("tunnel connection connected",
+			"tunnelId", tunnelID,
+			"rdName", strings.TrimSpace(s.sessions[tunnelID].RDName),
+			"connId", strings.TrimSpace(s.sessions[tunnelID].ConnID),
+			"sessionEpoch", event.SessionEpoch,
+		)
+	case event.SessionEpoch > existing.SessionEpoch:
+		slog.Info("tunnel connection connected",
+			"tunnelId", tunnelID,
+			"rdName", strings.TrimSpace(s.sessions[tunnelID].RDName),
+			"connId", strings.TrimSpace(s.sessions[tunnelID].ConnID),
+			"sessionEpoch", event.SessionEpoch,
+			"previousConnId", strings.TrimSpace(existing.ConnID),
+			"previousSessionEpoch", existing.SessionEpoch,
+		)
+	case strings.TrimSpace(existing.ConnID) != strings.TrimSpace(nextConnID):
+		slog.Info("tunnel connection switched",
+			"tunnelId", tunnelID,
+			"rdName", strings.TrimSpace(s.sessions[tunnelID].RDName),
+			"fromConnId", strings.TrimSpace(existing.ConnID),
+			"toConnId", strings.TrimSpace(nextConnID),
+			"sessionEpoch", event.SessionEpoch,
+		)
 	}
 	return s.sessions[tunnelID].ResourceVersion, nil
 }

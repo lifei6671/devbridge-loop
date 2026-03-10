@@ -432,9 +432,13 @@ agent:
   rdName: "alice"
   envName: "dev-alice"
   tunnel:
+    syncProtocol: "http" # http | masque
     bridgeAddress: "bridge.example.internal:443"
     heartbeatIntervalSec: 10
     reconnectBackoffMs: [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000, 50000, 55000, 60000]
+    masqueAuthMode: "psk" # psk | ecdh
+    masquePSK: "devloop-masque-default-psk"
+    masqueTargetAddr: "127.0.0.1:39081"
   registration:
     defaultTTLSeconds: 30
     scanIntervalSec: 5

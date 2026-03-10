@@ -25,6 +25,11 @@ struct DesktopConfigFile {
     env_resolve_order: Option<Vec<String>>,
     tunnel_bridge_address: Option<String>,
     tunnel_backflow_base_url: Option<String>,
+    tunnel_sync_protocol: Option<String>,
+    tunnel_masque_auth_mode: Option<String>,
+    tunnel_masque_psk: Option<String>,
+    tunnel_masque_proxy_url: Option<String>,
+    tunnel_masque_target_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +45,11 @@ pub struct DesktopConfigView {
     pub env_resolve_order: Vec<String>,
     pub tunnel_bridge_address: String,
     pub tunnel_backflow_base_url: String,
+    pub tunnel_sync_protocol: String,
+    pub tunnel_masque_auth_mode: String,
+    pub tunnel_masque_psk: String,
+    pub tunnel_masque_proxy_url: String,
+    pub tunnel_masque_target_addr: String,
     pub platform: String,
     pub arch: String,
     pub config_dir: String,
@@ -60,6 +70,11 @@ pub struct DesktopConfigSaveRequest {
     pub env_resolve_order: Vec<String>,
     pub tunnel_bridge_address: String,
     pub tunnel_backflow_base_url: String,
+    pub tunnel_sync_protocol: String,
+    pub tunnel_masque_auth_mode: String,
+    pub tunnel_masque_psk: String,
+    pub tunnel_masque_proxy_url: String,
+    pub tunnel_masque_target_addr: String,
 }
 
 pub fn resolve_storage_paths(app: &AppHandle) -> Result<HostStoragePaths, String> {
@@ -119,6 +134,27 @@ pub fn apply_persisted_env_overrides(storage: &HostStoragePaths) -> Result<(), S
         "DEVLOOP_TUNNEL_BACKFLOW_BASE_URL",
         file.tunnel_backflow_base_url.as_deref(),
     );
+    // MASQUE 相关配置与 tunnel 主配置同一优先级，统一走“环境变量未显式设置时再补默认”。
+    set_env_if_absent(
+        "DEVLOOP_TUNNEL_SYNC_PROTOCOL",
+        file.tunnel_sync_protocol.as_deref(),
+    );
+    set_env_if_absent(
+        "DEVLOOP_TUNNEL_MASQUE_AUTH_MODE",
+        file.tunnel_masque_auth_mode.as_deref(),
+    );
+    set_env_if_absent(
+        "DEVLOOP_TUNNEL_MASQUE_PSK",
+        file.tunnel_masque_psk.as_deref(),
+    );
+    set_env_if_absent(
+        "DEVLOOP_TUNNEL_MASQUE_PROXY_URL",
+        file.tunnel_masque_proxy_url.as_deref(),
+    );
+    set_env_if_absent(
+        "DEVLOOP_TUNNEL_MASQUE_TARGET_ADDR",
+        file.tunnel_masque_target_addr.as_deref(),
+    );
     Ok(())
 }
 
@@ -146,6 +182,17 @@ pub fn save_desktop_config(
         env_resolve_order: Some(normalize_env_resolve_order(request.env_resolve_order)),
         tunnel_bridge_address: normalize_required(&request.tunnel_bridge_address),
         tunnel_backflow_base_url: normalize_required(&request.tunnel_backflow_base_url),
+        tunnel_sync_protocol: Some(normalize_tunnel_sync_protocol(
+            &request.tunnel_sync_protocol,
+        )),
+        tunnel_masque_auth_mode: Some(normalize_masque_auth_mode(&request.tunnel_masque_auth_mode)),
+        tunnel_masque_psk: Some(normalize_optional_non_empty(&request.tunnel_masque_psk)),
+        tunnel_masque_proxy_url: Some(normalize_optional_non_empty(
+            &request.tunnel_masque_proxy_url,
+        )),
+        tunnel_masque_target_addr: Some(normalize_masque_target_addr(
+            &request.tunnel_masque_target_addr,
+        )),
     };
 
     save_config_file(storage, &file)?;
@@ -166,6 +213,11 @@ pub fn persist_close_to_tray_on_close(
         env_resolve_order: None,
         tunnel_bridge_address: None,
         tunnel_backflow_base_url: None,
+        tunnel_sync_protocol: None,
+        tunnel_masque_auth_mode: None,
+        tunnel_masque_psk: None,
+        tunnel_masque_proxy_url: None,
+        tunnel_masque_target_addr: None,
     });
 
     file.close_to_tray_on_close = Some(close_to_tray_on_close);
@@ -260,6 +312,48 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     )
     .unwrap_or_else(|| "http://127.0.0.1:39090".to_string());
 
+    // 协议与 MASQUE 参数统一在 View 层做一次兜底，避免前端拿到空值导致表单回显异常。
+    let tunnel_sync_protocol = normalize_tunnel_sync_protocol(
+        &first_non_blank(
+            std::env::var("DEVLOOP_TUNNEL_SYNC_PROTOCOL").ok(),
+            file.and_then(|item| item.tunnel_sync_protocol.clone()),
+            Some("http".to_string()),
+        )
+        .unwrap_or_else(|| "http".to_string()),
+    );
+    let tunnel_masque_auth_mode = normalize_masque_auth_mode(
+        &first_non_blank(
+            std::env::var("DEVLOOP_TUNNEL_MASQUE_AUTH_MODE").ok(),
+            file.and_then(|item| item.tunnel_masque_auth_mode.clone()),
+            Some("psk".to_string()),
+        )
+        .unwrap_or_else(|| "psk".to_string()),
+    );
+    let tunnel_masque_psk = normalize_optional_non_empty(
+        &first_non_blank(
+            std::env::var("DEVLOOP_TUNNEL_MASQUE_PSK").ok(),
+            file.and_then(|item| item.tunnel_masque_psk.clone()),
+            Some("devloop-masque-default-psk".to_string()),
+        )
+        .unwrap_or_else(|| "devloop-masque-default-psk".to_string()),
+    );
+    let tunnel_masque_proxy_url = normalize_optional_non_empty(
+        &first_non_blank(
+            std::env::var("DEVLOOP_TUNNEL_MASQUE_PROXY_URL").ok(),
+            file.and_then(|item| item.tunnel_masque_proxy_url.clone()),
+            Some(String::new()),
+        )
+        .unwrap_or_default(),
+    );
+    let tunnel_masque_target_addr = normalize_masque_target_addr(
+        &first_non_blank(
+            std::env::var("DEVLOOP_TUNNEL_MASQUE_TARGET_ADDR").ok(),
+            file.and_then(|item| item.tunnel_masque_target_addr.clone()),
+            Some("127.0.0.1:39081".to_string()),
+        )
+        .unwrap_or_else(|| "127.0.0.1:39081".to_string()),
+    );
+
     DesktopConfigView {
         agent_api_base,
         agent_binary,
@@ -271,6 +365,11 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
         env_resolve_order,
         tunnel_bridge_address,
         tunnel_backflow_base_url,
+        tunnel_sync_protocol,
+        tunnel_masque_auth_mode,
+        tunnel_masque_psk,
+        tunnel_masque_proxy_url,
+        tunnel_masque_target_addr,
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         config_dir: storage.config_dir.display().to_string(),
@@ -310,6 +409,10 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
             Some(normalized.to_string())
         }
     })
+}
+
+fn normalize_optional_non_empty(value: &str) -> String {
+    value.trim().to_string()
 }
 
 fn parse_auto_restart(value: String) -> bool {
@@ -400,4 +503,26 @@ fn join_u64(values: &[u64]) -> String {
         .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn normalize_tunnel_sync_protocol(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "masque" => "masque".to_string(),
+        _ => "http".to_string(),
+    }
+}
+
+fn normalize_masque_auth_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ecdh" => "ecdh".to_string(),
+        _ => "psk".to_string(),
+    }
+}
+
+fn normalize_masque_target_addr(value: &str) -> String {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return "127.0.0.1:39081".to_string();
+    }
+    normalized.to_string()
 }

@@ -20,6 +20,7 @@ export interface TunnelState {
   lastHeartbeatAt: string;
   nextReconnectAt: string | null;
   lastReconnectError: string;
+  protocol: string;
   bridgeAddress: string;
   reconnectBackoffMs: number[];
 }
@@ -107,6 +108,11 @@ export interface DesktopConfigView {
   envResolveOrder: string[];
   tunnelBridgeAddress: string;
   tunnelBackflowBaseUrl: string;
+  tunnelSyncProtocol: string;
+  tunnelMasqueAuthMode: string;
+  tunnelMasquePsk: string;
+  tunnelMasqueProxyUrl: string;
+  tunnelMasqueTargetAddr: string;
   platform: string;
   arch: string;
   configDir: string;
@@ -125,4 +131,9 @@ export interface DesktopConfigSaveRequest {
   envResolveOrder: string[];
   tunnelBridgeAddress: string;
   tunnelBackflowBaseUrl: string;
+  tunnelSyncProtocol: string;
+  tunnelMasqueAuthMode: string;
+  tunnelMasquePsk: string;
+  tunnelMasqueProxyUrl: string;
+  tunnelMasqueTargetAddr: string;
 }

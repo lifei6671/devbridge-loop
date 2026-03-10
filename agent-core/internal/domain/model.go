@@ -80,6 +80,7 @@ type TunnelState struct {
 	LastHeartbeatAt    time.Time  `json:"lastHeartbeatAt"`
 	NextReconnectAt    *time.Time `json:"nextReconnectAt"`
 	LastReconnectError string     `json:"lastReconnectError"`
+	Protocol           string     `json:"protocol"`
 	BridgeAddress      string     `json:"bridgeAddress"`
 	ReconnectBackoffM  []int      `json:"reconnectBackoffMs"`
 }
