@@ -6,13 +6,14 @@ import (
 )
 
 // NewAdapter 根据业务配置创建 registry 适配器。
-func NewAdapter(options Options) (Adapter, error) {
+func NewAdapter(options Options) (Registry, error) {
 	switch normalizeRegistryType(options.Type) {
 	case RegistryTypeAgent:
 		return NewAgentAdapter(AgentOptions{
 			AgentAddr:  options.AgentAddr,
 			RuntimeEnv: options.RuntimeEnv,
 			HTTPClient: options.HTTPClient,
+			WatchEvery: options.WatchEvery,
 		})
 	default:
 		return nil, fmt.Errorf("unsupported registry type: %s", strings.TrimSpace(string(options.Type)))

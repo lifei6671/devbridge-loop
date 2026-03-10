@@ -3,6 +3,7 @@ module github.com/lifei6671/devbridge-loop/agent-core
 go 1.26.0
 
 require (
+	github.com/lifei6671/devbridge-loop/service-registry v0.0.0
 	github.com/quic-go/masque-go v0.3.0
 	github.com/quic-go/quic-go v0.53.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
@@ -23,3 +24,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
+
+replace github.com/lifei6671/devbridge-loop/service-registry => ../service-registry

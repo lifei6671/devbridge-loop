@@ -6,33 +6,45 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestAgentAdapterRegisterHeartbeatUnregister(t *testing.T) {
+func TestAgentAdapterRegisterDeregisterAndAutoHeartbeat(t *testing.T) {
 	var registerCalled bool
-	var heartbeatCalled bool
-	var unregisterCalled bool
+	var heartbeatCalled int
+	var deregisterCalled bool
+	var mu sync.Mutex
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/registrations":
+			mu.Lock()
 			registerCalled = true
+			mu.Unlock()
+
 			var payload localRegistrationPayload
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode register payload failed: %v", err)
 			}
-			if payload.Env != "dev-alice" {
-				t.Fatalf("unexpected env: %+v", payload)
+			if payload.ServiceName != "user-service" || payload.Env != "dev-alice" {
+				t.Fatalf("unexpected register payload: %+v", payload)
+			}
+			if len(payload.Endpoints) != 1 || payload.Endpoints[0].Protocol != "tcp" {
+				t.Fatalf("unexpected register endpoint payload: %+v", payload.Endpoints)
 			}
 			payload.InstanceID = "inst-1"
 			_ = json.NewEncoder(w).Encode(payload)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/registrations/inst-1/heartbeat":
-			heartbeatCalled = true
+			mu.Lock()
+			heartbeatCalled++
+			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]string{"result": "ok"})
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/registrations/inst-1":
-			unregisterCalled = true
+			mu.Lock()
+			deregisterCalled = true
+			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]string{"result": "deleted"})
 		default:
 			http.NotFound(w, r)
@@ -49,62 +61,77 @@ func TestAgentAdapterRegisterHeartbeatUnregister(t *testing.T) {
 		t.Fatalf("new agent adapter failed: %v", err)
 	}
 
-	registered, err := adapter.Register(context.Background(), Registration{
-		ServiceName: "user-service",
-		Endpoints: []Endpoint{
-			{
-				Protocol:   "http",
-				ListenPort: 18080,
-				TargetPort: 18080,
-			},
-		},
-	})
+	registered, err := adapter.Register(context.Background(), NewService(
+		"user-service",
+		WithServiceMetadata(Metadata{
+			"env":        "dev-alice",
+			"ttlSeconds": 9,
+		}),
+		WithServiceEndpoints(Endpoints{
+			NewEndpoint("127.0.0.1", 18080),
+		}),
+	))
 	if err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
-	if strings.TrimSpace(registered.InstanceID) != "inst-1" {
+	if registered == nil || strings.TrimSpace(metadataString(registered.GetMetadata(), "instanceId")) != "inst-1" {
 		t.Fatalf("unexpected register result: %+v", registered)
 	}
 
-	if err := adapter.Heartbeat(context.Background(), "inst-1"); err != nil {
-		t.Fatalf("heartbeat failed: %v", err)
-	}
-	if err := adapter.Unregister(context.Background(), "inst-1"); err != nil {
-		t.Fatalf("unregister failed: %v", err)
+	// TTL=9 时心跳周期为 3s，这里等待一次自动心跳触发。
+	time.Sleep(3200 * time.Millisecond)
+	if err := adapter.Deregister(context.Background(), registered); err != nil {
+		t.Fatalf("deregister failed: %v", err)
 	}
 
-	if !registerCalled || !heartbeatCalled || !unregisterCalled {
-		t.Fatalf("expected all endpoints to be called, register=%v heartbeat=%v unregister=%v", registerCalled, heartbeatCalled, unregisterCalled)
+	mu.Lock()
+	defer mu.Unlock()
+	if !registerCalled || !deregisterCalled {
+		t.Fatalf("expected register and deregister called, register=%v deregister=%v", registerCalled, deregisterCalled)
+	}
+	if heartbeatCalled <= 0 {
+		t.Fatalf("expected auto heartbeat to be called, got %d", heartbeatCalled)
 	}
 }
 
-func TestAgentAdapterDiscover(t *testing.T) {
+func TestAgentAdapterSearch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/discover" {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/registrations" {
 			http.NotFound(w, r)
 			return
 		}
-
-		var payload discoverPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode discover payload failed: %v", err)
-		}
-		// 验证 discover 未传 env 时会自动使用运行时默认 env。
-		if payload.Env != "dev-alice" {
-			t.Fatalf("unexpected discover env: %+v", payload)
-		}
-
-		_ = json.NewEncoder(w).Encode(discoverResultPayload{
-			Matched:      true,
-			ResolvedEnv:  "dev-alice",
-			Resolution:   "dev-priority",
-			ResourceHint: "resourceVersion=8",
-			RouteTarget: struct {
-				TargetHost string `json:"targetHost"`
-				TargetPort int    `json:"targetPort"`
-			}{
-				TargetHost: "127.0.0.1",
-				TargetPort: 18080,
+		_ = json.NewEncoder(w).Encode([]localRegistrationPayload{
+			{
+				ServiceName: "user-service",
+				Env:         "dev-alice",
+				InstanceID:  "inst-a",
+				Metadata: map[string]string{
+					"env":     "dev-alice",
+					"version": "v1.2.3",
+				},
+				Endpoints: []endpointPayload{
+					{
+						Protocol:   "tcp",
+						TargetHost: "127.0.0.1",
+						TargetPort: 18080,
+					},
+				},
+			},
+			{
+				ServiceName: "order-service",
+				Env:         "base",
+				InstanceID:  "inst-b",
+				Metadata: map[string]string{
+					"env":     "base",
+					"version": "latest",
+				},
+				Endpoints: []endpointPayload{
+					{
+						Protocol:   "tcp",
+						TargetHost: "127.0.0.1",
+						TargetPort: 18081,
+					},
+				},
 			},
 		})
 	}))
@@ -119,26 +146,84 @@ func TestAgentAdapterDiscover(t *testing.T) {
 		t.Fatalf("new agent adapter failed: %v", err)
 	}
 
-	response, err := adapter.Discover(context.Background(), DiscoverRequest{
-		ServiceName: "user-service",
-		Protocol:    "http",
+	result, err := adapter.Search(context.Background(), SearchInput{
+		Name:    "user-service",
+		Version: "v1.2.3",
+		Metadata: Metadata{
+			"env": "dev-alice",
+		},
 	})
 	if err != nil {
-		t.Fatalf("discover failed: %v", err)
+		t.Fatalf("search failed: %v", err)
 	}
-	if !response.Matched || response.TargetPort != 18080 || response.TargetHost != "127.0.0.1" {
-		t.Fatalf("unexpected discover response: %+v", response)
+	if len(result) != 1 {
+		t.Fatalf("unexpected search result length: %d", len(result))
+	}
+	if result[0].GetName() != "user-service" || result[0].GetVersion() != "v1.2.3" {
+		t.Fatalf("unexpected service result: name=%s version=%s", result[0].GetName(), result[0].GetVersion())
 	}
 }
 
-func TestAgentAdapterDiscoverRequiresFields(t *testing.T) {
-	adapter, err := NewAgentAdapter(AgentOptions{})
+func TestAgentAdapterWatch(t *testing.T) {
+	var callCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/registrations" {
+			http.NotFound(w, r)
+			return
+		}
+		callCount++
+		if callCount == 1 {
+			_ = json.NewEncoder(w).Encode([]localRegistrationPayload{})
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]localRegistrationPayload{
+			{
+				ServiceName: "user-service",
+				Env:         "dev-alice",
+				InstanceID:  "inst-a",
+				Metadata: map[string]string{
+					"env":     "dev-alice",
+					"version": "latest",
+				},
+				Endpoints: []endpointPayload{
+					{Protocol: "tcp", TargetHost: "127.0.0.1", TargetPort: 18080},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	adapter, err := NewAgentAdapter(AgentOptions{
+		AgentAddr:  server.URL,
+		RuntimeEnv: "dev-alice",
+		HTTPClient: &http.Client{Timeout: 2 * time.Second},
+		WatchEvery: 10 * time.Millisecond,
+	})
 	if err != nil {
 		t.Fatalf("new agent adapter failed: %v", err)
 	}
 
-	_, err = adapter.Discover(context.Background(), DiscoverRequest{})
-	if err == nil {
-		t.Fatalf("discover should fail when fields are missing")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher, err := adapter.Watch(ctx, "/services")
+	if err != nil {
+		t.Fatalf("watch failed: %v", err)
+	}
+	defer watcher.Close()
+
+	first, err := watcher.Proceed()
+	if err != nil {
+		t.Fatalf("watch proceed first failed: %v", err)
+	}
+	if len(first) != 0 {
+		t.Fatalf("unexpected first watch result: %+v", first)
+	}
+
+	second, err := watcher.Proceed()
+	if err != nil {
+		t.Fatalf("watch proceed second failed: %v", err)
+	}
+	if len(second) != 1 || second[0].GetName() != "user-service" {
+		t.Fatalf("unexpected second watch result: %+v", second)
 	}
 }
