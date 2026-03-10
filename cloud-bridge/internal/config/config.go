@@ -17,10 +17,39 @@ type Config struct {
 	MasqueAuthMode      string
 	MasquePSK           string
 	RouteExtractorOrder []string
+	DiscoveryBackends   []string
+	DiscoveryTimeout    time.Duration
+	DiscoveryLocalFile  string
+	NacosDiscovery      NacosDiscoveryConfig
+	EtcdDiscovery       EtcdDiscoveryConfig
+	ConsulDiscovery     ConsulDiscoveryConfig
 	BridgePublicHost    string
 	BridgePublicPort    int
 	FallbackBackflowURL string
 	IngressTimeout      time.Duration
+}
+
+// NacosDiscoveryConfig 定义 Nacos 服务发现参数。
+type NacosDiscoveryConfig struct {
+	ServerAddr     string
+	Namespace      string
+	Group          string
+	ServicePattern string
+	Username       string
+	Password       string
+}
+
+// EtcdDiscoveryConfig 定义 etcd 服务发现参数。
+type EtcdDiscoveryConfig struct {
+	Endpoints []string
+	KeyPrefix string
+}
+
+// ConsulDiscoveryConfig 定义 Consul 服务发现参数。
+type ConsulDiscoveryConfig struct {
+	Addr           string
+	Datacenter     string
+	ServicePattern string
 }
 
 // LoadFromEnv 按环境变量加载配置，并提供默认值。
@@ -29,6 +58,8 @@ func LoadFromEnv() Config {
 	rawTunnelSyncProtocols := getenv("DEVLOOP_TUNNEL_SYNC_PROTOCOL", "")
 	tunnelSyncProtocols := normalizeTunnelSyncProtocols(rawTunnelSyncProtocols)
 	order := strings.Split(getenv("DEVLOOP_ROUTE_EXTRACT_ORDER", "host,header,sni"), ",")
+	discoveryBackends := normalizeDiscoveryBackends(getenv("DEVLOOP_BRIDGE_DISCOVERY_BACKENDS", "local,nacos,etcd,consul"))
+	discoveryTimeout := time.Duration(getenvInt("DEVLOOP_BRIDGE_DISCOVERY_TIMEOUT_MS", 2000)) * time.Millisecond
 	for i := range order {
 		order[i] = strings.TrimSpace(order[i])
 	}
@@ -42,6 +73,26 @@ func LoadFromEnv() Config {
 		MasqueAuthMode:      normalizeMasqueAuthMode(getenv("DEVLOOP_TUNNEL_MASQUE_AUTH_MODE", "psk")),
 		MasquePSK:           getenv("DEVLOOP_TUNNEL_MASQUE_PSK", "devloop-masque-default-psk"),
 		RouteExtractorOrder: order,
+		DiscoveryBackends:   discoveryBackends,
+		DiscoveryTimeout:    discoveryTimeout,
+		DiscoveryLocalFile:  strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE", "")),
+		NacosDiscovery: NacosDiscoveryConfig{
+			ServerAddr:     strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_ADDR", "")),
+			Namespace:      strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_NAMESPACE", "")),
+			Group:          strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_GROUP", "DEFAULT_GROUP")),
+			ServicePattern: strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_SERVICE_PATTERN", "${service}")),
+			Username:       strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_USERNAME", "")),
+			Password:       strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_NACOS_PASSWORD", "")),
+		},
+		EtcdDiscovery: EtcdDiscoveryConfig{
+			Endpoints: splitCommaValues(getenv("DEVLOOP_BRIDGE_DISCOVERY_ETCD_ENDPOINTS", "")),
+			KeyPrefix: strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_ETCD_KEY_PREFIX", "/devloop/services")),
+		},
+		ConsulDiscovery: ConsulDiscoveryConfig{
+			Addr:           strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_CONSUL_ADDR", "")),
+			Datacenter:     strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_CONSUL_DC", "")),
+			ServicePattern: strings.TrimSpace(getenv("DEVLOOP_BRIDGE_DISCOVERY_CONSUL_SERVICE_PATTERN", "${service}")),
+		},
 		BridgePublicHost:    getenv("DEVLOOP_BRIDGE_PUBLIC_HOST", "bridge.example.internal"),
 		BridgePublicPort:    getenvInt("DEVLOOP_BRIDGE_PUBLIC_PORT", 443),
 		FallbackBackflowURL: getenv("DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL", "http://127.0.0.1:39090"),
@@ -100,4 +151,39 @@ func normalizeMasqueAuthMode(value string) string {
 	default:
 		return "psk"
 	}
+}
+
+func normalizeDiscoveryBackends(value string) []string {
+	parts := splitCommaValues(value)
+	backends := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, 4)
+	for _, part := range parts {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case "local", "nacos", "etcd", "consul":
+			key := strings.ToLower(strings.TrimSpace(part))
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			backends = append(backends, key)
+		}
+	}
+	// 未配置或配置无效时，默认启用全部发现器，保证功能开箱即用。
+	if len(backends) == 0 {
+		return []string{"local", "nacos", "etcd", "consul"}
+	}
+	return backends
+}
+
+func splitCommaValues(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
 }

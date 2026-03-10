@@ -13,6 +13,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/httpapi"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/routing"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/upstream"
 )
 
 // App 负责组装 cloud-bridge 的传输层和运行态依赖。
@@ -30,6 +31,8 @@ func New(cfg config.Config) *App {
 	pipeline := routing.NewPipeline(cfg.RouteExtractorOrder)
 	stateStore := store.NewMemoryStoreWithBridge(cfg.BridgePublicHost, cfg.BridgePublicPort)
 	backflowClient := backflow.NewClient(cfg.IngressTimeout)
+	upstreamClient := upstream.NewClient(cfg.IngressTimeout)
+	discoveryResolver, discoveryErr := newDiscoveryResolver(cfg)
 	httpTunnelSyncEnabled := tunnelProtocolEnabled(tunnelProtocols, tunnelProtocolHTTP)
 	h := httpapi.NewHandler(
 		pipeline,
@@ -37,11 +40,16 @@ func New(cfg config.Config) *App {
 		backflowClient,
 		cfg.FallbackBackflowURL,
 		httpapi.WithTunnelEventHTTPEnabled(httpTunnelSyncEnabled),
+		httpapi.WithServiceDiscoveryResolver(discoveryResolver),
+		httpapi.WithUpstreamForwarder(upstreamClient),
 	)
 
 	protocolRuntimes, startupErr := newTunnelProtocolRuntimes(cfg, stateStore)
+	if discoveryErr != nil {
+		startupErr = errors.Join(startupErr, fmt.Errorf("init discovery resolver failed: %w", discoveryErr))
+	}
 	if startupErr != nil {
-		startupErr = fmt.Errorf("init tunnel runtimes failed: %w", startupErr)
+		startupErr = fmt.Errorf("init bridge runtimes failed: %w", startupErr)
 	}
 
 	slog.Info("bridge routing pipeline", "order", pipeline.DebugString())

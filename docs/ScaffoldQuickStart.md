@@ -240,6 +240,43 @@ make run-demo-order
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
 - `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:39090`）
 - `DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC`：bridge 调用 agent 回流接口的超时秒数（默认 `10`）
+- `DEVLOOP_BRIDGE_DISCOVERY_BACKENDS`：bridge 服务发现后端，逗号分隔（默认 `local,nacos,etcd,consul`）
+- `DEVLOOP_BRIDGE_DISCOVERY_TIMEOUT_MS`：服务发现请求超时毫秒（默认 `2000`）
+- `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE`：本地服务发现配置文件（JSON）
+- `DEVLOOP_BRIDGE_DISCOVERY_NACOS_ADDR`：Nacos 地址（例如 `127.0.0.1:8848`）
+- `DEVLOOP_BRIDGE_DISCOVERY_NACOS_NAMESPACE`：Nacos namespace（可选）
+- `DEVLOOP_BRIDGE_DISCOVERY_NACOS_GROUP`：Nacos group（默认 `DEFAULT_GROUP`）
+- `DEVLOOP_BRIDGE_DISCOVERY_NACOS_SERVICE_PATTERN`：Nacos serviceName 模板（默认 `${service}`，支持 `${env}` `${service}` `${protocol}`）
+- `DEVLOOP_BRIDGE_DISCOVERY_ETCD_ENDPOINTS`：etcd 地址列表（逗号分隔）
+- `DEVLOOP_BRIDGE_DISCOVERY_ETCD_KEY_PREFIX`：etcd key 前缀（默认 `/devloop/services`）
+- `DEVLOOP_BRIDGE_DISCOVERY_CONSUL_ADDR`：Consul 地址（例如 `127.0.0.1:8500`）
+- `DEVLOOP_BRIDGE_DISCOVERY_CONSUL_DC`：Consul datacenter（可选）
+- `DEVLOOP_BRIDGE_DISCOVERY_CONSUL_SERVICE_PATTERN`：Consul serviceName 模板（默认 `${service}`）
+
+### 本地服务发现文件示例
+
+> 文件路径通过 `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE` 指定，可参考 `examples/bridge-local-discovery.json`：
+
+```json
+{
+  "routes": [
+    {
+      "env": "base",
+      "serviceName": "user",
+      "protocol": "http",
+      "host": "127.0.0.1",
+      "port": 8081
+    },
+    {
+      "env": "base",
+      "serviceName": "order",
+      "protocol": "grpc",
+      "host": "127.0.0.1",
+      "port": 9091
+    }
+  ]
+}
+```
 
 ## 桌面配置持久化
 

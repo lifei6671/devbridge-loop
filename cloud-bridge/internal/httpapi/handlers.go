@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/backflow"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/discovery"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/domain"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/routing"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
@@ -25,13 +26,21 @@ type BackflowHTTPCaller interface {
 	ForwardGRPC(ctx context.Context, baseURL string, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error)
 }
 
+// UpstreamForwarder 抽象 bridge 直连上游能力（未命中 tunnel 时使用）。
+type UpstreamForwarder interface {
+	ForwardHTTP(ctx context.Context, endpoint discovery.Endpoint, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error)
+	ForwardGRPC(ctx context.Context, endpoint discovery.Endpoint, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error)
+}
+
 // Handler 提供 bridge 管理面与状态查询接口。
 type Handler struct {
-	pipeline            *routing.Pipeline
-	store               *store.MemoryStore
-	backflowCaller      BackflowHTTPCaller
-	fallbackBackflowURL string
-	httpTunnelSyncOn    bool
+	pipeline                 *routing.Pipeline
+	store                    *store.MemoryStore
+	backflowCaller           BackflowHTTPCaller
+	upstreamForwarder        UpstreamForwarder
+	serviceDiscoveryResolver discovery.Resolver
+	fallbackBackflowURL      string
+	httpTunnelSyncOn         bool
 }
 
 // HandlerOption 允许按需扩展 Handler 行为，不影响已有调用方。
@@ -44,6 +53,24 @@ func WithTunnelEventHTTPEnabled(enabled bool) HandlerOption {
 	}
 }
 
+// WithServiceDiscoveryResolver 注入服务发现实现（用于 tunnel 未命中场景）。
+func WithServiceDiscoveryResolver(resolver discovery.Resolver) HandlerOption {
+	return func(h *Handler) {
+		if resolver == nil {
+			h.serviceDiscoveryResolver = discovery.NoopResolver{}
+			return
+		}
+		h.serviceDiscoveryResolver = resolver
+	}
+}
+
+// WithUpstreamForwarder 注入直连上游转发能力。
+func WithUpstreamForwarder(forwarder UpstreamForwarder) HandlerOption {
+	return func(h *Handler) {
+		h.upstreamForwarder = forwarder
+	}
+}
+
 // NewHandler 创建 HTTP handler 集合。
 func NewHandler(
 	pipeline *routing.Pipeline,
@@ -53,10 +80,11 @@ func NewHandler(
 	options ...HandlerOption,
 ) *Handler {
 	h := &Handler{
-		pipeline:            pipeline,
-		store:               store,
-		backflowCaller:      backflowCaller,
-		fallbackBackflowURL: strings.TrimSpace(fallbackBackflowURL),
+		pipeline:                 pipeline,
+		store:                    store,
+		backflowCaller:           backflowCaller,
+		serviceDiscoveryResolver: discovery.NoopResolver{},
+		fallbackBackflowURL:      strings.TrimSpace(fallbackBackflowURL),
 		// 默认向后兼容：若上层未显式配置，HTTP tunnel 事件入口保持开启。
 		httpTunnelSyncOn: true,
 	}
@@ -235,36 +263,6 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route, session, ok := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "http")
-	if !ok {
-		h.store.AddError(domain.IngressErrorRouteNotFound, "ingress route not found", map[string]string{
-			"env":         strings.TrimSpace(result.Env),
-			"serviceName": strings.TrimSpace(result.ServiceName),
-			"protocol":    "http",
-		})
-		writeIngressError(
-			w,
-			http.StatusNotFound,
-			domain.IngressErrorRouteNotFound,
-			"route not found for env/service/protocol",
-		)
-		return
-	}
-
-	baseURL := strings.TrimSpace(session.BackflowBaseURL)
-	if baseURL == "" {
-		baseURL = h.fallbackBackflowURL
-	}
-	if baseURL == "" {
-		h.store.AddError(domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", map[string]string{
-			"env":         strings.TrimSpace(route.Env),
-			"serviceName": strings.TrimSpace(route.ServiceName),
-			"tunnelId":    strings.TrimSpace(route.TunnelID),
-		})
-		writeIngressError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable")
-		return
-	}
-
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.store.AddError(domain.IngressErrorRouteExtractFailed, "read ingress request body failed", map[string]string{
@@ -275,51 +273,145 @@ func (h *Handler) ingressHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	forwardResp, err := h.backflowCaller.ForwardHTTP(r.Context(), baseURL, domain.BackflowHTTPRequest{
-		Method:     r.Method,
-		Path:       normalizeIngressPath(r.URL.Path),
-		RawQuery:   r.URL.RawQuery,
-		Host:       r.Host,
-		Headers:    cloneHeaders(r.Header),
-		Body:       body,
-		TargetHost: "127.0.0.1",
-		TargetPort: route.TargetPort,
-		Protocol:   "http",
-	})
-	if err != nil {
-		var backflowErr *backflow.Error
-		if errors.As(err, &backflowErr) {
-			h.store.AddError(firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline), firstNonEmpty(backflowErr.Message, "call agent backflow failed"), map[string]string{
+	backflowRequest := domain.BackflowHTTPRequest{
+		Method:   r.Method,
+		Path:     normalizeIngressPath(r.URL.Path),
+		RawQuery: r.URL.RawQuery,
+		Host:     r.Host,
+		Headers:  cloneHeaders(r.Header),
+		Body:     body,
+		Protocol: "http",
+	}
+
+	if route, session, localMatched := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "http"); localMatched {
+		baseURL := strings.TrimSpace(session.BackflowBaseURL)
+		if baseURL == "" {
+			baseURL = h.fallbackBackflowURL
+		}
+		if baseURL == "" {
+			h.store.AddError(domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", map[string]string{
+				"env":         strings.TrimSpace(route.Env),
+				"serviceName": strings.TrimSpace(route.ServiceName),
+				"tunnelId":    strings.TrimSpace(route.TunnelID),
+			})
+			writeIngressError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable")
+			return
+		}
+
+		forwardResp, err := h.backflowCaller.ForwardHTTP(r.Context(), baseURL, domain.BackflowHTTPRequest{
+			Method:     backflowRequest.Method,
+			Path:       backflowRequest.Path,
+			RawQuery:   backflowRequest.RawQuery,
+			Host:       backflowRequest.Host,
+			Headers:    backflowRequest.Headers,
+			Body:       backflowRequest.Body,
+			TargetHost: "127.0.0.1",
+			TargetPort: route.TargetPort,
+			Protocol:   "http",
+		})
+		if err != nil {
+			var backflowErr *backflow.Error
+			if errors.As(err, &backflowErr) {
+				h.store.AddError(firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline), firstNonEmpty(backflowErr.Message, "call agent backflow failed"), map[string]string{
+					"env":         strings.TrimSpace(route.Env),
+					"serviceName": strings.TrimSpace(route.ServiceName),
+					"tunnelId":    strings.TrimSpace(route.TunnelID),
+					"baseURL":     strings.TrimSpace(baseURL),
+				})
+				writeIngressError(
+					w,
+					statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway),
+					firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline),
+					firstNonEmpty(backflowErr.Message, "call agent backflow failed"),
+				)
+				return
+			}
+			h.store.AddError(domain.IngressErrorTunnelOffline, "call agent backflow failed", map[string]string{
 				"env":         strings.TrimSpace(route.Env),
 				"serviceName": strings.TrimSpace(route.ServiceName),
 				"tunnelId":    strings.TrimSpace(route.TunnelID),
 				"baseURL":     strings.TrimSpace(baseURL),
+				"error":       err.Error(),
 			})
-			writeIngressError(
-				w,
-				statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway),
-				firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline),
-				firstNonEmpty(backflowErr.Message, "call agent backflow failed"),
-			)
+			writeIngressError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error())
 			return
 		}
-		h.store.AddError(domain.IngressErrorTunnelOffline, "call agent backflow failed", map[string]string{
-			"env":         strings.TrimSpace(route.Env),
-			"serviceName": strings.TrimSpace(route.ServiceName),
-			"tunnelId":    strings.TrimSpace(route.TunnelID),
-			"baseURL":     strings.TrimSpace(baseURL),
-			"error":       err.Error(),
-		})
-		writeIngressError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error())
+
+		// 透传目标服务返回头时过滤 hop-by-hop 头，避免代理链路语义冲突。
+		copyResponseHeaders(w, forwardResp.Headers)
+		w.Header().Set("X-DevLoop-Route-Env", route.Env)
+		w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
+		w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
+		w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+		w.Header().Set("X-DevLoop-Route-Source", "tunnel")
+
+		statusCode := statusOrDefault(forwardResp.StatusCode, http.StatusOK)
+		w.WriteHeader(statusCode)
+		if len(forwardResp.Body) > 0 {
+			_, _ = w.Write(forwardResp.Body)
+		}
 		return
 	}
 
-	// 透传目标服务返回头时过滤 hop-by-hop 头，避免代理链路语义冲突。
+	endpoint, matched, discoveryErr := h.resolveDiscoveredEndpoint(r.Context(), result.Env, result.ServiceName, "http")
+	if discoveryErr != nil {
+		h.store.AddError(domain.IngressErrorServiceDiscoveryFailed, "service discovery lookup failed", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "http",
+			"error":       discoveryErr.Error(),
+		})
+		writeIngressError(w, http.StatusBadGateway, domain.IngressErrorServiceDiscoveryFailed, discoveryErr.Error())
+		return
+	}
+	if !matched {
+		h.store.AddError(domain.IngressErrorRouteNotFound, "ingress route not found", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "http",
+		})
+		writeIngressError(w, http.StatusNotFound, domain.IngressErrorRouteNotFound, "route not found for env/service/protocol")
+		return
+	}
+	if h.upstreamForwarder == nil {
+		h.store.AddError(domain.IngressErrorLocalEndpointDown, "upstream forwarder is unavailable", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "http",
+			"target":      endpoint.Target(),
+		})
+		writeIngressError(w, http.StatusServiceUnavailable, domain.IngressErrorLocalEndpointDown, "upstream forwarder is unavailable")
+		return
+	}
+
+	forwardResp, err := h.upstreamForwarder.ForwardHTTP(r.Context(), endpoint, domain.BackflowHTTPRequest{
+		Method:   backflowRequest.Method,
+		Path:     backflowRequest.Path,
+		RawQuery: backflowRequest.RawQuery,
+		Host:     backflowRequest.Host,
+		Headers:  backflowRequest.Headers,
+		Body:     backflowRequest.Body,
+		Protocol: backflowRequest.Protocol,
+	})
+	if err != nil {
+		h.store.AddError(domain.IngressErrorLocalEndpointDown, "forward request to discovered endpoint failed", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "http",
+			"target":      endpoint.Target(),
+			"source":      endpoint.Source,
+			"error":       err.Error(),
+		})
+		writeIngressError(w, http.StatusBadGateway, domain.IngressErrorLocalEndpointDown, err.Error())
+		return
+	}
+
 	copyResponseHeaders(w, forwardResp.Headers)
-	w.Header().Set("X-DevLoop-Route-Env", route.Env)
-	w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
-	w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
-	w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+	w.Header().Set("X-DevLoop-Route-Env", strings.TrimSpace(result.Env))
+	w.Header().Set("X-DevLoop-Route-Service", strings.TrimSpace(result.ServiceName))
+	w.Header().Set("X-DevLoop-Route-Protocol", "http")
+	w.Header().Set("X-DevLoop-Route-Source", "discovery:"+endpoint.Source)
+	w.Header().Set("X-DevLoop-Route-Target", endpoint.Target())
 
 	statusCode := statusOrDefault(forwardResp.StatusCode, http.StatusOK)
 	w.WriteHeader(statusCode)
@@ -340,37 +432,6 @@ func (h *Handler) ingressGRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	route, session, ok := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "grpc")
-	if !ok {
-		h.store.AddError(domain.IngressErrorRouteNotFound, "grpc ingress route not found", map[string]string{
-			"env":         strings.TrimSpace(result.Env),
-			"serviceName": strings.TrimSpace(result.ServiceName),
-			"protocol":    "grpc",
-		})
-		writeIngressGRPCError(
-			w,
-			http.StatusNotFound,
-			domain.IngressErrorRouteNotFound,
-			"route not found for env/service/protocol",
-			"",
-		)
-		return
-	}
-
-	baseURL := strings.TrimSpace(session.BackflowBaseURL)
-	if baseURL == "" {
-		baseURL = h.fallbackBackflowURL
-	}
-	if baseURL == "" {
-		h.store.AddError(domain.IngressErrorTunnelOffline, "grpc backflow endpoint is unavailable", map[string]string{
-			"env":         strings.TrimSpace(route.Env),
-			"serviceName": strings.TrimSpace(route.ServiceName),
-			"tunnelId":    strings.TrimSpace(route.TunnelID),
-		})
-		writeIngressGRPCError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", "")
-		return
-	}
-
 	var request domain.IngressGRPCRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
 		h.store.AddError(domain.IngressErrorRouteExtractFailed, "decode grpc ingress payload failed", map[string]string{
@@ -381,54 +442,152 @@ func (h *Handler) ingressGRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startedAt := time.Now().UTC()
-	forwardResp, err := h.backflowCaller.ForwardGRPC(r.Context(), baseURL, domain.BackflowGRPCRequest{
-		TargetHost:    "127.0.0.1",
-		TargetPort:    route.TargetPort,
-		Env:           route.Env,
-		HealthService: strings.TrimSpace(request.HealthService),
-		TimeoutMs:     request.TimeoutMs,
-	})
-	if err != nil {
-		var backflowErr *backflow.Error
-		if errors.As(err, &backflowErr) {
-			errorCode := firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline)
-			message := firstNonEmpty(backflowErr.Message, "call agent grpc backflow failed")
-			h.store.AddError(errorCode, message, map[string]string{
+	if route, session, localMatched := h.store.ResolveRouteForIngress(result.Env, result.ServiceName, "grpc"); localMatched {
+		baseURL := strings.TrimSpace(session.BackflowBaseURL)
+		if baseURL == "" {
+			baseURL = h.fallbackBackflowURL
+		}
+		if baseURL == "" {
+			h.store.AddError(domain.IngressErrorTunnelOffline, "grpc backflow endpoint is unavailable", map[string]string{
+				"env":         strings.TrimSpace(route.Env),
+				"serviceName": strings.TrimSpace(route.ServiceName),
+				"tunnelId":    strings.TrimSpace(route.TunnelID),
+			})
+			writeIngressGRPCError(w, http.StatusServiceUnavailable, domain.IngressErrorTunnelOffline, "backflow endpoint is unavailable", "")
+			return
+		}
+
+		startedAt := time.Now().UTC()
+		forwardResp, err := h.backflowCaller.ForwardGRPC(r.Context(), baseURL, domain.BackflowGRPCRequest{
+			TargetHost:    "127.0.0.1",
+			TargetPort:    route.TargetPort,
+			Env:           route.Env,
+			HealthService: strings.TrimSpace(request.HealthService),
+			TimeoutMs:     request.TimeoutMs,
+		})
+		if err != nil {
+			var backflowErr *backflow.Error
+			if errors.As(err, &backflowErr) {
+				errorCode := firstNonEmpty(backflowErr.ErrorCode, domain.IngressErrorTunnelOffline)
+				message := firstNonEmpty(backflowErr.Message, "call agent grpc backflow failed")
+				h.store.AddError(errorCode, message, map[string]string{
+					"env":         strings.TrimSpace(route.Env),
+					"serviceName": strings.TrimSpace(route.ServiceName),
+					"tunnelId":    strings.TrimSpace(route.TunnelID),
+					"baseURL":     strings.TrimSpace(baseURL),
+				})
+				writeIngressGRPCError(w, statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway), errorCode, message, "")
+				return
+			}
+			h.store.AddError(domain.IngressErrorTunnelOffline, "call agent grpc backflow failed", map[string]string{
 				"env":         strings.TrimSpace(route.Env),
 				"serviceName": strings.TrimSpace(route.ServiceName),
 				"tunnelId":    strings.TrimSpace(route.TunnelID),
 				"baseURL":     strings.TrimSpace(baseURL),
+				"error":       err.Error(),
 			})
-			writeIngressGRPCError(w, statusOrDefault(backflowErr.StatusCode, http.StatusBadGateway), errorCode, message, "")
+			writeIngressGRPCError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error(), "")
 			return
 		}
-		h.store.AddError(domain.IngressErrorTunnelOffline, "call agent grpc backflow failed", map[string]string{
-			"env":         strings.TrimSpace(route.Env),
-			"serviceName": strings.TrimSpace(route.ServiceName),
-			"tunnelId":    strings.TrimSpace(route.TunnelID),
-			"baseURL":     strings.TrimSpace(baseURL),
-			"error":       err.Error(),
+
+		// gRPC ingress 返回 JSON 结果，同时通过响应头暴露命中路由，便于调试和观测。
+		w.Header().Set("X-DevLoop-Route-Env", route.Env)
+		w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
+		w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
+		w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+		w.Header().Set("X-DevLoop-Route-Source", "tunnel")
+		respondJSON(w, http.StatusOK, domain.IngressGRPCResponse{
+			Status:      firstNonEmpty(forwardResp.Status, "UNKNOWN"),
+			ResolvedEnv: route.Env,
+			ServiceName: route.ServiceName,
+			Protocol:    route.Protocol,
+			TunnelID:    route.TunnelID,
+			Target:      firstNonEmpty(forwardResp.Target, "127.0.0.1:"+strconv.Itoa(route.TargetPort)),
+			LatencyMs:   maxInt64Value(forwardResp.LatencyMs, time.Since(startedAt).Milliseconds()),
+			ErrorCode:   "",
+			Message:     "",
 		})
-		writeIngressGRPCError(w, http.StatusBadGateway, domain.IngressErrorTunnelOffline, err.Error(), "")
 		return
 	}
 
-	// gRPC ingress 返回 JSON 结果，同时通过响应头暴露命中路由，便于调试和观测。
-	w.Header().Set("X-DevLoop-Route-Env", route.Env)
-	w.Header().Set("X-DevLoop-Route-Service", route.ServiceName)
-	w.Header().Set("X-DevLoop-Route-Protocol", route.Protocol)
-	w.Header().Set("X-DevLoop-Route-Tunnel", route.TunnelID)
+	endpoint, matched, discoveryErr := h.resolveDiscoveredEndpoint(r.Context(), result.Env, result.ServiceName, "grpc")
+	if discoveryErr != nil {
+		h.store.AddError(domain.IngressErrorServiceDiscoveryFailed, "grpc service discovery lookup failed", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "grpc",
+			"error":       discoveryErr.Error(),
+		})
+		writeIngressGRPCError(w, http.StatusBadGateway, domain.IngressErrorServiceDiscoveryFailed, discoveryErr.Error(), "")
+		return
+	}
+	if !matched {
+		h.store.AddError(domain.IngressErrorRouteNotFound, "grpc ingress route not found", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "grpc",
+		})
+		writeIngressGRPCError(w, http.StatusNotFound, domain.IngressErrorRouteNotFound, "route not found for env/service/protocol", "")
+		return
+	}
+	if h.upstreamForwarder == nil {
+		h.store.AddError(domain.IngressErrorLocalEndpointDown, "upstream forwarder is unavailable", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "grpc",
+			"target":      endpoint.Target(),
+		})
+		writeIngressGRPCError(w, http.StatusServiceUnavailable, domain.IngressErrorLocalEndpointDown, "upstream forwarder is unavailable", endpoint.Target())
+		return
+	}
+
+	startedAt := time.Now().UTC()
+	forwardResp, err := h.upstreamForwarder.ForwardGRPC(r.Context(), endpoint, domain.BackflowGRPCRequest{
+		TargetHost:    endpoint.Host,
+		TargetPort:    endpoint.Port,
+		Env:           strings.TrimSpace(result.Env),
+		HealthService: strings.TrimSpace(request.HealthService),
+		TimeoutMs:     request.TimeoutMs,
+	})
+	if err != nil {
+		h.store.AddError(domain.IngressErrorLocalEndpointDown, "call discovered grpc endpoint failed", map[string]string{
+			"env":         strings.TrimSpace(result.Env),
+			"serviceName": strings.TrimSpace(result.ServiceName),
+			"protocol":    "grpc",
+			"target":      endpoint.Target(),
+			"source":      endpoint.Source,
+			"error":       err.Error(),
+		})
+		writeIngressGRPCError(w, http.StatusBadGateway, domain.IngressErrorLocalEndpointDown, err.Error(), endpoint.Target())
+		return
+	}
+
+	w.Header().Set("X-DevLoop-Route-Env", strings.TrimSpace(result.Env))
+	w.Header().Set("X-DevLoop-Route-Service", strings.TrimSpace(result.ServiceName))
+	w.Header().Set("X-DevLoop-Route-Protocol", "grpc")
+	w.Header().Set("X-DevLoop-Route-Source", "discovery:"+endpoint.Source)
+	w.Header().Set("X-DevLoop-Route-Target", endpoint.Target())
 	respondJSON(w, http.StatusOK, domain.IngressGRPCResponse{
 		Status:      firstNonEmpty(forwardResp.Status, "UNKNOWN"),
-		ResolvedEnv: route.Env,
-		ServiceName: route.ServiceName,
-		Protocol:    route.Protocol,
-		TunnelID:    route.TunnelID,
-		Target:      firstNonEmpty(forwardResp.Target, "127.0.0.1:"+strconv.Itoa(route.TargetPort)),
+		ResolvedEnv: strings.TrimSpace(result.Env),
+		ServiceName: strings.TrimSpace(result.ServiceName),
+		Protocol:    "grpc",
+		TunnelID:    "",
+		Target:      firstNonEmpty(forwardResp.Target, endpoint.Target()),
 		LatencyMs:   maxInt64Value(forwardResp.LatencyMs, time.Since(startedAt).Milliseconds()),
 		ErrorCode:   "",
 		Message:     "",
+	})
+}
+
+func (h *Handler) resolveDiscoveredEndpoint(ctx context.Context, env string, serviceName string, protocol string) (discovery.Endpoint, bool, error) {
+	if h.serviceDiscoveryResolver == nil {
+		return discovery.Endpoint{}, false, nil
+	}
+	return h.serviceDiscoveryResolver.Resolve(ctx, discovery.Query{
+		Env:         strings.TrimSpace(env),
+		ServiceName: strings.TrimSpace(serviceName),
+		Protocol:    strings.TrimSpace(protocol),
 	})
 }
 

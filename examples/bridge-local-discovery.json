@@ -1,0 +1,18 @@
+{
+  "routes": [
+    {
+      "env": "base",
+      "serviceName": "user",
+      "protocol": "http",
+      "host": "127.0.0.1",
+      "port": 8081
+    },
+    {
+      "env": "base",
+      "serviceName": "order",
+      "protocol": "grpc",
+      "host": "127.0.0.1",
+      "port": 9091
+    }
+  ]
+}

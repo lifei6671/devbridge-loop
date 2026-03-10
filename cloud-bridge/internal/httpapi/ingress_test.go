@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/discovery"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/domain"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/routing"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/store"
@@ -34,6 +35,44 @@ func (m *mockBackflowCaller) ForwardHTTP(_ context.Context, baseURL string, requ
 func (m *mockBackflowCaller) ForwardGRPC(_ context.Context, baseURL string, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error) {
 	m.lastGRPCBaseURL = baseURL
 	m.lastGRPCReq = request
+	return m.grpcResp, m.grpcErr
+}
+
+type mockDiscoveryResolver struct {
+	lastQuery discovery.Query
+	endpoint  discovery.Endpoint
+	matched   bool
+	err       error
+}
+
+func (m *mockDiscoveryResolver) Name() string { return "mock-discovery" }
+
+func (m *mockDiscoveryResolver) Resolve(_ context.Context, query discovery.Query) (discovery.Endpoint, bool, error) {
+	m.lastQuery = query
+	return m.endpoint, m.matched, m.err
+}
+
+type mockUpstreamForwarder struct {
+	lastHTTPEndpoint discovery.Endpoint
+	lastHTTPRequest  domain.BackflowHTTPRequest
+	httpResp         domain.BackflowHTTPResponse
+	httpErr          error
+
+	lastGRPCEndpoint discovery.Endpoint
+	lastGRPCRequest  domain.BackflowGRPCRequest
+	grpcResp         domain.BackflowGRPCResponse
+	grpcErr          error
+}
+
+func (m *mockUpstreamForwarder) ForwardHTTP(_ context.Context, endpoint discovery.Endpoint, request domain.BackflowHTTPRequest) (domain.BackflowHTTPResponse, error) {
+	m.lastHTTPEndpoint = endpoint
+	m.lastHTTPRequest = request
+	return m.httpResp, m.httpErr
+}
+
+func (m *mockUpstreamForwarder) ForwardGRPC(_ context.Context, endpoint discovery.Endpoint, request domain.BackflowGRPCRequest) (domain.BackflowGRPCResponse, error) {
+	m.lastGRPCEndpoint = endpoint
+	m.lastGRPCRequest = request
 	return m.grpcResp, m.grpcErr
 }
 
@@ -164,5 +203,113 @@ func TestIngressGRPC(t *testing.T) {
 	}
 	if backflowCaller.lastGRPCReq.HealthService != "user.v1.UserService" || backflowCaller.lastGRPCReq.TimeoutMs != 1200 {
 		t.Fatalf("unexpected grpc backflow options: %+v", backflowCaller.lastGRPCReq)
+	}
+}
+
+func TestIngressHTTPFallbackToDiscovery(t *testing.T) {
+	stateStore := store.NewMemoryStore()
+	backflowCaller := &mockBackflowCaller{}
+	discoveryResolver := &mockDiscoveryResolver{
+		endpoint: discovery.Endpoint{
+			Host:   "127.0.0.1",
+			Port:   8081,
+			Source: "local",
+		},
+		matched: true,
+	}
+	upstreamForwarder := &mockUpstreamForwarder{
+		httpResp: domain.BackflowHTTPResponse{
+			StatusCode: http.StatusAccepted,
+			Headers: map[string][]string{
+				"Content-Type": {"application/json"},
+			},
+			Body: []byte(`{"from":"discovery"}`),
+		},
+	}
+
+	handler := NewHandler(
+		routing.NewPipeline([]string{"host"}),
+		stateStore,
+		backflowCaller,
+		"",
+		WithServiceDiscoveryResolver(discoveryResolver),
+		WithUpstreamForwarder(upstreamForwarder),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://user.base.internal/api/v1/ingress/http/orders/list?verbose=1", nil)
+	resp := httptest.NewRecorder()
+
+	handler.Router().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("unexpected response status: %d", resp.Code)
+	}
+	if discoveryResolver.lastQuery.Env != "base" || discoveryResolver.lastQuery.ServiceName != "user" || discoveryResolver.lastQuery.Protocol != "http" {
+		t.Fatalf("unexpected discovery query: %+v", discoveryResolver.lastQuery)
+	}
+	if upstreamForwarder.lastHTTPEndpoint.Host != "127.0.0.1" || upstreamForwarder.lastHTTPEndpoint.Port != 8081 {
+		t.Fatalf("unexpected discovered endpoint: %+v", upstreamForwarder.lastHTTPEndpoint)
+	}
+	if upstreamForwarder.lastHTTPRequest.Path != "/orders/list" {
+		t.Fatalf("unexpected forwarded path: %+v", upstreamForwarder.lastHTTPRequest)
+	}
+	if got := resp.Header().Get("X-DevLoop-Route-Source"); got != "discovery:local" {
+		t.Fatalf("unexpected route source header: %s", got)
+	}
+}
+
+func TestIngressGRPCFallbackToDiscovery(t *testing.T) {
+	stateStore := store.NewMemoryStore()
+	backflowCaller := &mockBackflowCaller{}
+	discoveryResolver := &mockDiscoveryResolver{
+		endpoint: discovery.Endpoint{
+			Host:   "127.0.0.1",
+			Port:   9091,
+			Source: "consul",
+		},
+		matched: true,
+	}
+	upstreamForwarder := &mockUpstreamForwarder{
+		grpcResp: domain.BackflowGRPCResponse{
+			Status:    "SERVING",
+			Target:    "127.0.0.1:9091",
+			LatencyMs: 3,
+		},
+	}
+
+	handler := NewHandler(
+		routing.NewPipeline([]string{"host"}),
+		stateStore,
+		backflowCaller,
+		"",
+		WithServiceDiscoveryResolver(discoveryResolver),
+		WithUpstreamForwarder(upstreamForwarder),
+	)
+	req := httptest.NewRequest(http.MethodPost, "http://user.base.internal/api/v1/ingress/grpc", strings.NewReader(`{"healthService":"user.v1.UserService","timeoutMs":1500}`))
+	resp := httptest.NewRecorder()
+
+	handler.Router().ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected response status: %d", resp.Code)
+	}
+	if discoveryResolver.lastQuery.Env != "base" || discoveryResolver.lastQuery.ServiceName != "user" || discoveryResolver.lastQuery.Protocol != "grpc" {
+		t.Fatalf("unexpected discovery query: %+v", discoveryResolver.lastQuery)
+	}
+	if upstreamForwarder.lastGRPCEndpoint.Host != "127.0.0.1" || upstreamForwarder.lastGRPCEndpoint.Port != 9091 {
+		t.Fatalf("unexpected grpc endpoint: %+v", upstreamForwarder.lastGRPCEndpoint)
+	}
+	if upstreamForwarder.lastGRPCRequest.HealthService != "user.v1.UserService" || upstreamForwarder.lastGRPCRequest.TimeoutMs != 1500 {
+		t.Fatalf("unexpected grpc forward request: %+v", upstreamForwarder.lastGRPCRequest)
+	}
+
+	var payload domain.IngressGRPCResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if payload.Target != "127.0.0.1:9091" || payload.Status != "SERVING" {
+		t.Fatalf("unexpected grpc response payload: %+v", payload)
+	}
+	if got := resp.Header().Get("X-DevLoop-Route-Source"); got != "discovery:consul" {
+		t.Fatalf("unexpected route source header: %s", got)
 	}
 }

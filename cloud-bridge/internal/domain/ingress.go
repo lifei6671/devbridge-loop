@@ -11,6 +11,8 @@ const (
 	IngressErrorLocalEndpointDown = "LOCAL_ENDPOINT_UNREACHABLE"
 	// IngressErrorUpstreamTimeout 表示回流转发超时。
 	IngressErrorUpstreamTimeout = "UPSTREAM_TIMEOUT"
+	// IngressErrorServiceDiscoveryFailed 表示配置中心查询失败。
+	IngressErrorServiceDiscoveryFailed = "SERVICE_DISCOVERY_FAILED"
 )
 
 // BackflowHTTPRequest 描述 bridge 发给 agent 的回流请求。
