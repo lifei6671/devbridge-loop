@@ -423,7 +423,7 @@ export default function App(): ReactElement {
       showToast("配置保存成功，重启桌面端后生效。", "success");
     } catch (error) {
       setActionError(String(error));
-      showToast("配置保存失败，请检查输入并重试。", "error");
+      showToast(`配置保存失败：${String(error)}`, "error");
     } finally {
       setSavingConfig(false);
     }
@@ -628,6 +628,16 @@ export default function App(): ReactElement {
     }
     return "空闲";
   }, [manualReconnectPending, manualReconnecting, tunnel?.reconnecting, uiPhase]);
+
+  const masqueConfigVisible = useMemo(() => {
+    const protocol = desktopConfigDraft?.tunnelSyncProtocol ?? "";
+    return protocol.trim().toLowerCase() === "masque";
+  }, [desktopConfigDraft?.tunnelSyncProtocol]);
+
+  const masquePskVisible = useMemo(() => {
+    const authMode = desktopConfigDraft?.tunnelMasqueAuthMode ?? "";
+    return masqueConfigVisible && authMode.trim().toLowerCase() === "psk";
+  }, [desktopConfigDraft?.tunnelMasqueAuthMode, masqueConfigVisible]);
 
   const renderDashboard = (): ReactElement => (
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -1073,13 +1083,13 @@ export default function App(): ReactElement {
           </div>
 
           {/* 仅在 MASQUE 模式展示扩展参数，避免 HTTP 模式下出现无关配置噪音。 */}
-          {desktopConfigDraft?.tunnelSyncProtocol === "masque" ? (
+          {masqueConfigVisible ? (
             <>
               <div className="space-y-1">
                 <label className="text-xs text-muted-foreground">tunnelMasqueAuthMode</label>
                 <select
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
-                  value={desktopConfigDraft.tunnelMasqueAuthMode}
+                  value={desktopConfigDraft?.tunnelMasqueAuthMode ?? "psk"}
                   onChange={(event) =>
                     patchDesktopConfigDraft({
                       tunnelMasqueAuthMode: event.target.value
@@ -1091,25 +1101,31 @@ export default function App(): ReactElement {
                 </select>
               </div>
 
-              <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">tunnelMasquePsk</label>
-                <input
-                  className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
-                  value={desktopConfigDraft.tunnelMasquePsk}
-                  onChange={(event) =>
-                    patchDesktopConfigDraft({
-                      tunnelMasquePsk: event.target.value
-                    })
-                  }
-                />
-              </div>
+              {masquePskVisible ? (
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">tunnelMasquePsk</label>
+                  <input
+                    className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+                    value={desktopConfigDraft?.tunnelMasquePsk ?? ""}
+                    onChange={(event) =>
+                      patchDesktopConfigDraft({
+                        tunnelMasquePsk: event.target.value
+                      })
+                    }
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  当前为 ECDH 模式，`tunnelMasquePsk` 不参与鉴权。
+                </p>
+              )}
 
               <div className="space-y-1">
                 <label className="text-xs text-muted-foreground">tunnelMasqueProxyUrl</label>
                 <input
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
                   placeholder="留空按 tunnelBridgeAddress 自动推导"
-                  value={desktopConfigDraft.tunnelMasqueProxyUrl}
+                  value={desktopConfigDraft?.tunnelMasqueProxyUrl ?? ""}
                   onChange={(event) =>
                     patchDesktopConfigDraft({
                       tunnelMasqueProxyUrl: event.target.value
@@ -1122,7 +1138,7 @@ export default function App(): ReactElement {
                 <label className="text-xs text-muted-foreground">tunnelMasqueTargetAddr</label>
                 <input
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
-                  value={desktopConfigDraft.tunnelMasqueTargetAddr}
+                  value={desktopConfigDraft?.tunnelMasqueTargetAddr ?? ""}
                   onChange={(event) =>
                     patchDesktopConfigDraft({
                       tunnelMasqueTargetAddr: event.target.value

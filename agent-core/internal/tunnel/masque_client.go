@@ -10,8 +10,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ const (
 	masqueAuthModeECDH = "ecdh"
 
 	masqueServerPubHeader = "X-Devloop-Masque-Server-Pub"
+	masqueAuthModeHeader  = "X-Devloop-Masque-Auth-Mode"
 )
 
 type MasqueClientOptions struct {
@@ -58,6 +61,7 @@ type masqueTunnelResponse struct {
 
 type MasqueBridgeClient struct {
 	timeout       time.Duration
+	proxyURL      string
 	targetAddr    string
 	authMode      string
 	psk           string
@@ -93,20 +97,13 @@ func NewMasqueBridgeClient(options MasqueClientOptions) (*MasqueBridgeClient, er
 
 	client := &MasqueBridgeClient{
 		timeout:       normalizeTimeout(options.RequestTimeout),
+		proxyURL:      proxyURL,
 		targetAddr:    targetAddr,
 		authMode:      authMode,
 		psk:           strings.TrimSpace(options.PSK),
 		proxyTemplate: template,
-		client: &masque.Client{
-			TLSClientConfig: &tls.Config{
-				NextProtos:         []string{http3.NextProtoH3},
-				InsecureSkipVerify: true, // 动态证书每次重启都会变化，MASQUE 模式通过 PSK/ECDH 做应用层鉴权。
-			},
-			QUICConfig: &quic.Config{
-				EnableDatagrams: true,
-			},
-		},
 	}
+	client.client = client.newMasqueClient()
 	if client.psk == "" {
 		client.psk = "devloop-masque-default-psk"
 	}
@@ -145,14 +142,14 @@ func (c *MasqueBridgeClient) SendEvent(ctx context.Context, message domain.Tunne
 
 	// 连接态异常时立即丢弃当前连接，下次请求重新建链路。
 	if _, err := c.conn.WriteTo(payload, nil); err != nil {
-		c.closeConnLocked()
+		c.resetClientLocked()
 		return domain.TunnelReply{}, fmt.Errorf("write masque datagram failed: %w", err)
 	}
 
 	buffer := make([]byte, 64*1024)
 	n, _, err := c.conn.ReadFrom(buffer)
 	if err != nil {
-		c.closeConnLocked()
+		c.resetClientLocked()
 		return domain.TunnelReply{}, fmt.Errorf("read masque datagram failed: %w", err)
 	}
 
@@ -170,8 +167,21 @@ func (c *MasqueBridgeClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.closeConnLocked()
-	return c.client.Close()
+	// 关闭阶段不需要保留重试能力，直接释放全部底层句柄即可。
+	var joinedErr error
+	if c.conn != nil {
+		if err := c.conn.Close(); err != nil {
+			joinedErr = err
+		}
+		c.conn = nil
+	}
+	if c.client != nil {
+		if err := c.client.Close(); err != nil && joinedErr == nil {
+			joinedErr = err
+		}
+	}
+	c.clearECDHStateLocked()
+	return joinedErr
 }
 
 func (c *MasqueBridgeClient) ensureConn(ctx context.Context) error {
@@ -179,16 +189,23 @@ func (c *MasqueBridgeClient) ensureConn(ctx context.Context) error {
 		return nil
 	}
 
+	// CONNECT-UDP 建链必须受超时约束，避免外层无 deadline 时长时间阻塞在 QUIC 握手。
+	dialCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
 	// DialAddr 会建立 QUIC/H3 链路并发起 CONNECT-UDP，成功后返回可读写 datagram 的 PacketConn。
-	conn, response, err := c.client.DialAddr(ctx, c.proxyTemplate, c.targetAddr)
+	conn, response, err := c.client.DialAddr(dialCtx, c.proxyTemplate, c.targetAddr)
 	if err != nil {
-		return fmt.Errorf("dial masque proxy failed: %w", err)
+		// masque-go 在首次 Dial 失败后会缓存失败状态；需要主动重建 client 才能继续重试。
+		c.resetClientLocked()
+		return fmt.Errorf("dial masque proxy failed: %w%s", err, c.buildDialDiagnosticSuffix(err))
 	}
 
 	// ECDH 模式需要从 CONNECT-UDP 响应头读取服务端公钥，再派生本端 proof。
 	if c.authMode == masqueAuthModeECDH {
 		if err := c.prepareECDH(response); err != nil {
 			_ = conn.Close()
+			c.resetClientLocked()
 			return err
 		}
 	}
@@ -220,7 +237,19 @@ func (c *MasqueBridgeClient) prepareECDH(response *http.Response) error {
 	// 服务端公钥通过响应头返回；若缺失说明服务端未按 ECDH 模式工作。
 	serverPubEncoded := strings.TrimSpace(response.Header.Get(masqueServerPubHeader))
 	if serverPubEncoded == "" {
-		return fmt.Errorf("masque ecdh server public key is missing")
+		remoteAuthMode := strings.ToLower(strings.TrimSpace(response.Header.Get(masqueAuthModeHeader)))
+		switch remoteAuthMode {
+		case masqueAuthModePSK:
+			return fmt.Errorf(
+				"masque ecdh server public key is missing: auth mode mismatch (server=%s, client=%s), please set cloud-bridge DEVLOOP_TUNNEL_MASQUE_AUTH_MODE=ecdh or switch agent to psk",
+				remoteAuthMode,
+				masqueAuthModeECDH,
+			)
+		case masqueAuthModeECDH:
+			return fmt.Errorf("masque ecdh server public key is missing: server reported ecdh but no public key header returned")
+		default:
+			return fmt.Errorf("masque ecdh server public key is missing: server auth mode is unknown, cloud-bridge may still run psk or old version")
+		}
 	}
 
 	serverPubRaw, err := base64.StdEncoding.DecodeString(serverPubEncoded)
@@ -254,6 +283,113 @@ func (c *MasqueBridgeClient) closeConnLocked() {
 		_ = c.conn.Close()
 		c.conn = nil
 	}
+}
+
+func (c *MasqueBridgeClient) clearECDHStateLocked() {
+	c.ecdhPrivate = nil
+	c.ecdhClientPub = ""
+	c.ecdhProof = ""
+}
+
+func (c *MasqueBridgeClient) resetClientLocked() {
+	c.closeConnLocked()
+	if c.client != nil {
+		_ = c.client.Close()
+	}
+	c.client = c.newMasqueClient()
+	c.clearECDHStateLocked()
+}
+
+func (c *MasqueBridgeClient) newMasqueClient() *masque.Client {
+	return &masque.Client{
+		TLSClientConfig: &tls.Config{
+			NextProtos:         []string{http3.NextProtoH3},
+			InsecureSkipVerify: true, // 动态证书每次重启都会变化，MASQUE 模式通过 PSK/ECDH 做应用层鉴权。
+		},
+		QUICConfig: &quic.Config{
+			EnableDatagrams: true,
+		},
+	}
+}
+
+func (c *MasqueBridgeClient) buildDialDiagnosticSuffix(dialErr error) string {
+	diagnostics := make([]string, 0, 2)
+	if hint := masqueDialHint(c.proxyURL, dialErr); hint != "" {
+		diagnostics = append(diagnostics, hint)
+	}
+	if probe := c.probeBridgeHealthz(); probe != "" {
+		diagnostics = append(diagnostics, probe)
+	}
+	if len(diagnostics) == 0 {
+		return ""
+	}
+	return " | " + strings.Join(diagnostics, " | ")
+}
+
+func masqueDialHint(proxyURL string, dialErr error) string {
+	message := strings.ToLower(strings.TrimSpace(dialErr.Error()))
+	if message == "" {
+		return ""
+	}
+
+	host := ""
+	if parsed, err := url.Parse(strings.TrimSpace(proxyURL)); err == nil {
+		host = strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	}
+
+	hints := make([]string, 0, 2)
+	if strings.Contains(message, "no recent network activity") || strings.Contains(message, "timeout") {
+		hints = append(hints, "hint: MASQUE 依赖 UDP/H3，请确认 cloud-bridge 已启用 masque 协议，且防火墙未拦截对应 UDP 端口。")
+	}
+	if host == "localhost" {
+		hints = append(hints, "hint: 当前使用 localhost，Windows 环境建议改为 127.0.0.1 以避免 IPv6/IPv4 回环差异。")
+	}
+	return strings.Join(hints, " ")
+}
+
+func (c *MasqueBridgeClient) probeBridgeHealthz() string {
+	healthzURL, ok := deriveBridgeHealthzURL(c.proxyURL)
+	if !ok {
+		return ""
+	}
+
+	timeout := c.timeout
+	if timeout > 1500*time.Millisecond {
+		timeout = 1500 * time.Millisecond
+	}
+	if timeout <= 0 {
+		timeout = 1200 * time.Millisecond
+	}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := client.Get(healthzURL)
+	if err != nil {
+		return fmt.Sprintf("healthz probe failed (%s): %v", healthzURL, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 160))
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		trimmed = "<empty>"
+	}
+	return fmt.Sprintf("healthz probe status=%d body=%q (%s)", resp.StatusCode, trimmed, healthzURL)
+}
+
+func deriveBridgeHealthzURL(proxyURL string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(proxyURL))
+	if err != nil || strings.TrimSpace(parsed.Host) == "" {
+		return "", false
+	}
+	parsed.Scheme = "http"
+	parsed.Path = "/healthz"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), true
 }
 
 func buildECDHProof(shared []byte) string {

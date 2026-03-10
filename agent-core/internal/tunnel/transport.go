@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -59,7 +60,22 @@ func resolveMasqueProxyURL(bridgeAddress, configured string) string {
 	if err != nil || strings.TrimSpace(parsed.Host) == "" {
 		return "https://127.0.0.1:38080/masque/udp/{target_host}/{target_port}"
 	}
-	return fmt.Sprintf("https://%s/masque/udp/{target_host}/{target_port}", parsed.Host)
+
+	// Windows 某些环境下 localhost 可能优先解析到 IPv6 回环，导致 UDP/H3 握手超时。
+	// 这里对 localhost 做显式 IPv4 归一化，减少“端口看似可用但 QUIC 不通”的误判。
+	host := strings.TrimSpace(parsed.Hostname())
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	port := strings.TrimSpace(parsed.Port())
+	if port == "" {
+		port = "38080"
+	}
+	return fmt.Sprintf("https://%s/masque/udp/{target_host}/{target_port}", net.JoinHostPort(host, port))
 }
 
 func normalizeTimeout(timeout time.Duration) time.Duration {

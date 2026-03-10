@@ -196,6 +196,8 @@ pub fn save_desktop_config(
     };
 
     save_config_file(storage, &file)?;
+    // 保存成功后同步刷新当前进程内的环境变量，避免 UI 读取到旧值导致“看起来没保存”。
+    apply_runtime_env_from_file(&file);
     Ok(build_view(storage, Some(&file)))
 }
 
@@ -389,6 +391,74 @@ fn set_env_if_absent(key: &str, value: Option<&str>) {
             std::env::set_var(key, normalized);
         }
     }
+}
+
+fn set_env_override(key: &str, value: Option<&str>) {
+    match value {
+        Some(raw) => {
+            let normalized = raw.trim();
+            if normalized.is_empty() {
+                std::env::remove_var(key);
+            } else {
+                std::env::set_var(key, normalized);
+            }
+        }
+        None => std::env::remove_var(key),
+    }
+}
+
+fn apply_runtime_env_from_file(file: &DesktopConfigFile) {
+    // 运行时配置来源统一刷新为“最新保存值”，避免首次启动注入的旧环境变量遮蔽新配置。
+    set_env_override("DEVLOOP_AGENT_API_BASE", file.agent_api_base.as_deref());
+    set_env_override("DEVLOOP_AGENT_BINARY", file.agent_binary.as_deref());
+    set_env_override("DEVLOOP_AGENT_CORE_DIR", file.agent_core_dir.as_deref());
+    set_env_override(
+        "DEVLOOP_AGENT_AUTO_RESTART",
+        file.agent_auto_restart
+            .map(|value| if value { "true" } else { "false" }),
+    );
+    set_env_override(
+        "DEVLOOP_AGENT_RESTART_BACKOFF_MS",
+        file.agent_restart_backoff_ms
+            .as_ref()
+            .map(|values| join_u64(values))
+            .as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_ENV_RESOLVE_ORDER",
+        file.env_resolve_order
+            .as_ref()
+            .map(|values| values.join(","))
+            .as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_BRIDGE_ADDRESS",
+        file.tunnel_bridge_address.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_BACKFLOW_BASE_URL",
+        file.tunnel_backflow_base_url.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_SYNC_PROTOCOL",
+        file.tunnel_sync_protocol.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_MASQUE_AUTH_MODE",
+        file.tunnel_masque_auth_mode.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_MASQUE_PSK",
+        file.tunnel_masque_psk.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_MASQUE_PROXY_URL",
+        file.tunnel_masque_proxy_url.as_deref(),
+    );
+    set_env_override(
+        "DEVLOOP_TUNNEL_MASQUE_TARGET_ADDR",
+        file.tunnel_masque_target_addr.as_deref(),
+    );
 }
 
 fn normalize_required(value: &str) -> Option<String> {

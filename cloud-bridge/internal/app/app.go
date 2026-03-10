@@ -70,6 +70,7 @@ func (a *App) Run(ctx context.Context) error {
 		"enabledTunnelProtocols", a.tunnelProtocols,
 		"httpTunnelSyncEnabled", tunnelProtocolEnabled(a.tunnelProtocols, tunnelProtocolHTTP),
 		"masqueEnabled", tunnelProtocolEnabled(a.tunnelProtocols, tunnelProtocolMASQUE),
+		"masqueAuthMode", a.cfg.MasqueAuthMode,
 		"masqueAddr", a.cfg.MasqueAddr,
 		"masqueTunnelUDPAddr", a.cfg.MasqueTunnelUDPAddr,
 	)

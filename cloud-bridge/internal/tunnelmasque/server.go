@@ -39,6 +39,7 @@ const (
 	masqueAuthModeECDH = "ecdh"
 
 	masqueServerPubHeader = "X-Devloop-Masque-Server-Pub"
+	masqueAuthModeHeader  = "X-Devloop-Masque-Auth-Mode"
 	masqueProofContext    = "devloop-masque-auth"
 )
 
@@ -194,6 +195,8 @@ func (s *Server) handleProxyConnectUDP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ECDH 模式将服务端公钥放入响应头，供客户端派生共享密钥。
+	// 同时始终返回服务端认证模式，便于客户端在模式不一致时给出明确报错。
+	w.Header().Set(masqueAuthModeHeader, strings.TrimSpace(s.cfg.MasqueAuthMode))
 	if s.cfg.MasqueAuthMode == masqueAuthModeECDH {
 		w.Header().Set(masqueServerPubHeader, s.ecdhPublicB64)
 	}
