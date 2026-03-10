@@ -17,6 +17,11 @@ bridgePublicHost: bridge.test.internal
 bridgePublicPort: 8443
 fallbackBackflowUrl: http://127.0.0.1:49090
 ingressTimeoutSec: 15
+adminAuth:
+  enabled: true
+  username: bridge-admin
+  password: bridge-secret
+  realm: bridge-console
 discovery:
   backends: [local]
   timeoutMs: 3500
@@ -56,6 +61,9 @@ routes:
 	if len(cfg.DiscoveryBackends) != 1 || cfg.DiscoveryBackends[0] != "local" {
 		t.Fatalf("unexpected discovery backends: %+v", cfg.DiscoveryBackends)
 	}
+	if !cfg.AdminAuth.Enabled || cfg.AdminAuth.Username != "bridge-admin" || cfg.AdminAuth.Password != "bridge-secret" {
+		t.Fatalf("unexpected admin auth config: %+v", cfg.AdminAuth)
+	}
 	// YAML 文件内嵌 routes 时，默认使用该文件作为 local discovery 源。
 	if cfg.DiscoveryLocalFile != configFilePath {
 		t.Fatalf("unexpected local discovery file: %s", cfg.DiscoveryLocalFile)
@@ -89,5 +97,34 @@ routes:
 	}
 	if len(cfg.DiscoveryBackends) != 2 || cfg.DiscoveryBackends[0] != "nacos" || cfg.DiscoveryBackends[1] != "consul" {
 		t.Fatalf("unexpected discovery backends: %+v", cfg.DiscoveryBackends)
+	}
+}
+
+func TestLoadFromEnv_AdminAuthEnvOverridesConfigFile(t *testing.T) {
+	configFilePath := filepath.Join(t.TempDir(), "bridge.yaml")
+	content := `
+httpAddr: 0.0.0.0:48080
+adminAuth:
+  enabled: true
+  username: file-admin
+  password: file-pass
+  realm: file-realm
+`
+	if err := os.WriteFile(configFilePath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	t.Setenv(defaultBridgeConfigEnv, configFilePath)
+	t.Setenv("DEVLOOP_BRIDGE_ADMIN_AUTH_ENABLED", "false")
+	t.Setenv("DEVLOOP_BRIDGE_ADMIN_AUTH_USERNAME", "env-admin")
+	t.Setenv("DEVLOOP_BRIDGE_ADMIN_AUTH_PASSWORD", "env-pass")
+	t.Setenv("DEVLOOP_BRIDGE_ADMIN_AUTH_REALM", "env-realm")
+
+	cfg := LoadFromEnv()
+	if cfg.AdminAuth.Enabled {
+		t.Fatalf("expected admin auth disabled by env override")
+	}
+	if cfg.AdminAuth.Username != "env-admin" || cfg.AdminAuth.Password != "env-pass" || cfg.AdminAuth.Realm != "env-realm" {
+		t.Fatalf("unexpected admin auth env override: %+v", cfg.AdminAuth)
 	}
 }

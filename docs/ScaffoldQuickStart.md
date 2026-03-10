@@ -281,6 +281,17 @@ routes:
 go run ./cloud-bridge/cmd/cloud-bridge -config ./examples/bridge-config.yaml
 ```
 
+启动后可访问配置页：
+
+```text
+http://127.0.0.1:38080/admin
+```
+
+配置页能力：
+- 左侧菜单（基础设置 / 协议设置 / 服务发现 / 本地路由）
+- 右侧结构化表单编辑，不需要手工改 YAML
+- 点击“保存并热重启”后，bridge 会自动热重启并加载新配置
+
 ## 桌面配置持久化
 
 - Rust Host 启动后会自动创建配置目录与日志目录，并加载 `desktop-config.json`

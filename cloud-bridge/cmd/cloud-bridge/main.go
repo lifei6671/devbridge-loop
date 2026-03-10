@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"os"
@@ -18,17 +19,34 @@ func main() {
 	flag.StringVar(&configFile, "config", "", "bridge yaml config file path")
 	flag.Parse()
 	if strings.TrimSpace(configFile) != "" {
-		_ = os.Setenv("DEVLOOP_BRIDGE_CONFIG_FILE", strings.TrimSpace(configFile))
+		_ = os.Setenv(config.BridgeConfigFileEnv, strings.TrimSpace(configFile))
 	}
-
-	cfg := config.LoadFromEnv()
-	a := app.New(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("cloud-bridge process started", "httpAddr", cfg.HTTPAddr)
-	if err := a.Run(ctx); err != nil {
+	restartSignal := make(chan struct{}, 1)
+	for {
+		cfg := config.LoadFromEnv()
+		editor := app.NewBridgeConfigEditor(config.ResolveConfigFilePath(), cfg, restartSignal)
+		a := app.New(
+			cfg,
+			app.WithHotRestartSignal(restartSignal),
+			app.WithConfigEditor(editor),
+		)
+
+		slog.Info("cloud-bridge process started", "httpAddr", cfg.HTTPAddr, "configFile", config.ResolveConfigFilePath())
+		err := a.Run(ctx)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, app.ErrHotRestartRequested) {
+			slog.Info("cloud-bridge hot restart requested, restarting...")
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
 		slog.Error("cloud-bridge exited with error", "error", err)
 		os.Exit(1)
 	}

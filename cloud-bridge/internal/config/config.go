@@ -16,6 +16,10 @@ const (
 	defaultBridgeHTTPAddr            = "0.0.0.0:38080"
 	defaultBridgeMasqueTunnelUDPAddr = "127.0.0.1:39081"
 	defaultBridgeMasquePSK           = "devloop-masque-default-psk"
+	defaultBridgeAdminAuthUsername   = "admin"
+	defaultBridgeAdminAuthPassword   = "devloop-admin"
+	defaultBridgeAdminAuthRealm      = "bridge-console"
+	defaultBridgeConfigFilePath      = "./bridge-config.yaml"
 	defaultBridgePublicHost          = "bridge.example.internal"
 	defaultBridgePublicPort          = 443
 	defaultBridgeFallbackBackflowURL = "http://127.0.0.1:39090"
@@ -23,6 +27,11 @@ const (
 	defaultDiscoveryTimeoutMs        = 2000
 	defaultDiscoveryEtcdKeyPrefix    = "/devloop/services"
 	defaultBridgeConfigEnv           = "DEVLOOP_BRIDGE_CONFIG_FILE"
+)
+
+const (
+	// BridgeConfigFileEnv 指定 bridge YAML 配置文件路径。
+	BridgeConfigFileEnv = defaultBridgeConfigEnv
 )
 
 // Config 包含 cloud-bridge 运行配置。
@@ -34,6 +43,7 @@ type Config struct {
 	MasqueTunnelUDPAddr string
 	MasqueAuthMode      string
 	MasquePSK           string
+	AdminAuth           AdminAuthConfig
 	RouteExtractorOrder []string
 	DiscoveryBackends   []string
 	DiscoveryTimeout    time.Duration
@@ -45,6 +55,14 @@ type Config struct {
 	BridgePublicPort    int
 	FallbackBackflowURL string
 	IngressTimeout      time.Duration
+}
+
+// AdminAuthConfig 定义 bridge 管理控制台认证配置。
+type AdminAuthConfig struct {
+	Enabled  bool
+	Username string
+	Password string
+	Realm    string
 }
 
 // NacosDiscoveryConfig 定义 Nacos 服务发现参数。
@@ -78,6 +96,7 @@ type bridgeConfigFile struct {
 	MasqueTunnelUDPAddr string                    `yaml:"masqueTunnelUdpAddr"`
 	MasqueAuthMode      string                    `yaml:"masqueAuthMode"`
 	MasquePSK           string                    `yaml:"masquePsk"`
+	AdminAuth           bridgeAdminAuthConfigFile `yaml:"adminAuth"`
 	RouteExtractorOrder []string                  `yaml:"routeExtractorOrder"`
 	BridgePublicHost    string                    `yaml:"bridgePublicHost"`
 	BridgePublicPort    int                       `yaml:"bridgePublicPort"`
@@ -131,11 +150,18 @@ type bridgeRouteFile struct {
 	Port        int    `yaml:"port"`
 }
 
+type bridgeAdminAuthConfigFile struct {
+	Enabled  bool   `yaml:"enabled"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	Realm    string `yaml:"realm"`
+}
+
 // LoadFromEnv 按 “默认值 -> YAML 配置文件 -> 环境变量覆盖” 的顺序加载配置。
 func LoadFromEnv() Config {
 	cfg := defaultConfig()
 
-	configFilePath := strings.TrimSpace(getenv(defaultBridgeConfigEnv, ""))
+	configFilePath := ResolveConfigFilePath()
 	if configFilePath != "" {
 		fileCfg, err := loadConfigFile(configFilePath)
 		if err != nil {
@@ -174,7 +200,7 @@ func LoadFromEnv() Config {
 		bridgePublicPort = defaultBridgePublicPort
 	}
 
-	return Config{
+	loaded := Config{
 		HTTPAddr:            httpAddr,
 		TunnelSyncProtocol:  tunnelSyncProtocols[0],
 		TunnelSyncProtocols: tunnelSyncProtocols,
@@ -182,6 +208,12 @@ func LoadFromEnv() Config {
 		MasqueTunnelUDPAddr: getenv("DEVLOOP_BRIDGE_MASQUE_TUNNEL_UDP_ADDR", cfg.MasqueTunnelUDPAddr),
 		MasqueAuthMode:      normalizeMasqueAuthMode(getenv("DEVLOOP_TUNNEL_MASQUE_AUTH_MODE", cfg.MasqueAuthMode)),
 		MasquePSK:           getenv("DEVLOOP_TUNNEL_MASQUE_PSK", cfg.MasquePSK),
+		AdminAuth: AdminAuthConfig{
+			Enabled:  getenvBool("DEVLOOP_BRIDGE_ADMIN_AUTH_ENABLED", cfg.AdminAuth.Enabled),
+			Username: getenv("DEVLOOP_BRIDGE_ADMIN_AUTH_USERNAME", cfg.AdminAuth.Username),
+			Password: getenv("DEVLOOP_BRIDGE_ADMIN_AUTH_PASSWORD", cfg.AdminAuth.Password),
+			Realm:    getenv("DEVLOOP_BRIDGE_ADMIN_AUTH_REALM", cfg.AdminAuth.Realm),
+		},
 		RouteExtractorOrder: order,
 		DiscoveryBackends:   discoveryBackends,
 		DiscoveryTimeout:    discoveryTimeout,
@@ -208,6 +240,8 @@ func LoadFromEnv() Config {
 		FallbackBackflowURL: getenv("DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL", cfg.FallbackBackflowURL),
 		IngressTimeout:      time.Duration(ingressTimeoutSec) * time.Second,
 	}
+	loaded.AdminAuth = normalizeAdminAuthConfig(loaded.AdminAuth)
+	return loaded
 }
 
 func defaultConfig() Config {
@@ -221,6 +255,12 @@ func defaultConfig() Config {
 		MasqueTunnelUDPAddr: defaultBridgeMasqueTunnelUDPAddr,
 		MasqueAuthMode:      "psk",
 		MasquePSK:           defaultBridgeMasquePSK,
+		AdminAuth: AdminAuthConfig{
+			Enabled:  false,
+			Username: defaultBridgeAdminAuthUsername,
+			Password: defaultBridgeAdminAuthPassword,
+			Realm:    defaultBridgeAdminAuthRealm,
+		},
 		RouteExtractorOrder: routeOrder,
 		DiscoveryBackends:   discoveryBackends,
 		DiscoveryTimeout:    defaultDiscoveryTimeoutMs * time.Millisecond,
@@ -249,6 +289,71 @@ func defaultConfig() Config {
 	}
 	cfg.MasqueAddr = cfg.HTTPAddr
 	return cfg
+}
+
+// ResolveConfigFilePath 返回 bridge 配置文件路径；未显式指定时回退到默认路径。
+func ResolveConfigFilePath() string {
+	value := strings.TrimSpace(getenv(BridgeConfigFileEnv, ""))
+	if value != "" {
+		return value
+	}
+	return defaultBridgeConfigFilePath
+}
+
+// ValidateConfigYAML 校验配置内容是否为有效 bridge YAML，并执行一次标准化合并流程。
+func ValidateConfigYAML(path string, content []byte) error {
+	var fileCfg bridgeConfigFile
+	if err := yaml.Unmarshal(content, &fileCfg); err != nil {
+		return fmt.Errorf("decode yaml failed: %w", err)
+	}
+	_ = mergeConfigFile(defaultConfig(), fileCfg, strings.TrimSpace(path))
+	return nil
+}
+
+// MarshalConfigYAML 将运行时配置渲染为 bridge YAML 文本。
+func MarshalConfigYAML(cfg Config) ([]byte, error) {
+	fileCfg := bridgeConfigFile{
+		HTTPAddr:            strings.TrimSpace(cfg.HTTPAddr),
+		TunnelSyncProtocols: append([]string{}, cfg.TunnelSyncProtocols...),
+		MasqueAddr:          strings.TrimSpace(cfg.MasqueAddr),
+		MasqueTunnelUDPAddr: strings.TrimSpace(cfg.MasqueTunnelUDPAddr),
+		MasqueAuthMode:      strings.TrimSpace(cfg.MasqueAuthMode),
+		MasquePSK:           strings.TrimSpace(cfg.MasquePSK),
+		AdminAuth: bridgeAdminAuthConfigFile{
+			Enabled:  cfg.AdminAuth.Enabled,
+			Username: strings.TrimSpace(cfg.AdminAuth.Username),
+			Password: cfg.AdminAuth.Password,
+			Realm:    strings.TrimSpace(cfg.AdminAuth.Realm),
+		},
+		RouteExtractorOrder: append([]string{}, cfg.RouteExtractorOrder...),
+		BridgePublicHost:    strings.TrimSpace(cfg.BridgePublicHost),
+		BridgePublicPort:    cfg.BridgePublicPort,
+		FallbackBackflowURL: strings.TrimSpace(cfg.FallbackBackflowURL),
+		IngressTimeoutSec:   int(cfg.IngressTimeout / time.Second),
+		Discovery: bridgeDiscoveryConfigFile{
+			Backends:  append([]string{}, cfg.DiscoveryBackends...),
+			TimeoutMs: int(cfg.DiscoveryTimeout / time.Millisecond),
+			LocalFile: strings.TrimSpace(cfg.DiscoveryLocalFile),
+			Nacos: bridgeNacosConfigFile{
+				Addr:           strings.TrimSpace(cfg.NacosDiscovery.ServerAddr),
+				Namespace:      strings.TrimSpace(cfg.NacosDiscovery.Namespace),
+				Group:          strings.TrimSpace(cfg.NacosDiscovery.Group),
+				ServicePattern: strings.TrimSpace(cfg.NacosDiscovery.ServicePattern),
+				Username:       strings.TrimSpace(cfg.NacosDiscovery.Username),
+				Password:       strings.TrimSpace(cfg.NacosDiscovery.Password),
+			},
+			Etcd: bridgeEtcdConfigFile{
+				Endpoints: append([]string{}, cfg.EtcdDiscovery.Endpoints...),
+				KeyPrefix: strings.TrimSpace(cfg.EtcdDiscovery.KeyPrefix),
+			},
+			Consul: bridgeConsulConfigFile{
+				Addr:           strings.TrimSpace(cfg.ConsulDiscovery.Addr),
+				Datacenter:     strings.TrimSpace(cfg.ConsulDiscovery.Datacenter),
+				ServicePattern: strings.TrimSpace(cfg.ConsulDiscovery.ServicePattern),
+			},
+		},
+	}
+	return yaml.Marshal(fileCfg)
 }
 
 func loadConfigFile(path string) (bridgeConfigFile, error) {
@@ -290,6 +395,16 @@ func mergeConfigFile(base Config, fileCfg bridgeConfigFile, filePath string) Con
 	}
 	if value := strings.TrimSpace(fileCfg.MasquePSK); value != "" {
 		cfg.MasquePSK = value
+	}
+	cfg.AdminAuth.Enabled = fileCfg.AdminAuth.Enabled
+	if value := strings.TrimSpace(fileCfg.AdminAuth.Username); value != "" {
+		cfg.AdminAuth.Username = value
+	}
+	if strings.TrimSpace(fileCfg.AdminAuth.Password) != "" {
+		cfg.AdminAuth.Password = fileCfg.AdminAuth.Password
+	}
+	if value := strings.TrimSpace(fileCfg.AdminAuth.Realm); value != "" {
+		cfg.AdminAuth.Realm = value
 	}
 
 	if len(fileCfg.RouteExtractorOrder) > 0 {
@@ -369,6 +484,7 @@ func mergeConfigFile(base Config, fileCfg bridgeConfigFile, filePath string) Con
 	if cfg.MasqueAddr == "" {
 		cfg.MasqueAddr = cfg.HTTPAddr
 	}
+	cfg.AdminAuth = normalizeAdminAuthConfig(cfg.AdminAuth)
 	return cfg
 }
 
@@ -418,6 +534,18 @@ func getenvInt(key string, fallback int) int {
 	return parsed
 }
 
+func getenvBool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(getenv(key, "")))
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func normalizeTunnelSyncProtocols(value string) []string {
 	parts := strings.Split(value, ",")
 	protocols := make([]string, 0, len(parts))
@@ -450,6 +578,25 @@ func normalizeMasqueAuthMode(value string) string {
 	default:
 		return "psk"
 	}
+}
+
+func normalizeAdminAuthConfig(raw AdminAuthConfig) AdminAuthConfig {
+	normalized := AdminAuthConfig{
+		Enabled:  raw.Enabled,
+		Username: strings.TrimSpace(raw.Username),
+		Password: raw.Password,
+		Realm:    strings.TrimSpace(raw.Realm),
+	}
+	if normalized.Username == "" {
+		normalized.Username = defaultBridgeAdminAuthUsername
+	}
+	if strings.TrimSpace(normalized.Password) == "" {
+		normalized.Password = defaultBridgeAdminAuthPassword
+	}
+	if normalized.Realm == "" {
+		normalized.Realm = defaultBridgeAdminAuthRealm
+	}
+	return normalized
 }
 
 func normalizeDiscoveryBackends(value string) []string {

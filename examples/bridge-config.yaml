@@ -3,6 +3,11 @@ tunnelSyncProtocols:
   - masque
 masqueAuthMode: psk
 masquePsk: devloop-masque-default-psk
+adminAuth:
+  enabled: false
+  username: admin
+  password: devloop-admin
+  realm: bridge-console
 routeExtractorOrder:
   - host
   - header

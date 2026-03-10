@@ -16,17 +16,31 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/upstream"
 )
 
+var (
+	// ErrHotRestartRequested 表示收到热重启信号，需要由上层 supervisor 重建 App 实例。
+	ErrHotRestartRequested = errors.New("hot restart requested")
+)
+
 // App 负责组装 cloud-bridge 的传输层和运行态依赖。
 type App struct {
 	cfg              config.Config
 	server           *http.Server
 	tunnelProtocols  []string
 	protocolRuntimes []TunnelProtocolRuntime
+	hotRestartSignal <-chan struct{}
 	startupErr       error
 }
 
 // New 构造 cloud-bridge 应用实例。
-func New(cfg config.Config) *App {
+func New(cfg config.Config, options ...Option) *App {
+	appOptions := defaultAppOptions()
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		option(&appOptions)
+	}
+
 	tunnelProtocols := effectiveTunnelProtocols(cfg)
 	pipeline := routing.NewPipeline(cfg.RouteExtractorOrder)
 	stateStore := store.NewMemoryStoreWithBridge(cfg.BridgePublicHost, cfg.BridgePublicPort)
@@ -42,6 +56,8 @@ func New(cfg config.Config) *App {
 		httpapi.WithTunnelEventHTTPEnabled(httpTunnelSyncEnabled),
 		httpapi.WithServiceDiscoveryResolver(discoveryResolver),
 		httpapi.WithUpstreamForwarder(upstreamClient),
+		httpapi.WithConfigEditor(appOptions.configEditor),
+		httpapi.WithAdminAuth(cfg.AdminAuth),
 	)
 
 	protocolRuntimes, startupErr := newTunnelProtocolRuntimes(cfg, stateStore)
@@ -57,6 +73,7 @@ func New(cfg config.Config) *App {
 		cfg:              cfg,
 		tunnelProtocols:  tunnelProtocols,
 		protocolRuntimes: protocolRuntimes,
+		hotRestartSignal: appOptions.hotRestartSignal,
 		startupErr:       startupErr,
 		server: &http.Server{
 			Addr:              cfg.HTTPAddr,
@@ -107,6 +124,10 @@ func (a *App) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return a.shutdown()
+	case <-a.hotRestartSignal:
+		// 热重启流程：平滑关闭当前实例，由 main supervisor 重新加载配置后拉起新实例。
+		_ = a.shutdown()
+		return ErrHotRestartRequested
 	case runtimeErr := <-errorCh:
 		if runtimeErr.source == "http-api" && errors.Is(runtimeErr.err, http.ErrServerClosed) {
 			return nil
