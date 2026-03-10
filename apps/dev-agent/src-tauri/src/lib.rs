@@ -87,6 +87,7 @@ fn get_desktop_config(state: tauri::State<'_, AppState>) -> Result<DesktopConfig
 
 #[tauri::command]
 fn save_desktop_config(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request: DesktopConfigSaveRequest,
 ) -> Result<DesktopConfigView, String> {
@@ -96,6 +97,17 @@ fn save_desktop_config(
         .lock()
         .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
     *close_to_tray_on_close = Some(view.close_to_tray_on_close);
+    drop(close_to_tray_on_close);
+
+    // 配置保存后刷新管理器缓存，使“重启 Agent Core”立刻使用新启动参数。
+    let runtime = {
+        let mut manager = state
+            .manager
+            .lock()
+            .map_err(|_| "manager lock poisoned".to_string())?;
+        manager.reload_from_env()
+    };
+    let _ = emit_runtime_event(&app, &runtime);
     Ok(view)
 }
 

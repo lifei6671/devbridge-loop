@@ -139,6 +139,16 @@ impl AgentManager {
         }
     }
 
+    // 保存配置后刷新管理器缓存参数；新参数在下一次重启 agent-core 时生效。
+    pub fn reload_from_env(&mut self) -> AgentRuntime {
+        self.launch_plan = resolve_launch_plan();
+        self.restart_policy = resolve_restart_policy();
+        // 配置更新后重置退避窗口，避免旧窗口影响后续手动/自动重启行为。
+        self.restart_attempt = 0;
+        self.next_restart_at = None;
+        self.runtime()
+    }
+
     // 检查子进程退出状态，若已退出则清理句柄并记录错误信息。
     fn check_process_exit(&mut self) -> bool {
         let Some(child) = &mut self.child else {

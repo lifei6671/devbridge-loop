@@ -1,5 +1,3 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ComponentType, ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -19,6 +17,8 @@ import {
   Trash2,
   Zap
 } from "lucide-react";
+import type { ComponentType, ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -41,8 +41,8 @@ import { cn } from "@/lib/utils";
 import type {
   ActiveIntercept,
   AgentRuntime,
-  DesktopConfigView,
   DesktopConfigSaveRequest,
+  DesktopConfigView,
   DiagnosticsSnapshot,
   ErrorEntry,
   LocalRegistration,
@@ -61,13 +61,18 @@ interface AppToast {
   message: string;
 }
 
-const PAGE_ITEMS: Array<{ key: PageKey; label: string; icon: ComponentType<{ className?: string }> }> = [
-  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { key: "services", label: "Services", icon: ListTree },
-  { key: "intercepts", label: "Intercepts", icon: ShieldCheck },
-  { key: "logs", label: "Logs", icon: AlertTriangle },
-  { key: "config", label: "Config", icon: Settings }
-];
+const PAGE_ITEMS: Array<{
+  key: PageKey;
+  label: string;
+  description: string;
+  icon: ComponentType<{ className?: string }>;
+}> = [
+    { key: "dashboard", label: "总览", description: "运行状态与连接看板", icon: LayoutDashboard },
+    { key: "services", label: "服务", description: "本地注册服务与详情", icon: ListTree },
+    { key: "intercepts", label: "接管", description: "当前生效接管关系", icon: ShieldCheck },
+    { key: "logs", label: "日志", description: "错误与请求记录", icon: AlertTriangle },
+    { key: "config", label: "配置", description: "桌面端与隧道参数", icon: Settings }
+  ];
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(command, args);
@@ -100,9 +105,36 @@ function formatCountdown(remainingMs: number): string {
 
 function renderHealthBadge(healthy: boolean): ReactElement {
   if (healthy) {
-    return <Badge className="border-transparent bg-emerald-600 text-white">healthy</Badge>;
+    return <Badge className="border-transparent bg-emerald-600 text-white">健康</Badge>;
   }
-  return <Badge variant="secondary">unhealthy</Badge>;
+  return <Badge variant="secondary">异常</Badge>;
+}
+
+function formatStatusText(status: string | null | undefined): string {
+  switch ((status ?? "").trim().toLowerCase()) {
+    case "running":
+      return "运行中";
+    case "stopped":
+      return "已停止";
+    case "restarting":
+      return "重启中";
+    case "recovering":
+      return "恢复中";
+    case "online":
+      return "在线";
+    case "offline":
+      return "离线";
+    case "reconnecting":
+      return "重连中";
+    case "manual-reconnecting":
+      return "手动重连中";
+    case "connected":
+      return "已连接";
+    case "disconnected":
+      return "未连接";
+    default:
+      return status && status.trim() !== "" ? status : "未知";
+  }
 }
 
 function parseNumberList(input: string): number[] {
@@ -305,13 +337,13 @@ export default function App(): ReactElement {
       setSummary((current) =>
         current
           ? {
-              ...current,
-              bridgeStatus: "offline",
-              tunnelStatus: "disconnected",
-              registrationCount: 0,
-              activeIntercepts: 0,
-              lastUpdateAt: new Date().toISOString()
-            }
+            ...current,
+            bridgeStatus: "offline",
+            tunnelStatus: "disconnected",
+            registrationCount: 0,
+            activeIntercepts: 0,
+            lastUpdateAt: new Date().toISOString()
+          }
           : current
       );
       setRegistrations([]);
@@ -355,29 +387,29 @@ export default function App(): ReactElement {
     setSummary((current) =>
       current
         ? {
-            ...current,
-            agentStatus: "restarting",
-            bridgeStatus: "offline",
-            tunnelStatus: "disconnected",
-            registrationCount: 0,
-            activeIntercepts: 0,
-            lastUpdateAt: new Date().toISOString()
-          }
+          ...current,
+          agentStatus: "restarting",
+          bridgeStatus: "offline",
+          tunnelStatus: "disconnected",
+          registrationCount: 0,
+          activeIntercepts: 0,
+          lastUpdateAt: new Date().toISOString()
+        }
         : current
     );
     setTunnel((current) =>
       current
         ? {
-            ...current,
-            connected: false,
-            reconnecting: false,
-            reconnectAttempt: 0,
-            sessionEpoch: 0,
-            resourceVersion: 0,
-            lastHeartbeatAt: "",
-            nextReconnectAt: null,
-            lastReconnectError: ""
-          }
+          ...current,
+          connected: false,
+          reconnecting: false,
+          reconnectAttempt: 0,
+          sessionEpoch: 0,
+          resourceVersion: 0,
+          lastHeartbeatAt: "",
+          nextReconnectAt: null,
+          lastReconnectError: ""
+        }
         : current
     );
     setRegistrations([]);
@@ -388,10 +420,10 @@ export default function App(): ReactElement {
     setRuntime((current) =>
       current
         ? {
-            ...current,
-            status: "restarting",
-            lastError: null
-          }
+          ...current,
+          status: "restarting",
+          lastError: null
+        }
         : current
     );
 
@@ -420,7 +452,7 @@ export default function App(): ReactElement {
       setDesktopConfigDraft(buildDesktopConfigDraft(saved));
       // 保存成功后解锁草稿覆盖，后续轮询可继续同步后台配置。
       markDesktopConfigDraftDirty(false);
-      showToast("配置保存成功，重启桌面端后生效。", "success");
+      showToast("配置保存成功，重启核心进程后生效。", "success");
     } catch (error) {
       setActionError(String(error));
       showToast(`配置保存失败：${String(error)}`, "error");
@@ -549,12 +581,12 @@ export default function App(): ReactElement {
 
   const tunnelBadge = useMemo(() => {
     if (!tunnel) {
-      return <Badge variant="outline">unknown</Badge>;
+      return <Badge variant="outline">未知</Badge>;
     }
     if (tunnel.connected) {
-      return <Badge className="border-transparent bg-emerald-600 text-white">connected</Badge>;
+      return <Badge className="border-transparent bg-emerald-600 text-white">已连接</Badge>;
     }
-    return <Badge variant="secondary">disconnected</Badge>;
+    return <Badge variant="secondary">未连接</Badge>;
   }, [tunnel]);
 
   const reconnectCountdown = useMemo(() => {
@@ -612,7 +644,7 @@ export default function App(): ReactElement {
 
   const bridgeOperationLabel = useMemo(() => {
     if (uiPhase === "restarting") {
-      return "重启 Agent Core...";
+      return "重启核心进程...";
     }
     if (uiPhase === "recovering") {
       return "恢复连接中...";
@@ -648,21 +680,21 @@ export default function App(): ReactElement {
         )}
       >
         <CardHeader className="pb-2">
-          <CardDescription>Agent</CardDescription>
+          <CardDescription>核心进程</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
             <Server className={cn("h-4 w-4", phaseBusy && "animate-pulse")} />
-            {agentCardStatus}
+            {formatStatusText(agentCardStatus)}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
-          <div>pid: {runtime?.pid ?? "-"}</div>
-          <div>env: {summary?.currentEnv ?? "-"}</div>
-          <div>status: {agentCardStatus}</div>
-          <div>operation: {uiPhase === "restarting" ? "重启 Agent Core..." : uiPhase === "recovering" ? "恢复状态中..." : "空闲"}</div>
-          <div>sync: {refreshProgressLabel}</div>
-          <div>restart-count: {runtime?.restartCount ?? 0}</div>
+          <div>进程号: {runtime?.pid ?? "-"}</div>
+          <div>环境: {summary?.currentEnv ?? "-"}</div>
+          <div>状态: {formatStatusText(agentCardStatus)}</div>
+          <div>操作阶段: {uiPhase === "restarting" ? "重启核心进程..." : uiPhase === "recovering" ? "恢复状态中..." : "空闲"}</div>
+          <div>同步状态: {refreshProgressLabel}</div>
+          <div>重启次数: {runtime?.restartCount ?? 0}</div>
           <div className="whitespace-pre-wrap break-all">
-            last-error: {runtime?.lastError ? runtime.lastError : "-"}
+            最近错误: {runtime?.lastError ? runtime.lastError : "-"}
           </div>
         </CardContent>
       </Card>
@@ -674,54 +706,54 @@ export default function App(): ReactElement {
         )}
       >
         <CardHeader className="pb-2">
-          <CardDescription>Bridge</CardDescription>
+          <CardDescription>桥接连接</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
             <Cloud className={cn("h-4 w-4", (manualReconnectPending || manualReconnecting || phaseBusy) && "animate-pulse")} />
-            {bridgeCardStatus}
+            {formatStatusText(bridgeCardStatus)}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
-          <div>address: {tunnel?.bridgeAddress ?? "-"}</div>
-          <div>rdName: {summary?.rdName ?? "-"}</div>
-          <div>operation: {bridgeOperationLabel}</div>
-          <div>reconnect-attempt: {tunnel?.reconnectAttempt ?? 0}</div>
+          <div>地址: {tunnel?.bridgeAddress ?? "-"}</div>
+          <div>研发域名: {summary?.rdName ?? "-"}</div>
+          <div>操作阶段: {bridgeOperationLabel}</div>
+          <div>重连次数: {tunnel?.reconnectAttempt ?? 0}</div>
           <div>
-            next-retry:
+            下次重试:
             {reconnectCountdown !== null
               ? ` ${formatCountdown(reconnectCountdown)}`
               : ` ${formatTime(tunnel?.nextReconnectAt)}`}
           </div>
           <div className="whitespace-pre-wrap break-all">
-            last-error: {tunnel?.lastReconnectError ? tunnel.lastReconnectError : "-"}
+            最近错误: {tunnel?.lastReconnectError ? tunnel.lastReconnectError : "-"}
           </div>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader className="pb-2">
-          <CardDescription>Tunnel</CardDescription>
+          <CardDescription>隧道链路</CardDescription>
           <CardTitle className="flex items-center gap-2 text-base">
             <Zap className="h-4 w-4" />
             {tunnelBadge}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
-          <div>protocol: {tunnel?.protocol ?? "-"}</div>
-          <div>epoch: {tunnel?.sessionEpoch ?? 0}</div>
-          <div>resourceVersion: {tunnel?.resourceVersion ?? 0}</div>
-          <div>lastHeartbeat: {formatTime(tunnel?.lastHeartbeatAt)}</div>
+          <div>协议: {tunnel?.protocol ?? "-"}</div>
+          <div>会话计数: {tunnel?.sessionEpoch ?? 0}</div>
+          <div>资源版本: {tunnel?.resourceVersion ?? 0}</div>
+          <div>最近心跳: {formatTime(tunnel?.lastHeartbeatAt)}</div>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader className="pb-2">
-          <CardDescription>Registration</CardDescription>
-          <CardTitle className="text-base">{summary?.registrationCount ?? 0} active</CardTitle>
+          <CardDescription>注册信息</CardDescription>
+          <CardTitle className="text-base">{summary?.registrationCount ?? 0} 条生效</CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 text-sm text-muted-foreground">
-          <div>intercepts: {summary?.activeIntercepts ?? 0}</div>
-          <div>errors(50): {errors.length}</div>
-          <div>requests(200): {requests.length}</div>
+          <div>接管数: {summary?.activeIntercepts ?? 0}</div>
+          <div>错误数(50): {errors.length}</div>
+          <div>请求数(200): {requests.length}</div>
         </CardContent>
       </Card>
     </section>
@@ -731,7 +763,7 @@ export default function App(): ReactElement {
     <section className="grid gap-4 xl:grid-cols-3">
       <Card className="xl:col-span-2">
         <CardHeader>
-          <CardTitle>Local Services</CardTitle>
+          <CardTitle>本地服务</CardTitle>
           <CardDescription>
             实时读取 `/api/v1/registrations`，支持手动注销与详情查看。
           </CardDescription>
@@ -740,12 +772,12 @@ export default function App(): ReactElement {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Service</TableHead>
-                <TableHead>Env</TableHead>
-                <TableHead>Instance</TableHead>
-                <TableHead>Endpoints</TableHead>
-                <TableHead>Healthy</TableHead>
-                <TableHead>Register</TableHead>
+                <TableHead>服务名</TableHead>
+                <TableHead>环境</TableHead>
+                <TableHead>实例</TableHead>
+                <TableHead>端点</TableHead>
+                <TableHead>健康</TableHead>
+                <TableHead>注册时间</TableHead>
                 <TableHead>操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -807,7 +839,7 @@ export default function App(): ReactElement {
 
       <Card>
         <CardHeader>
-          <CardTitle>Service Detail</CardTitle>
+          <CardTitle>服务详情</CardTitle>
           <CardDescription>当前选中实例的详细状态</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
@@ -818,13 +850,13 @@ export default function App(): ReactElement {
               <div className="font-semibold">
                 {selectedRegistration.serviceName} / {selectedRegistration.env}
               </div>
-              <div className="text-muted-foreground">instance: {selectedRegistration.instanceId}</div>
-              <div>healthy: {selectedRegistration.healthy ? "true" : "false"}</div>
-              <div>ttlSeconds: {selectedRegistration.ttlSeconds}</div>
-              <div>registerTime: {formatTime(selectedRegistration.registerTime)}</div>
-              <div>lastHeartbeat: {formatTime(selectedRegistration.lastHeartbeatTime)}</div>
+              <div className="text-muted-foreground">实例ID: {selectedRegistration.instanceId}</div>
+              <div>健康状态: {selectedRegistration.healthy ? "是" : "否"}</div>
+              <div>TTL 秒数: {selectedRegistration.ttlSeconds}</div>
+              <div>注册时间: {formatTime(selectedRegistration.registerTime)}</div>
+              <div>最近心跳: {formatTime(selectedRegistration.lastHeartbeatTime)}</div>
               <div className="space-y-1 rounded-md border border-border/60 p-2">
-                <div className="font-medium">metadata</div>
+                <div className="font-medium">元数据</div>
                 <pre className="overflow-x-auto text-xs text-muted-foreground">
                   {JSON.stringify(selectedRegistration.metadata ?? {}, null, 2)}
                 </pre>
@@ -839,21 +871,21 @@ export default function App(): ReactElement {
   const renderIntercepts = (): ReactElement => (
     <Card>
       <CardHeader>
-        <CardTitle>Active Intercepts</CardTitle>
+        <CardTitle>生效接管</CardTitle>
         <CardDescription>读取 `/api/v1/state/intercepts` 的实时接管关系</CardDescription>
       </CardHeader>
       <CardContent>
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Env</TableHead>
-              <TableHead>Service</TableHead>
-              <TableHead>Protocol</TableHead>
-              <TableHead>Instance</TableHead>
-              <TableHead>Tunnel</TableHead>
-              <TableHead>TargetPort</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>UpdatedAt</TableHead>
+              <TableHead>环境</TableHead>
+              <TableHead>服务</TableHead>
+              <TableHead>协议</TableHead>
+              <TableHead>实例</TableHead>
+              <TableHead>隧道ID</TableHead>
+              <TableHead>目标端口</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>更新时间</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -890,7 +922,7 @@ export default function App(): ReactElement {
   const renderLogs = (): ReactElement => (
     <Card>
       <CardHeader>
-        <CardTitle>Runtime Logs</CardTitle>
+        <CardTitle>运行日志</CardTitle>
         <CardDescription>基于 `/api/v1/state/diagnostics` 与运行态事件的最近日志</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -917,7 +949,7 @@ export default function App(): ReactElement {
         <div className="h-px w-full bg-border/70" />
 
         <div className="space-y-2">
-          <p className="text-sm font-semibold">Recent Requests</p>
+          <p className="text-sm font-semibold">最近请求</p>
           {requests.length === 0 ? (
             <p className="text-sm text-muted-foreground">当前无请求摘要</p>
           ) : (
@@ -935,10 +967,10 @@ export default function App(): ReactElement {
                   </span>
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                  <span>upstream: {entry.upstream || "-"}</span>
-                  <span>status: {entry.statusCode}</span>
-                  <span>latency: {entry.latencyMs}ms</span>
-                  <span>result: {entry.result}</span>
+                  <span>上游: {entry.upstream || "-"}</span>
+                  <span>状态码: {entry.statusCode}</span>
+                  <span>耗时: {entry.latencyMs}ms</span>
+                  <span>结果: {entry.result}</span>
                   <span>{formatTime(entry.occurredAt)}</span>
                 </div>
                 {entry.errorCode || entry.message ? (
@@ -959,24 +991,24 @@ export default function App(): ReactElement {
     <section className="grid gap-4 xl:grid-cols-2">
       <Card>
         <CardHeader>
-          <CardTitle>Desktop Host Config</CardTitle>
+          <CardTitle>桌面端信息</CardTitle>
           <CardDescription>本地配置目录与配置文件状态</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
-          <div>configLoaded: {desktopConfig?.configLoaded ? "true" : "false"}</div>
-          <div>configDir: {desktopConfig?.configDir ?? "-"}</div>
-          <div>logDir: {desktopConfig?.logDir ?? "-"}</div>
-          <div>configFile: {desktopConfig?.configFile ?? "-"}</div>
+          <div>配置已加载: {desktopConfig?.configLoaded ? "是" : "否"}</div>
+          <div>配置目录: {desktopConfig?.configDir ?? "-"}</div>
+          <div>日志目录: {desktopConfig?.logDir ?? "-"}</div>
+          <div>配置文件: {desktopConfig?.configFile ?? "-"}</div>
           <div className="h-px w-full bg-border/70" />
-          <div>platform: {desktopConfig?.platform ?? "-"}</div>
-          <div>arch: {desktopConfig?.arch ?? "-"}</div>
+          <div>平台: {desktopConfig?.platform ?? "-"}</div>
+          <div>架构: {desktopConfig?.arch ?? "-"}</div>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Desktop Config Editor</CardTitle>
-          <CardDescription>基础配置加载与保存（保存后重启桌面端生效）</CardDescription>
+          <CardTitle>配置编辑器</CardTitle>
+          <CardDescription>基础配置加载与保存（保存后重启核心进程生效）</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           {desktopConfigDraftDirty ? (
@@ -986,7 +1018,7 @@ export default function App(): ReactElement {
           ) : null}
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">agentApiBase</label>
+            <label className="text-xs text-muted-foreground">核心 API 地址（agentApiBase）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentApiBase ?? ""}
@@ -995,7 +1027,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">agentBinary</label>
+            <label className="text-xs text-muted-foreground">核心可执行文件（agentBinary）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentBinary ?? ""}
@@ -1008,7 +1040,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">agentCoreDir</label>
+            <label className="text-xs text-muted-foreground">核心工作目录（agentCoreDir）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentCoreDir ?? ""}
@@ -1021,7 +1053,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">agentRestartBackoffMs (csv)</label>
+            <label className="text-xs text-muted-foreground">核心重启退避（毫秒，CSV）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={(desktopConfigDraft?.agentRestartBackoffMs ?? []).join(",")}
@@ -1034,7 +1066,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">envResolveOrder (csv)</label>
+            <label className="text-xs text-muted-foreground">环境解析顺序（CSV）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={(desktopConfigDraft?.envResolveOrder ?? []).join(",")}
@@ -1047,7 +1079,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">tunnelBridgeAddress</label>
+            <label className="text-xs text-muted-foreground">桥接服务地址（tunnelBridgeAddress）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.tunnelBridgeAddress ?? ""}
@@ -1058,7 +1090,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">tunnelBackflowBaseUrl</label>
+            <label className="text-xs text-muted-foreground">回流地址（tunnelBackflowBaseUrl）</label>
             <input
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.tunnelBackflowBaseUrl ?? ""}
@@ -1069,7 +1101,7 @@ export default function App(): ReactElement {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">tunnelSyncProtocol</label>
+            <label className="text-xs text-muted-foreground">隧道协议（tunnelSyncProtocol）</label>
             <select
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.tunnelSyncProtocol ?? "http"}
@@ -1077,8 +1109,8 @@ export default function App(): ReactElement {
                 patchDesktopConfigDraft({ tunnelSyncProtocol: event.target.value })
               }
             >
-              <option value="http">http</option>
-              <option value="masque">masque</option>
+              <option value="http">HTTP（兼容模式）</option>
+              <option value="masque">MASQUE（高性能）</option>
             </select>
           </div>
 
@@ -1086,7 +1118,7 @@ export default function App(): ReactElement {
           {masqueConfigVisible ? (
             <>
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">tunnelMasqueAuthMode</label>
+                <label className="text-xs text-muted-foreground">MASQUE 鉴权模式</label>
                 <select
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
                   value={desktopConfigDraft?.tunnelMasqueAuthMode ?? "psk"}
@@ -1096,14 +1128,14 @@ export default function App(): ReactElement {
                     })
                   }
                 >
-                  <option value="psk">psk</option>
-                  <option value="ecdh">ecdh</option>
+                  <option value="psk">PSK（预共享密钥）</option>
+                  <option value="ecdh">ECDH（密钥协商）</option>
                 </select>
               </div>
 
               {masquePskVisible ? (
                 <div className="space-y-1">
-                  <label className="text-xs text-muted-foreground">tunnelMasquePsk</label>
+                  <label className="text-xs text-muted-foreground">MASQUE 预共享密钥（PSK）</label>
                   <input
                     className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
                     value={desktopConfigDraft?.tunnelMasquePsk ?? ""}
@@ -1121,7 +1153,7 @@ export default function App(): ReactElement {
               )}
 
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">tunnelMasqueProxyUrl</label>
+                <label className="text-xs text-muted-foreground">MASQUE 代理模板地址</label>
                 <input
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
                   placeholder="留空按 tunnelBridgeAddress 自动推导"
@@ -1135,7 +1167,7 @@ export default function App(): ReactElement {
               </div>
 
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">tunnelMasqueTargetAddr</label>
+                <label className="text-xs text-muted-foreground">MASQUE 目标地址</label>
                 <input
                   className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
                   value={desktopConfigDraft?.tunnelMasqueTargetAddr ?? ""}
@@ -1157,7 +1189,7 @@ export default function App(): ReactElement {
                 patchDesktopConfigDraft({ agentAutoRestart: event.target.checked })
               }
             />
-            agentAutoRestart
+            自动拉起核心进程
           </label>
 
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -1168,7 +1200,7 @@ export default function App(): ReactElement {
                 patchDesktopConfigDraft({ closeToTrayOnClose: event.target.checked })
               }
             />
-            closeToTrayOnClose
+            关闭窗口时最小化到托盘
           </label>
 
           {!desktopConfig?.closeToTrayOnCloseConfigured ? (
@@ -1208,134 +1240,195 @@ export default function App(): ReactElement {
     }
   };
 
+  const activePageMeta = PAGE_ITEMS.find((item) => item.key === activePage) ?? PAGE_ITEMS[0];
+
   return (
-    <div className="h-screen w-screen overflow-hidden bg-app-gradient text-foreground">
-      <div className="flex h-full w-full flex-col gap-6 overflow-auto px-4 pb-6 pt-6 sm:px-6 lg:px-8">
-        <header className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-muted-foreground">
-              DevLoop Phase One
-            </p>
-            <h1 className="mt-1 font-mono text-2xl font-semibold tracking-tight">
-              dev-agent control surface
-            </h1>
+    <div className="h-screen w-screen overflow-hidden bg-[radial-gradient(circle_at_15%_10%,#f7efe1_0,#f4efea_32%,#eceff4_100%)] text-slate-900">
+      <div className="grid h-full md:grid-cols-[252px_minmax(0,1fr)]">
+        <aside className="hidden border-r border-slate-200/70 bg-white/70 backdrop-blur-xl md:flex md:flex-col">
+          <div className="border-b border-slate-200/70 px-5 pb-4 pt-5">
+            <p className="text-[11px] uppercase tracking-[0.3em] text-slate-500">开发桥接回路</p>
+            <h1 className="mt-2 font-mono text-xl font-semibold tracking-tight text-slate-900">控制中心</h1>
+            <p className="mt-2 text-xs leading-5 text-slate-500">核心进程、桥接服务与隧道状态的一体化控制台</p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              onClick={() => void refresh({ manual: true })}
-              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
-            >
-              <RefreshCcw className={cn("mr-2 h-4 w-4", manualRefreshing && "animate-spin")} />
-              {manualRefreshing ? "刷新中..." : "刷新"}
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => void restartAgent()}
-              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
-            >
-              <RotateCcw className={cn("mr-2 h-4 w-4", phaseBusy && "animate-spin")} />
-              {uiPhase === "restarting"
-                ? "重启中..."
-                : uiPhase === "recovering"
-                  ? "恢复中..."
-                  : "重启 Agent Core"}
-            </Button>
-            <Button
-              onClick={() => void reconnect()}
-              disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
-            >
-              <Cable className={cn("mr-2 h-4 w-4", (manualReconnectPending || manualReconnecting) && "animate-pulse")} />
-              {manualReconnectPending ? "准备重连..." : manualReconnecting ? "重连中..." : "手动重连"}
-            </Button>
-          </div>
-        </header>
 
-        <nav className="flex flex-wrap gap-2">
-          {PAGE_ITEMS.map((item) => {
-            const Icon = item.icon;
-            return (
-              <Button
-                key={item.key}
-                variant={activePage === item.key ? "default" : "outline"}
-                size="sm"
-                onClick={() => setActivePage(item.key)}
-              >
-                <Icon className="mr-2 h-4 w-4" />
-                {item.label}
-              </Button>
-            );
-          })}
-        </nav>
-
-        {actionError ? (
-          <Card className="border-amber-500/40 bg-amber-100/40">
-            <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
-              <AlertTriangle className="h-4 w-4" />
-              {actionError}
-            </CardContent>
-          </Card>
-        ) : null}
-
-        {runtime?.lastError ? (
-          <Card className="border-amber-500/40 bg-amber-100/40">
-            <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
-              <AlertTriangle className="h-4 w-4" />
-              {runtime.lastError}
-            </CardContent>
-          </Card>
-        ) : null}
-
-        {showCloseDecisionDialog ? (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
-            <Card className="w-full max-w-md border-border/80 shadow-xl">
-              <CardHeader>
-                <CardTitle>关闭 DevLoop Agent</CardTitle>
-                <CardDescription>
-                  请选择“直接退出”或“最小化到托盘”。选择最小化后将记住该偏好。
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-wrap justify-end gap-2">
-                <Button
-                  variant="outline"
-                  disabled={resolvingCloseDecision}
-                  onClick={() => void resolveWindowCloseAction("exit")}
-                >
-                  直接退出
-                </Button>
-                <Button
-                  disabled={resolvingCloseDecision}
-                  onClick={() => void resolveWindowCloseAction("tray")}
-                >
-                  最小化到托盘
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
-        ) : null}
-
-        {toast ? (
-          <div className="fixed bottom-6 right-6 z-50">
-            <div
-              className={cn(
-                "flex max-w-sm items-center gap-2 rounded-md border px-3 py-2 text-sm shadow-xl transition-all duration-300",
-                toast.level === "success"
-                  ? "border-emerald-500/40 bg-emerald-100/95 text-emerald-950"
-                  : "border-amber-500/40 bg-amber-100/95 text-amber-950"
-              )}
-            >
-              {toast.level === "success" ? (
-                <CheckCircle2 className="h-4 w-4" />
-              ) : (
-                <AlertTriangle className="h-4 w-4" />
-              )}
-              <span>{toast.message}</span>
+          <div className="space-y-2 border-b border-slate-200/70 px-4 py-4 text-xs text-slate-600">
+            <div className="flex items-center justify-between rounded-lg border border-slate-200/70 bg-white/80 px-3 py-2">
+              <span>核心进程</span>
+              <Badge variant="secondary">{formatStatusText(agentCardStatus)}</Badge>
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-slate-200/70 bg-white/80 px-3 py-2">
+              <span>桥接连接</span>
+              <Badge variant="secondary">{formatStatusText(bridgeCardStatus)}</Badge>
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-slate-200/70 bg-white/80 px-3 py-2">
+              <span>当前环境</span>
+              <span className="font-mono text-[11px]">{summary?.currentEnv ?? "-"}</span>
             </div>
           </div>
-        ) : null}
 
-        {renderPage()}
+          <nav className="space-y-1 px-3 py-4">
+            {PAGE_ITEMS.map((item) => {
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setActivePage(item.key)}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-all duration-200",
+                    activePage === item.key
+                      ? "bg-slate-900 text-white shadow-lg shadow-slate-900/15"
+                      : "text-slate-700 hover:bg-white hover:text-slate-950"
+                  )}
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                  <div>
+                    <div className="font-medium">{item.label}</div>
+                    <div className={cn("text-[11px]", activePage === item.key ? "text-slate-300" : "text-slate-500")}>
+                      {item.description}
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </nav>
+
+          <div className="mt-auto border-t border-slate-200/70 px-4 py-3 text-xs text-slate-500">
+            <div>研发域名：{summary?.rdName ?? "-"}</div>
+            <div className="mt-1">最后更新：{formatTime(summary?.lastUpdateAt)}</div>
+          </div>
+        </aside>
+
+        <section className="flex min-h-0 flex-col">
+          <header className="border-b border-slate-200/70 bg-white/50 px-4 py-4 backdrop-blur-xl sm:px-6">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500 md:hidden">开发桥接回路</p>
+                <h2 className="font-mono text-xl font-semibold tracking-tight text-slate-900">{activePageMeta.label}</h2>
+                <p className="mt-1 text-xs text-slate-500">{activePageMeta.description}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  onClick={() => void refresh({ manual: true })}
+                  disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
+                >
+                  <RefreshCcw className={cn("mr-2 h-4 w-4", manualRefreshing && "animate-spin")} />
+                  {manualRefreshing ? "刷新中..." : "刷新"}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => void restartAgent()}
+                  disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
+                >
+                  <RotateCcw className={cn("mr-2 h-4 w-4", phaseBusy && "animate-spin")} />
+                  {uiPhase === "restarting"
+                    ? "重启中..."
+                    : uiPhase === "recovering"
+                      ? "恢复中..."
+                      : "重启核心进程"}
+                </Button>
+                <Button
+                  onClick={() => void reconnect()}
+                  disabled={manualRefreshing || phaseBusy || manualReconnectPending || manualReconnecting}
+                >
+                  <Cable className={cn("mr-2 h-4 w-4", (manualReconnectPending || manualReconnecting) && "animate-pulse")} />
+                  {manualReconnectPending ? "准备重连..." : manualReconnecting ? "重连中..." : "手动重连"}
+                </Button>
+              </div>
+            </div>
+
+            <nav className="mt-4 flex gap-2 overflow-x-auto pb-1 md:hidden">
+              {PAGE_ITEMS.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <Button
+                    key={item.key}
+                    variant={activePage === item.key ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => setActivePage(item.key)}
+                    className="whitespace-nowrap"
+                  >
+                    <Icon className="mr-2 h-4 w-4" />
+                    {item.label}
+                  </Button>
+                );
+              })}
+            </nav>
+          </header>
+
+          <main className="relative min-h-0 flex-1 overflow-auto px-4 py-5 sm:px-6">
+            {actionError ? (
+              <Card className="mb-4 border-amber-500/40 bg-amber-100/40">
+                <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
+                  <AlertTriangle className="h-4 w-4" />
+                  {actionError}
+                </CardContent>
+              </Card>
+            ) : null}
+
+            {runtime?.lastError ? (
+              <Card className="mb-4 border-amber-500/40 bg-amber-100/40">
+                <CardContent className="flex items-center gap-2 p-4 text-sm text-amber-950">
+                  <AlertTriangle className="h-4 w-4" />
+                  {runtime.lastError}
+                </CardContent>
+              </Card>
+            ) : null}
+
+            {renderPage()}
+          </main>
+        </section>
       </div>
+
+      {showCloseDecisionDialog ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+          <Card className="w-full max-w-md border-border/80 shadow-xl">
+            <CardHeader>
+              <CardTitle>关闭客户端</CardTitle>
+              <CardDescription>
+                请选择“直接退出”或“最小化到托盘”。选择最小化后将记住该偏好。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                disabled={resolvingCloseDecision}
+                onClick={() => void resolveWindowCloseAction("exit")}
+              >
+                直接退出
+              </Button>
+              <Button
+                disabled={resolvingCloseDecision}
+                onClick={() => void resolveWindowCloseAction("tray")}
+              >
+                最小化到托盘
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      ) : null}
+
+      {toast ? (
+        <div className="fixed bottom-6 right-6 z-50">
+          <div
+            className={cn(
+              "flex max-w-sm items-center gap-2 rounded-md border px-3 py-2 text-sm shadow-xl transition-all duration-300",
+              toast.level === "success"
+                ? "border-emerald-500/40 bg-emerald-100/95 text-emerald-950"
+                : "border-amber-500/40 bg-amber-100/95 text-amber-950"
+            )}
+          >
+            {toast.level === "success" ? (
+              <CheckCircle2 className="h-4 w-4" />
+            ) : (
+              <AlertTriangle className="h-4 w-4" />
+            )}
+            <span>{toast.message}</span>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
