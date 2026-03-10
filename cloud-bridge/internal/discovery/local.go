@@ -2,30 +2,38 @@ package discovery
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
-// LocalFileConfig 是本地文件发现配置格式。
+// LocalFileConfig 是本地文件发现配置格式（YAML）。
 type LocalFileConfig struct {
-	Routes []LocalRoute `json:"routes"`
+	Routes    []LocalRoute          `json:"routes" yaml:"routes"`
+	Discovery localDiscoveryWrapper `json:"discovery" yaml:"discovery"`
 }
 
 // LocalRoute 定义一条静态服务发现映射。
 type LocalRoute struct {
-	Env         string            `json:"env"`
-	ServiceName string            `json:"serviceName"`
-	Protocol    string            `json:"protocol"`
-	Host        string            `json:"host,omitempty"`
-	Address     string            `json:"address,omitempty"`
-	Port        int               `json:"port"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	Env         string            `json:"env" yaml:"env"`
+	ServiceName string            `json:"serviceName" yaml:"serviceName"`
+	Protocol    string            `json:"protocol" yaml:"protocol"`
+	Host        string            `json:"host,omitempty" yaml:"host,omitempty"`
+	Address     string            `json:"address,omitempty" yaml:"address,omitempty"`
+	Port        int               `json:"port" yaml:"port"`
+	Metadata    map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
-// LocalFileResolver 基于本地 JSON 配置文件实现服务发现。
+type localDiscoveryWrapper struct {
+	Local struct {
+		Routes []LocalRoute `json:"routes" yaml:"routes"`
+	} `json:"local" yaml:"local"`
+}
+
+// LocalFileResolver 基于本地 YAML 配置文件实现服务发现。
 type LocalFileResolver struct {
 	path   string
 	routes []LocalRoute
@@ -50,10 +58,14 @@ func NewLocalFileResolver(path string) (*LocalFileResolver, error) {
 	}
 
 	var payload LocalFileConfig
-	if err := json.Unmarshal(content, &payload); err != nil {
+	if err := yaml.Unmarshal(content, &payload); err != nil {
 		return nil, fmt.Errorf("decode local discovery file %q failed: %w", resolver.path, err)
 	}
 	resolver.routes = payload.Routes
+	if len(resolver.routes) == 0 {
+		// 兼容嵌套结构：discovery.local.routes。
+		resolver.routes = payload.Discovery.Local.Routes
+	}
 	return resolver, nil
 }
 

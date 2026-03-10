@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/internal/app"
@@ -12,6 +14,13 @@ import (
 )
 
 func main() {
+	var configFile string
+	flag.StringVar(&configFile, "config", "", "bridge yaml config file path")
+	flag.Parse()
+	if strings.TrimSpace(configFile) != "" {
+		_ = os.Setenv("DEVLOOP_BRIDGE_CONFIG_FILE", strings.TrimSpace(configFile))
+	}
+
 	cfg := config.LoadFromEnv()
 	a := app.New(cfg)
 

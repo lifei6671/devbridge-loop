@@ -240,9 +240,10 @@ make run-demo-order
 - `DEVLOOP_BRIDGE_PUBLIC_PORT`：bridge 对外路由端口（默认 `443`）
 - `DEVLOOP_BRIDGE_FALLBACK_BACKFLOW_URL`：bridge 侧回流地址兜底值（默认 `http://127.0.0.1:39090`）
 - `DEVLOOP_BRIDGE_INGRESS_TIMEOUT_SEC`：bridge 调用 agent 回流接口的超时秒数（默认 `10`）
+- `DEVLOOP_BRIDGE_CONFIG_FILE`：bridge YAML 配置文件路径（支持同时配置启动参数与本地发现路由）
 - `DEVLOOP_BRIDGE_DISCOVERY_BACKENDS`：bridge 服务发现后端，逗号分隔（默认 `local,nacos,etcd,consul`）
 - `DEVLOOP_BRIDGE_DISCOVERY_TIMEOUT_MS`：服务发现请求超时毫秒（默认 `2000`）
-- `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE`：本地服务发现配置文件（JSON）
+- `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE`：本地服务发现配置文件（YAML）
 - `DEVLOOP_BRIDGE_DISCOVERY_NACOS_ADDR`：Nacos 地址（例如 `127.0.0.1:8848`）
 - `DEVLOOP_BRIDGE_DISCOVERY_NACOS_NAMESPACE`：Nacos namespace（可选）
 - `DEVLOOP_BRIDGE_DISCOVERY_NACOS_GROUP`：Nacos group（默认 `DEFAULT_GROUP`）
@@ -255,27 +256,29 @@ make run-demo-order
 
 ### 本地服务发现文件示例
 
-> 文件路径通过 `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE` 指定，可参考 `examples/bridge-local-discovery.json`：
+> 文件路径通过 `DEVLOOP_BRIDGE_DISCOVERY_LOCAL_FILE` 指定，可参考 `examples/bridge-config.yaml`（也可直接作为 bridge 主配置文件）：
 
-```json
-{
-  "routes": [
-    {
-      "env": "base",
-      "serviceName": "user",
-      "protocol": "http",
-      "host": "127.0.0.1",
-      "port": 8081
-    },
-    {
-      "env": "base",
-      "serviceName": "order",
-      "protocol": "grpc",
-      "host": "127.0.0.1",
-      "port": 9091
-    }
-  ]
-}
+```yaml
+httpAddr: 0.0.0.0:38080
+discovery:
+  backends: [local]
+routes:
+  - env: base
+    serviceName: user
+    protocol: http
+    host: 127.0.0.1
+    port: 8081
+  - env: base
+    serviceName: order
+    protocol: grpc
+    host: 127.0.0.1
+    port: 9091
+```
+
+使用该文件启动 bridge：
+
+```bash
+go run ./cloud-bridge/cmd/cloud-bridge -config ./examples/bridge-config.yaml
 ```
 
 ## 桌面配置持久化

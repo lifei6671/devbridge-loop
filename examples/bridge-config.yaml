@@ -1,0 +1,46 @@
+httpAddr: 0.0.0.0:38080
+tunnelSyncProtocols:
+  - masque
+masqueAuthMode: psk
+masquePsk: devloop-masque-default-psk
+routeExtractorOrder:
+  - host
+  - header
+  - sni
+bridgePublicHost: bridge.example.internal
+bridgePublicPort: 443
+fallbackBackflowUrl: http://127.0.0.1:39090
+ingressTimeoutSec: 10
+
+discovery:
+  backends:
+    - local
+    - nacos
+    - etcd
+    - consul
+  timeoutMs: 2000
+  # 若未配置 localFile 且本文件内存在 routes，则默认将本文件作为 local 发现数据源。
+  # localFile: ./bridge-config.yaml
+  nacos:
+    addr: 127.0.0.1:8848
+    group: DEFAULT_GROUP
+    servicePattern: ${service}
+  etcd:
+    endpoints:
+      - 127.0.0.1:2379
+    keyPrefix: /devloop/services
+  consul:
+    addr: 127.0.0.1:8500
+    servicePattern: ${service}
+
+routes:
+  - env: base
+    serviceName: user
+    protocol: http
+    host: 127.0.0.1
+    port: 8081
+  - env: base
+    serviceName: order
+    protocol: grpc
+    host: 127.0.0.1
+    port: 9091

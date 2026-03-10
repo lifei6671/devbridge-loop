@@ -7,6 +7,7 @@ require (
 	github.com/quic-go/quic-go v0.53.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	google.golang.org/grpc v1.76.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
