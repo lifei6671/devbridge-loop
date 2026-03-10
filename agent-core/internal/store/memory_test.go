@@ -196,6 +196,36 @@ func TestDiagnosticsSnapshotAggregatesSummaryErrorsAndRequests(t *testing.T) {
 	}
 }
 
+func TestClearDiagnosticsClearsRecentLogs(t *testing.T) {
+	s := NewMemoryStore()
+	s.AddError(domain.ErrorTunnelOffline, "tunnel disconnected", map[string]string{"step": "heartbeat"})
+	s.AddRequestSummary(domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "http",
+		ServiceName:  "user-service",
+		RequestedEnv: "dev-alice",
+		ResolvedEnv:  "dev-alice",
+		Resolution:   "dev-priority",
+		Upstream:     "http://bridge.example.internal",
+		StatusCode:   200,
+		Result:       "success",
+		LatencyMs:    16,
+		OccurredAt:   time.Now().UTC(),
+	})
+
+	clearedErrors, clearedRequests := s.ClearDiagnostics()
+	if clearedErrors != 1 || clearedRequests != 1 {
+		t.Fatalf("unexpected clear result: errors=%d requests=%d", clearedErrors, clearedRequests)
+	}
+
+	if len(s.ListErrors()) != 0 {
+		t.Fatalf("expected errors to be cleared")
+	}
+	if len(s.ListRequestSummaries()) != 0 {
+		t.Fatalf("expected requests to be cleared")
+	}
+}
+
 func TestSetSessionEpochAtLeast(t *testing.T) {
 	s := NewMemoryStore()
 

@@ -98,6 +98,7 @@ export interface AgentRuntime {
 }
 
 export interface DesktopConfigView {
+  agentHttpAddr: string;
   agentApiBase: string;
   agentBinary: string | null;
   agentCoreDir: string | null;
@@ -122,6 +123,7 @@ export interface DesktopConfigView {
 }
 
 export interface DesktopConfigSaveRequest {
+  agentHttpAddr: string;
   agentApiBase: string;
   agentBinary: string | null;
   agentCoreDir: string | null;

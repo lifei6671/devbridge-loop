@@ -128,4 +128,8 @@ impl AgentApiClient {
     pub async fn reconnect(&self) -> Result<Value, String> {
         self.post_json("/api/v1/control/reconnect").await
     }
+
+    pub async fn clear_recent_logs(&self) -> Result<Value, String> {
+        self.post_json("/api/v1/state/logs/clear").await
+    }
 }

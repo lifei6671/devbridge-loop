@@ -1,6 +1,8 @@
 package config
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -48,7 +50,7 @@ type EnvResolveConfig struct {
 // LoadFromEnv loads config from environment variables with sane defaults.
 func LoadFromEnv() Config {
 	cfg := Config{
-		HTTPAddr: getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"),
+		HTTPAddr: getenv("DEVLOOP_AGENT_HTTP_ADDR", "0.0.0.0:39090"),
 		RDName:   getenv("DEVLOOP_RD_NAME", "unknown-rd"),
 		EnvName:  getenv("DEVLOOP_ENV_NAME", "dev-default"),
 		Registration: RegistrationConfig{
@@ -57,7 +59,7 @@ func LoadFromEnv() Config {
 		},
 		Tunnel: TunnelConfig{
 			BridgeAddress:     getenv("DEVLOOP_TUNNEL_BRIDGE_ADDRESS", "http://127.0.0.1:38080"),
-			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "127.0.0.1:39090"))),
+			BackflowBaseURL:   getenv("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL", defaultBackflowBaseURL(getenv("DEVLOOP_AGENT_HTTP_ADDR", "0.0.0.0:39090"))),
 			SyncProtocol:      normalizeTunnelSyncProtocol(getenv("DEVLOOP_TUNNEL_SYNC_PROTOCOL", "http")),
 			MasqueAuthMode:    normalizeMasqueAuthMode(getenv("DEVLOOP_TUNNEL_MASQUE_AUTH_MODE", "psk")),
 			MasquePSK:         getenv("DEVLOOP_TUNNEL_MASQUE_PSK", "devloop-masque-default-psk"),
@@ -154,13 +156,38 @@ func defaultBackflowBaseURL(httpAddr string) string {
 	if value == "" {
 		return "http://127.0.0.1:39090"
 	}
-	if strings.Contains(value, "://") {
-		return value
-	}
 	if strings.HasPrefix(value, ":") {
 		value = "127.0.0.1" + value
 	}
-	return "http://" + value
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || strings.TrimSpace(parsed.Host) == "" {
+		return "http://127.0.0.1:39090"
+	}
+
+	host := strings.TrimSpace(parsed.Hostname())
+	port := strings.TrimSpace(parsed.Port())
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	if port == "" {
+		port = "39090"
+	}
+
+	scheme := strings.TrimSpace(parsed.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
+	return (&url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(host, port),
+	}).String()
 }
 
 func parseResolveOrder(value string) []string {

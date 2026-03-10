@@ -5,10 +5,9 @@ mod host_config;
 use agent_api::AgentApiClient;
 use agent_manager::{AgentManager, AgentRuntime};
 use host_config::{
-    apply_persisted_env_overrides, load_close_to_tray_on_close, load_desktop_config,
-    persist_close_to_tray_on_close, resolve_storage_paths,
-    save_desktop_config as save_desktop_config_file, DesktopConfigSaveRequest, DesktopConfigView,
-    HostStoragePaths,
+    apply_persisted_env_overrides, load_desktop_config, resolve_agent_api_base_from_env,
+    resolve_storage_paths, save_desktop_config as save_desktop_config_file,
+    DesktopConfigSaveRequest, DesktopConfigView, HostStoragePaths,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -27,44 +26,59 @@ const WINDOW_CLOSE_INTENT_EVENT: &str = "window-close-intent";
 
 struct AppState {
     manager: Mutex<AgentManager>,
-    close_to_tray_on_close: Mutex<Option<bool>>,
-    api: AgentApiClient,
+    close_to_tray_on_close: Mutex<bool>,
+    api: Mutex<AgentApiClient>,
     storage: HostStoragePaths,
+}
+
+fn clone_api_client(state: &AppState) -> Result<AgentApiClient, String> {
+    state
+        .api
+        .lock()
+        .map(|client| client.clone())
+        .map_err(|_| "api lock poisoned".to_string())
 }
 
 #[tauri::command]
 async fn get_state_summary(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.api.state_summary().await
+    let api = clone_api_client(&state)?;
+    api.state_summary().await
 }
 
 #[tauri::command]
 async fn get_tunnel_state(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.api.tunnel_state().await
+    let api = clone_api_client(&state)?;
+    api.tunnel_state().await
 }
 
 #[tauri::command]
 async fn get_diagnostics(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.api.diagnostics().await
+    let api = clone_api_client(&state)?;
+    api.diagnostics().await
 }
 
 #[tauri::command]
 async fn get_registrations(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
-    state.api.registrations().await
+    let api = clone_api_client(&state)?;
+    api.registrations().await
 }
 
 #[tauri::command]
 async fn get_recent_errors(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
-    state.api.recent_errors().await
+    let api = clone_api_client(&state)?;
+    api.recent_errors().await
 }
 
 #[tauri::command]
 async fn get_recent_requests(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
-    state.api.recent_requests().await
+    let api = clone_api_client(&state)?;
+    api.recent_requests().await
 }
 
 #[tauri::command]
 async fn get_active_intercepts(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
-    state.api.active_intercepts().await
+    let api = clone_api_client(&state)?;
+    api.active_intercepts().await
 }
 
 #[tauri::command]
@@ -72,12 +86,20 @@ async fn unregister_registration(
     state: tauri::State<'_, AppState>,
     instance_id: String,
 ) -> Result<Value, String> {
-    state.api.unregister_registration(&instance_id).await
+    let api = clone_api_client(&state)?;
+    api.unregister_registration(&instance_id).await
 }
 
 #[tauri::command]
 async fn trigger_reconnect(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.api.reconnect().await
+    let api = clone_api_client(&state)?;
+    api.reconnect().await
+}
+
+#[tauri::command]
+async fn clear_recent_logs(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let api = clone_api_client(&state)?;
+    api.clear_recent_logs().await
 }
 
 #[tauri::command]
@@ -92,11 +114,18 @@ fn save_desktop_config(
     request: DesktopConfigSaveRequest,
 ) -> Result<DesktopConfigView, String> {
     let view = save_desktop_config_file(&state.storage, request)?;
+    {
+        let mut api = state
+            .api
+            .lock()
+            .map_err(|_| "api lock poisoned".to_string())?;
+        *api = AgentApiClient::new(view.agent_api_base.clone());
+    }
     let mut close_to_tray_on_close = state
         .close_to_tray_on_close
         .lock()
         .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
-    *close_to_tray_on_close = Some(view.close_to_tray_on_close);
+    *close_to_tray_on_close = view.close_to_tray_on_close;
     drop(close_to_tray_on_close);
 
     // 配置保存后刷新管理器缓存，使“重启 Agent Core”立刻使用新启动参数。
@@ -114,22 +143,12 @@ fn save_desktop_config(
 #[tauri::command]
 fn resolve_window_close_action(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    _state: tauri::State<'_, AppState>,
     action: String,
 ) -> Result<(), String> {
     let normalized = action.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "tray" | "minimize" => {
-            // 用户在首次关闭弹窗里选择最小化时，自动持久化该偏好，后续不再弹窗。
-            persist_close_to_tray_on_close(&state.storage, true)?;
-            let mut close_to_tray_on_close = state
-                .close_to_tray_on_close
-                .lock()
-                .map_err(|_| "close_to_tray_on_close lock poisoned".to_string())?;
-            *close_to_tray_on_close = Some(true);
-            drop(close_to_tray_on_close);
-            hide_main_window(&app)
-        }
+        "tray" | "minimize" => hide_main_window(&app),
         "exit" => {
             request_app_exit(&app, 0);
             Ok(())
@@ -173,7 +192,7 @@ async fn restart_agent_process(
     emit_runtime_event(&app, &runtime)?;
 
     // 重启成功后立即触发一次 bridge 重连，避免等待下个轮询窗口才开始连接。
-    let api = state.api.clone();
+    let api = clone_api_client(&state)?;
     tauri::async_runtime::spawn(async move {
         trigger_reconnect_after_restart(api).await;
     });
@@ -183,15 +202,15 @@ async fn restart_agent_process(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
 
-            // 主窗口关闭行为支持三态：
-            // 1) 已配置最小化：直接隐藏到托盘
-            // 2) 已配置退出：直接退出应用
-            // 3) 未配置：通知前端弹出选择框
+            // 主窗口关闭行为：
+            // 1) 开启“关闭时最小化到托盘”：直接隐藏到托盘
+            // 2) 关闭该选项：通知前端弹出“退出/最小化”确认框
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = handle_main_window_close_requested(window);
@@ -203,17 +222,15 @@ pub fn run() {
             let storage =
                 resolve_storage_paths(app.handle()).map_err(|err| std::io::Error::other(err))?;
             apply_persisted_env_overrides(&storage).map_err(|err| std::io::Error::other(err))?;
-            let close_to_tray_on_close =
-                load_close_to_tray_on_close(&storage).map_err(|err| std::io::Error::other(err))?;
+            let close_to_tray_on_close = load_desktop_config(&storage)
+                .map(|view| view.close_to_tray_on_close)
+                .map_err(|err| std::io::Error::other(err))?;
 
             // 先应用配置文件中的环境变量，再创建运行时依赖，确保启动参数与配置页一致。
             app.manage(AppState {
                 manager: Mutex::new(AgentManager::new()),
                 close_to_tray_on_close: Mutex::new(close_to_tray_on_close),
-                api: AgentApiClient::new(
-                    std::env::var("DEVLOOP_AGENT_API_BASE")
-                        .unwrap_or_else(|_| "http://127.0.0.1:39090".to_string()),
-                ),
+                api: Mutex::new(AgentApiClient::new(resolve_agent_api_base_from_env())),
                 storage,
             });
 
@@ -251,6 +268,7 @@ pub fn run() {
             get_active_intercepts,
             unregister_registration,
             trigger_reconnect,
+            clear_recent_logs,
             get_desktop_config,
             save_desktop_config,
             resolve_window_close_action,
@@ -272,17 +290,13 @@ fn handle_main_window_close_requested(window: &Window) -> Result<(), String> {
         *close_to_tray_on_close
     };
 
-    match close_to_tray_on_close {
-        Some(true) => window
+    if close_to_tray_on_close {
+        window
             .hide()
-            .map_err(|err| format!("hide main window failed: {err}")),
-        Some(false) => {
-            request_app_exit(&app, 0);
-            Ok(())
-        }
-        None => app
-            .emit(WINDOW_CLOSE_INTENT_EVENT, ())
-            .map_err(|err| format!("emit window close intent failed: {err}")),
+            .map_err(|err| format!("hide main window failed: {err}"))
+    } else {
+        app.emit(WINDOW_CLOSE_INTENT_EVENT, ())
+            .map_err(|err| format!("emit window close intent failed: {err}"))
     }
 }
 

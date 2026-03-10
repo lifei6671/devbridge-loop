@@ -87,6 +87,7 @@ func (h *Handler) Router() http.Handler {
 	mux.HandleFunc("GET /api/v1/state/errors", h.stateErrors)
 	mux.HandleFunc("GET /api/v1/state/requests", h.stateRequests)
 	mux.HandleFunc("GET /api/v1/state/diagnostics", h.stateDiagnostics)
+	mux.HandleFunc("POST /api/v1/state/logs/clear", h.clearStateLogs)
 	mux.HandleFunc("POST /api/v1/control/reconnect", h.reconnect)
 	mux.HandleFunc("POST /api/v1/backflow/http", h.backflowHTTP)
 	mux.HandleFunc("POST /api/v1/backflow/grpc", h.backflowGRPC)
@@ -575,6 +576,14 @@ func (h *Handler) stateDiagnostics(w http.ResponseWriter, _ *http.Request) {
 		h.cfg.Registration.ScanInterval,
 	)
 	respondJSON(w, http.StatusOK, diagnostics)
+}
+
+func (h *Handler) clearStateLogs(w http.ResponseWriter, _ *http.Request) {
+	clearedErrors, clearedRequests := h.store.ClearDiagnostics()
+	respondJSON(w, http.StatusOK, map[string]int{
+		"clearedErrors":   clearedErrors,
+		"clearedRequests": clearedRequests,
+	})
 }
 
 func (h *Handler) currentTunnelProtocol() string {

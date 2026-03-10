@@ -213,7 +213,7 @@ make run-demo-order
 
 ## 环境变量（已支持）
 
-- `DEVLOOP_AGENT_HTTP_ADDR`：Go Agent Core HTTP 地址，默认 `127.0.0.1:39090`
+- `DEVLOOP_AGENT_HTTP_ADDR`：Go Agent Core HTTP 监听地址，默认 `0.0.0.0:39090`（便于局域网应用接入）
 - `DEVLOOP_RD_NAME`：当前研发人员标识
 - `DEVLOOP_ENV_NAME`：当前默认 env
 - `DEVLOOP_ENV_RESOLVE_ORDER`：env 解析优先级（默认 `requestHeader,payload,runtimeDefault,baseFallback`）
@@ -300,7 +300,9 @@ http://127.0.0.1:38080/admin
   - `logDir`
   - `configFile`
 - 当前实现优先级：环境变量 > 配置文件 > 默认值
-- 配置页已支持 tunnel 协议参数持久化：
+- 配置页已支持以下参数持久化：
+  - `agentHttpAddr`（对应 `DEVLOOP_AGENT_HTTP_ADDR`）
+  - `agentApiBase`（对应 `DEVLOOP_AGENT_API_BASE`）
   - `tunnelSyncProtocol`（`http` / `masque`）
   - `tunnelMasqueAuthMode`（`psk` / `ecdh`）
   - `tunnelMasquePsk`

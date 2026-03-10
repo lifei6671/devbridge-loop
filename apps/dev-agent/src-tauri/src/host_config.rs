@@ -16,6 +16,7 @@ pub struct HostStoragePaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopConfigFile {
+    agent_http_addr: Option<String>,
     agent_api_base: Option<String>,
     agent_binary: Option<String>,
     agent_core_dir: Option<String>,
@@ -35,6 +36,7 @@ struct DesktopConfigFile {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopConfigView {
+    pub agent_http_addr: String,
     pub agent_api_base: String,
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
@@ -61,6 +63,7 @@ pub struct DesktopConfigView {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopConfigSaveRequest {
+    pub agent_http_addr: String,
     pub agent_api_base: String,
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
@@ -104,6 +107,7 @@ pub fn apply_persisted_env_overrides(storage: &HostStoragePaths) -> Result<(), S
     };
 
     // 环境变量优先级高于配置文件：只在环境变量未显式设置时补齐默认值。
+    set_env_if_absent("DEVLOOP_AGENT_HTTP_ADDR", file.agent_http_addr.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_API_BASE", file.agent_api_base.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_BINARY", file.agent_binary.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_CORE_DIR", file.agent_core_dir.as_deref());
@@ -163,16 +167,12 @@ pub fn load_desktop_config(storage: &HostStoragePaths) -> Result<DesktopConfigVi
     Ok(build_view(storage, file.as_ref()))
 }
 
-pub fn load_close_to_tray_on_close(storage: &HostStoragePaths) -> Result<Option<bool>, String> {
-    let file = load_config_file(storage)?;
-    Ok(file.and_then(|item| item.close_to_tray_on_close))
-}
-
 pub fn save_desktop_config(
     storage: &HostStoragePaths,
     request: DesktopConfigSaveRequest,
 ) -> Result<DesktopConfigView, String> {
     let file = DesktopConfigFile {
+        agent_http_addr: Some(normalize_agent_http_addr(&request.agent_http_addr)),
         agent_api_base: normalize_required(&request.agent_api_base),
         agent_binary: normalize_optional(request.agent_binary),
         agent_core_dir: normalize_optional(request.agent_core_dir),
@@ -201,31 +201,6 @@ pub fn save_desktop_config(
     Ok(build_view(storage, Some(&file)))
 }
 
-pub fn persist_close_to_tray_on_close(
-    storage: &HostStoragePaths,
-    close_to_tray_on_close: bool,
-) -> Result<(), String> {
-    let mut file = load_config_file(storage)?.unwrap_or_else(|| DesktopConfigFile {
-        agent_api_base: None,
-        agent_binary: None,
-        agent_core_dir: None,
-        agent_auto_restart: None,
-        close_to_tray_on_close: None,
-        agent_restart_backoff_ms: None,
-        env_resolve_order: None,
-        tunnel_bridge_address: None,
-        tunnel_backflow_base_url: None,
-        tunnel_sync_protocol: None,
-        tunnel_masque_auth_mode: None,
-        tunnel_masque_psk: None,
-        tunnel_masque_proxy_url: None,
-        tunnel_masque_target_addr: None,
-    });
-
-    file.close_to_tray_on_close = Some(close_to_tray_on_close);
-    save_config_file(storage, &file)
-}
-
 fn load_config_file(storage: &HostStoragePaths) -> Result<Option<DesktopConfigFile>, String> {
     if !storage.config_file.exists() {
         return Ok(None);
@@ -247,14 +222,15 @@ fn save_config_file(storage: &HostStoragePaths, file: &DesktopConfigFile) -> Res
 }
 
 fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> DesktopConfigView {
-    let agent_http_addr =
-        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:39090".to_string());
-    let default_api_base =
-        if agent_http_addr.starts_with("http://") || agent_http_addr.starts_with("https://") {
-            agent_http_addr.clone()
-        } else {
-            format!("http://{}", agent_http_addr)
-        };
+    let agent_http_addr = normalize_agent_http_addr(
+        &first_non_blank(
+            std::env::var("DEVLOOP_AGENT_HTTP_ADDR").ok(),
+            file.and_then(|item| item.agent_http_addr.clone()),
+            Some(default_agent_http_addr()),
+        )
+        .unwrap_or_else(default_agent_http_addr),
+    );
+    let default_api_base = default_agent_api_base_from_http_addr(&agent_http_addr);
 
     // 一处统一处理配置优先级：环境变量 > 持久化文件 > 内置默认值。
     let agent_api_base = first_non_blank(
@@ -282,7 +258,7 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
         .unwrap_or(true);
 
     let close_to_tray_on_close_option = file.and_then(|item| item.close_to_tray_on_close);
-    // 该值未配置时保持“首次关闭询问”语义；配置页展示默认选中但标记为未配置。
+    // 未配置时默认 true（兼容历史行为）；是否弹确认框由该布尔值决定，而非“是否已配置”。
     let close_to_tray_on_close = close_to_tray_on_close_option.unwrap_or(true);
     let close_to_tray_on_close_configured = close_to_tray_on_close_option.is_some();
 
@@ -310,7 +286,7 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     let tunnel_backflow_base_url = first_non_blank(
         std::env::var("DEVLOOP_TUNNEL_BACKFLOW_BASE_URL").ok(),
         file.and_then(|item| item.tunnel_backflow_base_url.clone()),
-        Some(default_api_base),
+        Some(default_api_base.clone()),
     )
     .unwrap_or_else(|| "http://127.0.0.1:39090".to_string());
 
@@ -357,6 +333,7 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     );
 
     DesktopConfigView {
+        agent_http_addr,
         agent_api_base,
         agent_binary,
         agent_core_dir,
@@ -409,6 +386,7 @@ fn set_env_override(key: &str, value: Option<&str>) {
 
 fn apply_runtime_env_from_file(file: &DesktopConfigFile) {
     // 运行时配置来源统一刷新为“最新保存值”，避免首次启动注入的旧环境变量遮蔽新配置。
+    set_env_override("DEVLOOP_AGENT_HTTP_ADDR", file.agent_http_addr.as_deref());
     set_env_override("DEVLOOP_AGENT_API_BASE", file.agent_api_base.as_deref());
     set_env_override("DEVLOOP_AGENT_BINARY", file.agent_binary.as_deref());
     set_env_override("DEVLOOP_AGENT_CORE_DIR", file.agent_core_dir.as_deref());
@@ -483,6 +461,58 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
 
 fn normalize_optional_non_empty(value: &str) -> String {
     value.trim().to_string()
+}
+
+fn default_agent_http_addr() -> String {
+    "0.0.0.0:39090".to_string()
+}
+
+fn normalize_agent_http_addr(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default_agent_http_addr();
+    }
+
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let host_port = without_scheme
+        .split('/')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if host_port.is_empty() {
+        return default_agent_http_addr();
+    }
+
+    if host_port.starts_with(':') {
+        return format!("0.0.0.0{host_port}");
+    }
+
+    host_port.to_string()
+}
+
+fn default_agent_api_base_from_http_addr(agent_http_addr: &str) -> String {
+    let normalized = normalize_agent_http_addr(agent_http_addr);
+    if let Some(port) = normalized.strip_prefix("0.0.0.0:") {
+        return format!("http://127.0.0.1:{port}");
+    }
+    if let Some(port) = normalized.strip_prefix("[::]:") {
+        return format!("http://127.0.0.1:{port}");
+    }
+    format!("http://{normalized}")
+}
+
+pub fn resolve_agent_api_base_from_env() -> String {
+    first_non_blank(
+        std::env::var("DEVLOOP_AGENT_API_BASE").ok(),
+        None,
+        Some(default_agent_api_base_from_http_addr(
+            &std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| default_agent_http_addr()),
+        )),
+    )
+    .unwrap_or_else(|| "http://127.0.0.1:39090".to_string())
 }
 
 fn parse_auto_restart(value: String) -> bool {

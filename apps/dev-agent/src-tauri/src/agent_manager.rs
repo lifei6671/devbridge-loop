@@ -343,7 +343,7 @@ fn parse_backoff(value: String) -> Vec<u64> {
 
 fn validate_agent_http_addr_before_spawn() -> Result<(), String> {
     let raw_addr =
-        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:39090".to_string());
+        std::env::var("DEVLOOP_AGENT_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:39090".to_string());
     let listen_addr = normalize_http_addr_to_socket(&raw_addr);
 
     if listen_addr.is_empty() {

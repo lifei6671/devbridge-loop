@@ -90,3 +90,66 @@ func TestStateDiagnosticsEndpointReturnsSnapshot(t *testing.T) {
 		t.Fatalf("unexpected recent requests count: %d", len(response.RecentRequests))
 	}
 }
+
+func TestClearStateLogsEndpointClearsErrorsAndRequests(t *testing.T) {
+	state := store.NewMemoryStore()
+	state.AddError(domain.ErrorTunnelOffline, "tunnel down", map[string]string{"action": "heartbeat"})
+	state.AddRequestSummary(domain.RequestSummary{
+		Direction:    "egress",
+		Protocol:     "http",
+		ServiceName:  "user-service",
+		RequestedEnv: "dev-alice",
+		ResolvedEnv:  "dev-alice",
+		Resolution:   "dev-priority",
+		Upstream:     "http://bridge.example.internal",
+		StatusCode:   http.StatusOK,
+		Result:       "success",
+		LatencyMs:    10,
+		OccurredAt:   time.Now().UTC(),
+	})
+
+	cfg := config.Config{
+		RDName:  "alice",
+		EnvName: "dev-alice",
+		Registration: config.RegistrationConfig{
+			DefaultTTLSeconds: 30,
+			ScanInterval:      5 * time.Second,
+		},
+		Tunnel: config.TunnelConfig{
+			BridgeAddress:  "http://127.0.0.1:18080",
+			RequestTimeout: 5 * time.Second,
+		},
+	}
+
+	handler := NewHandler(cfg, state, nil, nil)
+
+	clearReq := httptest.NewRequest(http.MethodPost, "/api/v1/state/logs/clear", nil)
+	clearRecorder := httptest.NewRecorder()
+	handler.Router().ServeHTTP(clearRecorder, clearReq)
+	if clearRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected clear status code: %d", clearRecorder.Code)
+	}
+
+	var clearResponse map[string]int
+	if err := json.Unmarshal(clearRecorder.Body.Bytes(), &clearResponse); err != nil {
+		t.Fatalf("decode clear response failed: %v", err)
+	}
+	if clearResponse["clearedErrors"] != 1 || clearResponse["clearedRequests"] != 1 {
+		t.Fatalf("unexpected clear response: %+v", clearResponse)
+	}
+
+	diagnosticsReq := httptest.NewRequest(http.MethodGet, "/api/v1/state/diagnostics", nil)
+	diagnosticsRecorder := httptest.NewRecorder()
+	handler.Router().ServeHTTP(diagnosticsRecorder, diagnosticsReq)
+	if diagnosticsRecorder.Code != http.StatusOK {
+		t.Fatalf("unexpected diagnostics status code: %d", diagnosticsRecorder.Code)
+	}
+
+	var diagnostics domain.DiagnosticsSnapshot
+	if err := json.Unmarshal(diagnosticsRecorder.Body.Bytes(), &diagnostics); err != nil {
+		t.Fatalf("decode diagnostics response failed: %v", err)
+	}
+	if len(diagnostics.RecentErrors) != 0 || len(diagnostics.RecentRequests) != 0 {
+		t.Fatalf("expected diagnostics logs to be empty after clear")
+	}
+}

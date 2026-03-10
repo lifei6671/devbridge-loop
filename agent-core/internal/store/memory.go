@@ -451,6 +451,18 @@ func (s *MemoryStore) AddRequestSummary(summary domain.RequestSummary) {
 	}
 }
 
+// ClearDiagnostics clears recent error and request summaries.
+func (s *MemoryStore) ClearDiagnostics() (clearedErrors int, clearedRequests int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clearedErrors = len(s.recentErrors)
+	clearedRequests = len(s.recentReqs)
+	s.recentErrors = s.recentErrors[:0]
+	s.recentReqs = s.recentReqs[:0]
+	return clearedErrors, clearedRequests
+}
+
 // ExpireRegistrations 删除超过 TTL 的注册项，并返回被删除的快照列表。
 func (s *MemoryStore) ExpireRegistrations(now time.Time) []domain.LocalRegistration {
 	s.mu.Lock()
