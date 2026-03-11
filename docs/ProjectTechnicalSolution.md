@@ -21,6 +21,8 @@ DevLoop 一期目标是构建研发联调闭环，打通以下链路：
 2. `dev-agent` 通过 tunnel 将接管关系同步到 `cloud-bridge`
 3. base 环境通过 bridge 访问到本地 dev 服务（入口回流）
 4. 本地服务通过 `dev-agent` 完成发现与出口代理（dev 优先、base fallback）
+5. bridge 端口映射入口（监听 `0.0.0.0` 并无条件映射到目标服务）
+6. agent 与 bridge 的可扩展服务协商（同时支持端口映射与客户端自动协商）
 
 ---
 
@@ -36,6 +38,9 @@ DevLoop 一期目标是构建研发联调闭环，打通以下链路：
 6. 同步事件幂等（`sessionEpoch`、`resourceVersion`、`eventId`）
 7. 注册心跳续期与 TTL 被动摘除
 8. UI 实时状态展示与诊断信息输出
+9. bridge 端口映射入口（`0.0.0.0:<listenPort>`）
+10. 服务协商机制（会话级 + 请求级）
+11. 协商链路复用 tunnel 同步协议（`http`/`masque`），不引入独立协商通道
 
 ### 3.2 一期明确不做
 
@@ -61,11 +66,14 @@ DevLoop 一期目标是构建研发联调闭环，打通以下链路：
 3. `Go Agent Core`
    - 注册、心跳、注销、发现、出口代理
    - tunnel client、状态同步、回流转发
+   - 协商结果校验与 `forwardIntent` 严格转发
    - 运行时内存态状态机
 4. `cloud-bridge`
    - tunnel session 管理
    - ActiveIntercept 管理
    - ingress（HTTP/gRPC）路由与转发
+   - 端口映射监听与映射路由解析
+   - 会话级/请求级协商决策
 
 ### 4.2 架构总览图
 
@@ -158,6 +166,36 @@ agent 与 bridge 的同步模型必须包含：
 2. bridge 对重复事件返回成功语义
 3. bridge 拒绝旧 epoch 事件
 
+### 5.7 端口映射入口模型
+
+必须支持 bridge 侧显式配置端口映射，入口请求无条件绑定到目标服务标识：
+
+1. `listenAddr`：固定监听地址，默认 `0.0.0.0`
+2. `listenPort`：独立监听端口
+3. `protocol`：`http` 或 `grpc`
+4. `env` + `serviceName`：目标服务标识
+5. `sourceOrder`：目标解析顺序（`tunnel`、`localRoute`、`serviceDiscovery`）
+
+必须满足：
+
+1. 端口映射命中后不再执行 `RouteExtractPipeline`
+2. 请求服务标识不允许被 Host/Header/SNI 覆盖
+3. bridge 必须在响应中标记路由来源，便于观测
+
+### 5.8 服务协商协议模型
+
+协商分为两层：
+
+1. 会话级协商：在 `HELLO` 与 `ACK/ERROR` 完成能力协商
+2. 请求级协商：bridge 在每次回流请求中通过 `forwardIntent` 下发决策
+
+必须满足：
+
+1. 会话级协商复用 tunnel 同步协议（`http`/`masque`）的同一消息通道
+2. `requiredFeatures` 未满足时，握手失败并触发重连
+3. 请求级协商必须携带 `mode`、`negotiationId`、`selectedSource`
+4. agent 对 `mode=port_mapping` 必须执行“无条件严格转发”
+
 ---
 
 ## 6. 核心对象模型
@@ -224,6 +262,34 @@ lastHeartbeatAt: timestamp
 connectedAt: timestamp
 ```
 
+### 6.6 PortMappingConfig
+
+```text
+id: string
+listenAddr: string
+listenPort: int
+protocol: string
+env: string
+serviceName: string
+sourceOrder: []string
+status: string
+updatedAt: timestamp
+```
+
+### 6.7 NegotiationProfile
+
+```text
+version: string                # 例如 snp/1
+requiredFeatures: []string
+optionalFeatures: []string
+capabilities:
+  forwardModes: []string       # legacy_direct|port_mapping|auto_negotiation
+  routeSources: []string       # tunnel|local_route|service_discovery
+sessionId: string
+enabledFeatures: []string
+disabledFeatures: []string
+```
+
 ---
 
 ## 7. 接口契约
@@ -267,6 +333,42 @@ connectedAt: timestamp
 3. `eventId`
 4. `sentAt`
 
+新增协商字段（复用上述消息体，不新增独立传输协议）：
+
+1. `HELLO.payload.negotiation`
+   - `version`
+   - `requiredFeatures`
+   - `optionalFeatures`
+   - `capabilities.forwardModes`
+   - `capabilities.routeSources`
+2. `ACK.payload.negotiationResult`
+   - `sessionId`
+   - `enabledFeatures`
+   - `disabledFeatures`
+3. `ERROR.errorCode`
+   - `NEGOTIATION_UNSUPPORTED_VERSION`
+   - `NEGOTIATION_UNSUPPORTED_FEATURE`
+
+### 7.4 Bridge -> Agent（回流请求扩展）
+
+`/api/v1/backflow/http` 与 `/api/v1/backflow/grpc` 需扩展 `forwardIntent`：
+
+1. `mode`：`legacy_direct` | `port_mapping` | `auto_negotiation`
+2. `mappingId`：端口映射 ID（`mode=port_mapping` 时必填）
+3. `negotiationId`：单次请求协商 ID
+4. `service(env, serviceName, protocol)`：协商目标
+5. `sourceOrder`：候选来源顺序
+6. `selectedSource`：bridge 已选择来源
+7. `attempt`：当前重试次数
+
+agent 响应需扩展 `forwardDecision`：
+
+1. `negotiationId`
+2. `mode`
+3. `decision`（`accepted`/`rejected`）
+4. `selectedSource`
+5. `selectedTarget`
+
 ---
 
 ## 8. 通信流程（完整 Mermaid 图）
@@ -285,11 +387,17 @@ sequenceDiagram
     RH->>AG: GET /state/summary
     AG-->>RH: running
     AG->>BR: Tunnel Connect
-    AG->>BR: HELLO(sessionEpoch++)
-    BR-->>AG: HELLO_ACK(connId)
-    AG->>BR: FULL_SYNC_REQUEST(resourceVersion=x)
-    AG->>BR: FULL_SYNC_SNAPSHOT(all LocalRegistration)
-    BR-->>AG: ACK(eventId)
+    AG->>BR: HELLO(sessionEpoch++, negotiationProfile)
+    Note over AG,BR: HELLO 与协商消息走同一 tunnel 传输协议（http/masque）
+    BR-->>AG: HELLO_ACK/ACK(negotiationResult)
+    AG->>AG: 校验 requiredFeatures 是否满足
+    alt requiredFeatures 未满足
+        AG->>AG: 本次握手失败，触发重连退避
+    else 协商通过
+        AG->>BR: FULL_SYNC_REQUEST(resourceVersion=x)
+        AG->>BR: FULL_SYNC_SNAPSHOT(all LocalRegistration)
+        BR-->>AG: ACK(eventId)
+    end
     RH->>AG: GET /state/tunnel
     AG-->>RH: connected
     RH-->>UI: 渲染在线状态
@@ -400,6 +508,45 @@ sequenceDiagram
     BR-->>AG: ACK(eventId)
 ```
 
+### 8.7 端口映射入口回流（无条件转发）
+
+```mermaid
+sequenceDiagram
+    participant CALLER as Client
+    participant BR as cloud-bridge
+    participant AG as Go Agent Core
+    participant DEV as Local Service Endpoint
+
+    CALLER->>BR: 请求 0.0.0.0:38100
+    BR->>BR: 命中 PortMappingConfig(mappingId, env, serviceName, protocol)
+    BR->>BR: 按 sourceOrder 解析目标(tunnel->localRoute->serviceDiscovery)
+    BR->>AG: backflow + forwardIntent(mode=port_mapping, selectedSource=tunnel)
+    AG->>AG: 按 forwardIntent 严格转发，不做路由提取
+    AG->>DEV: 转发到 targetHost:targetPort
+    DEV-->>AG: 响应
+    AG-->>BR: forwardDecision(accepted, selectedTarget)
+    BR-->>CALLER: 返回响应 + 路由来源头
+```
+
+### 8.8 客户端自动协商回流
+
+```mermaid
+sequenceDiagram
+    participant CALLER as Client
+    participant BR as cloud-bridge
+    participant AG as Go Agent Core
+    participant UP as Target Service
+
+    CALLER->>BR: ingress + X-DevLoop-Negotiate:auto
+    BR->>BR: 按协商规则选择服务与来源(selectedSource)
+    BR->>AG: backflow + forwardIntent(mode=auto_negotiation)
+    AG->>AG: 校验 negotiationId 与 mode
+    AG->>UP: 按 selectedSource/selectedTarget 转发
+    UP-->>AG: 响应
+    AG-->>BR: forwardDecision(accepted)
+    BR-->>CALLER: 响应 + X-DevLoop-Negotiated-* 头
+```
+
 ---
 
 ## 9. 错误模型与重试策略
@@ -414,12 +561,18 @@ sequenceDiagram
 6. `INVALID_ENV`
 7. `STALE_EPOCH_EVENT`
 8. `DUPLICATE_EVENT_IGNORED`
+9. `NEGOTIATION_UNSUPPORTED_VERSION`
+10. `NEGOTIATION_UNSUPPORTED_FEATURE`
+11. `NEGOTIATION_NO_CANDIDATE`
+12. `NEGOTIATION_REQUIRED_FIELD_MISSING`
+13. `PORT_MAPPING_NOT_FOUND`
 
 ### 9.2 重试规则
 
 1. tunnel 断线后按阶梯退避重连（默认每次 +5s，最大 60s）
 2. 可重试同步事件必须带同一 `eventId` 重放
 3. 不可重试错误（协议解析失败、参数非法）直接返回并记录
+4. 协商失败仅对可恢复错误重试（如 `NEGOTIATION_NO_CANDIDATE`），协议版本不兼容直接失败并告警
 
 ---
 
@@ -432,13 +585,19 @@ agent:
   rdName: "alice"
   envName: "dev-alice"
   tunnel:
-    syncProtocol: "http" # http | masque
+    syncProtocol: "masque" # http | masque
     bridgeAddress: "bridge.example.internal:443"
     heartbeatIntervalSec: 10
     reconnectBackoffMs: [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000, 45000, 50000, 55000, 60000]
     masqueAuthMode: "psk" # psk | ecdh
     masquePSK: "devloop-masque-default-psk"
     masqueTargetAddr: "127.0.0.1:39081"
+    negotiation:
+      version: "snp/1"
+      requiredFeatures: ["port_mapping_forward"]
+      optionalFeatures: ["client_auto_negotiation"]
+      forwardModes: ["legacy_direct", "port_mapping", "auto_negotiation"]
+      routeSources: ["tunnel", "local_route", "service_discovery"]
   registration:
     defaultTTLSeconds: 30
     scanIntervalSec: 5
@@ -446,7 +605,22 @@ agent:
     order: ["host", "header", "sni"]
   envResolve:
     order: ["requestHeader", "runtimeDefault", "baseFallback"]
+bridge:
+  tunnelSyncProtocols: ["masque", "http"]
+  portMappings:
+    - id: "pm-user-http-38100"
+      listenAddr: "0.0.0.0"
+      listenPort: 38100
+      protocol: "http"
+      env: "dev-alice"
+      serviceName: "user"
+      sourceOrder: ["tunnel", "local_route", "service_discovery"]
 ```
+
+说明：
+
+1. 协商消息不独立配置协议，固定复用 `agent.tunnel.syncProtocol` 对应链路。
+2. 当 `syncProtocol=masque` 时，协商与 `HELLO/FULL_SYNC/HEARTBEAT` 一样走 MASQUE datagram 通道。
 
 ---
 
@@ -458,6 +632,8 @@ agent:
 2. 最近请求摘要（入口/出口、命中 env、延迟、结果）
 3. tunnel 状态（connected、lastHeartbeat、sessionEpoch）
 4. 当前注册表与 ActiveIntercept 摘要
+5. 协商会话摘要（`version`、`enabledFeatures`、`sessionId`）
+6. 端口映射命中摘要（`mappingId`、`selectedSource`、`selectedTarget`）
 
 ### 11.2 UI 必须展示
 
@@ -468,6 +644,8 @@ agent:
 5. 本地注册项
 6. 接管关系
 7. 最近错误
+8. 端口映射状态
+9. 协商状态（成功/失败、最近失败原因）
 
 ---
 
@@ -477,20 +655,22 @@ agent:
 2. 注册变更同步到 bridge 生效延迟 P95 不超过 `2s`
 3. 单 agent 运行时内存态至少支持 `200` 个 `LocalRegistration` 与 `400` 个 endpoint
 4. 入口回流代理链路额外延迟 P95 不超过 `20ms`（同地域内网基准）
+5. 协商握手额外开销 P95 不超过 `50ms`（同地域内网基准）
 
 ---
 
-## 13. 实施阶段（P0-P8）
+## 13. 实施阶段（P0-P9）
 
 1. `P0` 设计冻结：抽象接口、对象模型、消息模型、错误码、NFR 指标
 2. `P1` Tauri 桌面壳：UI、Rust Host、子进程管理
 3. `P2` Go Agent Core 基础能力：注册/心跳/注销/发现/状态接口
-4. `P3` cloud-bridge 基础能力：session/intercept/route 管理
-5. `P4` tunnel 与同步：握手、心跳、重连、全量重同步、幂等
-6. `P5` 入口回流：RouteExtractPipeline、HTTP/gRPC ingress、本地转发
-7. `P6` 出口代理：discover、env 透传、HTTP/gRPC egress
-8. `P7` UI 一期页面：Dashboard、注册列表、接管列表、日志、配置
-9. `P8` Demo 联调：order/user 双服务，HTTP/gRPC 全链路验证
+4. `P3` cloud-bridge 基础能力：session/intercept/route 管理、端口映射监听
+5. `P4` tunnel 与同步：握手、心跳、重连、全量重同步、幂等、会话级协商
+6. `P5` 入口回流：RouteExtractPipeline、HTTP/gRPC ingress、本地转发、请求级协商
+7. `P6` 出口代理：discover、env 透传、HTTP/gRPC egress、客户端自动协商
+8. `P7` UI 一期页面：Dashboard、注册列表、接管列表、端口映射、日志、配置
+9. `P8` Demo 联调：order/user 双服务，HTTP/gRPC/端口映射全链路验证
+10. `P9` 协商协议扩展：新增 feature 时的向后兼容验证
 
 ---
 
@@ -508,6 +688,9 @@ agent:
 8. 异常退出可在 TTL 时间窗内被动摘除
 9. 重复事件、乱序、重放不破坏最终一致性
 10. UI 状态展示与后端真实状态一致
+11. 端口映射入口请求可无条件回流到目标服务（不依赖 Host/Header/SNI）
+12. 协商消息可随 tunnel 传输协议切换（`http`/`masque`），无需独立协商通道
+13. `mode=port_mapping` 的 agent 回流行为满足严格转发语义
 
 ### 14.2 工程验收
 
@@ -516,6 +699,7 @@ agent:
 3. 新协议接入不需重构 tunnel 主干
 4. 路由提取与 env 解析优先级均可配置
 5. 日志可追踪、错误码可定位、配置项完整
+6. 协商协议版本与 feature 可扩展，并对旧版本 agent/bridge 向后兼容
 
 ---
 
