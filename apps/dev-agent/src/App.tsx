@@ -19,11 +19,13 @@ export default function App(): ReactElement {
           activePage={controller.activePage}
           agentStatus={controller.agentCardStatus}
           bridgeStatus={controller.bridgeCardStatus}
-          currentEnv={controller.summary?.currentEnv ?? null}
+          currentEnv={controller.desktopConfig?.envName ?? controller.summary?.currentEnv ?? null}
           lastUpdateAt={controller.summary?.lastUpdateAt ?? null}
           onChangePage={controller.onChangePage}
+          onSaveCurrentEnv={controller.onSaveCurrentEnv}
           pageItems={controller.pageItems}
           rdName={controller.summary?.rdName ?? null}
+          savingConfig={controller.savingConfig}
         />
 
         <section className="flex min-h-0 flex-col">

@@ -226,6 +226,7 @@ export function ConfigPage({
           <div>配置已加载: {desktopConfig?.configLoaded ? "是" : "否"}</div>
           <div>核心监听地址: {desktopConfig?.agentHttpAddr ?? "-"}</div>
           <div>核心 API 地址: {desktopConfig?.agentApiBase ?? "-"}</div>
+          <div>默认环境: {desktopConfig?.envName ?? "-"}</div>
           <div>配置目录: {desktopConfig?.configDir ?? "-"}</div>
           <div>日志目录: {desktopConfig?.logDir ?? "-"}</div>
           <div>配置文件: {desktopConfig?.configFile ?? "-"}</div>
@@ -271,6 +272,19 @@ export function ConfigPage({
               className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
               value={desktopConfigDraft?.agentApiBase ?? ""}
               onChange={(event) => onPatchDraft({ agentApiBase: event.target.value })}
+            />
+          </div>
+
+          <div className="space-y-1">
+            <FieldLabel
+              text="默认环境（envName）"
+              tooltip="写入 DEVLOOP_ENV_NAME。注册时未指定 env、或按环境解析顺序命中 runtimeDefault 时会使用该值。"
+            />
+            <input
+              className="w-full rounded-md border border-border/70 bg-background px-2 py-1 font-mono text-xs"
+              value={desktopConfigDraft?.envName ?? ""}
+              placeholder="dev-default"
+              onChange={(event) => onPatchDraft({ envName: event.target.value })}
             />
           </div>
 

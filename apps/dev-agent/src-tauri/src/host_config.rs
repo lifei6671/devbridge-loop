@@ -18,6 +18,7 @@ pub struct HostStoragePaths {
 struct DesktopConfigFile {
     agent_http_addr: Option<String>,
     agent_api_base: Option<String>,
+    env_name: Option<String>,
     agent_binary: Option<String>,
     agent_core_dir: Option<String>,
     agent_auto_restart: Option<bool>,
@@ -38,6 +39,7 @@ struct DesktopConfigFile {
 pub struct DesktopConfigView {
     pub agent_http_addr: String,
     pub agent_api_base: String,
+    pub env_name: String,
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
     pub agent_auto_restart: bool,
@@ -65,6 +67,7 @@ pub struct DesktopConfigView {
 pub struct DesktopConfigSaveRequest {
     pub agent_http_addr: String,
     pub agent_api_base: String,
+    pub env_name: String,
     pub agent_binary: Option<String>,
     pub agent_core_dir: Option<String>,
     pub agent_auto_restart: bool,
@@ -109,6 +112,7 @@ pub fn apply_persisted_env_overrides(storage: &HostStoragePaths) -> Result<(), S
     // 环境变量优先级高于配置文件：只在环境变量未显式设置时补齐默认值。
     set_env_if_absent("DEVLOOP_AGENT_HTTP_ADDR", file.agent_http_addr.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_API_BASE", file.agent_api_base.as_deref());
+    set_env_if_absent("DEVLOOP_ENV_NAME", file.env_name.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_BINARY", file.agent_binary.as_deref());
     set_env_if_absent("DEVLOOP_AGENT_CORE_DIR", file.agent_core_dir.as_deref());
     set_env_if_absent(
@@ -174,6 +178,7 @@ pub fn save_desktop_config(
     let file = DesktopConfigFile {
         agent_http_addr: Some(normalize_agent_http_addr(&request.agent_http_addr)),
         agent_api_base: normalize_required(&request.agent_api_base),
+        env_name: Some(normalize_env_name(&request.env_name)),
         agent_binary: normalize_optional(request.agent_binary),
         agent_core_dir: normalize_optional(request.agent_core_dir),
         agent_auto_restart: Some(request.agent_auto_restart),
@@ -239,6 +244,14 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
         Some(default_api_base.clone()),
     )
     .unwrap_or(default_api_base.clone());
+    let env_name = normalize_env_name(
+        &first_non_blank(
+            std::env::var("DEVLOOP_ENV_NAME").ok(),
+            file.and_then(|item| item.env_name.clone()),
+            Some(default_env_name()),
+        )
+        .unwrap_or_else(default_env_name),
+    );
 
     let agent_binary = first_non_blank(
         std::env::var("DEVLOOP_AGENT_BINARY").ok(),
@@ -335,6 +348,7 @@ fn build_view(storage: &HostStoragePaths, file: Option<&DesktopConfigFile>) -> D
     DesktopConfigView {
         agent_http_addr,
         agent_api_base,
+        env_name,
         agent_binary,
         agent_core_dir,
         agent_auto_restart,
@@ -388,6 +402,7 @@ fn apply_runtime_env_from_file(file: &DesktopConfigFile) {
     // 运行时配置来源统一刷新为“最新保存值”，避免首次启动注入的旧环境变量遮蔽新配置。
     set_env_override("DEVLOOP_AGENT_HTTP_ADDR", file.agent_http_addr.as_deref());
     set_env_override("DEVLOOP_AGENT_API_BASE", file.agent_api_base.as_deref());
+    set_env_override("DEVLOOP_ENV_NAME", file.env_name.as_deref());
     set_env_override("DEVLOOP_AGENT_BINARY", file.agent_binary.as_deref());
     set_env_override("DEVLOOP_AGENT_CORE_DIR", file.agent_core_dir.as_deref());
     set_env_override(
@@ -465,6 +480,18 @@ fn normalize_optional_non_empty(value: &str) -> String {
 
 fn default_agent_http_addr() -> String {
     "0.0.0.0:39090".to_string()
+}
+
+fn default_env_name() -> String {
+    "dev-default".to_string()
+}
+
+fn normalize_env_name(value: &str) -> String {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return default_env_name();
+    }
+    normalized.to_string()
 }
 
 fn normalize_agent_http_addr(value: &str) -> String {

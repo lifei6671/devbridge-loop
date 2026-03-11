@@ -98,6 +98,7 @@ export function buildDesktopConfigDraft(view: DesktopConfigView): DesktopConfigS
   return {
     agentHttpAddr: view.agentHttpAddr,
     agentApiBase: view.agentApiBase,
+    envName: view.envName,
     agentBinary: view.agentBinary,
     agentCoreDir: view.agentCoreDir,
     agentAutoRestart: view.agentAutoRestart,

@@ -29,10 +29,19 @@ function formatUnknownError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function normalizeEnvName(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return "dev-default";
+  }
+  return trimmed;
+}
+
 function buildDefaultDesktopConfigDraft(): DesktopConfigSaveRequest {
   return {
     agentHttpAddr: "0.0.0.0:39090",
     agentApiBase: "http://127.0.0.1:39090",
+    envName: "dev-default",
     agentBinary: null,
     agentCoreDir: null,
     agentAutoRestart: true,
@@ -133,6 +142,7 @@ export interface AppController {
   onRefresh: () => void;
   onResolveCloseDecision: (action: "tray" | "exit") => void;
   onRestartAgent: () => void;
+  onSaveCurrentEnv: (envName: string) => void;
   onSaveDesktopConfig: () => void;
   onSelectInstance: (instanceId: string) => void;
   onUnregisterRegistration: (instanceId: string) => void;
@@ -490,6 +500,44 @@ export function useAppController(): AppController {
     }
   }, [agentHttpAddrValidationError, desktopConfigDraft, markDesktopConfigDraftDirty, showToast]);
 
+  const saveCurrentEnv = useCallback(async (envNameInput: string) => {
+    const normalizedEnvName = normalizeEnvName(envNameInput);
+    const baseDraft = desktopConfig
+      ? buildDesktopConfigDraft(desktopConfig)
+      : desktopConfigDraft ?? buildDefaultDesktopConfigDraft();
+    if (baseDraft.envName === normalizedEnvName) {
+      return;
+    }
+
+    const request: DesktopConfigSaveRequest = {
+      ...baseDraft,
+      envName: normalizedEnvName
+    };
+
+    setSavingConfig(true);
+    setActionError("");
+    try {
+      const saved = await call<DesktopConfigView>("save_desktop_config", { request });
+      setDesktopConfig(saved);
+      setDesktopConfigDraft((current) => {
+        if (!desktopConfigDraftDirtyRef.current || !current) {
+          return buildDesktopConfigDraft(saved);
+        }
+        return {
+          ...current,
+          envName: saved.envName
+        };
+      });
+      showToast("默认环境已保存，重启核心进程后生效。", "success");
+    } catch (error) {
+      const message = formatUnknownError(error);
+      setActionError(message);
+      showToast(`保存默认环境失败：${message}`, "error");
+    } finally {
+      setSavingConfig(false);
+    }
+  }, [desktopConfig, desktopConfigDraft, showToast]);
+
   const clearLogs = useCallback(async () => {
     if (clearingLogs) {
       return;
@@ -751,6 +799,10 @@ export function useAppController(): AppController {
     void saveDesktopConfig();
   }, [saveDesktopConfig]);
 
+  const onSaveCurrentEnv = useCallback((envName: string) => {
+    void saveCurrentEnv(envName);
+  }, [saveCurrentEnv]);
+
   const onUnregisterRegistration = useCallback((instanceId: string) => {
     void unregisterRegistration(instanceId);
   }, [unregisterRegistration]);
@@ -788,6 +840,7 @@ export function useAppController(): AppController {
     onRefresh,
     onResolveCloseDecision,
     onRestartAgent,
+    onSaveCurrentEnv,
     onSaveDesktopConfig,
     onSelectInstance: setSelectedInstanceId,
     onUnregisterRegistration,
