@@ -182,7 +182,7 @@ flowchart TD
 * 心跳
 * service publish / unpublish
 * service health report
-* route assign / revoke
+* route sync（可选扩展）
 * 状态同步
 * 错误通知
 
@@ -260,6 +260,9 @@ dev/alice/order-service
 * `service_key -> service_id` 在当前系统中一对一映射
 * route target 使用 `service_key`
 * runtime / traffic / ACK / audit 使用 `service_id`
+* 当 `PublishService.service_id` 为空时：
+  * 若 `service_key` 已存在，server **必须复用既有 `service_id`**
+  * 仅当 `service_key` 首次出现时，server 才分配新的 `service_id`
 
 ---
 
@@ -319,6 +322,7 @@ dev/alice/order-service
 * `connector_id`
 * `service_name`
 * `service_type`
+* `status`
 * `resource_version`
 * `endpoints`
 * `exposure`
@@ -327,6 +331,28 @@ dev/alice/order-service
 * `discovery_policy`
 * `labels`
 * `metadata`
+
+### `status`
+
+`status` 是 **server 维护的派生生命周期状态**，不是 agent 直接声明的配置字段。
+
+首版收敛为：
+
+* `ACTIVE`
+* `INACTIVE`
+* `STALE`
+
+语义：
+
+* `ACTIVE`：最新 publish 已被采纳，owner connector 在线，当前 `session_epoch` 有效，可参与 route resolve
+* `INACTIVE`：服务已下线、被 revoke、或当前不满足接流条件，不参与 route resolve / export
+* `STALE`：server 因 heartbeat/session 失效保留旧记录用于审计，但视为不可用
+
+说明：
+
+* `status` 与 `health_status` 正交
+* export 规则中的 “service 状态为 `ACTIVE`” 指这里的生命周期状态
+* v2.1 不要求单独定义 `ServiceStatus` 控制消息；该状态由 server 内部维护并对外暴露
 
 ---
 
@@ -602,6 +628,25 @@ stateDiagram-v2
 
 * 自己这次变更是否被采纳
 * server 当前最终版本是多少
+
+### 适用对象
+
+至少包括：
+
+* `PublishServiceAck`
+* `UnpublishServiceAck`
+* `RouteAssignAck`
+* `RouteRevokeAck`
+
+---
+
+## 10.4 握手期 `session_epoch` 权威规则
+
+* `ConnectorWelcome.assigned_session_epoch` 是 server 为本次握手预分配的 epoch
+* `ConnectorAuthAck.session_epoch` 是认证成功后生效的 **最终权威值**
+* 认证成功时，`ConnectorAuthAck.session_epoch` 必须等于 `assigned_session_epoch`
+* 若认证失败，则该预分配 epoch 不进入 `ACTIVE` session
+* 后续所有资源级消息必须以 `ConnectorAuthAck.session_epoch` 为准
 
 ---
 
@@ -999,18 +1044,33 @@ rpc ControlChannel(stream ControlEnvelope) returns (stream ControlEnvelope);
 * `PublishService`
 * `PublishServiceAck`
 * `UnpublishService`
+* `UnpublishServiceAck`
 * `ServiceHealthReport`
-* `ServiceStatus`
-* `RouteAssign`
-* `RouteRevoke`
-* `RouteStatusReport`
 * `ControlError`
+
+### 可选扩展消息
+
+以下消息只在启用 agent 侧 route cache / edge route sync 时使用：
+
+* `RouteAssign`
+* `RouteAssignAck`
+* `RouteRevoke`
+* `RouteRevokeAck`
+* `RouteStatusReport`
+
+### v2.1 核心路径约束
+
+v2.1 核心数据路径中：
+
+* route match / resolve 发生在 server 侧
+* agent 只消费 `TrafficOpen` 与数据流
+* agent **不要求**消费 `RouteAssign/RouteRevoke`
 
 ---
 
 ## 18.3 关键字段要求
 
-`PublishService` / `UnpublishService` / `RouteAssign` 这类资源级消息必须带：
+`PublishService` / `UnpublishService` / `RouteAssign` / `RouteRevoke` 这类资源级消息必须带：
 
 * `session_epoch`
 * `event_id`
@@ -1216,7 +1276,7 @@ message DiscoveryPolicy {
 }
 
 message PublishService {
-  string service_id = 1;      // may be empty on first publish, server allocates
+  string service_id = 1;      // may be empty on first publish; server must reuse existing id for known service_key
   string service_key = 2;     // <namespace>/<environment>/<service_name>
   string namespace = 3;
   string environment = 4;
@@ -1246,6 +1306,16 @@ message UnpublishService {
   string namespace = 3;
   string environment = 4;
   string reason = 5;
+}
+
+message UnpublishServiceAck {
+  bool accepted = 1;
+  string service_id = 2;
+  string service_key = 3;
+  uint64 accepted_resource_version = 4;
+  uint64 current_resource_version = 5;
+  string error_code = 6;
+  string error_message = 7;
 }
 
 message EndpointHealthStatus {
@@ -1308,8 +1378,34 @@ message RouteAssign {
   string environment = 3;
   RouteMatch match = 4;
   RouteTarget target = 5;
-  string policy_json = 6; // experimental only, not canonical schema
-  map<string, string> metadata = 7;
+  uint32 priority = 6;
+  string policy_json = 7; // experimental only, not canonical schema
+  map<string, string> metadata = 8;
+}
+
+message RouteAssignAck {
+  bool accepted = 1;
+  string route_id = 2;
+  uint64 accepted_resource_version = 3;
+  uint64 current_resource_version = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+message RouteRevoke {
+  string route_id = 1;
+  string namespace = 2;
+  string environment = 3;
+  string reason = 4;
+}
+
+message RouteRevokeAck {
+  bool accepted = 1;
+  string route_id = 2;
+  uint64 accepted_resource_version = 3;
+  uint64 current_resource_version = 4;
+  string error_code = 5;
+  string error_message = 6;
 }
 
 message RouteStatusReport {
@@ -1439,6 +1535,7 @@ agent/
 
 Agent 不直接感知第三方 discovery provider。
 第三方发现集成逻辑只在 server 侧。
+v2.1 核心路径中，Agent 不要求维护 route 表；只有启用可选 edge route sync 时才消费 `RouteAssign/RouteRevoke`。
 
 ---
 

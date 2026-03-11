@@ -1,371 +1,314 @@
-# DevLoop 开发清单
+# DevBridge Loop 执行清单（共享协议库版）
 
 ## 一、文档目的
 
-本清单用于承接 [ProjectDevelopmentPlan.md](./ProjectDevelopmentPlan.md) 的技术方案，将已确认的设计约束冻结下来，并拆分为可执行、可验收、可排期的开发任务。
+本清单用于承接 [ProjectDevelopmentPlan.md](./ProjectDevelopmentPlan.md) 与 [LTFP-v1-Draft.md](./LTFP-v1-Draft.md)，在“协议必须抽成共享库，由 `agent-core` 与 `cloud-bridge` 复用”这一原则下，将任务拆成可执行、可验收、可提交的工作项。
 
 ---
 
 ## 二、已冻结设计前提
 
-### 1. 协议设计必须可扩展
+### 1. LTFP 协议必须沉淀为独立共享库
 
-一期先支持 `HTTP`、`gRPC`，但整体架构必须抽象为可扩展模型，后续可新增其他协议而不推翻现有实现。
+本期冻结原则：
 
-建议在设计时固定以下抽象：
-
-- `ProtocolAdapter`：协议适配器，定义入口解析、出口代理、回流转发、错误映射。
-- `IngressResolver`：入口解析器，负责从请求上下文提取路由信息。
-- `RouteTarget`：统一路由目标，屏蔽不同协议的目标表示差异。
-- `Forwarder`：agent 侧本地转发器，负责将 bridge 回流流量落到本地实例。
-- `EgressProxy`：出口代理器，负责本地服务对外调用时的协议处理。
+- `agent-core` 与 `cloud-bridge` 之间的线协议、错误码、协商字段、消息类型、校验规则，不允许各自维护一份副本。
+- 协议相关代码必须下沉到独立模块，建议目录固定为 `ltfp/`。
+- 共享库优先承载“线协议与语义”，而不是承载业务运行态实现。
 
 要求：
 
-- HTTP/gRPC 以插件化适配器方式接入。
-- 协议无关的 tunnel、注册表、路由表、状态同步逻辑独立实现。
-- 新协议接入时，优先通过新增适配器完成，不改 tunnel 主干模型。
+- 共享库至少同时被 `agent-core` 和 `cloud-bridge` 引用。
+- 共享库不能反向依赖 `agent-core/internal` 或 `cloud-bridge/internal`。
+- 所有跨进程/跨模块消息定义都必须以共享库为单一真相源。
 
-### 2. 注册模型必须支持多实例、多端口
+### 2. 共享库与业务运行态必须分层
 
-这是本地实例与服务端实例的注册模型，必须支持同一服务多开实例、同一实例暴露多个端口。
+共享库承载：
 
-建议拆分三个层次的键：
+- 控制面消息模型
+- 数据面消息模型
+- 协商模型
+- 错误码、状态码、feature 常量
+- 编解码与校验辅助
+- 兼容性测试夹具
 
-- `ServiceKey = (env, serviceName)`
-- `InstanceKey = (env, serviceName, instanceId)`
-- `EndpointKey = (env, serviceName, instanceId, protocol, listenPort)`
+业务模块本地保留：
 
-建议对象模型：
-
-- `LocalRegistration`
-  - `serviceName`
-  - `env`
-  - `instanceId`
-  - `metadata`
-  - `healthy`
-  - `registerTime`
-  - `lastHeartbeatTime`
-  - `ttlSeconds`
-  - `endpoints[]`
-- `LocalEndpoint`
-  - `protocol`
-  - `listenHost`
-  - `listenPort`
-  - `targetHost`
-  - `targetPort`
-  - `status`
+- `agent-core` 的 `LocalRegistration`、本地发现、forwarder、runtime store
+- `cloud-bridge` 的 ingress listener、discovery provider、runtime registry、admin config
+- UI、配置文件、服务发现 provider 的具体实现
 
 要求：
 
-- 不再用 `(serviceName, env)` 直接映射单个实例。
-- 同一 `serviceName` 在同一 `env` 下允许多个实例并存。
-- 同一实例允许同时注册 `httpPort`、`grpcPort` 或未来更多协议端口。
-- `instanceId` 生成规则必须冻结（推荐 `UUID`，或 `hostname + pid + startTs`）。
-- 注册模型必须支持心跳续期与 TTL 超时清理（被动摘除），避免异常退出后残留脏注册。
+- `PortMappingConfig` 属于 bridge 本地配置模型，不强行下沉到共享库。
+- `ForwardIntent`、`ForwardDecision`、`TrafficOpen`、`PublishService` 这类跨模块契约必须在共享库。
+- 本地运行态结构若需要上行或下行，必须通过 adapter 映射到共享库消息，而不是直接复用内部 struct。
 
-### 3. bridge 的路由提取必须高度抽象
+### 3. 共享库优先采用“协议定义 + 绑定适配”结构
 
-bridge 需要支持从以下来源提取服务路由信息，并支持后续扩展：
+建议目录：
 
-- `Host`
-- 请求头
-- `SNI`
-
-建议抽象：
-
-- `RouteExtractor`：单一提取器接口。
-- `RouteExtractResult`：统一提取结果，至少包含 `serviceName`、`env`、`protocol`、`source`。
-- `RouteExtractPipeline`：提取器链路，按优先级顺序执行。
-
-要求：
-
-- 一期内置 `HostExtractor`、`HeaderExtractor`、`SNIExtractor`。
-- 提取顺序可配置，不写死在业务代码中。
-- 提取不到时进入统一兜底逻辑与错误分类。
-
-### 4. 技术栈冻结
-
-桌面端采用：
-
-- 前端：`React` + `TypeScript` + `shadcn/ui`
-- 宿主后端：`Rust`
-- 核心通信与 bridge：`Go`
-
-职责划分：
-
-- Tauri 前端负责界面与交互。
-- Rust Host 负责桌面能力、配置、日志、子进程管理、前端命令桥接。
-- Go Agent Core 负责注册、发现、代理、tunnel、同步。
-- Rust 负责拉起 Go 子进程，并通过本地 `HTTP API` 与 Go 通信（一期固定，`IPC` 留作二期优化项）。
-- `cloud-bridge` 采用 Go 实现。
-
-### 5. env 透传与优先级可配置
-
-统一使用 `x-env` 语义，兼容 `X-Env`。
-
-默认规则：
-
-- 显式请求中的 `x-env` / `X-Env` 优先。
-- 其次可使用运行时默认 `envName`。
-- 最后回退到 `base`。
-
-要求：
-
-- HTTP 与 gRPC 统一走一套 env 解析配置。
-- env 解析优先级做成配置项，而不是写死。
-- bridge 与 agent 两侧都自动透传 env。
-
-### 6. LocalRegistration 以运行时内存态为主
-
-本期不依赖落盘的注册数据。agent 启动后实时接收本地服务的 `register` / `unregister` 请求维护内存态注册表。
-
-要求：
-
-- 配置和日志可以持久化。
-- 注册表、发现结果、接管关系以运行时状态为主。
-- agent 重启后不恢复旧注册，等待本地服务重新注册。
-- tunnel 重连后对当前内存态 `LocalRegistration` 做全量重同步。
-- 本地注册通过心跳维持存活；心跳超时后执行被动摘除并触发同步下线事件。
-
-### 7. 本期不做鉴权
-
-一期先不实现 agent 与 bridge 鉴权、权限校验、敏感配置保护。
+```text
+ltfp/
+  go.mod
+  README.md
+  proto/
+  pb/
+  codec/
+  errors/
+  negotiation/
+  validate/
+  testkit/
+```
 
 说明：
 
-- 接口与消息协议预留扩展位。
-- 文档中标记为二期能力，不纳入本期交付阻塞项。
+- `proto/`：LTFP 的 schema 源文件
+- `pb/`：生成后的 Go 绑定或统一暴露层
+- `codec/`：当前 `http/masque` tunnel 对协议消息的封装与解析
+- `errors/`：错误码、状态码、feature 名称
+- `negotiation/`：会话级与请求级协商模型、特性集合、能力交集计算
+- `validate/`：字段合法性、版本与幂等检查的纯函数校验
+- `testkit/`：golden payload、兼容性夹具、共享断言
 
-### 8. tunnel 同步模型必须幂等且可恢复
+### 4. 本期优先复用现有 transport binding
 
-一期同步链路需要支持重试、乱序、重复投递场景，避免重连后出现重复接管或脏路由。
-
-建议在握手与事件模型中固定以下字段：
-
-- `sessionEpoch`：每次 tunnel 建连成功后递增，旧 epoch 事件必须丢弃。
-- `resourceVersion`：注册表快照版本号，用于全量/增量同步衔接。
-- `eventId`：事件唯一标识，用于去重与幂等处理。
-
-要求：
-
-- `register` / `unregister` / `full-sync` 事件都可幂等重放。
-- bridge 对重复事件返回成功语义，不因重复报错。
-- 重连后按 `sessionEpoch + resourceVersion` 恢复一致状态。
-
-### 9. bridge 必须支持端口映射入口
-
-一期需要支持 bridge 增量能力：监听固定端口并无条件映射到目标服务。
+本期不先做全新 tunnel 协议栈，先复用现有 binding。
 
 要求：
 
-- 端口映射配置至少包含：`listenAddr`、`listenPort`、`protocol`、`env`、`serviceName`、`sourceOrder`。
-- 命中端口映射后，不再执行 `Host/Header/SNI` 提取。
-- 端口映射请求必须按 `sourceOrder` 在 `tunnel/localRoute/serviceDiscovery` 间解析目标。
-- 对同一映射请求，禁止被请求方覆盖服务标识（`env/serviceName`）。
+- 协议消息统一由 `ltfp` 定义。
+- `http` 与 `masque` 只负责承载，不再各自维护独立消息语义。
+- 协商流程与普通同步流程共用同一条 tunnel 连接。
 
-### 10. 服务协商必须复用 tunnel 传输协议
-
-服务协商协议（会话级）必须走现有 tunnel 底层协议，而不是独立通道。
+### 5. v2.1 核心路径保持 server 侧 route resolve
 
 要求：
 
-- `HELLO/ACK/ERROR` 扩展协商字段，复用已有 tunnel 消息模型。
-- 协商传输协议固定继承 `syncProtocol`（`http` 或 `masque`）。
-- `requiredFeatures` 未满足时，握手失败并触发重连退避。
-- 请求级协商通过回流请求 `forwardIntent` 承载，不新增独立协商连接。
+- `connector_service`、`external_service`、`hybrid_group` 的 route resolve 主逻辑在 `cloud-bridge`。
+- `agent-core` 核心路径只消费 `TrafficOpen`、数据流与请求级 `forwardIntent`。
+- `RouteAssign / RouteRevoke` 在本期仍视为可选扩展，不作为首批闭环阻塞项。
+
+### 6. 幂等、一致性、协商语义必须先于功能扩展落地
+
+要求：
+
+- 所有资源级消息固定具备 `session_epoch + event_id + resource_version`。
+- `HELLO / ACK / ERROR` 固定支持会话级协商字段。
+- `requiredFeatures` 不满足时握手必须失败。
+- `TrafficOpenAck success` 之后不得触发 hybrid fallback。
 
 ---
 
-## 三、一期开发清单
+## 三、执行清单
 
-### P0. 设计冻结
+### C0. 共享协议库骨架
 
-- [x] 输出系统架构图、分层图、注册时序图、入口回流时序图、出口代理时序图
-- [x] 定义 `ProtocolAdapter`、`IngressResolver`、`Forwarder`、`EgressProxy` 抽象接口
-- [x] 定义 `ServiceKey`、`InstanceKey`、`EndpointKey`、`RouteTarget`、`RouteExtractResult`
-- [x] 冻结 `instanceId` 生成规则、注册心跳协议、TTL 超时被动摘除策略
-- [x] 明确 Rust Host 与 Go Agent Core 的通信方式，固定为本地 `HTTP API`（一期不做 `IPC`）
-- [x] 定义 agent 与 bridge 的 tunnel 消息模型、事件类型、错误码、重连与重同步机制，包含 `sessionEpoch`、`resourceVersion`、`eventId`
-- [x] 定义 bridge 路由解析优先级配置模型，覆盖 `Host`、Header、`SNI`
-- [x] 定义 env 解析优先级配置模型，默认支持 `x-env` / `X-Env`
-- [x] 定义一期非功能指标（同步时延、重连恢复时间、支持注册规模、代理延迟增量）与压测口径
-- [ ] 定义 `PortMappingConfig`、`NegotiationProfile`、`ForwardIntent`、`ForwardDecision` 模型
-- [ ] 定义 `HELLO/ACK/ERROR` 协商字段与 `NEGOTIATION_*` 错误码
-- [ ] 明确协商协议复用 tunnel `syncProtocol`（`http/masque`）且不新增独立协商通道
+- [x] 冻结原则：LTFP 协议抽成独立共享库，由 `agent-core` 与 `cloud-bridge` 复用
+- [ ] 新建 `ltfp/` 目录与独立 `go.mod`
+- [ ] 约定模块路径，例如 `github.com/lifei6671/devbridge-loop/ltfp`
+- [ ] 在仓库根目录新增 `go.work`，纳入 `ltfp`、`agent-core`、`cloud-bridge`、`examples`、`service-registry`
+- [ ] 编写 `ltfp/README.md`，明确共享库边界、包结构、禁止项
+- [ ] 约定 codegen 命令、生成目录与更新流程
+- [ ] 约定版本策略：共享库变更必须先更新 schema，再更新使用方
 
-### P1. Tauri 桌面壳
+验收标准：
 
-- [x] 创建 `Tauri + React + TypeScript + shadcn/ui` 项目骨架
-- [x] 搭建基础布局、导航与全局状态模型
-- [x] 实现主窗口、最小化到托盘、系统托盘菜单
-- [x] 实现配置目录、日志目录、基础配置加载与保存
-- [x] 实现 Rust Host 命令桥接层
-- [x] 实现 Rust Host 拉起 Go Agent Core 子进程
-- [x] 实现 Go 子进程生命周期管理、崩溃检测、自动重启
-- [x] 前端展示 Go Agent Core 运行状态
+- `agent-core` 与 `cloud-bridge` 可以通过 workspace 同时引用本地 `ltfp`
+- 共享库目录职责明确，不再依赖后续口头约定
 
-### P2. Go Agent Core 基础能力
+### C1. 协议 schema 与常量收口
 
-- [x] 创建 Go Agent Core 工程骨架
-- [x] 实现配置加载、日志、生命周期管理
-- [x] 实现内存态状态存储，不持久化注册数据
-- [x] 提供本地管理接口：`register`、`heartbeat`、`unregister`、`discover`、`list registrations`
-- [x] 实现 `LocalRegistration` 管理
-- [x] 实现 `LocalEndpoint` 管理，支持同服务多实例、多端口
-- [x] 实现注册心跳续期与 TTL 超时摘除（被动摘除）
-- [x] 实现本地状态查询接口，供 UI 和 Rust Host 获取状态
-- [x] 定义最近错误、最近请求、状态摘要等诊断输出模型
+- [ ] 将 LTFP 文档中的控制面消息整理为实际 schema：`ControlEnvelope`、`ConnectorHello`、`ConnectorWelcome`、`ConnectorAuthAck`、`PublishService`、`UnpublishService`、`ServiceHealthReport`
+- [ ] 将数据面消息整理为实际 schema：`TrafficOpen`、`TrafficOpenAck`、`TrafficClose`、`TrafficReset`
+- [ ] 将协商相关消息字段整理为统一 schema：`NegotiationProfile`、`NegotiationResult`、`ForwardIntent`、`ForwardDecision`
+- [ ] 在 `ltfp/errors` 中定义统一错误码：同步错误、协商错误、入口错误、traffic 错误
+- [ ] 在 `ltfp/errors` 中定义统一状态常量：`accepted / duplicate / rejected`、`ACTIVE / INACTIVE / STALE` 等
+- [ ] 在 `ltfp/negotiation` 中定义 feature 常量：如 `port_mapping_forward`、`client_auto_negotiation`
+- [ ] 明确哪些字段是 canonical identity，哪些字段是 lookup key
+- [ ] 补齐注释：`service_id` 为空首发时复用既有 `service_key` 对应 identity
 
-### P3. cloud-bridge 基础能力
+验收标准：
 
-- [x] 创建 `cloud-bridge` Go 工程骨架
-- [x] 实现配置加载、日志、生命周期、基础管理接口
-- [x] 实现 `TunnelSession` 管理
-- [x] 实现 `ActiveIntercept` 管理
-- [x] 实现 `BridgeRoute` 生成与查询
-- [x] 实现 bridge 侧状态查询接口：session、intercept、route、错误统计
-- [ ] 实现 `PortMappingConfig` 配置加载、校验与热更新
-- [ ] 实现端口映射监听生命周期管理（启动、冲突检测、关闭、重建）
+- 文档中的核心消息都能在 `ltfp` 中找到一一对应定义
+- 不再出现 agent 和 bridge 各自定义一份同名但不同义的 struct
 
-### P4. tunnel 与注册驱动同步
+### C2. 编解码、校验与兼容性夹具
 
-- [x] 实现 agent 到 bridge 的长连接
-- [x] 实现连接建立、心跳、断线检测、自动重连
-- [x] 实现 agent 启动后的初次握手与状态上报（携带 `sessionEpoch`、快照版本）
-- [x] 实现本地注册事件同步到 bridge
-- [x] 实现本地下线事件同步到 bridge
-- [x] 实现 bridge 根据注册事件生成/更新/删除 `ActiveIntercept`
-- [x] 实现基于 `eventId` 的事件去重与幂等处理
-- [x] 实现基于 `sessionEpoch` 的旧连接事件拒绝与乱序保护
-- [x] 实现 tunnel 重连后的全量重同步
-- [x] 验证多实例、多端口下同步模型正确
-- [x] 验证重复注册、重复下线、乱序事件下状态一致性
-- [ ] 实现 `HELLO` 协商字段解析与能力交集计算
-- [ ] 实现 `requiredFeatures` 校验失败时的握手拒绝与错误码回传
-- [ ] 验证 `syncProtocol=http/masque` 下协商流程一致
+- [ ] 在 `ltfp/codec` 中实现当前 tunnel 消息的统一编码/解码入口
+- [ ] 支持当前 `http` sync path 的 envelope 编解码
+- [ ] 支持当前 `masque` sync path 的 envelope 编解码
+- [ ] 在 `ltfp/validate` 中实现纯函数校验：必填字段、feature 集合、版本号、幂等字段、scope 约束
+- [ ] 在 `ltfp/testkit` 中建立 golden payload
+- [ ] 为 `HELLO`、`PublishService`、`TrafficOpen`、`TrafficOpenAck`、`ForwardIntent` 建立跨模块共享断言
+- [ ] 为兼容升级预留 schema 版本测试
 
-### P5. 入口回流与路由抽象
+验收标准：
 
-- [x] 实现 `RouteExtractor` 抽象与提取器注册机制
-- [x] 实现 `HostExtractor`
-- [x] 实现 `HeaderExtractor`
-- [x] 实现 `SNIExtractor`
-- [x] 实现可配置的提取优先级链路
-- [x] 实现 HTTP ingress
-- [x] 实现 gRPC ingress
-- [x] 实现 bridge 根据 `(env, serviceName, protocol)` 路由到目标 tunnel
-- [x] 实现 agent 侧本地转发，将回流请求转发到目标 localhost endpoint
-- [x] 实现统一错误分类，至少覆盖未命中路由、tunnel 离线、本地不可达、上游超时、提取失败
-- [ ] 实现端口映射 ingress：命中后绕过 `RouteExtractPipeline`
-- [ ] 实现 `sourceOrder` 解析链路：`tunnel -> localRoute -> serviceDiscovery`
-- [ ] 实现 `forwardIntent(mode=port_mapping)` 回流与 agent 严格转发
+- 同一条消息在 `http` 与 `masque` 承载下解码得到同一语义对象
+- 错误 payload 能在共享库层被稳定拒绝，而不是交给使用方各自兜底
 
-### P6. 出口发现与代理
+### C3. 会话协商与握手清单
 
-- [x] 在业务系统现有 registry 抽象中新增 `agent` 类型
-- [x] 实现 `discover` 规则：同 env 优先，未命中则 fallback 到 `base`
-- [x] 实现 HTTP 出口代理
-- [x] 实现 gRPC 出口代理
-- [x] 实现 HTTP/gRPC 协议分离的出口链路
-- [x] 实现 env 自动透传
-- [x] 实现 env 优先级配置化
-- [x] 将请求命中的 `dev/base` 结果暴露给诊断接口与 UI
-- [ ] 实现客户端自动协商入口（例如 `X-DevLoop-Negotiate:auto`）
-- [ ] 实现 `forwardIntent(mode=auto_negotiation)` 请求级协商与回包决策
+- [ ] 在 `ltfp/negotiation` 中实现能力集合、required/optional features、交集计算逻辑
+- [ ] 固定会话级协商字段进入 `HELLO / ACK / ERROR`
+- [ ] 固定请求级协商字段进入 `ForwardIntent / ForwardDecision`
+- [ ] 明确 `ConnectorWelcome.assigned_session_epoch` 与 `ConnectorAuthAck.session_epoch` 的权威关系
+- [ ] 实现 `NEGOTIATION_UNSUPPORTED_VERSION`、`NEGOTIATION_UNSUPPORTED_FEATURE` 等错误码
+- [ ] 提供共享校验：缺少 required feature 时直接拒绝握手
+- [ ] 建立协商成功、部分降级、失败拒绝三类 golden case
 
-### P7. Tauri UI 一期页面
+验收标准：
 
-- [x] 实现 Dashboard 页面
-- [x] 展示 agent 状态、bridge 状态、tunnel 状态、当前 env、当前 rdName、接管数量、最近错误
-- [x] 实现本地服务列表页
-- [x] 展示服务名、env、instanceId、协议端口、健康状态、注册时间
-- [x] 支持刷新、手动注销、查看详情
-- [x] 实现 ActiveIntercept 列表页
-- [x] 实现日志页面
-- [x] 实现配置页面
-- [x] 页面数据全部接入 Rust Host / Go Agent Core 的真实状态接口
+- 协商行为由共享库定义，agent 与 bridge 只消费结果
+- `syncProtocol=http/masque` 下协商行为一致
 
-### P8. Demo 与联调
+### C4. 控制面一致性语义清单
 
-- [x] 准备 `order-service` demo
-- [x] 准备 `user-service` demo
-- [x] 两个 demo 同时提供 HTTP 与 gRPC 能力
-- [ ] 验证 `order(base) -> user(base)`
-- [ ] 验证 `order(dev) -> user(base)`
-- [ ] 验证 `order(base, env=dev-xxx) -> user(dev-xxx)`
-- [ ] 验证 `order(dev-xxx) -> user(dev-xxx) -> inventory(base)`
-- [ ] 验证 HTTP 全链路正常
-- [ ] 验证 gRPC 全链路正常
-- [ ] 验证本地服务停止后可自动摘除
-- [ ] 验证本地服务异常退出（未主动 `unregister`）后可通过心跳超时自动摘除
-- [ ] 验证 tunnel 重连后可基于当前内存态注册表完成全量重同步
-- [ ] 验证重复注册/重复注销不导致重复接管或错误摘除
-- [ ] 验证同步事件乱序/重放下 bridge 与 agent 最终状态一致
-- [ ] 验证 UI 可正确展示连接、注册、接管、错误状态变化
-- [ ] 验证端口映射请求无需 Host/Header/SNI 仍可命中目标服务
-- [ ] 验证 `syncProtocol=masque` 下协商消息与握手消息走同一通道
-- [ ] 验证 `requiredFeatures` 不满足时握手拒绝并按退避重连
-- [ ] 验证 `mode=port_mapping` 在 agent 侧为无条件严格转发
+- [ ] 在共享库中固定资源级消息必带字段：`session_id`、`session_epoch`、`event_id`、`resource_version`
+- [ ] 固定 ACK 契约：`accepted`、`accepted_resource_version`、`current_resource_version`、`error_code`、`error_message`
+- [ ] 固定 `PublishServiceAck`、`UnpublishServiceAck`、`RouteAssignAck`、`RouteRevokeAck` schema
+- [ ] 提供共享幂等辅助：事件去重键生成、版本比较辅助函数
+- [ ] 提供共享 reject reason 常量：旧 epoch、版本回退、重复事件、非法 scope、缺失 feature
+- [ ] 为 full-sync 与增量 sync 建立 schema 与测试样例
+
+验收标准：
+
+- agent 和 bridge 不再手写各自的 ACK 语义
+- 所有资源级处理链路都能按共享库规则做幂等判断
+
+### C5. 数据面与回流协议清单
+
+- [ ] 在共享库中固定 `1 traffic = 1 stream` 的协议约束与注释
+- [ ] 固定 `TrafficOpen` 只用于 connector proxy path
+- [ ] 固定 `TrafficOpen` 中 `service_id` 与 `endpoint_selection_hint` 的语义
+- [ ] 固定 `ForwardIntent.mode=port_mapping` 的严格转发语义
+- [ ] 固定 `ForwardIntent.mode=auto_negotiation` 的协商转发语义
+- [ ] 固定 `ForwardDecision` 返回字段与错误语义
+- [ ] 明确 `TrafficOpenAck success` 前后的状态边界，用于 hybrid fallback
+
+验收标准：
+
+- connector proxy path 的线协议完全来自共享库
+- port mapping 与 auto negotiation 都走同一套请求级协商消息
+
+### C6. `agent-core` 接入共享库
+
+- [ ] 盘点 `agent-core/internal/domain` 中哪些 struct 属于线协议，列出迁移清单
+- [ ] 将 `sync.go`、`backflow.go`、tunnel 相关消息中的共享协议对象替换为 `ltfp` 类型
+- [ ] 保留 `LocalRegistration`、本地诊断、runtime store 等 agent 本地模型，不强行迁移
+- [ ] 在 `agent-core/internal/tunnel` 增加 adapter：本地运行态 -> `ltfp` 消息
+- [ ] 在 `agent-core/internal/httpapi` 增加 adapter：`ltfp` 回流请求 -> forwarder 输入
+- [ ] 在 `manager.go` 中改为使用共享库处理握手、协商、ACK 校验
+- [ ] 在 agent 测试中引入 `ltfp/testkit`，复用 golden payload
+- [ ] 删除 agent 侧重复定义且已迁移到共享库的协议 struct
+
+验收标准：
+
+- agent 的线协议定义不再散落在 `internal/domain` 各文件中
+- handshake、publish、backflow、traffic open 的解析和校验都走共享库
+
+### C7. `cloud-bridge` 接入共享库
+
+- [ ] 盘点 `cloud-bridge/internal/domain` 中哪些 struct 属于线协议，列出迁移清单
+- [ ] 将 tunnel event、reply、backflow 契约中的共享协议对象替换为 `ltfp` 类型
+- [ ] 保留 bridge 本地配置模型、listener 配置、discovery endpoint、本地 runtime registry，不强行迁移
+- [ ] 在 `sync_processor.go` 中改为使用共享库完成消息校验、ACK 组装、错误码回填
+- [ ] 在 ingress / backflow handler 中接入共享的 `ForwardIntent / ForwardDecision`
+- [ ] 在 `http` 与 `masque` 入口共用同一套共享协议解码结果
+- [ ] 在 bridge 测试中引入 `ltfp/testkit`
+- [ ] 删除 bridge 侧重复定义且已迁移到共享库的协议 struct
+
+验收标准：
+
+- bridge 的 sync path 和 backflow path 共享同一套协议对象
+- `http` 和 `masque` 只剩 transport 差异，不再有协议语义差异
+
+### C8. 端口映射与专属端口入口清单
+
+- [ ] 在 `cloud-bridge` 本地配置模型中定义 `PortMappingConfig`
+- [ ] 明确 `PortMappingConfig` 不进入共享库，只在 bridge 本地配置与 listener 生命周期中使用
+- [ ] 将端口映射请求转换为共享库 `ForwardIntent(mode=port_mapping)`
+- [ ] 命中 dedicated port / port mapping 后绕过 `RouteExtractPipeline`
+- [ ] 支持 `sourceOrder=tunnel/local_route/service_discovery`
+- [ ] 禁止请求方覆盖映射绑定的 `env/serviceName`
+- [ ] 补齐端口冲突、监听失败、热更新、关闭清理测试
+
+验收标准：
+
+- 端口映射配置仍由 bridge 本地维护
+- 端口映射转发行为通过共享库消息与 agent 协同
+
+### C9. External Service、Export、Hybrid 清单
+
+- [ ] `external_service` 路径继续保持 bridge 自己查、自己连、自己转发
+- [ ] connector path 与 direct proxy path 共用 route 抽象，但不共用数据面控制语义
+- [ ] export 判断逻辑引用共享库中的 service status / health status 常量
+- [ ] hybrid fallback 判断引用共享库中的 traffic 边界与错误码
+- [ ] 补齐 pre-open fallback 测试：resolve miss、service unavailable、open ack fail、pre-open timeout
+- [ ] 明确 post-open 不 fallback：已收到 `TrafficOpenAck success`、已写出数据、partial response、mid-stream reset
+
+验收标准：
+
+- direct proxy 与 connector proxy 的边界清晰
+- hybrid 行为在代码、测试、共享常量上保持一致
+
+### C10. 清理、迁移与发布门槛
+
+- [ ] 删除双端重复的协议常量、错误码、消息 struct
+- [ ] 清理注释与命名不一致的历史字段
+- [ ] 将 `docs/ProjectDevelopmentPlan.md`、`docs/LTFP-v1-Draft.md`、`docs/ProjectDevelopmentChecklist.md` 之间的术语统一
+- [ ] 为共享库建立升级说明：新增字段、向后兼容、必填变更的处理规则
+- [ ] 建立最小发布门槛：共享库变更必须伴随 agent 和 bridge 兼容性测试通过
+- [ ] 建立回归清单：握手、full-sync、publish/unpublish、port mapping、external proxy、hybrid fallback
+
+验收标准：
+
+- 协议语义的真相源只有 `ltfp`
+- 新增协议字段时，变更路径可追踪、可测试、可回滚
 
 ---
 
-## 四、本期明确不做
+## 四、建议执行顺序
 
-- [ ] agent 与 bridge 鉴权
-- [ ] 接管权限控制
-- [ ] token 加密存储
-- [ ] 桌面通知
-- [ ] 请求可视化链路页
-- [ ] 日志导出与诊断信息复制
-- [ ] 多 RD 并发隔离
-- [ ] 主动健康检查（HTTP/gRPC probe）自动摘除
-- [ ] 路由来源可信级与 Header 防注入策略（企业内 VPN 场景下延期到二期）
-
-说明：本期仅实现基于注册心跳与 tunnel 状态的被动摘除能力。
-
-以上能力保留接口扩展点，但不纳入本期 MVP 交付。
+1. 先做 `C0-C2`，把共享库立起来。
+2. 再做 `C3-C5`，先冻结协商、幂等、traffic 语义。
+3. 然后并行推进 `C6-C7`，让 agent 与 bridge 都切到共享库。
+4. 共享库接入稳定后，再做 `C8-C9`，补端口映射、direct proxy、export、hybrid。
+5. 最后做 `C10`，清重复代码、补回归与升级规则。
 
 ---
 
-## 五、本期验收口径
+## 五、本期明确不做
+
+- 不在首批闭环里实现完整 `RouteAssign / RouteRevoke` 运行时下发
+- 不在本期实现跨 server 集群一致性
+- 不在本期实现 session resume
+- 不在本期实现 mid-stream failover
+- 不在本期实现完整鉴权与权限体系
+
+---
+
+## 六、本期验收口径
 
 ### 功能验收
 
-- [ ] Win11 上可启动 Tauri 桌面端
-- [ ] Rust Host 可稳定拉起 Go Agent Core
-- [ ] agent 可与 `cloud-bridge` 建立长连接并维持心跳
-- [ ] 本地服务可实时注册到 dev-agent
-- [ ] 本地服务可实时从 dev-agent 注销
-- [ ] dev-agent 可同步接管关系到 `cloud-bridge`
-- [ ] bridge 可从 `Host`、Header、`SNI` 抽象链路中解析路由信息
-- [ ] base 服务可通过 bridge 访问到本地 dev 服务
-- [ ] dev 服务出口可实现 dev 优先、base fallback
-- [ ] HTTP 链路可用
-- [ ] gRPC 链路可用
-- [ ] bridge 端口映射入口可监听 `0.0.0.0:<listenPort>` 并稳定转发
-- [ ] 多实例、多端口注册与转发正确
-- [ ] tunnel 重连后状态恢复正确
-- [ ] 协商握手可复用 `syncProtocol=http/masque`，无需独立通道
-- [ ] 本地服务异常退出后可在 TTL 时间窗内被动摘除并同步到 bridge
-- [ ] 重复注册/重复注销/重放事件不会破坏最终接管状态
-- [ ] UI 可正确展示注册、连接、接管、错误状态
+- `agent-core` 与 `cloud-bridge` 都通过 `ltfp` 复用同一套协议对象
+- handshake、publish/unpublish、backflow、traffic open 全部使用共享协议库
+- dedicated port / port mapping 可通过共享 `ForwardIntent` 正常转发
+- `external_service` 不向 agent 发送 `TrafficOpen`
+- hybrid fallback 严格符合 `pre_open_only`
 
 ### 工程验收
 
-- [ ] Tauri UI、Rust Host、Go Agent Core、cloud-bridge 模块边界清晰
-- [ ] 协议无关层与协议适配层边界清晰
-- [ ] HTTP 与 gRPC 路径分离，扩展其他协议时不需要重构主干
-- [ ] 路由提取链支持配置优先级
-- [ ] env 解析优先级支持配置
-- [ ] tunnel 同步模型具备幂等语义（`sessionEpoch`、`resourceVersion`、`eventId`）
-- [ ] 配置项清晰、日志可追踪、错误码明确
-- [ ] 协商协议具备版本/feature 扩展能力并对旧版本保持向后兼容
+- 仓库存在独立 `ltfp` 模块
+- 根目录存在 `go.work`，本地联调不依赖临时 replace 手改
+- 双端重复协议定义已清理
+- golden payload 与兼容性测试可运行
 
-### 非功能验收（一期目标）
+### 非功能验收
 
-- [ ] tunnel 断线重连后，P95 在 `10s` 内恢复有效路由
-- [ ] 注册变更同步到 bridge 生效延迟 P95 不超过 `2s`
-- [ ] 单 agent 运行时内存态支持至少 `200` 个 `LocalRegistration` 与 `400` 个 endpoint
-- [ ] 入口回流代理链路引入的额外延迟 P95 不超过 `20ms`（同地域内网基准）
-- [ ] 协商握手引入额外时延 P95 不超过 `50ms`（同地域内网基准）
+- `http` 与 `masque` 在共享协议层行为一致
+- 重复事件、旧 epoch、非法 feature 能稳定拒绝
+- 共享库变更不会要求双端手工同步两套 struct
