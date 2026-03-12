@@ -72,7 +72,7 @@
 - [ ] 统一术语：`connector/agent`、`server/cloud-bridge`、`canonical config registry`、`runtime traffic registry`
 - [ ] 统一术语：`connector_service`、`external_service`、`hybrid_group`、`l7_shared`、`tls_sni_shared`、`l4_dedicated_port`
 - [ ] 统一术语：`service_id`、`service_key`、`session_epoch`、`resource_version`、`event_id`
-- [ ] 决议 `ForwardIntent / ForwardDecision / NegotiationProfile / NegotiationResult` 的归属：进入 LTFP schema 或降级为本地 adapter
+- [x] 决议 `ForwardIntent / ForwardDecision / NegotiationProfile / NegotiationResult` 的归属：进入 LTFP schema 或降级为本地 adapter
 - [ ] 将 docs、proto、代码中的命名统一，避免“正文一套、proto 一套、代码一套”
 
 验收标准：
@@ -107,7 +107,7 @@
 - [x] 在 schema 注释中明确 `service_id` 为空首发时的复用规则
 - [x] 在 schema 注释中明确 `TrafficOpen` 只携带 `service_id` 与非权威 `endpoint_selection_hint`
 - [x] 保留 `policy_json` 仅作为实验字段，不允许其成为长期扩展主通道
-- [ ] 若保留 `ForwardIntent / ForwardDecision`，则在此阶段补齐正式 schema 与注释
+- [x] 若保留 `ForwardIntent / ForwardDecision`，则在此阶段补齐正式 schema 与注释
 
 验收标准：
 

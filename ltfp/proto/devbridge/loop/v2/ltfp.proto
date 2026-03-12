@@ -244,6 +244,50 @@ message RouteStatusReport {
   string message = 3;
 }
 
+message NegotiationProfile {
+  uint32 version_major = 1;
+  uint32 version_minor = 2;
+  repeated string required_features = 3;
+  repeated string optional_features = 4;
+  map<string, string> metadata = 5;
+}
+
+message NegotiationResult {
+  bool accepted = 1;
+  repeated string negotiated_features = 2;
+  repeated string missing_required = 3;
+  string error_code = 4;
+  string error_message = 5;
+  map<string, string> metadata = 6;
+}
+
+message ForwardIntent {
+  string request_id = 1;
+  string traffic_id = 2;
+  string mode = 3;
+  string namespace = 4;
+  string environment = 5;
+  string service_name = 6;
+  string protocol_hint = 7;
+  repeated string source_order = 8;
+  NegotiationProfile negotiation_profile = 9;
+  map<string, string> metadata = 10;
+}
+
+message ForwardDecision {
+  bool accepted = 1;
+  string request_id = 2;
+  string traffic_id = 3;
+  string mode = 4;
+  string selected_source = 5;
+  string selected_service_id = 6;
+  string selected_route_id = 7;
+  NegotiationResult negotiation_result = 8;
+  string error_code = 9;
+  string error_message = 10;
+  map<string, string> metadata = 11;
+}
+
 message ControlError {
   string scope = 1;
   string code = 2;
@@ -299,4 +343,3 @@ service DevBridgeControlService {
 service DevBridgeTunnelService {
   rpc TunnelStream(stream StreamPayload) returns (stream StreamPayload);
 }
-
