@@ -57,3 +57,13 @@ func IsCode(err error, code string) bool {
 	// 比较错误码时保持精确匹配，不做模糊比较。
 	return protocolErr.Code == code
 }
+
+// ExtractCode 返回错误链中的协议错误码，不存在时返回空字符串。
+func ExtractCode(err error) string {
+	var protocolErr *ProtocolError
+	// 提取失败时返回空字符串，调用方可按未知错误处理。
+	if !stderrors.As(err, &protocolErr) {
+		return ""
+	}
+	return protocolErr.Code
+}

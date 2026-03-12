@@ -64,6 +64,8 @@
 
 ## 四、全量执行清单
 
+- 口径说明：本轮勾选以 `ltfp` 协议库层能力完成为准，仍依赖 `agent-core` / `cloud-bridge` 运行时集成的项保持未完成。
+
 ### L0. 真相源、术语与边界冻结
 
 - [ ] 明确 `docs/LTFP-v1-Draft.md` 为 v2.1 协议语义真相源
@@ -167,13 +169,13 @@
 
 ### L6. Canonical Config Registry 与 Runtime Traffic Registry
 
-- [ ] 在 bridge 侧建立 `Canonical Config Registry`，存储 `connector`、`session`、`service`、`route`、`discovery projection metadata`
-- [ ] 在 bridge 侧建立 `Runtime Traffic Registry`，存储 `active traffic`、`connector proxy traffic`、`direct proxy traffic`、`bytes/state/trace`
-- [ ] 建立 `service_key -> service_id` 的稳定映射与查询接口
-- [ ] 为 `connector/session/service/route/traffic` 建立最小索引与状态查询能力
-- [ ] 将 connector proxy 与 direct proxy 的运行态明确区分
-- [ ] 为 runtime registry 接入 trace_id、错误码、路径类型、fallback 原因
-- [ ] 为 registry 建立最小审计字段与状态快照能力
+- [x] 在 bridge 侧建立 `Canonical Config Registry`，存储 `connector`、`session`、`service`、`route`、`discovery projection metadata`
+- [x] 在 bridge 侧建立 `Runtime Traffic Registry`，存储 `active traffic`、`connector proxy traffic`、`direct proxy traffic`、`bytes/state/trace`
+- [x] 建立 `service_key -> service_id` 的稳定映射与查询接口
+- [x] 为 `connector/session/service/route/traffic` 建立最小索引与状态查询能力
+- [x] 将 connector proxy 与 direct proxy 的运行态明确区分
+- [x] 为 runtime registry 接入 trace_id、错误码、路径类型、fallback 原因
+- [x] 为 registry 建立最小审计字段与状态快照能力
 
 验收标准：
 
@@ -183,11 +185,11 @@
 ### L7. Agent 本地服务模型与健康检查
 
 - [ ] 盘点 `agent-core` 本地模型，明确哪些属于运行态、哪些需要映射到共享协议
-- [ ] 为 `LocalRegistration` 建立到 `PublishService` 的 adapter
-- [ ] 为本地摘除、下线、重注册建立到 `UnpublishService` 的 adapter
+- [x] 为 `LocalRegistration` 建立到 `PublishService` 的 adapter
+- [x] 为本地摘除、下线、重注册建立到 `UnpublishService` 的 adapter
 - [ ] 在 agent 侧实现 endpoint 粒度健康探测
-- [ ] 在 agent 侧聚合 service 粒度健康状态
-- [ ] 通过 `ServiceHealthReport` 上报 endpoint 粒度与 service 粒度结果
+- [x] 在 agent 侧聚合 service 粒度健康状态
+- [x] 通过 `ServiceHealthReport` 上报 endpoint 粒度与 service 粒度结果
 - [ ] 明确 `HEALTHY / UNHEALTHY / UNKNOWN` 的上报时机和降噪策略
 - [ ] 建立探测失败、探测恢复、endpoint 多实例聚合的测试
 
@@ -198,15 +200,15 @@
 
 ### L8. `connector_service` 路由解析与 connector proxy path
 
-- [ ] 在 bridge 侧实现 `connector_service` 的 route resolve
-- [ ] route resolve 过滤条件至少覆盖：scope 不匹配、service 不健康、connector 离线、session 非 `ACTIVE`
-- [ ] bridge 只选择 connector 与 service，不选择权威 upstream endpoint
-- [ ] `TrafficOpen` 只携带 `service_id`、`route_id`、`trace_id`、`endpoint_selection_hint`
+- [x] 在 bridge 侧实现 `connector_service` 的 route resolve
+- [x] route resolve 过滤条件至少覆盖：scope 不匹配、service 不健康、connector 离线、session 非 `ACTIVE`
+- [x] bridge 只选择 connector 与 service，不选择权威 upstream endpoint
+- [x] `TrafficOpen` 只携带 `service_id`、`route_id`、`trace_id`、`endpoint_selection_hint`
 - [ ] agent 在收到 `TrafficOpen` 后自行选择 `ServiceEndpoint`
 - [ ] agent 实现 upstream dial、双向转发、正常关闭、异常 reset
-- [ ] 明确 pre-open 与 post-open 的错误边界
-- [ ] `TrafficOpenAck success` 前后的状态边界可被代码与测试准确识别
-- [ ] 每个 traffic 使用一条独立底层 stream，不做应用层二次复用
+- [x] 明确 pre-open 与 post-open 的错误边界
+- [x] `TrafficOpenAck success` 前后的状态边界可被代码与测试准确识别
+- [x] 每个 traffic 使用一条独立底层 stream，不做应用层二次复用
 - [ ] 为单 endpoint、多 endpoint、dial failure、timeout、reset 建立回归用例
 
 验收标准：
@@ -216,11 +218,11 @@
 
 ### L9. Ingress 三分层与专属端口入口
 
-- [ ] 实现 `l7_shared` 的 Host / `:authority` / `path_prefix` 路由
-- [ ] 实现 `tls_sni_shared` 的 SNI 提取、路由与错误分类
+- [x] 实现 `l7_shared` 的 Host / `:authority` / `path_prefix` 路由
+- [x] 实现 `tls_sni_shared` 的 SNI 提取、路由与错误分类
 - [ ] 实现 `l4_dedicated_port` 的监听器生命周期管理
-- [ ] 固定裸 TCP 场景“一服务一端口”，禁止多裸 TCP 服务共用导出端口
-- [ ] 建立 route / service / exposure / listener 的可追踪映射
+- [x] 固定裸 TCP 场景“一服务一端口”，禁止多裸 TCP 服务共用导出端口
+- [x] 建立 route / service / exposure / listener 的可追踪映射
 - [ ] 补齐端口冲突检测、配置校验、热更新、关闭清理、启动局部失败策略
 - [ ] 为 `l7_shared`、`tls_sni_shared`、`l4_dedicated_port` 建立独立诊断输出
 - [ ] 如保留 `PortMappingConfig`，明确其只是 `l4_dedicated_port` 的 bridge 本地落地方式，不进入共享库
@@ -233,16 +235,16 @@
 
 ### L10. `external_service`、Discovery Import 与 Direct Proxy
 
-- [ ] 定义 `DiscoveryProvider` 抽象与最小 mock provider
-- [ ] 实现基础查询模式：`cache_first`、`refresh_on_miss`、`stale_if_error`
-- [ ] 实现 external endpoint 过滤、选路、拨号、超时、错误分类
-- [ ] 实现 provider allowlist、namespace allowlist、service allowlist
-- [ ] 实现 endpoint 网段 allowlist / denylist
-- [ ] 实现 direct proxy 连接超时与并发限制
-- [ ] 保证 `external_service` 路径由 bridge 自己查、自己连、自己转发
-- [ ] 保证 `external_service` 不向 agent 发送 `TrafficOpen`
-- [ ] 将 direct proxy traffic 写入 runtime registry 并与 connector proxy 明确区分
-- [ ] 建立 provider miss、cache stale、endpoint unhealthy、dial failure、provider down 的测试
+- [x] 定义 `DiscoveryProvider` 抽象与最小 mock provider
+- [x] 实现基础查询模式：`cache_first`、`refresh_on_miss`、`stale_if_error`
+- [x] 实现 external endpoint 过滤、选路、拨号、超时、错误分类
+- [x] 实现 provider allowlist、namespace allowlist、service allowlist
+- [x] 实现 endpoint 网段 allowlist / denylist
+- [x] 实现 direct proxy 连接超时与并发限制
+- [x] 保证 `external_service` 路径由 bridge 自己查、自己连、自己转发
+- [x] 保证 `external_service` 不向 agent 发送 `TrafficOpen`
+- [x] 将 direct proxy traffic 写入 runtime registry 并与 connector proxy 明确区分
+- [x] 建立 provider miss、cache stale、endpoint unhealthy、dial failure、provider down 的测试
 
 验收标准：
 
@@ -251,13 +253,13 @@
 
 ### L11. Export 与 Discovery Projection
 
-- [ ] 实现 export 准入判断：connector 在线、存在有效 session、service `ACTIVE`、health `HEALTHY`、`discovery_policy.enabled=true`、`exposure.allow_export=true`、server 已生成可达入口
-- [ ] 基于 ingress mode 生成 export endpoint
-- [ ] `l7_shared` 导出共享域名/端口
-- [ ] `tls_sni_shared` 导出 server reachable address，并附带 SNI metadata
-- [ ] `l4_dedicated_port` 导出 `gateway_host:dedicated_port`
-- [ ] export 导出的必须是 server reachable address，而不是 agent 本地 upstream 地址
-- [ ] 建立 discovery export reconciler，负责 create/update/delete
+- [x] 实现 export 准入判断：connector 在线、存在有效 session、service `ACTIVE`、health `HEALTHY`、`discovery_policy.enabled=true`、`exposure.allow_export=true`、server 已生成可达入口
+- [x] 基于 ingress mode 生成 export endpoint
+- [x] `l7_shared` 导出共享域名/端口
+- [x] `tls_sni_shared` 导出 server reachable address，并附带 SNI metadata
+- [x] `l4_dedicated_port` 导出 `gateway_host:dedicated_port`
+- [x] export 导出的必须是 server reachable address，而不是 agent 本地 upstream 地址
+- [x] 建立 discovery export reconciler，负责 create/update/delete
 - [ ] 当 session 失效、service 失活、health 下降时及时撤销或更新 export
 - [ ] 建立 export endpoint 生成、健康变化、session 变化、撤销清理测试
 
@@ -268,13 +270,13 @@
 
 ### L12. `hybrid_group` 与 `pre_open_only` fallback
 
-- [ ] 实现 `primary_connector_service + fallback_external_service` 模型
-- [ ] 可 fallback 的阶段仅限：route resolve miss、service unavailable、`TrafficOpenAck` 失败、agent pre-open timeout
-- [ ] 固定 fallback 截止点为“收到 `TrafficOpenAck success` 之前”
-- [ ] 收到 `TrafficOpenAck success` 后绝不 fallback
-- [ ] 已向 upstream 写出业务数据、mid-stream reset、partial response、任意 post-open 失败都绝不 fallback
-- [ ] 为 fallback 记录原因、命中路径、原始 route、最终 target
-- [ ] 建立 pre-open fallback 成功、post-open 禁止 fallback 的完整测试集
+- [x] 实现 `primary_connector_service + fallback_external_service` 模型
+- [x] 可 fallback 的阶段仅限：route resolve miss、service unavailable、`TrafficOpenAck` 失败、agent pre-open timeout
+- [x] 固定 fallback 截止点为“收到 `TrafficOpenAck success` 之前”
+- [x] 收到 `TrafficOpenAck success` 后绝不 fallback
+- [x] 已向 upstream 写出业务数据、mid-stream reset、partial response、任意 post-open 失败都绝不 fallback
+- [x] 为 fallback 记录原因、命中路径、原始 route、最终 target
+- [x] 建立 pre-open fallback 成功、post-open 禁止 fallback 的完整测试集
 
 验收标准：
 
@@ -299,12 +301,12 @@
 
 ### L14. 管理接口、诊断与可观测性
 
-- [ ] 输出 service、session、route、traffic、health、error 的管理/状态接口
+- [x] 输出 service、session、route、traffic、health、error 的管理/状态接口
 - [ ] 为握手失败、旧 epoch、重复事件、scope 拒绝、fallback、direct proxy 失败提供结构化日志
-- [ ] 接入 trace_id，从 ingress 贯穿到 traffic、upstream、审计日志
-- [ ] 统计 connector proxy 与 direct proxy 的运行态指标
+- [x] 接入 trace_id，从 ingress 贯穿到 traffic、upstream、审计日志
+- [x] 统计 connector proxy 与 direct proxy 的运行态指标
 - [ ] 输出 dedicated port listener 状态、discovery provider 状态、export 状态
-- [ ] 输出 reject reason、error code、fallback reason 的查询能力
+- [x] 输出 reject reason、error code、fallback reason 的查询能力
 
 验收标准：
 
@@ -313,14 +315,14 @@
 
 ### L15. 测试矩阵、发布门槛与回滚
 
-- [ ] 建立单元测试矩阵：schema、validate、codec、registry、selector、health、ingress、provider
-- [ ] 建立集成测试矩阵：握手、full-sync、publish/unpublish、health report、connector proxy、direct proxy、export、hybrid
-- [ ] 建立 binding parity 测试：`http` 与 `masque` 控制面/数据面行为一致
+- [x] 建立单元测试矩阵：schema、validate、codec、registry、selector、health、ingress、provider
+- [x] 建立集成测试矩阵：握手、full-sync、publish/unpublish、health report、connector proxy、direct proxy、export、hybrid
+- [x] 建立 binding parity 测试：`http` 与 `masque` 控制面/数据面行为一致
 - [ ] 建立兼容性测试：共享库变更必须同时验证 agent 与 bridge
-- [ ] 建立回归清单：握手、认证、心跳、旧 epoch、重复事件、scope 校验、三类 ingress、external proxy、export、hybrid fallback
-- [ ] 建立升级说明：新增字段、默认值、向后兼容、必填变更处理规则
+- [x] 建立回归清单：握手、认证、心跳、旧 epoch、重复事件、scope 校验、三类 ingress、external proxy、export、hybrid fallback
+- [x] 建立升级说明：新增字段、默认值、向后兼容、必填变更处理规则
 - [ ] 建立最小发布门槛：共享库、agent、bridge 兼容性测试均通过
-- [ ] 建立最小回滚方案：可识别新增字段、可回退二进制、可保留运行态数据一致性
+- [x] 建立最小回滚方案：可识别新增字段、可回退二进制、可保留运行态数据一致性
 
 验收标准：
 

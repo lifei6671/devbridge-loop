@@ -28,6 +28,38 @@ const (
 	CodeMissingDependency = "MISSING_DEPENDENCY"
 	// CodeInvalidStateTransition 表示会话状态流转非法。
 	CodeInvalidStateTransition = "INVALID_STATE_TRANSITION"
+	// CodeDiscoveryProviderNotAllowed 表示 provider 不在允许列表。
+	CodeDiscoveryProviderNotAllowed = "DISCOVERY_PROVIDER_NOT_ALLOWED"
+	// CodeDiscoveryNamespaceNotAllowed 表示 namespace 不在允许列表。
+	CodeDiscoveryNamespaceNotAllowed = "DISCOVERY_NAMESPACE_NOT_ALLOWED"
+	// CodeDiscoveryServiceNotAllowed 表示 serviceName 不在允许列表。
+	CodeDiscoveryServiceNotAllowed = "DISCOVERY_SERVICE_NOT_ALLOWED"
+	// CodeDiscoveryProviderUnavailable 表示 provider 查询失败且无可用缓存。
+	CodeDiscoveryProviderUnavailable = "DISCOVERY_PROVIDER_UNAVAILABLE"
+	// CodeDiscoveryNoEndpoint 表示查询后无可用 endpoint。
+	CodeDiscoveryNoEndpoint = "DISCOVERY_NO_ENDPOINT"
+	// CodeDiscoveryEndpointDenied 表示 endpoint 被安全策略拒绝。
+	CodeDiscoveryEndpointDenied = "DISCOVERY_ENDPOINT_DENIED"
+	// CodeResolveServiceNotFound 表示 route 解析时未找到目标服务。
+	CodeResolveServiceNotFound = "RESOLVE_SERVICE_NOT_FOUND"
+	// CodeResolveServiceUnavailable 表示 route 解析时目标服务不可用。
+	CodeResolveServiceUnavailable = "RESOLVE_SERVICE_UNAVAILABLE"
+	// CodeResolveSessionNotActive 表示 route 解析时会话非 ACTIVE。
+	CodeResolveSessionNotActive = "RESOLVE_SESSION_NOT_ACTIVE"
+	// CodeExportNotEligible 表示 export 条件不满足。
+	CodeExportNotEligible = "EXPORT_NOT_ELIGIBLE"
+	// CodeHybridFallbackForbidden 表示 hybrid fallback 被策略禁止。
+	CodeHybridFallbackForbidden = "HYBRID_FALLBACK_FORBIDDEN"
+	// CodeDirectProxyTimeout 表示 direct proxy 拨号超时。
+	CodeDirectProxyTimeout = "DIRECT_PROXY_TIMEOUT"
+	// CodeDirectProxyConcurrencyLimit 表示 direct proxy 并发达到上限。
+	CodeDirectProxyConcurrencyLimit = "DIRECT_PROXY_CONCURRENCY_LIMIT"
+	// CodeDirectProxyDialFailed 表示 direct proxy 拨号失败。
+	CodeDirectProxyDialFailed = "DIRECT_PROXY_DIAL_FAILED"
+	// CodeIngressPortConflict 表示 dedicated port 出现端口冲突。
+	CodeIngressPortConflict = "INGRESS_PORT_CONFLICT"
+	// CodeIngressRouteMismatch 表示 ingress 路由匹配条件冲突。
+	CodeIngressRouteMismatch = "INGRESS_ROUTE_MISMATCH"
 )
 
 // 协商相关错误码定义。
