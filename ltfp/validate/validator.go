@@ -140,6 +140,19 @@ func ValidateRouteScope(routeNamespace, routeEnvironment, targetNamespace, targe
 	return nil
 }
 
+// ValidateControlError 校验控制面错误消息语义。
+func ValidateControlError(message pb.ControlError) error {
+	// code 为空会导致调用方无法按错误类型分支处理。
+	if strings.TrimSpace(message.Code) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "control error code is required")
+	}
+	// message 为空会导致错误排障信息丢失。
+	if strings.TrimSpace(message.Message) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "control error message is required")
+	}
+	return nil
+}
+
 // requiresResourceMeta 判断消息类型是否需要强制幂等元信息。
 func requiresResourceMeta(messageType pb.ControlMessageType) bool {
 	// 资源级变更消息必须携带 sessionEpoch/eventID/resourceVersion。

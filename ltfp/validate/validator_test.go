@@ -111,3 +111,33 @@ func TestValidateStreamPayloadRejectInvalidOneof(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestValidateControlError 验证控制面错误消息校验。
+func TestValidateControlError(t *testing.T) {
+	t.Parallel()
+
+	message := pb.ControlError{
+		Code:    "NEGOTIATION_UNSUPPORTED_FEATURE",
+		Message: "required feature missing",
+	}
+	if err := ValidateControlError(message); err != nil {
+		t.Fatalf("validate control error failed: %v", err)
+	}
+}
+
+// TestValidateControlErrorRejectMissingCode 验证缺失 code 会被拒绝。
+func TestValidateControlErrorRejectMissingCode(t *testing.T) {
+	t.Parallel()
+
+	message := pb.ControlError{
+		Message: "required feature missing",
+	}
+	err := ValidateControlError(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	// code 缺失应返回 missing required 错误码。
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

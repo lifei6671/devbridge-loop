@@ -22,6 +22,8 @@
 - `codec/`：协议编解码实现
 - `validate/`：字段与语义校验
 - `negotiation/`：协商算法与能力交集
+- `session/`：握手链路与会话状态机
+- `consistency/`：幂等键、版本比较、ACK 构造与重连同步计划
 - `testkit/`：golden fixtures 与跨模块测试夹具
 - `proto/`：保留给后续 `.proto` 真正落地
 

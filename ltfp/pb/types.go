@@ -115,6 +115,7 @@ type DiscoveryPolicy struct {
 
 // PublishService 描述服务发布请求。
 type PublishService struct {
+	// serviceId 在首次发布时允许为空；若 service_key 已存在，服务端必须复用既有 service_id。
 	ServiceID       string            `json:"serviceId,omitempty"`
 	ServiceKey      string            `json:"serviceKey"`
 	Namespace       string            `json:"namespace"`

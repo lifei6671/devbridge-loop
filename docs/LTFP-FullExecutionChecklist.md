@@ -82,13 +82,13 @@
 
 ### L1. `ltfp/` 模块骨架与 workspace
 
-- [ ] 新建 `ltfp/` 目录与独立 `go.mod`
-- [ ] 在仓库根目录新增 `go.work`，纳入 `ltfp`、`agent-core`、`cloud-bridge`、`examples`、`service-registry`
-- [ ] 编写 `ltfp/README.md`，明确共享库职责、禁止项、升级方式
-- [ ] 固定包结构：`proto/`、`pb/`、`codec/`、`errors/`、`validate/`、`testkit/`
+- [x] 新建 `ltfp/` 目录与独立 `go.mod`
+- [x] 在仓库根目录新增 `go.work`，纳入 `ltfp`、`agent-core`、`cloud-bridge`、`examples`、`service-registry`
+- [x] 编写 `ltfp/README.md`，明确共享库职责、禁止项、升级方式
+- [x] 固定包结构：`proto/`、`pb/`、`codec/`、`errors/`、`validate/`、`testkit/`
 - [ ] 约定 codegen 命令、生成目录、提交流程与更新规则
-- [ ] 固定共享库版本策略：schema 变更优先于使用方改造
-- [ ] 明确 `ltfp` 不得反向依赖 `agent-core/internal` 或 `cloud-bridge/internal`
+- [x] 固定共享库版本策略：schema 变更优先于使用方改造
+- [x] 明确 `ltfp` 不得反向依赖 `agent-core/internal` 或 `cloud-bridge/internal`
 - [ ] 建立最小示例，验证 agent 与 bridge 可同时引用本地 `ltfp`
 
 验收标准：
@@ -98,15 +98,15 @@
 
 ### L2. 资源模型、proto 与常量收口
 
-- [ ] 将资源模型整理为 typed schema：`Connector`、`Session`、`Service`、`ServiceEndpoint`、`ServiceExposure`、`HealthCheckConfig`、`Route`、`RouteMatch`、`RouteTarget`
-- [ ] 将控制面消息整理为 typed schema：`ControlEnvelope`、`ConnectorHello`、`ConnectorWelcome`、`ConnectorAuth`、`ConnectorAuthAck`、`Heartbeat`、`PublishService`、`PublishServiceAck`、`UnpublishService`、`UnpublishServiceAck`、`ServiceHealthReport`、`ControlError`
-- [ ] 将可选扩展消息整理为 typed schema：`RouteAssign`、`RouteAssignAck`、`RouteRevoke`、`RouteRevokeAck`、`RouteStatusReport`
-- [ ] 将数据面消息整理为 typed schema：`TrafficOpen`、`TrafficOpenAck`、`TrafficClose`、`TrafficReset`、`StreamPayload`
-- [ ] 固定状态常量：session state、service status、health status、ACK 状态、fallback policy、ingress mode
-- [ ] 固定统一错误码：认证错误、协商错误、scope 错误、幂等错误、ingress 错误、route resolve 错误、traffic 错误、proxy 错误
-- [ ] 在 schema 注释中明确 `service_id` 为空首发时的复用规则
-- [ ] 在 schema 注释中明确 `TrafficOpen` 只携带 `service_id` 与非权威 `endpoint_selection_hint`
-- [ ] 保留 `policy_json` 仅作为实验字段，不允许其成为长期扩展主通道
+- [x] 将资源模型整理为 typed schema：`Connector`、`Session`、`Service`、`ServiceEndpoint`、`ServiceExposure`、`HealthCheckConfig`、`Route`、`RouteMatch`、`RouteTarget`
+- [x] 将控制面消息整理为 typed schema：`ControlEnvelope`、`ConnectorHello`、`ConnectorWelcome`、`ConnectorAuth`、`ConnectorAuthAck`、`Heartbeat`、`PublishService`、`PublishServiceAck`、`UnpublishService`、`UnpublishServiceAck`、`ServiceHealthReport`、`ControlError`
+- [x] 将可选扩展消息整理为 typed schema：`RouteAssign`、`RouteAssignAck`、`RouteRevoke`、`RouteRevokeAck`、`RouteStatusReport`
+- [x] 将数据面消息整理为 typed schema：`TrafficOpen`、`TrafficOpenAck`、`TrafficClose`、`TrafficReset`、`StreamPayload`
+- [x] 固定状态常量：session state、service status、health status、ACK 状态、fallback policy、ingress mode
+- [x] 固定统一错误码：认证错误、协商错误、scope 错误、幂等错误、ingress 错误、route resolve 错误、traffic 错误、proxy 错误
+- [x] 在 schema 注释中明确 `service_id` 为空首发时的复用规则
+- [x] 在 schema 注释中明确 `TrafficOpen` 只携带 `service_id` 与非权威 `endpoint_selection_hint`
+- [x] 保留 `policy_json` 仅作为实验字段，不允许其成为长期扩展主通道
 - [ ] 若保留 `ForwardIntent / ForwardDecision`，则在此阶段补齐正式 schema 与注释
 
 验收标准：
@@ -116,17 +116,17 @@
 
 ### L3. 编解码、校验与兼容性夹具
 
-- [ ] 在 `ltfp/codec` 中实现共享控制面消息的编码/解码入口
-- [ ] 在 `ltfp/codec` 中实现共享数据面消息的编码/解码入口
-- [ ] 支持现有 `http` tunnel 的控制面/数据面承载
-- [ ] 支持现有 `masque` tunnel 的控制面/数据面承载
-- [ ] 在 `ltfp/validate` 中实现纯函数校验：必填字段、枚举值、scope、版本号、事件幂等字段、兼容性字段
-- [ ] 校验 `Route` scope 必须等于 target scope
-- [ ] 校验首版不允许跨 scope 引用与跨 environment fallback
-- [ ] 校验 `TrafficOpen` 不得携带权威 `target_addr`
-- [ ] 为 `policy_json` 建立过渡期校验与警告规则
-- [ ] 在 `ltfp/testkit` 中建立 golden payload、round-trip 断言、错误 payload 断言
-- [ ] 为 schema 版本演进建立兼容性夹具与升级样例
+- [x] 在 `ltfp/codec` 中实现共享控制面消息的编码/解码入口
+- [x] 在 `ltfp/codec` 中实现共享数据面消息的编码/解码入口
+- [x] 支持现有 `http` tunnel 的控制面/数据面承载
+- [x] 支持现有 `masque` tunnel 的控制面/数据面承载
+- [x] 在 `ltfp/validate` 中实现纯函数校验：必填字段、枚举值、scope、版本号、事件幂等字段、兼容性字段
+- [x] 校验 `Route` scope 必须等于 target scope
+- [x] 校验首版不允许跨 scope 引用与跨 environment fallback
+- [x] 校验 `TrafficOpen` 不得携带权威 `target_addr`
+- [x] 为 `policy_json` 建立过渡期校验与警告规则
+- [x] 在 `ltfp/testkit` 中建立 golden payload、round-trip 断言、错误 payload 断言
+- [x] 为 schema 版本演进建立兼容性夹具与升级样例
 
 验收标准：
 
@@ -135,14 +135,14 @@
 
 ### L4. 握手、认证、心跳与 session 状态机
 
-- [ ] 在共享库中固定 `HELLO -> WELCOME -> AUTH -> AUTH_ACK -> HEARTBEAT` 主链路
-- [ ] 明确 `ConnectorWelcome.assigned_session_epoch` 与 `ConnectorAuthAck.session_epoch` 的权威关系
-- [ ] 固定 session 状态机：`CONNECTING -> AUTHENTICATING -> ACTIVE -> DRAINING/STALE -> CLOSED`
-- [ ] 实现 heartbeat 超时后的 `STALE` 流转规则
-- [ ] 实现新 `session_epoch` 接管后旧 session 进入 `DRAINING` 或 `STALE`
-- [ ] 旧 session 禁止继续修改资源状态
-- [ ] 固定 `ControlError.scope/code/message/retryable` 的语义
-- [ ] 建立握手失败、认证失败、心跳超时、旧 epoch 晚到消息的测试样例
+- [x] 在共享库中固定 `HELLO -> WELCOME -> AUTH -> AUTH_ACK -> HEARTBEAT` 主链路
+- [x] 明确 `ConnectorWelcome.assigned_session_epoch` 与 `ConnectorAuthAck.session_epoch` 的权威关系
+- [x] 固定 session 状态机：`CONNECTING -> AUTHENTICATING -> ACTIVE -> DRAINING/STALE -> CLOSED`
+- [x] 实现 heartbeat 超时后的 `STALE` 流转规则
+- [x] 实现新 `session_epoch` 接管后旧 session 进入 `DRAINING` 或 `STALE`
+- [x] 旧 session 禁止继续修改资源状态
+- [x] 固定 `ControlError.scope/code/message/retryable` 的语义
+- [x] 建立握手失败、认证失败、心跳超时、旧 epoch 晚到消息的测试样例
 
 验收标准：
 
@@ -151,14 +151,14 @@
 
 ### L5. 控制面一致性、幂等 ACK 与 full-sync
 
-- [ ] 固定资源级消息必带 `session_id`、`session_epoch`、`event_id`、`resource_version`
-- [ ] 固定 ACK 契约：`accepted`、`accepted_resource_version`、`current_resource_version`、`error_code`、`error_message`
-- [ ] 为 `PublishServiceAck`、`UnpublishServiceAck`、`RouteAssignAck`、`RouteRevokeAck` 固定幂等语义
-- [ ] 提供共享去重键生成与版本比较辅助函数
-- [ ] 固定 reject reason：旧 epoch、重复事件、版本回退、非法 scope、缺失依赖资源
-- [ ] 设计 full-sync 与增量 sync 的消息边界和回放规则
-- [ ] 实现重连后的全量重同步流程
-- [ ] 建立重复事件安全 ACK、版本回退拒绝、重连恢复一致性的测试
+- [x] 固定资源级消息必带 `session_id`、`session_epoch`、`event_id`、`resource_version`
+- [x] 固定 ACK 契约：`accepted`、`accepted_resource_version`、`current_resource_version`、`error_code`、`error_message`
+- [x] 为 `PublishServiceAck`、`UnpublishServiceAck`、`RouteAssignAck`、`RouteRevokeAck` 固定幂等语义
+- [x] 提供共享去重键生成与版本比较辅助函数
+- [x] 固定 reject reason：旧 epoch、重复事件、版本回退、非法 scope、缺失依赖资源
+- [x] 设计 full-sync 与增量 sync 的消息边界和回放规则
+- [x] 实现重连后的全量重同步流程
+- [x] 建立重复事件安全 ACK、版本回退拒绝、重连恢复一致性的测试
 
 验收标准：
 
@@ -406,4 +406,3 @@
 - 重复事件、旧 epoch、非法 scope、非法 payload 能稳定拒绝
 - connector proxy 与 direct proxy 运行态可区分、可追踪、可审计
 - 新增协议字段时，变更路径可追踪、可测试、可回滚
-

@@ -18,6 +18,16 @@ const (
 	CodeInvalidScope = "INVALID_SCOPE"
 	// CodeUnknownMessageType 表示消息类型未知。
 	CodeUnknownMessageType = "UNKNOWN_MESSAGE_TYPE"
+	// CodeStaleEpochEvent 表示收到旧会话 epoch 的事件。
+	CodeStaleEpochEvent = "STALE_EPOCH_EVENT"
+	// CodeDuplicateEvent 表示事件重复提交。
+	CodeDuplicateEvent = "DUPLICATE_EVENT"
+	// CodeVersionRollback 表示资源版本回退。
+	CodeVersionRollback = "VERSION_ROLLBACK"
+	// CodeMissingDependency 表示事件依赖的资源不存在。
+	CodeMissingDependency = "MISSING_DEPENDENCY"
+	// CodeInvalidStateTransition 表示会话状态流转非法。
+	CodeInvalidStateTransition = "INVALID_STATE_TRANSITION"
 )
 
 // 协商相关错误码定义。
