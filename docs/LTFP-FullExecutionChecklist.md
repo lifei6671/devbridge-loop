@@ -86,10 +86,10 @@
 - [x] 在仓库根目录新增 `go.work`，纳入 `ltfp`、`agent-core`、`cloud-bridge`、`examples`、`service-registry`
 - [x] 编写 `ltfp/README.md`，明确共享库职责、禁止项、升级方式
 - [x] 固定包结构：`proto/`、`pb/`、`codec/`、`errors/`、`validate/`、`testkit/`
-- [ ] 约定 codegen 命令、生成目录、提交流程与更新规则
+- [x] 约定 codegen 命令、生成目录、提交流程与更新规则
 - [x] 固定共享库版本策略：schema 变更优先于使用方改造
 - [x] 明确 `ltfp` 不得反向依赖 `agent-core/internal` 或 `cloud-bridge/internal`
-- [ ] 建立最小示例，验证 agent 与 bridge 可同时引用本地 `ltfp`
+- [x] 建立最小示例，验证 agent 与 bridge 可同时引用本地 `ltfp`
 
 验收标准：
 

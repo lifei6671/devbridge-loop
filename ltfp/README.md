@@ -25,10 +25,25 @@
 - `session/`：握手链路与会话状态机
 - `consistency/`：幂等键、版本比较、ACK 构造与重连同步计划
 - `testkit/`：golden fixtures 与跨模块测试夹具
-- `proto/`：保留给后续 `.proto` 真正落地
+- `proto/`：协议 `.proto` 真相源
+- `pb/gen/`：由 `proto/` 生成的 Go 绑定
 
 ## 开发约束
 
 - 共享库变更优先更新协议对象，再更新使用方
 - 新增字段必须补兼容性说明与测试
 - 导出函数必须有中文函数级注释
+
+## Codegen 流程
+
+1. 在 `proto/` 修改或新增 `.proto` 文件。
+2. 在 `ltfp/` 目录执行 `make proto` 生成 Go 绑定。
+3. 执行 `go test ./...` 校验协议对象、校验器与编解码器兼容性。
+
+常用命令：
+
+```bash
+cd ltfp
+make proto
+make test
+```

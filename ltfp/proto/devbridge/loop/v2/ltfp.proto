@@ -1,0 +1,302 @@
+syntax = "proto3";
+
+package devbridge.loop.v2;
+
+option go_package = "github.com/lifei6671/devbridge-loop/ltfp/pb/gen;ltfpgen";
+
+message ControlEnvelope {
+  uint32 version_major = 1;
+  uint32 version_minor = 2;
+  string msg_type = 3;
+  string request_id = 4;
+  string session_id = 5;
+  uint64 session_epoch = 6;
+  string connector_id = 7;
+  string resource_type = 8;
+  string resource_id = 9;
+  string event_id = 10;
+  uint64 resource_version = 11;
+  bytes payload = 12;
+}
+
+message ConnectorHello {
+  string connector_id = 1;
+  string namespace = 2;
+  string environment = 3;
+  string node_name = 4;
+  string version = 5;
+  repeated string supported_bindings = 6;
+  repeated string capabilities = 7;
+  map<string, string> labels = 8;
+  map<string, string> metadata = 9;
+}
+
+message ConnectorWelcome {
+  string selected_binding = 1;
+  uint32 version_major = 2;
+  uint32 version_minor = 3;
+  uint32 heartbeat_interval_sec = 4;
+  repeated string capabilities = 5;
+  uint64 assigned_session_epoch = 6;
+  map<string, string> metadata = 7;
+}
+
+message ConnectorAuth {
+  string auth_method = 1;
+  map<string, string> auth_payload = 2;
+  map<string, string> metadata = 3;
+}
+
+message ConnectorAuthAck {
+  bool success = 1;
+  string session_id = 2;
+  uint64 session_epoch = 3;
+  string error_code = 4;
+  string error_message = 5;
+  map<string, string> metadata = 6;
+}
+
+message Heartbeat {
+  int64 timestamp_unix = 1;
+  string session_state = 2;
+  string load_hint = 3;
+  map<string, string> metadata = 4;
+}
+
+message ServiceEndpoint {
+  string endpoint_id = 1;
+  string protocol = 2;
+  string host = 3;
+  uint32 port = 4;
+  string tls_mode = 5;
+  string server_name = 6;
+  uint32 dial_timeout_ms = 7;
+  uint32 read_timeout_ms = 8;
+  uint32 write_timeout_ms = 9;
+  uint32 weight = 10;
+  map<string, string> metadata = 11;
+}
+
+message ServiceExposure {
+  string ingress_mode = 1;
+  string host = 2;
+  uint32 listen_port = 3;
+  string sni_name = 4;
+  string path_prefix = 5;
+  bool allow_export = 6;
+}
+
+message HealthCheckConfig {
+  string type = 1;
+  string endpoint = 2;
+  uint32 interval_sec = 3;
+  uint32 timeout_sec = 4;
+  uint32 healthy_threshold = 5;
+  uint32 unhealthy_threshold = 6;
+}
+
+message DiscoveryPolicy {
+  bool enabled = 1;
+  repeated string providers = 2;
+  string external_name = 3;
+  string namespace = 4;
+  string group = 5;
+  map<string, string> tags = 6;
+  map<string, string> metadata = 7;
+}
+
+message PublishService {
+  string service_id = 1;
+  string service_key = 2;
+  string namespace = 3;
+  string environment = 4;
+  string service_name = 5;
+  string service_type = 6;
+  repeated ServiceEndpoint endpoints = 7;
+  ServiceExposure exposure = 8;
+  HealthCheckConfig health_check = 9;
+  DiscoveryPolicy discovery_policy = 10;
+  map<string, string> labels = 11;
+  map<string, string> metadata = 12;
+}
+
+message PublishServiceAck {
+  bool accepted = 1;
+  string service_id = 2;
+  string service_key = 3;
+  uint64 accepted_resource_version = 4;
+  uint64 current_resource_version = 5;
+  string error_code = 6;
+  string error_message = 7;
+}
+
+message UnpublishService {
+  string service_id = 1;
+  string service_key = 2;
+  string namespace = 3;
+  string environment = 4;
+  string reason = 5;
+}
+
+message UnpublishServiceAck {
+  bool accepted = 1;
+  string service_id = 2;
+  string service_key = 3;
+  uint64 accepted_resource_version = 4;
+  uint64 current_resource_version = 5;
+  string error_code = 6;
+  string error_message = 7;
+}
+
+message EndpointHealthStatus {
+  string endpoint_id = 1;
+  string health_status = 2;
+  string reason = 3;
+}
+
+message ServiceHealthReport {
+  string service_id = 1;
+  string service_key = 2;
+  string service_health_status = 3;
+  repeated EndpointHealthStatus endpoint_statuses = 4;
+  int64 check_time_unix = 5;
+  string reason = 6;
+  map<string, string> metadata = 7;
+}
+
+message ConnectorServiceTarget {
+  string service_key = 1;
+  map<string, string> selector = 2;
+}
+
+message ExternalServiceTarget {
+  string provider = 1;
+  string namespace = 2;
+  string environment = 3;
+  string service_name = 4;
+  string group = 5;
+  map<string, string> selector = 6;
+  uint32 cache_ttl_sec = 7;
+  uint32 stale_if_error_sec = 8;
+}
+
+message HybridGroupTarget {
+  ConnectorServiceTarget primary_connector_service = 1;
+  ExternalServiceTarget fallback_external_service = 2;
+  string fallback_policy = 3;
+}
+
+message RouteTarget {
+  string type = 1;
+  ConnectorServiceTarget connector_service = 2;
+  ExternalServiceTarget external_service = 3;
+  HybridGroupTarget hybrid_group = 4;
+}
+
+message RouteMatch {
+  string protocol = 1;
+  string host = 2;
+  string authority = 3;
+  uint32 listen_port = 4;
+  string path_prefix = 5;
+  string sni = 6;
+}
+
+message RouteAssign {
+  string route_id = 1;
+  string namespace = 2;
+  string environment = 3;
+  RouteMatch match = 4;
+  RouteTarget target = 5;
+  uint32 priority = 6;
+  string policy_json = 7;
+  map<string, string> metadata = 8;
+}
+
+message RouteAssignAck {
+  bool accepted = 1;
+  string route_id = 2;
+  uint64 accepted_resource_version = 3;
+  uint64 current_resource_version = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+message RouteRevoke {
+  string route_id = 1;
+  string namespace = 2;
+  string environment = 3;
+  string reason = 4;
+}
+
+message RouteRevokeAck {
+  bool accepted = 1;
+  string route_id = 2;
+  uint64 accepted_resource_version = 3;
+  uint64 current_resource_version = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+message RouteStatusReport {
+  string route_id = 1;
+  string status = 2;
+  string message = 3;
+}
+
+message ControlError {
+  string scope = 1;
+  string code = 2;
+  string message = 3;
+  bool retryable = 4;
+  map<string, string> metadata = 5;
+}
+
+message TrafficOpen {
+  string traffic_id = 1;
+  string route_id = 2;
+  string service_id = 3;
+  string source_addr = 4;
+  string protocol_hint = 5;
+  string trace_id = 6;
+  map<string, string> endpoint_selection_hint = 7;
+  map<string, string> metadata = 8;
+}
+
+message TrafficOpenAck {
+  string traffic_id = 1;
+  bool success = 2;
+  string error_code = 3;
+  string error_message = 4;
+  map<string, string> metadata = 5;
+}
+
+message TrafficClose {
+  string traffic_id = 1;
+  string reason = 2;
+}
+
+message TrafficReset {
+  string traffic_id = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+message StreamPayload {
+  oneof payload {
+    TrafficOpen open_req = 1;
+    TrafficOpenAck open_ack = 2;
+    bytes data = 3;
+    TrafficClose close = 4;
+    TrafficReset reset = 5;
+  }
+}
+
+service DevBridgeControlService {
+  rpc ControlChannel(stream ControlEnvelope) returns (stream ControlEnvelope);
+}
+
+service DevBridgeTunnelService {
+  rpc TunnelStream(stream StreamPayload) returns (stream StreamPayload);
+}
+
