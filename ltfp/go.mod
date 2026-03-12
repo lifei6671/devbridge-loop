@@ -3,6 +3,7 @@ module github.com/lifei6671/devbridge-loop/ltfp
 go 1.26.0
 
 require (
+	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.11
 )
