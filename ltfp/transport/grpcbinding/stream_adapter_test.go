@@ -82,6 +82,22 @@ func (stream *fakeTunnelEnvelopeStream) Context() context.Context {
 	return context.Background()
 }
 
+type fakeTunnelEnvelopeStreamWithoutCloseSend struct {
+	base *fakeTunnelEnvelopeStream
+}
+
+func (stream *fakeTunnelEnvelopeStreamWithoutCloseSend) Send(frame *transportgen.TunnelEnvelope) error {
+	return stream.base.Send(frame)
+}
+
+func (stream *fakeTunnelEnvelopeStreamWithoutCloseSend) Recv() (*transportgen.TunnelEnvelope, error) {
+	return stream.base.Recv()
+}
+
+func (stream *fakeTunnelEnvelopeStreamWithoutCloseSend) Context() context.Context {
+	return stream.base.Context()
+}
+
 // TestGRPCH2TunnelStreamWriteReadAndClose 验证 TunnelEnvelope 的读写映射与关闭语义。
 func TestGRPCH2TunnelStreamWriteReadAndClose(testingObject *testing.T) {
 	fakeStream := &fakeTunnelEnvelopeStream{
@@ -283,6 +299,50 @@ func TestGRPCH2TunnelStreamCloseUnblocksBlockedWrite(testingObject *testing.T) {
 	case <-tunnelStream.Done():
 	case <-time.After(time.Second):
 		testingObject.Fatalf("expected done channel to close after close")
+	}
+}
+
+// TestGRPCH2TunnelStreamCloseWithoutInterruptibleWrite 验证无 cancel/CloseSend 时 Close 不会卡住。
+func TestGRPCH2TunnelStreamCloseWithoutInterruptibleWrite(testingObject *testing.T) {
+	sendBlock := make(chan struct{})
+	sendReady := make(chan struct{}, 1)
+	fakeStream := &fakeTunnelEnvelopeStreamWithoutCloseSend{
+		base: &fakeTunnelEnvelopeStream{
+			sendBlock: sendBlock,
+			sendReady: sendReady,
+		},
+	}
+	tunnelStream, err := newGRPCH2TunnelStream(fakeStream)
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel stream failed: %v", err)
+	}
+
+	writeResultChannel := make(chan error, 1)
+	go func() {
+		writeResultChannel <- tunnelStream.WritePayload(context.Background(), []byte("blocked-write"))
+	}()
+	select {
+	case <-sendReady:
+	case <-time.After(time.Second):
+		testingObject.Fatalf("expected write path to enter blocked send")
+	}
+
+	closeContext, cancelClose := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelClose()
+	if err := tunnelStream.Close(closeContext); err != nil {
+		testingObject.Fatalf("expected close to finish without error, got %v", err)
+	}
+	select {
+	case <-tunnelStream.Done():
+	case <-time.After(time.Second):
+		testingObject.Fatalf("expected done channel to close after close")
+	}
+
+	close(sendBlock)
+	select {
+	case <-writeResultChannel:
+	case <-time.After(time.Second):
+		testingObject.Fatalf("write goroutine did not exit after unblocking send")
 	}
 }
 

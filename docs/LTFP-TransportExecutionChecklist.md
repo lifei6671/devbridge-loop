@@ -162,8 +162,8 @@
 - [x] 定义 `ControlChannel` 与 `TunnelStream` 的 gRPC proto / service
 - [x] 定义 `TunnelEnvelope { bytes payload = 1; }`，禁止在 envelope 中直接暴露业务协议字段
 - [x] 实现 `ltfp/transport/grpcbinding/transport.go`
-- [ ] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
-- [ ] 实现 Agent 主动打开 `TunnelStream`，Server 侧接收后写入 idle pool
+- [x] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
+- [x] 实现 Agent 主动打开 `TunnelStream`，Server 侧接收后写入 idle pool
 - [ ] 实现 gRPC keepalive、最大消息大小、deadline 与 cancel 语义映射
 - [ ] 实现对象池、缓冲复用与可选 fast-path，但不得把 gRPC 私有类型泄露到公共接口
 

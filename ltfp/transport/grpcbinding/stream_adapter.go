@@ -15,8 +15,11 @@ import (
 type tunnelStream interface {
 	Send(*transportgen.TunnelEnvelope) error
 	Recv() (*transportgen.TunnelEnvelope, error)
-	CloseSend() error
 	Context() context.Context
+}
+
+type tunnelStreamCloseSender interface {
+	CloseSend() error
 }
 
 // GRPCH2TunnelStream 封装 TunnelEnvelope 的双向字节读写。
@@ -177,12 +180,26 @@ func (stream *GRPCH2TunnelStream) Close(ctx context.Context) error {
 	}
 	stream.stateMutex.Unlock()
 
+	_, supportsCloseSend := stream.stream.(tunnelStreamCloseSender)
+	canInterruptBlockedWrite := stream.cancel != nil || supportsCloseSend
 	writeLockHeld := false
 	if stream.writeMutex.TryLock() {
 		writeLockHeld = true
 	} else {
 		// 先取消底层 stream，打断可能卡住的 Send，再按 ctx 等待写锁。
 		stream.cancelStream()
+		if !canInterruptBlockedWrite {
+			// 服务端 stream 既无 cancel 也无 CloseSend 时，写阻塞不可中断；
+			// 这里直接收敛到 closed，避免 Close 永久等待写锁。
+			stream.stateMutex.Lock()
+			if stream.closed {
+				stream.stateMutex.Unlock()
+				return nil
+			}
+			stream.markClosedLocked(transport.ErrClosed)
+			stream.stateMutex.Unlock()
+			return nil
+		}
 		lockWaitTicker := time.NewTicker(closeWriteLockRetryInterval)
 		defer lockWaitTicker.Stop()
 		for !writeLockHeld {
@@ -217,12 +234,14 @@ func (stream *GRPCH2TunnelStream) Close(ctx context.Context) error {
 	}
 	stream.stateMutex.Unlock()
 
-	if err := stream.stream.CloseSend(); err != nil {
-		stream.cancelStream()
-		stream.stateMutex.Lock()
-		stream.markClosedLocked(err)
-		stream.stateMutex.Unlock()
-		return fmt.Errorf("grpc tunnel stream close: %w", err)
+	if closeSender, ok := stream.stream.(tunnelStreamCloseSender); ok {
+		if err := closeSender.CloseSend(); err != nil {
+			stream.cancelStream()
+			stream.stateMutex.Lock()
+			stream.markClosedLocked(err)
+			stream.stateMutex.Unlock()
+			return fmt.Errorf("grpc tunnel stream close: %w", err)
+		}
 	}
 	stream.cancelStream()
 	stream.stateMutex.Lock()
