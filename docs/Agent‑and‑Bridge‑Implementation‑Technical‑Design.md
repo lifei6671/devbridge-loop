@@ -618,13 +618,19 @@ sequenceDiagram
     B->>A: TrafficOpen
     A->>U: Dial local upstream
     U-->>A: Connected
-    A-->>B: TrafficOpenAck(success=true)
-    B<->>A: TrafficData
-    A<->>U: Byte relay
-    A-->>B: TrafficClose or TrafficReset
+    A-->>B: TrafficOpenAck success=true
+    B->>A: TrafficData
+    A->>B: TrafficData
+    A->>U: Forward request bytes
+    U->>A: Return response bytes
+    A-->>B: TrafficClose
     B->>B: Remove tunnel state
     A->>A: Refill tunnel pool
 ```
+
+- TrafficOpenAck success=true 后才进入正式 relay
+- TrafficClose 或 TrafficReset 后该 tunnel 生命周期结束
+- Bridge 移除 tunnel 状态，Agent 负责补池
 
 ### 8.7.2 新增：no idle tunnel 处理链路
 
@@ -713,19 +719,29 @@ sequenceDiagram
     participant C as Client
     participant B as Bridge
     participant A as Agent
-    participant E as External Endpoint
+    participant E as ExternalEndpoint
 
     C->>B: Request
     B->>A: TrafficOpen
+
     alt Pre-open failed
-        A-->>B: TrafficOpenAck(failed) or timeout
+        A-->>B: TrafficOpenAck success=false
         B->>E: Direct dial
-        B<->>E: Relay
+        B->>E: Forward request
+        E->>B: Return response
+    else Pre-open timeout
+        B->>E: Direct dial
+        B->>E: Forward request
+        E->>B: Return response
     else Pre-open success
-        A-->>B: TrafficOpenAck(success)
-        B<->>A: Relay
+        A-->>B: TrafficOpenAck success=true
+        B->>A: TrafficData
+        A->>B: TrafficData
     end
 ```
+
+- hybrid_group 仅允许在 pre-open failed 或 pre-open timeout 时 fallback
+- 一旦收到 TrafficOpenAck success=true，禁止切换到 direct path
 
 收到 `TrafficOpenAck success` 后禁止 fallback。
 
