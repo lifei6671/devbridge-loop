@@ -65,7 +65,7 @@
 
 - [x] 明确本清单以 [LTFP-TransportAbstraction.md](./LTFP-TransportAbstraction.md) 为唯一规范依据
 - [x] 明确 binding 优先级：一期 `grpc_h2`、`tcp_framed`；二期 `quic_native`、`h3_stream`
-- [ ] 冻结目录命名：`ltfp/transport/`、`ltfp/runtime/`、`ltfp/transport/grpcbinding/`、`ltfp/transport/tcpbinding/`
+- [x] 冻结目录命名：`ltfp/transport/`、`ltfp/runtime/`、`ltfp/transport/grpcbinding/`、`ltfp/transport/tcpbinding/`
 - [x] 冻结 binding type 常量：`grpc_h2`、`tcp_framed`、`quic_native`、`h3_stream`
 - [ ] 建立“规范章节 -> 代码包 -> 测试用例”映射表，避免文档与代码脱节
 
@@ -144,13 +144,13 @@
 
 ### T6. `TrafficDataStream` Framed Adapter
 
-- [ ] 实现 `TrafficDataStream`，对上提供标准 `io.Reader` / `io.Writer`
-- [ ] `Write(p)` 按 `max_data_frame_size` 强制拆包，并保持原始字节顺序
-- [ ] `Read(p)` 在 `Data` frame 大于 `p` 时维护内部缓冲，禁止截断
-- [ ] 收到 `Close` 时返回 `io.EOF`
-- [ ] 收到 `Reset` 时返回显式错误
-- [ ] 适配器支持一侧读、一侧写并发，以兼容双向 `io.Copy`
-- [ ] `grpc_h2` 首版默认 `max_data_frame_size` 控制在安全值内，避免触发单消息大小限制
+- [x] 实现 `TrafficDataStream`，对上提供标准 `io.Reader` / `io.Writer`
+- [x] `Write(p)` 按 `max_data_frame_size` 强制拆包，并保持原始字节顺序
+- [x] `Read(p)` 在 `Data` frame 大于 `p` 时维护内部缓冲，禁止截断
+- [x] 收到 `Close` 时返回 `io.EOF`
+- [x] 收到 `Reset` 时返回显式错误
+- [x] 适配器支持一侧读、一侧写并发，以兼容双向 `io.Copy`
+- [x] `grpc_h2` 首版默认 `max_data_frame_size` 控制在安全值内，避免触发单消息大小限制
 
 验收标准：
 
@@ -159,9 +159,9 @@
 
 ### T7. `grpc_h2` Binding 一期实现
 
-- [ ] 定义 `ControlChannel` 与 `TunnelStream` 的 gRPC proto / service
-- [ ] 定义 `TunnelEnvelope { bytes payload = 1; }`，禁止在 envelope 中直接暴露业务协议字段
-- [ ] 实现 `ltfp/transport/grpcbinding/transport.go`
+- [x] 定义 `ControlChannel` 与 `TunnelStream` 的 gRPC proto / service
+- [x] 定义 `TunnelEnvelope { bytes payload = 1; }`，禁止在 envelope 中直接暴露业务协议字段
+- [x] 实现 `ltfp/transport/grpcbinding/transport.go`
 - [ ] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
 - [ ] 实现 Agent 主动打开 `TunnelStream`，Server 侧接收后写入 idle pool
 - [ ] 实现 gRPC keepalive、最大消息大小、deadline 与 cancel 语义映射

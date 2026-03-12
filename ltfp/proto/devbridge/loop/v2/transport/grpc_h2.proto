@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package devbridge.loop.v2.transport;
+
+option go_package = "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport;transportgen";
+
+// ControlFrameEnvelope 是 grpc_h2 transport 控制面的最小承载帧。
+message ControlFrameEnvelope {
+  uint32 frame_type = 1;
+  bytes payload = 2;
+}
+
+// TunnelEnvelope 是 grpc_h2 transport 数据面的纯字节载体。
+//
+// 约束：业务字段不得直接出现在该 envelope 中；
+// Open/OpenAck/Data/Close/Reset 等 runtime frame 需先编码为 bytes payload。
+message TunnelEnvelope {
+  bytes payload = 1;
+}
+
+// GRPCH2TransportService 定义 grpc_h2 binding 的控制面与数据面流。
+service GRPCH2TransportService {
+  rpc ControlChannel(stream ControlFrameEnvelope) returns (stream ControlFrameEnvelope);
+  rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
+}
