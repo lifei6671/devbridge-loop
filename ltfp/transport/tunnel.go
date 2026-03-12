@@ -28,6 +28,11 @@ type Tunnel interface {
 	Err() error
 }
 
+// TunnelHealthProber 定义 tunnel 可选探活能力。
+type TunnelHealthProber interface {
+	Probe(ctx context.Context) error
+}
+
 // TunnelProducer 定义 Agent 侧主动建 tunnel 能力。
 type TunnelProducer interface {
 	OpenTunnel(ctx context.Context) (Tunnel, error)

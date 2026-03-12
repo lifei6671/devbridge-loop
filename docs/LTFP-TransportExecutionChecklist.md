@@ -121,7 +121,7 @@
 - [x] 实现 `min_idle_tunnels`、`max_idle_tunnels`、`idle_tunnel_ttl`、`acquire_timeout`
 - [x] 实现 `max_inflight_tunnel_opens`、`tunnel_open_rate_limit`、`tunnel_open_burst`
 - [x] 实现 Agent 侧平滑补池控制循环，禁止把 refill delta 解释为瞬时硬命令
-- [ ] 实现僵尸 tunnel 治理：TTL、keepalive/probe、broken 剔除
+- [x] 实现僵尸 tunnel 治理：TTL、keepalive/probe、broken 剔除
 
 验收标准：
 
@@ -130,12 +130,12 @@
 
 ### T5. `ltfp/runtime` 最小数据面协议
 
-- [ ] 新建 `ltfp/runtime/` 包并落地 `TrafficMeta`、`TrafficState`、`TrafficFrameType`、`TrafficFrame`、`TrafficProtocol`
-- [ ] 固定最小帧集合：`Open`、`OpenAck`、`Data`、`Close`、`Reset`
-- [ ] 保证 runtime 只使用 `service_id`，不重新依赖 `service_key`
-- [ ] 为 `TrafficProtocol` 实现统一 `ReadFrame` / `WriteFrame` 入口
-- [ ] 固定 `TrafficProtocol` 无 `context.Context`，超时统一走 `Tunnel.SetDeadline*`
-- [ ] 落地单 tunnel 并发边界：单读单写允许，多写必须串行化，多读不保证安全
+- [x] 新建 `ltfp/runtime/` 包并落地 `TrafficMeta`、`TrafficState`、`TrafficFrameType`、`TrafficFrame`、`TrafficProtocol`
+- [x] 固定最小帧集合：`Open`、`OpenAck`、`Data`、`Close`、`Reset`
+- [x] 保证 runtime 只使用 `service_id`，不重新依赖 `service_key`
+- [x] 为 `TrafficProtocol` 实现统一 `ReadFrame` / `WriteFrame` 入口
+- [x] 固定 `TrafficProtocol` 无 `context.Context`，超时统一走 `Tunnel.SetDeadline*`
+- [x] 落地单 tunnel 并发边界：单读单写允许，多写必须串行化，多读不保证安全
 
 验收标准：
 

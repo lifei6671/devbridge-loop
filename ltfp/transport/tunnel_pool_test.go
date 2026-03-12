@@ -16,6 +16,10 @@ type mockTunnel struct {
 	bindingInfo BindingInfo
 	doneChannel chan struct{}
 	lastError   error
+	resetCause  error
+	resetError  error
+	closeCount  int
+	resetCount  int
 }
 
 // Read 实现 io.Reader。
@@ -33,6 +37,7 @@ func (tunnel *mockTunnel) Write(payload []byte) (int, error) {
 // Close 实现 io.Closer。
 func (tunnel *mockTunnel) Close() error {
 	// 关闭时仅记录统一 closed 错误。
+	tunnel.closeCount++
 	tunnel.lastError = ErrClosed
 	return nil
 }
@@ -70,7 +75,12 @@ func (tunnel *mockTunnel) CloseWrite() error {
 // Reset 实现异常终止。
 func (tunnel *mockTunnel) Reset(cause error) error {
 	// reset 时保存原因供断言使用。
+	tunnel.resetCount++
+	tunnel.resetCause = cause
 	tunnel.lastError = cause
+	if tunnel.resetError != nil {
+		return tunnel.resetError
+	}
 	return nil
 }
 
@@ -113,6 +123,17 @@ func newIdleMockTunnel(tunnelID string) *mockTunnel {
 		bindingInfo: BindingInfo{Type: BindingTypeGRPCH2},
 		doneChannel: make(chan struct{}),
 	}
+}
+
+type mockProbeTunnel struct {
+	*mockTunnel
+	probeError error
+	probeCount int
+}
+
+func (tunnel *mockProbeTunnel) Probe(ctx context.Context) error {
+	tunnel.probeCount++
+	return tunnel.probeError
 }
 
 // TestInMemoryTunnelPoolAcquireAndCount 验证池的入队、获取与计数行为。
@@ -324,4 +345,182 @@ func TestInMemoryTunnelPoolAcquireWakesMultipleWaiters(testingObject *testing.T)
 			testingObject.Fatalf("timed out waiting for waiter %d to acquire tunnel", waiterIndex)
 		}
 	}
+}
+
+// TestInMemoryTunnelPoolAcquireSkipsBrokenIdle 验证 Acquire 会跳过已 broken 的 idle tunnel。
+func TestInMemoryTunnelPoolAcquireSkipsBrokenIdle(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPool()
+	staleTunnel := newIdleMockTunnel("stale-tunnel")
+	healthyTunnel := newIdleMockTunnel("healthy-tunnel")
+	if err := tunnelPool.PutIdle(staleTunnel); err != nil {
+		testingObject.Fatalf("put stale tunnel failed: %v", err)
+	}
+	if err := tunnelPool.PutIdle(healthyTunnel); err != nil {
+		testingObject.Fatalf("put healthy tunnel failed: %v", err)
+	}
+	// 模拟入池后底层链路异常。
+	staleTunnel.state = TunnelStateBroken
+
+	acquireContext, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAcquire()
+	acquiredTunnel, err := tunnelPool.Acquire(acquireContext)
+	if err != nil {
+		testingObject.Fatalf("acquire tunnel failed: %v", err)
+	}
+	if acquiredTunnel.ID() != healthyTunnel.ID() {
+		testingObject.Fatalf("expected healthy tunnel %s, got %s", healthyTunnel.ID(), acquiredTunnel.ID())
+	}
+	if staleTunnel.resetCount != 1 {
+		testingObject.Fatalf("expected stale tunnel reset once, got %d", staleTunnel.resetCount)
+	}
+	if !errors.Is(staleTunnel.resetCause, ErrTunnelBroken) {
+		testingObject.Fatalf("expected stale reset cause ErrTunnelBroken, got %v", staleTunnel.resetCause)
+	}
+}
+
+// TestInMemoryTunnelPoolEvictZombieIdleProbeFailure 验证 probe 失败会标记 broken 并剔除。
+func TestInMemoryTunnelPoolEvictZombieIdleProbeFailure(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPoolWithConfig(TunnelPoolConfig{
+		MinIdleTunnels: 0,
+		MaxIdleTunnels: 8,
+		IdleTunnelTTL:  time.Minute,
+	})
+	probeFailure := errors.New("probe timeout")
+	unhealthyTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-bad"),
+		probeError: probeFailure,
+	}
+	healthyTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-good"),
+	}
+	if err := tunnelPool.PutIdle(unhealthyTunnel); err != nil {
+		testingObject.Fatalf("put unhealthy tunnel failed: %v", err)
+	}
+	if err := tunnelPool.PutIdle(healthyTunnel); err != nil {
+		testingObject.Fatalf("put healthy tunnel failed: %v", err)
+	}
+
+	evictions := tunnelPool.EvictZombieIdle(context.Background(), time.Now().UTC())
+	evictionByID := indexEvictionsByTunnelID(evictions)
+	eviction, exists := evictionByID["probe-bad"]
+	if !exists {
+		testingObject.Fatalf("expected probe-bad to be evicted, got %+v", evictions)
+	}
+	if eviction.Reason != IdleTunnelEvictionReasonProbeFailed {
+		testingObject.Fatalf("expected probe_failed reason, got %s", eviction.Reason)
+	}
+	if !errors.Is(eviction.Cause, probeFailure) {
+		testingObject.Fatalf("expected probe failure cause, got %v", eviction.Cause)
+	}
+	if unhealthyTunnel.resetCount != 1 {
+		testingObject.Fatalf("expected unhealthy tunnel reset once, got %d", unhealthyTunnel.resetCount)
+	}
+	if !errors.Is(unhealthyTunnel.resetCause, probeFailure) {
+		testingObject.Fatalf("expected reset cause probe failure, got %v", unhealthyTunnel.resetCause)
+	}
+	if idleCount := tunnelPool.IdleCount(); idleCount != 1 {
+		testingObject.Fatalf("expected idle count 1 after eviction, got %d", idleCount)
+	}
+}
+
+// TestInMemoryTunnelPoolEvictZombieIdleTTLClose 验证 TTL 剔除走关闭语义而非 broken reset。
+func TestInMemoryTunnelPoolEvictZombieIdleTTLClose(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPoolWithConfig(TunnelPoolConfig{
+		MinIdleTunnels: 0,
+		MaxIdleTunnels: 8,
+		IdleTunnelTTL:  50 * time.Millisecond,
+	})
+	ttlTunnel := newIdleMockTunnel("ttl-zombie")
+	if err := tunnelPool.PutIdle(ttlTunnel); err != nil {
+		testingObject.Fatalf("put ttl tunnel failed: %v", err)
+	}
+	tunnelPool.mutex.Lock()
+	tunnelPool.idleInsertedAt[ttlTunnel.ID()] = time.Now().UTC().Add(-time.Second)
+	tunnelPool.mutex.Unlock()
+
+	evictions := tunnelPool.EvictZombieIdle(context.Background(), time.Now().UTC())
+	evictionByID := indexEvictionsByTunnelID(evictions)
+	eviction, exists := evictionByID["ttl-zombie"]
+	if !exists {
+		testingObject.Fatalf("expected ttl-zombie to be evicted, got %+v", evictions)
+	}
+	if eviction.Reason != IdleTunnelEvictionReasonTTLExpired {
+		testingObject.Fatalf("expected ttl_expired reason, got %s", eviction.Reason)
+	}
+	if ttlTunnel.closeCount != 1 {
+		testingObject.Fatalf("expected ttl tunnel close once, got %d", ttlTunnel.closeCount)
+	}
+	if ttlTunnel.resetCount != 0 {
+		testingObject.Fatalf("expected ttl tunnel no reset, got %d", ttlTunnel.resetCount)
+	}
+}
+
+// TestInMemoryTunnelPoolAcquireFallbackCloseWhenResetUnsupported 验证 reset 不支持时会回退 close 回收资源。
+func TestInMemoryTunnelPoolAcquireFallbackCloseWhenResetUnsupported(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPool()
+	unsupportedResetTunnel := newIdleMockTunnel("unsupported-reset")
+	unsupportedResetTunnel.resetError = ErrUnsupported
+	healthyTunnel := newIdleMockTunnel("healthy-tunnel")
+	if err := tunnelPool.PutIdle(unsupportedResetTunnel); err != nil {
+		testingObject.Fatalf("put unsupported-reset tunnel failed: %v", err)
+	}
+	if err := tunnelPool.PutIdle(healthyTunnel); err != nil {
+		testingObject.Fatalf("put healthy tunnel failed: %v", err)
+	}
+	unsupportedResetTunnel.state = TunnelStateBroken
+
+	acquireContext, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAcquire()
+	acquiredTunnel, err := tunnelPool.Acquire(acquireContext)
+	if err != nil {
+		testingObject.Fatalf("acquire tunnel failed: %v", err)
+	}
+	if acquiredTunnel.ID() != healthyTunnel.ID() {
+		testingObject.Fatalf("expected healthy tunnel %s, got %s", healthyTunnel.ID(), acquiredTunnel.ID())
+	}
+	if unsupportedResetTunnel.resetCount != 1 {
+		testingObject.Fatalf("expected unsupported-reset tunnel reset once, got %d", unsupportedResetTunnel.resetCount)
+	}
+	if unsupportedResetTunnel.closeCount != 1 {
+		testingObject.Fatalf("expected unsupported-reset tunnel close once, got %d", unsupportedResetTunnel.closeCount)
+	}
+}
+
+// TestInMemoryTunnelPoolEvictZombieIdleSkipsProbeContextCancellation 验证 probe 因上下文取消/超时不会触发驱逐。
+func TestInMemoryTunnelPoolEvictZombieIdleSkipsProbeContextCancellation(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPoolWithConfig(TunnelPoolConfig{
+		MinIdleTunnels: 0,
+		MaxIdleTunnels: 8,
+		IdleTunnelTTL:  time.Minute,
+	})
+	cancelProbeTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-canceled"),
+		probeError: context.Canceled,
+	}
+	timeoutProbeTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-timeout"),
+		probeError: context.DeadlineExceeded,
+	}
+	if err := tunnelPool.PutIdle(cancelProbeTunnel); err != nil {
+		testingObject.Fatalf("put canceled probe tunnel failed: %v", err)
+	}
+	if err := tunnelPool.PutIdle(timeoutProbeTunnel); err != nil {
+		testingObject.Fatalf("put timeout probe tunnel failed: %v", err)
+	}
+
+	evictions := tunnelPool.EvictZombieIdle(context.Background(), time.Now().UTC())
+	if len(evictions) != 0 {
+		testingObject.Fatalf("expected no evictions for probe cancellation/timeout, got %+v", evictions)
+	}
+	if idleCount := tunnelPool.IdleCount(); idleCount != 2 {
+		testingObject.Fatalf("expected idle count 2 after scan, got %d", idleCount)
+	}
+}
+
+func indexEvictionsByTunnelID(evictions []IdleTunnelEviction) map[string]IdleTunnelEviction {
+	index := make(map[string]IdleTunnelEviction, len(evictions))
+	for _, eviction := range evictions {
+		index[eviction.TunnelID] = eviction
+	}
+	return index
 }
