@@ -102,11 +102,11 @@
 
 ### T3. Control Channel 与控制面治理
 
-- [ ] 实现 `ControlChannel` 的读写约束与关闭语义
+- [x] 实现 `ControlChannel` 的读写约束与关闭语义
 - [x] 实现控制面消息优先级队列或等价调度机制，避免 heartbeat、认证、refill 被大消息 HOL 阻塞
-- [ ] 支持大体积 `PublishService` / `TunnelPoolReport` 的分块、分页或增量发送策略
-- [ ] 为 heartbeat 建立发送周期、丢失阈值、判死逻辑与超时口径
-- [ ] 为控制面错误建立统一日志字段：`session_id`、`session_epoch`、`binding`、`last_error`、`retryable`
+- [x] 支持大体积 `PublishService` / `TunnelPoolReport` 的分块、分页或增量发送策略
+- [x] 为 heartbeat 建立发送周期、丢失阈值、判死逻辑与超时口径
+- [x] 为控制面错误建立统一日志字段：`session_id`、`session_epoch`、`binding`、`last_error`、`retryable`
 
 验收标准：
 
@@ -174,12 +174,12 @@
 
 ### T8. `tcp_framed` Binding 一期实现
 
-- [ ] 定义 `tcp_framed` 的线格式：长度前缀、帧边界、控制面与数据面承载方式
-- [ ] 实现 `ltfp/transport/tcpbinding/transport.go`
-- [ ] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
-- [ ] 实现 TCP listener / dialer 与连接生命周期治理
-- [ ] 实现 `CloseWrite`、`Reset`、`SetDeadline*` 的能力映射与 `ErrUnsupported` 兜底
-- [ ] 与 `grpc_h2` 对齐控制面、pool、traffic 的语义，不得出现 binding 特判分叉
+- [x] 定义 `tcp_framed` 的线格式：长度前缀、帧边界、控制面与数据面承载方式
+- [x] 实现 `ltfp/transport/tcpbinding/transport.go`
+- [x] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
+- [x] 实现 TCP listener / dialer 与连接生命周期治理
+- [x] 实现 `CloseWrite`、`Reset`、`SetDeadline*` 的能力映射与 `ErrUnsupported` 兜底
+- [x] 与 `grpc_h2` 对齐控制面、pool、traffic 的语义，不得出现 binding 特判分叉
 
 验收标准：
 

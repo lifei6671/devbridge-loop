@@ -128,11 +128,15 @@ func newIdleMockTunnel(tunnelID string) *mockTunnel {
 type mockProbeTunnel struct {
 	*mockTunnel
 	probeError error
+	probeFunc  func(context.Context) error
 	probeCount int
 }
 
 func (tunnel *mockProbeTunnel) Probe(ctx context.Context) error {
 	tunnel.probeCount++
+	if tunnel.probeFunc != nil {
+		return tunnel.probeFunc(ctx)
+	}
 	return tunnel.probeError
 }
 
@@ -375,6 +379,155 @@ func TestInMemoryTunnelPoolAcquireSkipsBrokenIdle(testingObject *testing.T) {
 	}
 	if !errors.Is(staleTunnel.resetCause, ErrTunnelBroken) {
 		testingObject.Fatalf("expected stale reset cause ErrTunnelBroken, got %v", staleTunnel.resetCause)
+	}
+}
+
+// TestInMemoryTunnelPoolAcquireSkipsProbeFailedIdle 验证 Acquire 会在分配前执行探活并跳过坏 tunnel。
+func TestInMemoryTunnelPoolAcquireSkipsProbeFailedIdle(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPool()
+	probeFailure := errors.New("peer already closed")
+	staleTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-stale"),
+		probeError: probeFailure,
+	}
+	healthyTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-healthy"),
+	}
+	if err := tunnelPool.PutIdle(staleTunnel); err != nil {
+		testingObject.Fatalf("put stale tunnel failed: %v", err)
+	}
+	if err := tunnelPool.PutIdle(healthyTunnel); err != nil {
+		testingObject.Fatalf("put healthy tunnel failed: %v", err)
+	}
+
+	acquireContext, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAcquire()
+	acquiredTunnel, err := tunnelPool.Acquire(acquireContext)
+	if err != nil {
+		testingObject.Fatalf("acquire tunnel failed: %v", err)
+	}
+	if acquiredTunnel.ID() != healthyTunnel.ID() {
+		testingObject.Fatalf("expected healthy tunnel %s, got %s", healthyTunnel.ID(), acquiredTunnel.ID())
+	}
+	if staleTunnel.probeCount != 1 {
+		testingObject.Fatalf("expected stale tunnel probe once, got %d", staleTunnel.probeCount)
+	}
+	if staleTunnel.resetCount != 1 {
+		testingObject.Fatalf("expected stale tunnel reset once, got %d", staleTunnel.resetCount)
+	}
+	if !errors.Is(staleTunnel.resetCause, probeFailure) {
+		testingObject.Fatalf("expected stale reset cause probe failure, got %v", staleTunnel.resetCause)
+	}
+}
+
+// TestInMemoryTunnelPoolAcquireReturnsContextErrorWhenProbeBlocked 验证 Probe 阻塞到 ctx 超时时 Acquire 不会错误分配 tunnel。
+func TestInMemoryTunnelPoolAcquireReturnsContextErrorWhenProbeBlocked(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPool()
+	blockedProbeTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-blocked"),
+		probeFunc: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	if err := tunnelPool.PutIdle(blockedProbeTunnel); err != nil {
+		testingObject.Fatalf("put blocked probe tunnel failed: %v", err)
+	}
+
+	acquireContext, cancelAcquire := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelAcquire()
+	startAt := time.Now()
+	acquiredTunnel, err := tunnelPool.Acquire(acquireContext)
+	if err == nil {
+		testingObject.Fatalf("expected acquire context error, got nil")
+	}
+	if acquiredTunnel != nil {
+		testingObject.Fatalf("expected no tunnel returned after ctx timeout, got %s", acquiredTunnel.ID())
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		testingObject.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if blockedProbeTunnel.probeCount != 1 {
+		testingObject.Fatalf("expected blocked probe tunnel probe once, got %d", blockedProbeTunnel.probeCount)
+	}
+	if tunnelPool.IdleCount() != 1 {
+		testingObject.Fatalf("expected blocked probe tunnel requeued to idle pool, got idle=%d", tunnelPool.IdleCount())
+	}
+	if elapsed := time.Since(startAt); elapsed < 15*time.Millisecond {
+		testingObject.Fatalf("expected acquire to block until probe sees ctx done, elapsed=%s", elapsed)
+	}
+}
+
+// TestInMemoryTunnelPoolAcquireProbeDoesNotBlockPoolOperations 验证 Acquire 探活期间不会阻塞池内其他操作。
+func TestInMemoryTunnelPoolAcquireProbeDoesNotBlockPoolOperations(testingObject *testing.T) {
+	tunnelPool := NewInMemoryTunnelPool()
+	probeStartedChannel := make(chan struct{}, 1)
+	releaseProbeChannel := make(chan struct{})
+	blockedProbeTunnel := &mockProbeTunnel{
+		mockTunnel: newIdleMockTunnel("probe-lock-free"),
+		probeFunc: func(ctx context.Context) error {
+			select {
+			case probeStartedChannel <- struct{}{}:
+			default:
+			}
+			select {
+			case <-releaseProbeChannel:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	if err := tunnelPool.PutIdle(blockedProbeTunnel); err != nil {
+		testingObject.Fatalf("put blocked probe tunnel failed: %v", err)
+	}
+
+	acquireContext, cancelAcquire := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAcquire()
+	type acquireResult struct {
+		tunnel Tunnel
+		err    error
+	}
+	acquireResultChannel := make(chan acquireResult, 1)
+	go func() {
+		acquiredTunnel, err := tunnelPool.Acquire(acquireContext)
+		acquireResultChannel <- acquireResult{
+			tunnel: acquiredTunnel,
+			err:    err,
+		}
+	}()
+
+	select {
+	case <-probeStartedChannel:
+	case <-time.After(200 * time.Millisecond):
+		testingObject.Fatalf("expected probe to start")
+	}
+
+	putResultChannel := make(chan error, 1)
+	go func() {
+		putResultChannel <- tunnelPool.PutIdle(newIdleMockTunnel("probe-lock-free-fresh"))
+	}()
+
+	select {
+	case err := <-putResultChannel:
+		if err != nil {
+			testingObject.Fatalf("put idle during probe failed: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		testingObject.Fatalf("put idle blocked by acquire probe")
+	}
+
+	close(releaseProbeChannel)
+	select {
+	case result := <-acquireResultChannel:
+		if result.err != nil {
+			testingObject.Fatalf("acquire tunnel failed: %v", result.err)
+		}
+		if result.tunnel == nil || result.tunnel.ID() != blockedProbeTunnel.ID() {
+			testingObject.Fatalf("unexpected acquired tunnel: %+v", result.tunnel)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("acquire did not finish after probe release")
 	}
 }
 

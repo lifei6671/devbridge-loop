@@ -48,3 +48,10 @@ type ControlChannel interface {
 	Done() <-chan struct{}
 	Err() error
 }
+
+// PrioritizedControlChannel 为支持优先级发送调度的可选控制面能力。
+type PrioritizedControlChannel interface {
+	ControlChannel
+
+	WritePrioritizedControlFrame(ctx context.Context, frame PrioritizedControlFrame) error
+}

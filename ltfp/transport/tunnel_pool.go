@@ -219,30 +219,46 @@ func (pool *InMemoryTunnelPool) Acquire(ctx context.Context) (Tunnel, error) {
 	}
 	for {
 		pool.mutex.Lock()
-		tunnel, exists := pool.popIdleLocked()
-		if exists {
-			reason, cause := classifyIdleTunnelRuntimeState(tunnel)
-			if reason != "" {
-				// 已失效的 idle tunnel 直接丢弃，避免分配给调用方。
-				pool.mutex.Unlock()
-				pool.cleanupEvictedIdleTunnel(tunnel, reason, cause)
-				continue
-			}
-			// 出队成功后转入 in-use 集合，避免重复分配。
-			pool.inUseTunnelsByID[tunnel.ID()] = tunnel
+		tunnel, insertedAt, exists := pool.popIdleLocked()
+		if !exists {
+			notifyChannel := pool.notifyChannel
 			pool.mutex.Unlock()
-			return tunnel, nil
+
+			select {
+			case <-ctx.Done():
+				// 等待被取消时返回上下文错误，让上层决定重试策略。
+				return nil, fmt.Errorf("acquire tunnel: %w", ctx.Err())
+			case <-notifyChannel:
+				// 收到广播后重新检查 idle 池。
+			}
+			continue
 		}
-		notifyChannel := pool.notifyChannel
 		pool.mutex.Unlock()
 
-		select {
-		case <-ctx.Done():
-			// 等待被取消时返回上下文错误，让上层决定重试策略。
-			return nil, fmt.Errorf("acquire tunnel: %w", ctx.Err())
-		case <-notifyChannel:
-			// 收到广播后重新检查 idle 池。
+		reason, cause := classifyIdleTunnelAcquireState(ctx, tunnel)
+		if reason != "" {
+			// 已失效的 idle tunnel 直接丢弃，避免分配给调用方。
+			pool.cleanupEvictedIdleTunnel(tunnel, reason, cause)
+			continue
 		}
+		pool.mutex.Lock()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Probe 期间若调用方 ctx 已取消，不应继续分配 tunnel。
+			pool.pushIdleLocked(tunnel, insertedAt)
+			pool.mutex.Unlock()
+			return nil, fmt.Errorf("acquire tunnel: %w", ctxErr)
+		}
+		// 在探活窗口后再次校验运行时状态，避免并发状态漂移。
+		reason, cause = classifyIdleTunnelRuntimeState(tunnel)
+		if reason != "" {
+			pool.mutex.Unlock()
+			pool.cleanupEvictedIdleTunnel(tunnel, reason, cause)
+			continue
+		}
+		// 出队成功后转入 in-use 集合，避免重复分配。
+		pool.inUseTunnelsByID[tunnel.ID()] = tunnel
+		pool.mutex.Unlock()
+		return tunnel, nil
 	}
 }
 
@@ -442,6 +458,30 @@ func classifyIdleTunnelRuntimeState(tunnel Tunnel) (IdleTunnelEvictionReason, er
 	return "", nil
 }
 
+func classifyIdleTunnelAcquireState(ctx context.Context, tunnel Tunnel) (IdleTunnelEvictionReason, error) {
+	reason, cause := classifyIdleTunnelRuntimeState(tunnel)
+	if reason != "" {
+		return reason, cause
+	}
+	prober, supportsProbe := tunnel.(TunnelHealthProber)
+	if !supportsProbe {
+		return "", nil
+	}
+	probeErr := prober.Probe(ctx)
+	if probeErr == nil || errors.Is(probeErr, ErrUnsupported) {
+		return "", nil
+	}
+	if errors.Is(probeErr, context.Canceled) || errors.Is(probeErr, context.DeadlineExceeded) {
+		// 取得 tunnel 的调用方取消时，不把 tunnel 误判为坏连接。
+		return "", nil
+	}
+	reason, cause = classifyIdleTunnelRuntimeState(tunnel)
+	if reason != "" {
+		return reason, cause
+	}
+	return IdleTunnelEvictionReasonProbeFailed, probeErr
+}
+
 func classifyIdleTunnelZombieState(
 	ctx context.Context,
 	tunnel Tunnel,
@@ -504,7 +544,7 @@ func (pool *InMemoryTunnelPool) cleanupEvictedIdleTunnel(
 }
 
 // popIdleLocked 从 idle 队列中弹出第一条仍然存在的 tunnel。
-func (pool *InMemoryTunnelPool) popIdleLocked() (Tunnel, bool) {
+func (pool *InMemoryTunnelPool) popIdleLocked() (Tunnel, time.Time, bool) {
 	for len(pool.idleTunnelOrder) > 0 {
 		tunnelID := pool.idleTunnelOrder[0]
 		// 头删切片，维持 FIFO 出队顺序。
@@ -514,11 +554,32 @@ func (pool *InMemoryTunnelPool) popIdleLocked() (Tunnel, bool) {
 			// 若 map 中已不存在，说明是历史脏索引，继续下一个。
 			continue
 		}
+		insertedAt := pool.idleInsertedAt[tunnelID]
 		delete(pool.idleTunnelsByID, tunnelID)
 		delete(pool.idleInsertedAt, tunnelID)
-		return tunnel, true
+		return tunnel, insertedAt, true
 	}
-	return nil, false
+	return nil, time.Time{}, false
+}
+
+func (pool *InMemoryTunnelPool) pushIdleLocked(tunnel Tunnel, insertedAt time.Time) {
+	if tunnel == nil {
+		return
+	}
+	tunnelID := strings.TrimSpace(tunnel.ID())
+	if tunnelID == "" {
+		return
+	}
+	if _, exists := pool.idleTunnelsByID[tunnelID]; exists {
+		return
+	}
+	if insertedAt.IsZero() {
+		insertedAt = time.Now().UTC()
+	}
+	pool.idleTunnelsByID[tunnelID] = tunnel
+	pool.idleInsertedAt[tunnelID] = insertedAt
+	pool.idleTunnelOrder = append(pool.idleTunnelOrder, tunnelID)
+	pool.notifyLocked()
 }
 
 // removeIdleOrderLocked 清理 idle 顺序切片中的指定 tunnelId。

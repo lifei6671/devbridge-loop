@@ -38,6 +38,7 @@ type GRPCH2ControlChannel struct {
 const closeWriteLockRetryInterval = 2 * time.Millisecond
 
 var _ transport.ControlChannel = (*GRPCH2ControlChannel)(nil)
+var _ transport.PrioritizedControlChannel = (*GRPCH2ControlChannel)(nil)
 
 func newGRPCH2ControlChannel(stream controlChannelStream) (*GRPCH2ControlChannel, error) {
 	return newGRPCH2ControlChannelWithCancel(stream, nil)
@@ -109,6 +110,14 @@ func (channel *GRPCH2ControlChannel) WriteControlFrame(ctx context.Context, fram
 		return fmt.Errorf("grpc control channel write: %w", err)
 	}
 	return nil
+}
+
+// WritePrioritizedControlFrame 为 grpc_h2 暴露统一优先级发送入口。
+func (channel *GRPCH2ControlChannel) WritePrioritizedControlFrame(
+	ctx context.Context,
+	frame transport.PrioritizedControlFrame,
+) error {
+	return channel.WriteControlFrame(ctx, frame.Frame)
 }
 
 // ReadControlFrame 读取一条控制帧。
