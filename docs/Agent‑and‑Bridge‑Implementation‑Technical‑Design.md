@@ -4,6 +4,8 @@
 
 本文档定义基于 **LTFP 协议** 与 **Transport 抽象** 的首期运行时实现方案，明确 **Agent** 与 **Bridge** 的职责边界、模块划分、状态管理、数据路径、容量处理、错误语义与实施顺序，作为研发实现与技术评审的统一依据。
 
+对应执行清单见 [Agent-and-Bridge-ExecutionChecklist.md](./Agent-and-Bridge-ExecutionChecklist.md)。
+
 本文档不重新冻结协议字段，只在现有两份规范的约束下补齐运行时细节，特别是：
 
 * idle tunnel 的接收与读路径
@@ -35,6 +37,8 @@
 * traffic 结束后 tunnel 关闭，由 Agent 补池
 * `connector_service` / `external_service` / `hybrid_group` 分路执行
 * `hybrid_group` 仅支持 `pre_open_only` fallback  
+* Agent 桌面 UI 层固定使用 Tauri
+* Bridge 管理页面可使用 React + shadcn/ui，但发布包必须将 UI 静态资源内嵌到 Bridge 可执行文件
 
 ## 2.3 本期不做
 
