@@ -37,6 +37,8 @@ type TransportConfig struct {
 	ClientKeepAliveTimeout time.Duration
 	// ClientPermitWithoutStream 控制无活跃流时是否允许 keepalive。
 	ClientPermitWithoutStream bool
+	// ClientPermitWithoutStreamSet 标记是否显式设置了 ClientPermitWithoutStream。
+	ClientPermitWithoutStreamSet bool
 
 	// ServerKeepAliveTime 控制服务端探活周期。
 	ServerKeepAliveTime time.Duration
@@ -46,6 +48,8 @@ type TransportConfig struct {
 	ServerMinPingInterval time.Duration
 	// ServerPermitWithoutStream 控制服务端是否允许无活跃流的客户端 ping。
 	ServerPermitWithoutStream bool
+	// ServerPermitWithoutStreamSet 标记是否显式设置了 ServerPermitWithoutStream。
+	ServerPermitWithoutStreamSet bool
 
 	// DisableReadPayloadFastPath 关闭 TunnelStream 读路径的零拷贝快路径。
 	DisableReadPayloadFastPath bool
@@ -110,21 +114,31 @@ func (config TransportConfig) NormalizeAndValidate() (TransportConfig, error) {
 	if normalizedConfig.ServerMinPingInterval == 0 {
 		normalizedConfig.ServerMinPingInterval = defaultServerMinPingInterval
 	}
+	if !normalizedConfig.ClientPermitWithoutStreamSet {
+		normalizedConfig.ClientPermitWithoutStream = true
+		normalizedConfig.ClientPermitWithoutStreamSet = true
+	}
+	if !normalizedConfig.ServerPermitWithoutStreamSet {
+		normalizedConfig.ServerPermitWithoutStream = true
+		normalizedConfig.ServerPermitWithoutStreamSet = true
+	}
 	return normalizedConfig, nil
 }
 
 // DefaultTransportConfig 返回默认配置。
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
-		MaxCallRecvMsgSize:        defaultMaxCallMessageBytes,
-		MaxCallSendMsgSize:        defaultMaxCallMessageBytes,
-		ClientKeepAliveTime:       defaultClientKeepAliveTime,
-		ClientKeepAliveTimeout:    defaultClientKeepAliveTimeout,
-		ClientPermitWithoutStream: true,
-		ServerKeepAliveTime:       defaultServerKeepAliveTime,
-		ServerKeepAliveTimeout:    defaultServerKeepAliveTimeout,
-		ServerMinPingInterval:     defaultServerMinPingInterval,
-		ServerPermitWithoutStream: true,
+		MaxCallRecvMsgSize:           defaultMaxCallMessageBytes,
+		MaxCallSendMsgSize:           defaultMaxCallMessageBytes,
+		ClientKeepAliveTime:          defaultClientKeepAliveTime,
+		ClientKeepAliveTimeout:       defaultClientKeepAliveTimeout,
+		ClientPermitWithoutStream:    true,
+		ClientPermitWithoutStreamSet: true,
+		ServerKeepAliveTime:          defaultServerKeepAliveTime,
+		ServerKeepAliveTimeout:       defaultServerKeepAliveTimeout,
+		ServerMinPingInterval:        defaultServerMinPingInterval,
+		ServerPermitWithoutStream:    true,
+		ServerPermitWithoutStreamSet: true,
 	}
 }
 

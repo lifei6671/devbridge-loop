@@ -21,14 +21,14 @@ type TransportMetricsSnapshot struct {
 // Fields 返回可直接用于结构化日志/指标导出的字段映射。
 func (snapshot TransportMetricsSnapshot) Fields() map[string]any {
 	return map[string]any{
-		"heartbeat_rtt_ms":      snapshot.HeartbeatRTT.Milliseconds(),
-		"idle_count":            snapshot.IdleCount,
-		"in_use_count":          snapshot.InUseCount,
-		"refill_rate_per_sec":   snapshot.RefillRatePerSec,
-		"refill_opened_total":   snapshot.RefillOpenedTotal,
-		"open_timeout_count":    snapshot.OpenTimeoutCount,
-		"reset_count":           snapshot.ResetCount,
-		"broken_tunnel_count":   snapshot.BrokenCount,
+		"heartbeat_rtt_ms":    snapshot.HeartbeatRTT.Milliseconds(),
+		"idle_count":          snapshot.IdleCount,
+		"in_use_count":        snapshot.InUseCount,
+		"refill_rate_per_sec": snapshot.RefillRatePerSec,
+		"refill_opened_total": snapshot.RefillOpenedTotal,
+		"open_timeout_count":  snapshot.OpenTimeoutCount,
+		"reset_count":         snapshot.ResetCount,
+		"broken_tunnel_count": snapshot.BrokenCount,
 	}
 }
 

@@ -129,11 +129,17 @@ func TestTransportConfigNormalizeAndValidate(testingObject *testing.T) {
 	if normalizedConfig.ClientKeepAliveTime <= 0 || normalizedConfig.ClientKeepAliveTimeout <= 0 {
 		testingObject.Fatalf("unexpected client keepalive config: %+v", normalizedConfig)
 	}
+	if !normalizedConfig.ClientPermitWithoutStream || !normalizedConfig.ClientPermitWithoutStreamSet {
+		testingObject.Fatalf("unexpected client keepalive permit config: %+v", normalizedConfig)
+	}
 	if normalizedConfig.ServerKeepAliveTime <= 0 || normalizedConfig.ServerKeepAliveTimeout <= 0 {
 		testingObject.Fatalf("unexpected server keepalive config: %+v", normalizedConfig)
 	}
 	if normalizedConfig.ServerMinPingInterval <= 0 {
 		testingObject.Fatalf("unexpected server min ping interval: %+v", normalizedConfig)
+	}
+	if !normalizedConfig.ServerPermitWithoutStream || !normalizedConfig.ServerPermitWithoutStreamSet {
+		testingObject.Fatalf("unexpected server keepalive permit config: %+v", normalizedConfig)
 	}
 }
 
@@ -147,6 +153,25 @@ func TestTransportConfigNormalizeRejectsNegativeDuration(testingObject *testing.
 	}
 	if !errors.Is(err, transport.ErrInvalidArgument) {
 		testingObject.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+}
+
+// TestTransportConfigNormalizePreservesExplicitKeepAlivePermit 验证显式禁用 keepalive permit 不会被默认值覆盖。
+func TestTransportConfigNormalizePreservesExplicitKeepAlivePermit(testingObject *testing.T) {
+	normalizedConfig, err := (TransportConfig{
+		ClientPermitWithoutStream:    false,
+		ClientPermitWithoutStreamSet: true,
+		ServerPermitWithoutStream:    false,
+		ServerPermitWithoutStreamSet: true,
+	}).NormalizeAndValidate()
+	if err != nil {
+		testingObject.Fatalf("normalize config failed: %v", err)
+	}
+	if normalizedConfig.ClientPermitWithoutStream {
+		testingObject.Fatalf("expected explicit client permit=false to be preserved, got %+v", normalizedConfig)
+	}
+	if normalizedConfig.ServerPermitWithoutStream {
+		testingObject.Fatalf("expected explicit server permit=false to be preserved, got %+v", normalizedConfig)
 	}
 }
 

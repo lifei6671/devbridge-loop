@@ -67,7 +67,20 @@
 - [x] 明确 binding 优先级：一期 `grpc_h2`、`tcp_framed`；二期 `quic_native`、`h3_stream`
 - [x] 冻结目录命名：`ltfp/transport/`、`ltfp/runtime/`、`ltfp/transport/grpcbinding/`、`ltfp/transport/tcpbinding/`
 - [x] 冻结 binding type 常量：`grpc_h2`、`tcp_framed`、`quic_native`、`h3_stream`
-- [ ] 建立“规范章节 -> 代码包 -> 测试用例”映射表，避免文档与代码脱节
+- [x] 建立“规范章节 -> 代码包 -> 测试用例”映射表，避免文档与代码脱节
+
+映射表（首版）：
+
+| 规范章节 | 代码包 / 文件 | 测试用例 |
+| --- | --- | --- |
+| Session 聚合根与状态机 | `ltfp/transport/session.go` | `ltfp/transport/session_test.go` |
+| ControlChannel 抽象与语义 | `ltfp/transport/control_channel.go` | `ltfp/transport/grpcbinding/control_channel_test.go`、`ltfp/transport/tcpbinding/control_channel_test.go` |
+| Tunnel 抽象与语义 | `ltfp/transport/tunnel.go`、`ltfp/transport/grpcbinding/tunnel.go`、`ltfp/transport/tcpbinding/tunnel.go` | `ltfp/transport/grpcbinding/tunnel_test.go`、`ltfp/transport/tcpbinding/tunnel_test.go` |
+| TunnelPool / Refill / 僵尸治理 | `ltfp/transport/tunnel_pool.go`、`ltfp/transport/refill_controller.go` | `ltfp/transport/tunnel_pool_test.go`、`ltfp/transport/refill_controller_test.go` |
+| Runtime 数据面帧协议 | `ltfp/runtime/protocol.go`、`ltfp/runtime/types.go` | `ltfp/runtime/protocol_test.go` |
+| TrafficDataStream 适配器 | `ltfp/runtime/stream.go` | `ltfp/runtime/stream_test.go` |
+| `grpc_h2` binding | `ltfp/transport/grpcbinding/*.go` | `ltfp/transport/grpcbinding/*_test.go` |
+| `tcp_framed` binding | `ltfp/transport/tcpbinding/*.go` | `ltfp/transport/tcpbinding/*_test.go` |
 
 验收标准：
 
@@ -164,8 +177,8 @@
 - [x] 实现 `ltfp/transport/grpcbinding/transport.go`
 - [x] 实现 `session.go`、`control_channel.go`、`tunnel_producer.go`、`tunnel_acceptor.go`、`stream_adapter.go`
 - [x] 实现 Agent 主动打开 `TunnelStream`，Server 侧接收后写入 idle pool
-- [ ] 实现 gRPC keepalive、最大消息大小、deadline 与 cancel 语义映射
-- [ ] 实现对象池、缓冲复用与可选 fast-path，但不得把 gRPC 私有类型泄露到公共接口
+- [x] 实现 gRPC keepalive、最大消息大小、deadline 与 cancel 语义映射
+- [x] 实现对象池、缓冲复用与可选 fast-path，但不得把 gRPC 私有类型泄露到公共接口
 
 验收标准：
 
@@ -214,11 +227,11 @@
 
 ### T11. 观测性、诊断与基准
 
-- [ ] 输出 session、control、tunnel、pool、traffic 的结构化日志
-- [ ] 输出关键指标：heartbeat RTT、idle/in-use 数量、refill 速率、open timeout、reset 数量、broken 数量
-- [ ] 输出 `last_error`、`binding`、`session_epoch`、`tunnel_id`、`traffic_id` 等定位字段
-- [ ] 为 `grpc_h2` 与 `tcp_framed` 建立最小 benchmark：小包流量、大包流量、空闲维持、突发 refill
-- [ ] 记录 HOL、fragmentation、并发写串行化、keepalive 行为的诊断样例
+- [x] 输出 session、control、tunnel、pool、traffic 的结构化日志
+- [x] 输出关键指标：heartbeat RTT、idle/in-use 数量、refill 速率、open timeout、reset 数量、broken 数量
+- [x] 输出 `last_error`、`binding`、`session_epoch`、`tunnel_id`、`traffic_id` 等定位字段
+- [x] 为 `grpc_h2` 与 `tcp_framed` 建立最小 benchmark：小包流量、大包流量、空闲维持、突发 refill
+- [x] 记录 HOL、fragmentation、并发写串行化、keepalive 行为的诊断样例（见 [LTFP-TransportDiagnosticsSamples.md](./LTFP-TransportDiagnosticsSamples.md)）
 
 验收标准：
 

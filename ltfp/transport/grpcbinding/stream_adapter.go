@@ -117,7 +117,11 @@ func (stream *GRPCH2TunnelStream) WritePayload(ctx context.Context, payload []by
 			return fmt.Errorf("grpc tunnel stream write: %w", stream.closedErrorLocked())
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			stream.markClosedLocked(ctxErr)
+			// 区分：是 stream 自身 context 取消，还是 per-call deadline
+			if stream.stream.Context().Err() != nil {
+				// stream 级别的取消，才标记关闭
+				stream.markClosedLocked(ctxErr)
+			}
 			return fmt.Errorf("grpc tunnel stream write: %w", ctxErr)
 		}
 		if errors.Is(err, io.EOF) {
@@ -168,7 +172,11 @@ func (stream *GRPCH2TunnelStream) ReadPayload(ctx context.Context) ([]byte, erro
 			return nil, fmt.Errorf("grpc tunnel stream read: %w", stream.closedErrorLocked())
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			stream.markClosedLocked(ctxErr)
+			// 区分：是 stream 自身 context 取消，还是 per-call deadline
+			if stream.stream.Context().Err() != nil {
+				// stream 级别的取消，才标记关闭
+				stream.markClosedLocked(ctxErr)
+			}
 			return nil, fmt.Errorf("grpc tunnel stream read: %w", ctxErr)
 		}
 		if errors.Is(err, io.EOF) {
@@ -311,7 +319,13 @@ func (stream *GRPCH2TunnelStream) watchCallContext(ctx context.Context) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			stream.cancelStream()
+			// 只有 stream 自身的 context 取消才应该 cancelStream
+			// per-call deadline 超时只需要中断当次 Recv/Send
+			// 通过 stream.stream.Context() 区分来源
+			if stream.stream.Context().Err() != nil {
+				stream.cancelStream()
+			}
+			// 否则什么都不做，让 Recv/Send 因 ctx 超时自然返回错误
 		case <-done:
 		}
 	}()
