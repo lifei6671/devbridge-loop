@@ -120,10 +120,10 @@
 
 ### A6. Bridge ConnectorProxy 主链路
 
-- [ ] `AcquireIdleTunnel` 分配与状态流转：`idle -> reserved -> active`
-- [ ] 发送 `TrafficOpen`，等待 `TrafficOpenAck` 成功后进入 relay
-- [ ] 正常关闭后清理 tunnel registry，本地状态回收
-- [ ] no-idle 场景：短等待 + refill + 超时失败（503）
+- [x] `AcquireIdleTunnel` 分配与状态流转：`idle -> reserved -> active`
+- [x] 发送 `TrafficOpen`，等待 `TrafficOpenAck` 成功后进入 relay
+- [x] 正常关闭后清理 tunnel registry，本地状态回收
+- [x] no-idle 场景：短等待 + refill + 超时失败（503）
 
 验收标准：
 
@@ -132,10 +132,10 @@
 
 ### A7. 超时取消与迟到 Ack 规则
 
-- [ ] 实现 `open_sent` 超时后的取消流程（reset 或直接关闭）
-- [ ] tunnel 标记 `broken` 并从 registry 摘除
-- [ ] 迟到 `TrafficOpenAck` 一律丢弃，不得恢复终态
-- [ ] 增加 `bridge_traffic_open_ack_late_total` 指标
+- [x] 实现 `open_sent` 超时后的取消流程（reset 或直接关闭）
+- [x] tunnel 标记 `broken` 并从 registry 摘除
+- [x] 迟到 `TrafficOpenAck` 一律丢弃，不得恢复终态
+- [x] 增加 `bridge_traffic_open_ack_late_total` 指标
 
 验收标准：
 
@@ -144,10 +144,10 @@
 
 ### A8. DirectProxy 与 Hybrid Fallback
 
-- [ ] `external_service` 路径：discovery、endpoint cache、direct dial、relay
-- [ ] `hybrid_group` 仅允许 `pre_open_only` fallback
-- [ ] pre-open 失败分支区分：已分配 tunnel vs 未分配 tunnel
-- [ ] post-open 失败禁止 fallback
+- [x] `external_service` 路径：discovery、endpoint cache、direct dial、relay
+- [x] `hybrid_group` 仅允许 `pre_open_only` fallback
+- [x] pre-open 失败分支区分：已分配 tunnel vs 未分配 tunnel
+- [x] post-open 失败禁止 fallback
 
 验收标准：
 
@@ -156,11 +156,11 @@
 
 ### A9. 数据面协议、并发与反压
 
-- [ ] 落地统一帧：`Open/OpenAck/Data/Close/Reset`
-- [ ] 落地并发约束：单读单写，多写串行，多读禁止
-- [ ] relay pump 使用有界缓冲，禁止无界队列
-- [ ] 下游阻塞时暂停继续 `ReadFrame`，依赖底层窗口流控回压
-- [ ] 回压超阈值（deadline/timeout）按错误语义 close/reset
+- [x] 落地统一帧：`Open/OpenAck/Data/Close/Reset`
+- [x] 落地并发约束：单读单写，多写串行，多读禁止
+- [x] relay pump 使用有界缓冲，禁止无界队列
+- [x] 下游阻塞时暂停继续 `ReadFrame`，依赖底层窗口流控回压
+- [x] 回压超阈值（deadline/timeout）按错误语义 close/reset
 
 验收标准：
 
@@ -218,7 +218,8 @@
 
 ### A14. UI 层与内嵌打包
 
-- [ ] Agent 桌面 UI 层采用 Tauri，并定义与 Agent Runtime 的本地交互边界（IPC/HTTP）
+- [ ] Agent 桌面 UI 层采用 Tauri，并定义与 Agent Runtime 的本地交互边界（UDS / Named Pipe 长连接，支持Linux和Windows两种平台）
+- [ ] Agent 桌面 UI 层通信协议参考 [Agent 与 Tauri 本地通信技术方案](./Agent–TauriLocalCommunicationDesignProposal.md)。
 - [ ] Bridge 管理页面采用 React + shadcn/ui 实现
 - [ ] 建立 Bridge 管理页面构建产物流程（如 `npm run build` 输出静态资源）
 - [ ] Bridge 服务端实现静态资源内嵌（如 `go:embed`）与管理页面路由
