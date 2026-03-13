@@ -1,6 +1,6 @@
-# LTFP 测试矩阵（协议库层）
+# LTFP 测试矩阵（协议库 + 传输层）
 
-本文档只覆盖 `ltfp` 协议库本身，不包含 `agent-core` 与 `cloud-bridge` 业务联调实现。
+本文档覆盖 `ltfp` 模块内协议库与一期 transport/runtime/binding 基线，不包含 `agent-core` 与 `cloud-bridge` 业务联调实现。
 
 ## 单元测试矩阵
 
@@ -12,49 +12,58 @@
 | consistency | `consistency` | 去重键、版本比较、ACK 构造、重连计划 |
 | negotiation | `negotiation` | 特性交集与 pb 适配器 |
 | session | `session` | 握手顺序、epoch 权威、状态机、心跳超时 |
-| registry | `registry` | canonical/runtime registry、索引、审计、快照 |
-| routing | `routing` | connector/external/hybrid route resolve 与 `TrafficOpen` 构造 |
-| discovery | `discovery` | provider 查询、缓存模式、安全策略、endpoint 选路与拨号守卫 |
-| export | `export` | export 准入、endpoint 生成、projection reconcile |
-| ingress | `ingress` | Host/Authority/Path/SNI/listen_port 匹配与端口冲突校验 |
-| fallback | `fallback` | `pre_open_only` 判定与 post-open 拒绝策略 |
-| health | `health` | endpoint -> service 健康聚合 |
-| observe | `observe` | trace/error/reject/fallback 事件记录与指标聚合 |
-| adapter | `adapter` | 本地运行态到 `Publish/Unpublish/HealthReport` 适配 |
-| errors | `errors` | 错误码封装、错误链匹配 |
-| testkit | `testkit` | golden fixtures（通过其它包测试间接验证） |
+| runtime framed data plane | `runtime` | `Open/OpenAck/Data/Close/Reset` 帧语义、stream adapter 缓冲与并发读写 |
+| transport abstraction | `transport` | session/tunnel 状态机、error model、capability query、pool/refill、fragmentation、heartbeat |
 
 说明：
 
-- 以上覆盖仍然是“协议库层”验证，不替代 `agent-core` / `cloud-bridge` 端到端网络行为测试。
-- 双端接入后需要新增兼容性矩阵，验证共享协议库升级不会破坏实际联调链路。
+- `make test-unit` 会运行以上协议库与传输层核心单测。
 
-## 集成测试矩阵（协议库内）
+## 绑定测试矩阵
 
-| 流程 | 当前覆盖 |
-| --- | --- |
-| 握手链路（HELLO/WELCOME/AUTH/AUTH_ACK/HEARTBEAT） | `examples/interop/interop_test.go` |
-| full-sync 请求与快照 | `examples/interop/sync_flow_test.go` |
-| publish/unpublish ACK 语义 | `examples/interop/sync_flow_test.go` + `consistency` |
-| health report | `examples/interop/sync_flow_test.go` |
-| route resolve（connector/external/hybrid） | `routing/resolver_test.go` |
-| discovery cache 与安全策略 | `discovery/manager_test.go` + `discovery/*_test.go` |
-| export 准入与 reconcile | `export/export_test.go` |
-| fallback pre-open only | `fallback/policy_test.go` + `routing/resolver_test.go` |
-| binding parity（http/masque） | `codec/binding_codec_test.go` |
-| schema 版本兼容 | `validate/versioning_test.go` |
+| binding | 当前覆盖包 | 重点场景 |
+| --- | --- | --- |
+| `grpc_h2` | `transport/grpcbinding` | control/tunnel 读写、deadline/cancel、reset/close、keepalive、消息上限与 transport option |
+| `tcp_framed` | `transport/tcpbinding` | 控制帧分块重组、优先级写队列、tunnel 生命周期、`SetDeadline*`/`Reset`/`CloseWrite` 语义 |
 
 说明：
 
-- 协议库层只验证消息语义与决策逻辑，不验证真实网络代理、listener 生命周期与 provider 实例可用性。
+- `make test-binding` 运行两种 binding 的完整测试包。
+
+## Parity、集成与压测
+
+| 类型 | 当前入口 | 说明 |
+| --- | --- | --- |
+| parity smoke | `make test-parity` | 运行 `codec` parity 与两种 binding 的同层语义回归 |
+| integration | `make test-integration` | `examples/interop` 握手、full-sync、publish/unpublish、health 等链路 |
+| pressure smoke | `make test-pressure` | 基准场景烟测：小包/大包、空闲维持、突发 refill（`-benchtime=1x`） |
+
+说明：
+
+- parity 当前为 smoke 级别，双端接入后会继续补充真实端到端流量场景对齐用例。
+
+## 发布门槛
+
+`scripts/verify_release.sh` 默认按顺序执行：
+
+1. `make test-unit`
+2. `make test-binding`
+3. `make test-integration`
+4. `make test-parity`
+5. `make test-pressure`
+6. `make test-compat`
+
+任一步失败即阻塞 release verification。
 
 ## 执行入口
 
 ```bash
 cd ltfp
 make test-unit
+make test-binding
 make test-integration
 make test-parity
+make test-pressure
 make test-compat
 make test-regression
 ```

@@ -117,11 +117,8 @@ func (stream *GRPCH2TunnelStream) WritePayload(ctx context.Context, payload []by
 			return fmt.Errorf("grpc tunnel stream write: %w", stream.closedErrorLocked())
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			// 区分：是 stream 自身 context 取消，还是 per-call deadline
-			if stream.stream.Context().Err() != nil {
-				// stream 级别的取消，才标记关闭
-				stream.markClosedLocked(ctxErr)
-			}
+			// 调用方 context 取消后，当前 stream 已不可安全复用，统一收敛为关闭态。
+			stream.markClosedLocked(ctxErr)
 			return fmt.Errorf("grpc tunnel stream write: %w", ctxErr)
 		}
 		if errors.Is(err, io.EOF) {
@@ -172,11 +169,8 @@ func (stream *GRPCH2TunnelStream) ReadPayload(ctx context.Context) ([]byte, erro
 			return nil, fmt.Errorf("grpc tunnel stream read: %w", stream.closedErrorLocked())
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			// 区分：是 stream 自身 context 取消，还是 per-call deadline
-			if stream.stream.Context().Err() != nil {
-				// stream 级别的取消，才标记关闭
-				stream.markClosedLocked(ctxErr)
-			}
+			// 调用方 context 取消后，当前 stream 已不可安全复用，统一收敛为关闭态。
+			stream.markClosedLocked(ctxErr)
 			return nil, fmt.Errorf("grpc tunnel stream read: %w", ctxErr)
 		}
 		if errors.Is(err, io.EOF) {
@@ -319,13 +313,16 @@ func (stream *GRPCH2TunnelStream) watchCallContext(ctx context.Context) func() {
 	go func() {
 		select {
 		case <-ctx.Done():
-			// 只有 stream 自身的 context 取消才应该 cancelStream
-			// per-call deadline 超时只需要中断当次 Recv/Send
-			// 通过 stream.stream.Context() 区分来源
-			if stream.stream.Context().Err() != nil {
-				stream.cancelStream()
+			// 调用结束时 stopWatch 会先关闭 done；若 done 已关闭，说明本次调用已正常返回，
+			// 此时 ctx.Done() 多半来自上层 defer cancel，不应再误触发 stream 级取消。
+			select {
+			case <-done:
+				return
+			default:
 			}
-			// 否则什么都不做，让 Recv/Send 因 ctx 超时自然返回错误
+			// gRPC Recv/Send 不支持传入 per-call context；调用方 context 结束后
+			// 必须主动 cancel 底层 stream，才能中断阻塞调用并避免 goroutine 泄漏。
+			stream.cancelStream()
 		case <-done:
 		}
 	}()

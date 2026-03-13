@@ -9,8 +9,10 @@ echo ">> [ltfp] run proto generation"
 
 echo ">> [ltfp] run regression matrix"
 make -C "${ROOT_DIR}" test-unit
+make -C "${ROOT_DIR}" test-binding
 make -C "${ROOT_DIR}" test-integration
 make -C "${ROOT_DIR}" test-parity
+make -C "${ROOT_DIR}" test-pressure
 make -C "${ROOT_DIR}" test-compat
 
 # 校验 pb/gen 目录是否存在未生成提交，避免 schema 与绑定代码漂移。
@@ -23,4 +25,3 @@ if [[ "${LTFP_REQUIRE_CROSS_MODULE:-0}" == "1" ]]; then
 fi
 
 echo ">> [ltfp] release verification passed"
-

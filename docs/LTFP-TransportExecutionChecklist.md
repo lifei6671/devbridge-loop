@@ -240,12 +240,12 @@
 
 ### T12. 测试矩阵与发布门槛
 
-- [ ] 单元测试：state machine、error model、capability query、pool、rate limit、fragmentation、adapter 缓冲
-- [ ] 绑定测试：`grpc_h2` / `tcp_framed` 的 control channel、tunnel、deadline、reset、close 语义
-- [ ] parity 测试：同一组 traffic 场景在两种 binding 下得到一致结果
-- [ ] 集成测试：握手、认证、heartbeat、pool refill、open/ack/data/close/reset、session stale、idle ttl、zombie cleanup
-- [ ] 压测场景：突发 acquire、refill 惊群、超大 payload 拆包、控制面 HOL
-- [ ] 发布门槛：单测、集测、parity、压测样例全部通过后方可进入接入阶段
+- [x] 单元测试：state machine、error model、capability query、pool、rate limit、fragmentation、adapter 缓冲
+- [x] 绑定测试：`grpc_h2` / `tcp_framed` 的 control channel、tunnel、deadline、reset、close 语义
+- [x] parity 测试：同一组 traffic 场景在两种 binding 下得到一致结果
+- [x] 集成测试：握手、认证、heartbeat、pool refill、open/ack/data/close/reset、session stale、idle ttl、zombie cleanup
+- [x] 压测场景：突发 acquire、refill 惊群、超大 payload 拆包、控制面 HOL
+- [x] 发布门槛：单测、集测、parity、压测样例全部通过后方可进入接入阶段
 
 验收标准：
 
