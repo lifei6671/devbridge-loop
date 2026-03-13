@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -67,6 +68,16 @@ func (dialer *directProxyTestDialer) Calls() int {
 	dialer.mutex.Lock()
 	defer dialer.mutex.Unlock()
 	return dialer.calls
+}
+
+type directProxyFailDialer struct {
+	err error
+}
+
+func (dialer *directProxyFailDialer) Dial(ctx context.Context, endpoint ExternalEndpoint) (UpstreamConn, error) {
+	_ = ctx
+	_ = endpoint
+	return nil, dialer.err
 }
 
 type directProxyTestRelay struct {
@@ -191,6 +202,12 @@ func TestExecutorExecuteExternalPath(testingObject *testing.T) {
 	if relay.TrafficID() != "traffic-1" {
 		testingObject.Fatalf("unexpected relay traffic_id: %s", relay.TrafficID())
 	}
+	if result.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != "" {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
 }
 
 // TestExecutorExecuteCacheHit 验证 endpoint cache 命中可绕过 discovery。
@@ -308,5 +325,195 @@ func TestExecutorExecuteStaleIfError(testingObject *testing.T) {
 	}
 	if discoveryProvider.Calls() != 2 {
 		testingObject.Fatalf("expected discovery retried once on stale cache, got=%d", discoveryProvider.Calls())
+	}
+	if result.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected http status for stale fallback: %d", result.HTTPStatus)
+	}
+}
+
+// TestExecutorExecuteDiscoveryMissClassification 验证 discovery miss 会映射为 503 + DISCOVERY_NO_ENDPOINT。
+func TestExecutorExecuteDiscoveryMissClassification(testingObject *testing.T) {
+	testingObject.Parallel()
+	discoveryAdapter, err := NewDiscoveryAdapter(DiscoveryAdapterOptions{
+		Provider: &directProxyTestDiscoveryProvider{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new discovery adapter failed: %v", err)
+	}
+	dialer, err := NewDialer(DialerOptions{
+		Upstream: &directProxyTestDialer{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new dialer failed: %v", err)
+	}
+	executor, err := NewExecutor(ExecutorOptions{
+		Discovery: discoveryAdapter,
+		Cache:     NewEndpointCache(EndpointCacheOptions{}),
+		Dialer:    dialer,
+		Relay:     &directProxyTestRelay{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new direct executor failed: %v", err)
+	}
+	result, err := executor.Execute(context.Background(), ExecuteRequest{
+		TrafficID: "traffic-discovery-miss",
+		Target: pb.ExternalServiceTarget{
+			Provider:    "k8s",
+			Namespace:   "dev",
+			Environment: "alice",
+			ServiceName: "pay",
+		},
+	})
+	if err == nil {
+		testingObject.Fatalf("expected discovery miss error")
+	}
+	if result.HTTPStatus != 503 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != ltfperrors.CodeDiscoveryNoEndpoint {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
+}
+
+// TestExecutorExecuteDiscoveryPolicyFailureClassification 验证 discovery 安全策略错误会保留原始错误码。
+func TestExecutorExecuteDiscoveryPolicyFailureClassification(testingObject *testing.T) {
+	testingObject.Parallel()
+	discoveryAdapter, err := NewDiscoveryAdapter(DiscoveryAdapterOptions{
+		Provider: &directProxyTestDiscoveryProvider{
+			err: ltfperrors.New(ltfperrors.CodeDiscoveryEndpointDenied, "endpoint denied"),
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new discovery adapter failed: %v", err)
+	}
+	dialer, err := NewDialer(DialerOptions{
+		Upstream: &directProxyTestDialer{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new dialer failed: %v", err)
+	}
+	executor, err := NewExecutor(ExecutorOptions{
+		Discovery: discoveryAdapter,
+		Cache:     NewEndpointCache(EndpointCacheOptions{}),
+		Dialer:    dialer,
+		Relay:     &directProxyTestRelay{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new direct executor failed: %v", err)
+	}
+	result, err := executor.Execute(context.Background(), ExecuteRequest{
+		TrafficID: "traffic-discovery-policy-denied",
+		Target: pb.ExternalServiceTarget{
+			Provider:    "k8s",
+			Namespace:   "dev",
+			Environment: "alice",
+			ServiceName: "pay",
+		},
+	})
+	if err == nil {
+		testingObject.Fatalf("expected discovery policy failure")
+	}
+	if result.HTTPStatus != 403 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != ltfperrors.CodeDiscoveryEndpointDenied {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
+}
+
+// TestExecutorExecuteDialFailureClassification 验证 direct dial 失败会映射为 502 + DIRECT_PROXY_DIAL_FAILED。
+func TestExecutorExecuteDialFailureClassification(testingObject *testing.T) {
+	testingObject.Parallel()
+	discoveryAdapter, err := NewDiscoveryAdapter(DiscoveryAdapterOptions{
+		Provider: &directProxyTestDiscoveryProvider{
+			endpoints: []ExternalEndpoint{{EndpointID: "ep-1", Address: "10.0.0.1:443"}},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new discovery adapter failed: %v", err)
+	}
+	dialer, err := NewDialer(DialerOptions{
+		Upstream: &directProxyFailDialer{err: errors.New("dial timeout")},
+	})
+	if err != nil {
+		testingObject.Fatalf("new dialer failed: %v", err)
+	}
+	executor, err := NewExecutor(ExecutorOptions{
+		Discovery: discoveryAdapter,
+		Cache:     NewEndpointCache(EndpointCacheOptions{}),
+		Dialer:    dialer,
+		Relay:     &directProxyTestRelay{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new direct executor failed: %v", err)
+	}
+	result, err := executor.Execute(context.Background(), ExecuteRequest{
+		TrafficID: "traffic-dial-failed",
+		Target: pb.ExternalServiceTarget{
+			Provider:    "k8s",
+			Namespace:   "dev",
+			Environment: "alice",
+			ServiceName: "pay",
+		},
+	})
+	if err == nil {
+		testingObject.Fatalf("expected dial failure")
+	}
+	if result.HTTPStatus != 502 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != ltfperrors.CodeDirectProxyDialFailed {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
+}
+
+// TestExecutorExecuteRelayFailureClassification 验证 relay 失败会映射为 502 + DIRECT_PROXY_RELAY_FAILED。
+func TestExecutorExecuteRelayFailureClassification(testingObject *testing.T) {
+	testingObject.Parallel()
+	discoveryAdapter, err := NewDiscoveryAdapter(DiscoveryAdapterOptions{
+		Provider: &directProxyTestDiscoveryProvider{
+			endpoints: []ExternalEndpoint{{EndpointID: "ep-1", Address: "10.0.0.1:443"}},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new discovery adapter failed: %v", err)
+	}
+	dialer, err := NewDialer(DialerOptions{
+		Upstream: &directProxyTestDialer{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new dialer failed: %v", err)
+	}
+	executor, err := NewExecutor(ExecutorOptions{
+		Discovery: discoveryAdapter,
+		Cache:     NewEndpointCache(EndpointCacheOptions{}),
+		Dialer:    dialer,
+		Relay: RelayFunc(func(ctx context.Context, connection UpstreamConn, trafficID string) error {
+			_ = ctx
+			_ = connection
+			_ = trafficID
+			return errors.New("relay broken")
+		}),
+	})
+	if err != nil {
+		testingObject.Fatalf("new direct executor failed: %v", err)
+	}
+	result, err := executor.Execute(context.Background(), ExecuteRequest{
+		TrafficID: "traffic-relay-failed",
+		Target: pb.ExternalServiceTarget{
+			Provider:    "k8s",
+			Namespace:   "dev",
+			Environment: "alice",
+			ServiceName: "pay",
+		},
+	})
+	if err == nil {
+		testingObject.Fatalf("expected relay failure")
+	}
+	if result.HTTPStatus != 502 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != ltfperrors.CodeDirectProxyRelayFailed {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
 	}
 }

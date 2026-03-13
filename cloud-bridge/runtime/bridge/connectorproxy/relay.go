@@ -16,6 +16,31 @@ var (
 	ErrRelayReset = errors.New("relay reset")
 )
 
+// RelayResetError 描述 relay 收到 reset 时的结构化详情。
+type RelayResetError struct {
+	TrafficID    string
+	ResetCode    string
+	ResetMessage string
+}
+
+// Error 返回 reset 错误的结构化文本。
+func (relayResetError *RelayResetError) Error() string {
+	if relayResetError == nil {
+		return ErrRelayReset.Error()
+	}
+	return fmt.Sprintf(
+		"relay reset: traffic_id=%s error_code=%s message=%s",
+		strings.TrimSpace(relayResetError.TrafficID),
+		strings.TrimSpace(relayResetError.ResetCode),
+		strings.TrimSpace(relayResetError.ResetMessage),
+	)
+}
+
+// Unwrap 暴露基础 reset 错误类型，保持 errors.Is 行为一致。
+func (relayResetError *RelayResetError) Unwrap() error {
+	return ErrRelayReset
+}
+
 // RelayPump 定义 connector path relay 抽象。
 type RelayPump interface {
 	Relay(ctx context.Context, tunnel registry.RuntimeTunnel, trafficID string) error
@@ -61,13 +86,11 @@ func (relay *Relay) Relay(ctx context.Context, tunnel registry.RuntimeTunnel, tr
 			return nil
 		}
 		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == normalizedTrafficID {
-			return fmt.Errorf(
-				"relay: %w: traffic_id=%s error_code=%s message=%s",
-				ErrRelayReset,
-				normalizedTrafficID,
-				payload.Reset.ErrorCode,
-				payload.Reset.ErrorMessage,
-			)
+			return &RelayResetError{
+				TrafficID:    normalizedTrafficID,
+				ResetCode:    strings.TrimSpace(payload.Reset.ErrorCode),
+				ResetMessage: strings.TrimSpace(payload.Reset.ErrorMessage),
+			}
 		}
 	}
 }

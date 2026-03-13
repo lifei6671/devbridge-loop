@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
@@ -14,6 +16,13 @@ import (
 var (
 	// ErrDispatcherDependencyMissing 表示 Dispatcher 关键依赖缺失。
 	ErrDispatcherDependencyMissing = errors.New("dispatcher dependency missing")
+)
+
+const (
+	trafficOpenHintEndpointIDKey   = "endpoint_id"
+	trafficOpenHintEndpointAddrKey = "endpoint_addr"
+	openAckActualEndpointIDKey     = "actual_endpoint_id"
+	openAckActualEndpointAddrKey   = "actual_endpoint_addr"
 )
 
 // DispatchRequest 描述 connector path 执行请求。
@@ -37,6 +46,7 @@ type DispatcherOptions struct {
 	Relay          RelayPump
 	TunnelRegistry *registry.TunnelRegistry
 	FailureMapper  *FailureMapper
+	Metrics        *obs.Metrics
 	Now            func() time.Time
 }
 
@@ -47,6 +57,7 @@ type Dispatcher struct {
 	relay          RelayPump
 	tunnelRegistry *registry.TunnelRegistry
 	failureMapper  *FailureMapper
+	metrics        *obs.Metrics
 	now            func() time.Time
 }
 
@@ -73,6 +84,7 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 		relay:          relay,
 		tunnelRegistry: options.TunnelRegistry,
 		failureMapper:  failureMapper,
+		metrics:        normalizeBridgeMetrics(options.Metrics),
 		now:            nowFunction,
 	}, nil
 }
@@ -91,10 +103,20 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	baseLogFields := obs.LogFields{
+		TrafficID:   strings.TrimSpace(request.TrafficOpen.TrafficID),
+		ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
+		ConnectorID: normalizedConnectorID,
+	}
 
 	acquiredTunnel, err := dispatcher.tunnelAcquirer.AcquireIdleTunnel(normalizedContext, normalizedConnectorID)
 	if err != nil {
 		mappedFailure := dispatcher.failureMapper.Map(err)
+		log.Printf(
+			"bridge connector dispatch failed event=acquire_idle_failed %s err=%v",
+			obs.FormatLogFields(baseLogFields),
+			err,
+		)
 		return DispatchResult{
 			HTTPStatus: mappedFailure.HTTPStatus,
 			ErrorCode:  mappedFailure.Code,
@@ -107,27 +129,91 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 	}
 	trafficID := strings.TrimSpace(request.TrafficOpen.TrafficID)
 	if err := dispatcher.tunnelRegistry.MarkActive(dispatcher.now(), acquiredTunnel.TunnelID, trafficID); err != nil {
+		log.Printf(
+			"bridge connector dispatch failed event=mark_tunnel_active_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:   trafficID,
+				ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ConnectorID: normalizedConnectorID,
+				TunnelID:    strings.TrimSpace(acquiredTunnel.TunnelID),
+			}),
+			err,
+		)
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
 
 	openAck, err := dispatcher.openHandshake.Execute(normalizedContext, acquiredTunnel.Tunnel, request.TrafficOpen)
 	if err != nil {
+		dispatcher.observeOpenHandshakeFailure(err)
 		var openRejectedError *OpenRejectedError
 		if errors.As(err, &openRejectedError) {
 			ack := openRejectedError.Ack
 			result.OpenAck = &ack
 		}
+		log.Printf(
+			"bridge connector dispatch failed event=open_handshake_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:   trafficID,
+				ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ConnectorID: normalizedConnectorID,
+				TunnelID:    strings.TrimSpace(acquiredTunnel.TunnelID),
+			}),
+			err,
+		)
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
 	result.OpenAck = &openAck
+	if dispatcher.isActualEndpointOverride(request.TrafficOpen, openAck) {
+		dispatcher.metrics.IncBridgeActualEndpointOverrideTotal()
+	}
 
 	if err := dispatcher.relay.Relay(normalizedContext, acquiredTunnel.Tunnel, request.TrafficOpen.TrafficID); err != nil {
+		relayEvent := "relay_failed"
+		resetCode := ""
+		resetMessage := ""
+		var relayResetError *RelayResetError
+		if errors.As(err, &relayResetError) {
+			// 收到 reset 时单独打标，便于与普通 relay I/O 失败区分。
+			relayEvent = "relay_reset_received"
+			resetCode = strings.TrimSpace(relayResetError.ResetCode)
+			resetMessage = strings.TrimSpace(relayResetError.ResetMessage)
+		}
+		mappedFailure := dispatcher.failureMapper.Map(err)
+		log.Printf(
+			"bridge connector dispatch failed event=%s http=%d error_code=%s reset_code=%s reset_message=%s %s err=%v",
+			relayEvent,
+			mappedFailure.HTTPStatus,
+			mappedFailure.Code,
+			resetCode,
+			resetMessage,
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          trafficID,
+				ServiceID:          strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(openAck.Metadata[openAckActualEndpointIDKey]),
+				ActualEndpointAddr: strings.TrimSpace(openAck.Metadata[openAckActualEndpointAddrKey]),
+				ConnectorID:        normalizedConnectorID,
+				TunnelID:           strings.TrimSpace(acquiredTunnel.TunnelID),
+			}),
+			err,
+		)
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
 	if err := dispatcher.recycleTunnelClosed(acquiredTunnel); err != nil {
+		log.Printf(
+			"bridge connector dispatch failed event=recycle_tunnel_closed_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          trafficID,
+				ServiceID:          strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(openAck.Metadata[openAckActualEndpointIDKey]),
+				ActualEndpointAddr: strings.TrimSpace(openAck.Metadata[openAckActualEndpointAddrKey]),
+				ConnectorID:        normalizedConnectorID,
+				TunnelID:           strings.TrimSpace(acquiredTunnel.TunnelID),
+			}),
+			err,
+		)
 		return dispatcher.failResult(result, err)
 	}
 	return result, nil
@@ -170,4 +256,40 @@ func (dispatcher *Dispatcher) recycleTunnelBroken(runtime registry.TunnelRuntime
 		)
 	}
 	return nil
+}
+
+// observeOpenHandshakeFailure 根据握手失败类型更新 Bridge 侧错误指标。
+func (dispatcher *Dispatcher) observeOpenHandshakeFailure(dispatchErr error) {
+	if dispatcher == nil || dispatcher.metrics == nil {
+		return
+	}
+	if errors.Is(dispatchErr, ErrOpenAckTimeout) {
+		// open_ack 超时用于跟踪 pre-open 阶段容量与可用性问题。
+		dispatcher.metrics.IncBridgeTrafficOpenTimeoutTotal()
+	}
+	if errors.Is(dispatchErr, ErrTrafficOpenRejected) && !isConnectorDialFailed(dispatchErr) {
+		// open_ack reject 用于统计 agent 显式拒绝比例。
+		dispatcher.metrics.IncBridgeTrafficOpenRejectTotal()
+	}
+}
+
+// isActualEndpointOverride 判断 open_ack 回传 endpoint 是否覆盖了请求 hint。
+func (dispatcher *Dispatcher) isActualEndpointOverride(open pb.TrafficOpen, ack pb.TrafficOpenAck) bool {
+	if dispatcher == nil {
+		return false
+	}
+	actualEndpointID := strings.TrimSpace(ack.Metadata[openAckActualEndpointIDKey])
+	actualEndpointAddr := strings.TrimSpace(ack.Metadata[openAckActualEndpointAddrKey])
+	if actualEndpointID == "" && actualEndpointAddr == "" {
+		return false
+	}
+	requestedEndpointID := strings.TrimSpace(open.EndpointSelectionHint[trafficOpenHintEndpointIDKey])
+	requestedEndpointAddr := strings.TrimSpace(open.EndpointSelectionHint[trafficOpenHintEndpointAddrKey])
+	if requestedEndpointID != "" && actualEndpointID != "" && requestedEndpointID != actualEndpointID {
+		return true
+	}
+	if requestedEndpointAddr != "" && actualEndpointAddr != "" && requestedEndpointAddr != actualEndpointAddr {
+		return true
+	}
+	return false
 }

@@ -38,6 +38,8 @@ const (
 	CodeDiscoveryProviderUnavailable = "DISCOVERY_PROVIDER_UNAVAILABLE"
 	// CodeDiscoveryNoEndpoint 表示查询后无可用 endpoint。
 	CodeDiscoveryNoEndpoint = "DISCOVERY_NO_ENDPOINT"
+	// CodeDiscoveryRefreshFailed 表示 stale 刷新尝试失败。
+	CodeDiscoveryRefreshFailed = "DISCOVERY_REFRESH_FAILED"
 	// CodeDiscoveryEndpointDenied 表示 endpoint 被安全策略拒绝。
 	CodeDiscoveryEndpointDenied = "DISCOVERY_ENDPOINT_DENIED"
 	// CodeResolveServiceNotFound 表示 route 解析时未找到目标服务。
@@ -78,6 +80,10 @@ const (
 	CodeTrafficInvalidOneof = "TRAFFIC_INVALID_ONEOF"
 	// CodeTrafficOpenRejected 表示 TrafficOpen 被拒绝。
 	CodeTrafficOpenRejected = "TRAFFIC_OPEN_REJECTED"
+	// CodeConnectorDialFailed 表示 connector path 在 Agent 侧 upstream dial 失败。
+	CodeConnectorDialFailed = "CONNECTOR_DIAL_FAILED"
+	// CodeDirectProxyRelayFailed 表示 direct proxy relay 过程失败。
+	CodeDirectProxyRelayFailed = "DIRECT_PROXY_RELAY_FAILED"
 	// CodeTrafficInvalidServiceID 表示 TrafficOpen 缺少 service_id。
 	CodeTrafficInvalidServiceID = "TRAFFIC_INVALID_SERVICE_ID"
 )

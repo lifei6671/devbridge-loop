@@ -31,6 +31,21 @@ type TunnelPoolConfig struct {
 	ReconcileGap time.Duration
 }
 
+// TunnelPoolOverride 用于外部按字段覆盖 tunnelPool 参数。
+//
+// 约束：
+// 1. nil 表示未传入，不覆盖原值。
+// 2. 非 nil 表示显式传入，覆盖原值后再走 Validate 校验。
+type TunnelPoolOverride struct {
+	MinIdle      *int
+	MaxIdle      *int
+	MaxInflight  *int
+	TTL          *time.Duration
+	OpenRate     *float64
+	OpenBurst    *int
+	ReconcileGap *time.Duration
+}
+
 type ObservabilityConfig struct {
 	MetricsAddr string
 	LogLevel    string
@@ -111,4 +126,33 @@ func (c Config) Validate() error {
 		return fmt.Errorf("validate config: invalid tunnel_pool.reconcile_gap=%v", c.TunnelPool.ReconcileGap)
 	}
 	return nil
+}
+
+// ApplyTunnelPoolOverride 按字段应用 tunnelPool 覆盖参数。
+func (c Config) ApplyTunnelPoolOverride(override TunnelPoolOverride) Config {
+	updatedConfig := c
+	updatedPool := updatedConfig.TunnelPool
+	if override.MinIdle != nil {
+		updatedPool.MinIdle = *override.MinIdle
+	}
+	if override.MaxIdle != nil {
+		updatedPool.MaxIdle = *override.MaxIdle
+	}
+	if override.MaxInflight != nil {
+		updatedPool.MaxInflight = *override.MaxInflight
+	}
+	if override.TTL != nil {
+		updatedPool.TTL = *override.TTL
+	}
+	if override.OpenRate != nil {
+		updatedPool.OpenRate = *override.OpenRate
+	}
+	if override.OpenBurst != nil {
+		updatedPool.OpenBurst = *override.OpenBurst
+	}
+	if override.ReconcileGap != nil {
+		updatedPool.ReconcileGap = *override.ReconcileGap
+	}
+	updatedConfig.TunnelPool = updatedPool
+	return updatedConfig
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/connectorproxy"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/directproxy"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -114,9 +115,11 @@ func TestPathExecutorHybridFallbackPreOpenNoTunnel(testingObject *testing.T) {
 			},
 		},
 	}
+	metrics := obs.NewMetrics()
 	executor, err := NewPathExecutor(PathExecutorOptions{
 		Connector: connectorDispatcher,
 		Direct:    directExecutor,
+		Metrics:   metrics,
 	})
 	if err != nil {
 		testingObject.Fatalf("new path executor failed: %v", err)
@@ -143,6 +146,9 @@ func TestPathExecutorHybridFallbackPreOpenNoTunnel(testingObject *testing.T) {
 	if directExecutor.calls != 1 {
 		testingObject.Fatalf("expected direct executor called once, got=%d", directExecutor.calls)
 	}
+	if metrics.BridgeHybridFallbackTotal() != 1 {
+		testingObject.Fatalf("expected hybrid fallback metric increment once, got=%d", metrics.BridgeHybridFallbackTotal())
+	}
 }
 
 // TestPathExecutorHybridFallbackPreOpenWithTunnel 验证 pre-open 已分配 tunnel 失败允许 fallback。
@@ -164,9 +170,11 @@ func TestPathExecutorHybridFallbackPreOpenWithTunnel(testingObject *testing.T) {
 			},
 		},
 	}
+	metrics := obs.NewMetrics()
 	executor, err := NewPathExecutor(PathExecutorOptions{
 		Connector: connectorDispatcher,
 		Direct:    directExecutor,
+		Metrics:   metrics,
 	})
 	if err != nil {
 		testingObject.Fatalf("new path executor failed: %v", err)
@@ -186,6 +194,52 @@ func TestPathExecutorHybridFallbackPreOpenWithTunnel(testingObject *testing.T) {
 	}
 	if result.HybridFallbackStage != HybridFallbackStagePreOpenWithTunnel {
 		testingObject.Fatalf("unexpected fallback stage: %s", result.HybridFallbackStage)
+	}
+	if metrics.BridgeHybridFallbackTotal() != 1 {
+		testingObject.Fatalf("expected hybrid fallback metric increment once, got=%d", metrics.BridgeHybridFallbackTotal())
+	}
+}
+
+// TestPathExecutorHybridFallbackFailureReturnsDirectFailure 验证 fallback 失败时优先返回 direct 路径错误语义。
+func TestPathExecutorHybridFallbackFailureReturnsDirectFailure(testingObject *testing.T) {
+	testingObject.Parallel()
+	connectorDispatcher := &routingTestConnectorDispatcher{
+		result: connectorproxy.DispatchResult{
+			HTTPStatus: 503,
+			ErrorCode:  connectorproxy.FailureCodeNoIdleTunnel,
+		},
+		err: connectorproxy.ErrNoIdleTunnel,
+	}
+	directExecutor := &routingTestDirectExecutor{
+		result: directproxy.ExecuteResult{
+			HTTPStatus: 502,
+			ErrorCode:  ltfperrors.CodeDirectProxyDialFailed,
+		},
+		err: directproxy.ErrDirectDialFailed,
+	}
+	executor, err := NewPathExecutor(PathExecutorOptions{
+		Connector: connectorDispatcher,
+		Direct:    directExecutor,
+	})
+	if err != nil {
+		testingObject.Fatalf("new path executor failed: %v", err)
+	}
+
+	result, err := executor.Execute(context.Background(), PathExecuteRequest{
+		Resolution: buildHybridResolution(pb.FallbackPolicyPreOpenOnly),
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-hybrid-fallback-failed",
+			ServiceID: "svc-1",
+		},
+	})
+	if !errors.Is(err, directproxy.ErrDirectDialFailed) {
+		testingObject.Fatalf("expected direct dial failure, got=%v", err)
+	}
+	if result.HTTPStatus != 502 {
+		testingObject.Fatalf("unexpected http status: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != ltfperrors.CodeDirectProxyDialFailed {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
 	}
 }
 

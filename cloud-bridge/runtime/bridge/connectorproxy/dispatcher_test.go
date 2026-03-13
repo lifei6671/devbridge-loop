@@ -10,6 +10,7 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -122,11 +123,13 @@ func TestTunnelAcquirerNoIdleTimeoutAndRefill(testingObject *testing.T) {
 	testingObject.Parallel()
 	tunnelRegistry := registry.NewTunnelRegistry()
 	refillRequester := &connectorProxyTestRefillRequester{}
+	metrics := obs.NewMetrics()
 	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
 		Registry:       tunnelRegistry,
 		Refill:         refillRequester,
 		WaitHint:       25 * time.Millisecond,
 		PollInterval:   5 * time.Millisecond,
+		Metrics:        metrics,
 		EnableNoIdleWT: true,
 	})
 	if err != nil {
@@ -147,6 +150,12 @@ func TestTunnelAcquirerNoIdleTimeoutAndRefill(testingObject *testing.T) {
 	}
 	if calls[0].connectorID != "connector-1" {
 		testingObject.Fatalf("unexpected refill connector id: %s", calls[0].connectorID)
+	}
+	if metrics.BridgeTunnelAcquireWaitCount() != 1 {
+		testingObject.Fatalf("expected acquire wait metric sample once, got=%d", metrics.BridgeTunnelAcquireWaitCount())
+	}
+	if metrics.BridgeTunnelAcquireWaitTotalMs() <= 0 {
+		testingObject.Fatalf("expected acquire wait metric > 0, got=%d", metrics.BridgeTunnelAcquireWaitTotalMs())
 	}
 }
 
@@ -288,6 +297,118 @@ func TestOpenHandshakeTimeoutReturnsWithoutDrainDelay(testingObject *testing.T) 
 	}
 }
 
+// TestDispatcherOpenRejectedMetrics 验证 open_ack reject 会记录 reject 指标并返回 503 语义。
+func TestDispatcherOpenRejectedMetrics(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnel := newConnectorProxyTestTunnel("tunnel-open-reject")
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID:    "traffic-open-reject",
+			Success:      false,
+			ErrorCode:    "TRAFFIC_OPEN_REJECTED",
+			ErrorMessage: "upstream unavailable",
+		},
+	})
+	_, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel)
+	if err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	metrics := obs.NewMetrics()
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry: tunnelRegistry,
+		Metrics:  metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: 100 * time.Millisecond}),
+		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
+		ConnectorID: "connector-1",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-open-reject",
+			ServiceID: "svc-1",
+		},
+	})
+	if !errors.Is(err, ErrTrafficOpenRejected) {
+		testingObject.Fatalf("expected open rejected error, got=%v", err)
+	}
+	if result.HTTPStatus != 503 {
+		testingObject.Fatalf("unexpected status code: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != FailureCodeOpenRejected {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
+	if metrics.BridgeTrafficOpenRejectTotal() != 1 {
+		testingObject.Fatalf("expected open reject metric increment once, got=%d", metrics.BridgeTrafficOpenRejectTotal())
+	}
+}
+
+// TestDispatcherConnectorDialFailureDoesNotCountAsOpenReject 验证 connector dial 失败不会计入 open reject 指标。
+func TestDispatcherConnectorDialFailureDoesNotCountAsOpenReject(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnel := newConnectorProxyTestTunnel("tunnel-dial-failed")
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID:    "traffic-dial-failed",
+			Success:      false,
+			ErrorCode:    ltfperrors.CodeConnectorDialFailed,
+			ErrorMessage: "dial upstream failed",
+		},
+	})
+	_, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel)
+	if err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	metrics := obs.NewMetrics()
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry: tunnelRegistry,
+		Metrics:  metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: 100 * time.Millisecond}),
+		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
+		ConnectorID: "connector-1",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-dial-failed",
+			ServiceID: "svc-1",
+		},
+	})
+	if !errors.Is(err, ErrTrafficOpenRejected) {
+		testingObject.Fatalf("expected open rejected error, got=%v", err)
+	}
+	if result.HTTPStatus != 502 {
+		testingObject.Fatalf("unexpected status code: %d", result.HTTPStatus)
+	}
+	if result.ErrorCode != FailureCodeDialFailed {
+		testingObject.Fatalf("unexpected error code: %s", result.ErrorCode)
+	}
+	if metrics.BridgeTrafficOpenRejectTotal() != 0 {
+		testingObject.Fatalf("expected open reject metric unchanged, got=%d", metrics.BridgeTrafficOpenRejectTotal())
+	}
+}
+
 // TestDispatcherDispatchSuccessLifecycle 验证 connector path 成功链路与回收行为。
 func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -297,15 +418,21 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 		OpenAck: &pb.TrafficOpenAck{
 			TrafficID: "traffic-1",
 			Success:   true,
+			Metadata: map[string]string{
+				"actual_endpoint_id":   "endpoint-2",
+				"actual_endpoint_addr": "10.0.0.2:443",
+			},
 		},
 	})
 	_, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel)
 	if err != nil {
 		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
 	}
+	metrics := obs.NewMetrics()
 
 	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
 		Registry: tunnelRegistry,
+		Metrics:  metrics,
 	})
 	if err != nil {
 		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
@@ -324,6 +451,7 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 			return nil
 		}),
 		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
 	})
 	if err != nil {
 		testingObject.Fatalf("new dispatcher failed: %v", err)
@@ -337,6 +465,9 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 			TrafficOpen: pb.TrafficOpen{
 				TrafficID: "traffic-1",
 				ServiceID: "svc-1",
+				EndpointSelectionHint: map[string]string{
+					"endpoint_id": "endpoint-1",
+				},
 			},
 		})
 		resultChannel <- result
@@ -368,6 +499,9 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	}
 	if tunnel.CloseCount() != 1 {
 		testingObject.Fatalf("expected tunnel closed once, got=%d", tunnel.CloseCount())
+	}
+	if metrics.BridgeActualEndpointOverrideTotal() != 1 {
+		testingObject.Fatalf("expected actual endpoint override metric increment once, got=%d", metrics.BridgeActualEndpointOverrideTotal())
 	}
 	writes := tunnel.Writes()
 	if len(writes) == 0 || writes[0].OpenReq == nil {
@@ -454,6 +588,7 @@ func TestDispatcherOpenAckTimeoutDropsLateAck(testingObject *testing.T) {
 			Metrics:             metrics,
 		}),
 		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
 	})
 	if err != nil {
 		testingObject.Fatalf("new dispatcher failed: %v", err)
@@ -493,6 +628,9 @@ func TestDispatcherOpenAckTimeoutDropsLateAck(testingObject *testing.T) {
 	}
 	if writes[1].Reset.ErrorCode != OpenTimeoutResetCode {
 		testingObject.Fatalf("unexpected reset error code: %s", writes[1].Reset.ErrorCode)
+	}
+	if metrics.BridgeTrafficOpenTimeoutTotal() != 1 {
+		testingObject.Fatalf("expected open timeout metric increment once, got=%d", metrics.BridgeTrafficOpenTimeoutTotal())
 	}
 	waitUntil(testingObject, 300*time.Millisecond, func() bool {
 		return metrics.BridgeTrafficOpenAckLateTotal() == 1

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
@@ -362,7 +363,7 @@ func TestOpenerHandleDialCanceled(testingObject *testing.T) {
 	if writes[0].OpenAck == nil || writes[0].OpenAck.Success {
 		testingObject.Fatalf("expected open ack reject on canceled dial")
 	}
-	if writes[0].OpenAck.ErrorCode != ltfperrors.CodeTrafficOpenRejected {
+	if writes[0].OpenAck.ErrorCode != ltfperrors.CodeConnectorDialFailed {
 		testingObject.Fatalf("unexpected open ack error code: %s", writes[0].OpenAck.ErrorCode)
 	}
 	if acceptor.IsReaderOwned("tunnel-2") {
@@ -494,5 +495,55 @@ func TestOpenerHandleRelayFailure(testingObject *testing.T) {
 	}
 	if upstreamConnection.closeCount.Load() != 1 {
 		testingObject.Fatalf("expected upstream closed once, got %d", upstreamConnection.closeCount.Load())
+	}
+}
+
+// TestOpenerHandleRecordsLatencyMetrics 验证 opener 会记录 open_ack 与 upstream dial 延迟指标。
+func TestOpenerHandleRecordsLatencyMetrics(testingObject *testing.T) {
+	testingObject.Parallel()
+	metrics := obs.NewMetrics()
+	opener, err := NewOpener(OpenerOptions{
+		Selector: &openerTestSelector{
+			endpoint: Endpoint{
+				ID:   "endpoint-metric",
+				Addr: "10.0.0.99:8080",
+			},
+		},
+		Dialer: &openerTestDialer{
+			dialFunc: func(ctx context.Context, endpoint Endpoint) (io.ReadWriteCloser, error) {
+				time.Sleep(3 * time.Millisecond)
+				return &openerTestConn{}, nil
+			},
+		},
+		Relay: &openerTestRelay{
+			relayFunc: func(ctx context.Context, tunnel TunnelIO, upstream io.ReadWriteCloser, trafficID string) error {
+				return nil
+			},
+		},
+		Metrics: metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new opener failed: %v", err)
+	}
+	acceptor := NewAcceptor()
+	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-metric", &acceptorTestReader{
+		payload: pb.StreamPayload{
+			OpenReq: &pb.TrafficOpen{
+				TrafficID: "traffic-metric",
+				ServiceID: "svc-metric",
+			},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("wait traffic open failed: %v", err)
+	}
+	if _, err := opener.Handle(context.Background(), handoff, &openerTestTunnelIO{}); err != nil {
+		testingObject.Fatalf("handle open failed: %v", err)
+	}
+	if metrics.AgentUpstreamDialLatencyCount() != 1 {
+		testingObject.Fatalf("expected one dial latency sample, got=%d", metrics.AgentUpstreamDialLatencyCount())
+	}
+	if metrics.AgentTrafficOpenAckLatencyCount() != 1 {
+		testingObject.Fatalf("expected one open_ack latency sample, got=%d", metrics.AgentTrafficOpenAckLatencyCount())
 	}
 }

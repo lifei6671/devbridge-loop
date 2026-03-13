@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
+	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
@@ -51,6 +54,7 @@ type OpenerOptions struct {
 	Selector EndpointSelector
 	Dialer   UpstreamDialer
 	Relay    RelayPump
+	Metrics  *obs.Metrics
 }
 
 // HandleResult 描述单次 TrafficOpen 的执行结果。
@@ -64,6 +68,7 @@ type Opener struct {
 	selector EndpointSelector
 	dialer   UpstreamDialer
 	relay    RelayPump
+	metrics  *obs.Metrics
 }
 
 // NewOpener 创建 traffic runtime opener。
@@ -77,15 +82,21 @@ func NewOpener(options OpenerOptions) (*Opener, error) {
 	if options.Relay == nil {
 		return nil, fmt.Errorf("new opener: %w: nil relay", ErrTrafficRuntimeDependencyMissing)
 	}
+	metrics := options.Metrics
+	if metrics == nil {
+		metrics = obs.DefaultMetrics
+	}
 	return &Opener{
 		selector: options.Selector,
 		dialer:   options.Dialer,
 		relay:    options.Relay,
+		metrics:  metrics,
 	}, nil
 }
 
 // Handle 执行单次 TrafficOpen 全流程（open -> dial -> ack -> relay -> close/reset）。
 func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel TunnelIO) (HandleResult, error) {
+	handleStartedAt := time.Now()
 	if opener == nil {
 		if handoff.Lease != nil {
 			handoff.Lease.Release()
@@ -108,6 +119,11 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		// runtime 结束时归还 reader 所有权。
 		defer handoff.Lease.Release()
 	}
+	baseLogFields := obs.LogFields{
+		TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
+		ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
+		TunnelID:  strings.TrimSpace(handoff.TunnelID),
+	}
 	if err := validateTrafficOpen(handoff.Open); err != nil {
 		errorCode := ltfperrors.ExtractCode(err)
 		if strings.TrimSpace(errorCode) == "" {
@@ -119,28 +135,54 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			ErrorCode:    errorCode,
 			ErrorMessage: err.Error(),
 		})
+		opener.observeOpenAckLatency(handleStartedAt)
+		log.Printf(
+			"agent traffic open rejected event=validate_open_failed %s err=%v",
+			obs.FormatLogFields(baseLogFields),
+			err,
+		)
 		return HandleResult{}, errors.Join(err, ackError)
 	}
 
 	selectedEndpoint, err := opener.selector.SelectEndpoint(normalizedContext, handoff.Open.ServiceID, copyStringMap(handoff.Open.EndpointSelectionHint))
 	if err != nil {
 		ackError := opener.writeOpenAck(terminalWriteContext, tunnel, pb.TrafficOpenAck{
-			TrafficID:    handoff.Open.TrafficID,
-			Success:      false,
+			TrafficID: handoff.Open.TrafficID,
+			Success:   false,
+			// endpoint 选择失败属于 open reject 语义。
 			ErrorCode:    ltfperrors.CodeTrafficOpenRejected,
 			ErrorMessage: err.Error(),
 		})
+		opener.observeOpenAckLatency(handleStartedAt)
+		log.Printf(
+			"agent traffic open rejected event=select_endpoint_failed %s err=%v",
+			obs.FormatLogFields(baseLogFields),
+			err,
+		)
 		return HandleResult{}, errors.Join(fmt.Errorf("handle traffic open: select endpoint: %w", err), ackError)
 	}
 
+	dialStartedAt := time.Now()
 	upstream, err := opener.dialer.Dial(normalizedContext, selectedEndpoint)
+	opener.observeDialLatency(dialStartedAt)
 	if err != nil {
 		ackError := opener.writeOpenAck(terminalWriteContext, tunnel, pb.TrafficOpenAck{
-			TrafficID:    handoff.Open.TrafficID,
-			Success:      false,
-			ErrorCode:    ltfperrors.CodeTrafficOpenRejected,
+			TrafficID: handoff.Open.TrafficID,
+			Success:   false,
+			// 拨号失败单独打标，供 Bridge 做 connector dial 分类。
+			ErrorCode:    ltfperrors.CodeConnectorDialFailed,
 			ErrorMessage: err.Error(),
 		})
+		opener.observeOpenAckLatency(handleStartedAt)
+		log.Printf(
+			"agent traffic open rejected event=dial_upstream_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
+				ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
+				TunnelID:  strings.TrimSpace(handoff.TunnelID),
+			}),
+			err,
+		)
 		return HandleResult{}, errors.Join(fmt.Errorf("handle traffic open: dial upstream: %w", err), ackError)
 	}
 	defer func() {
@@ -156,8 +198,21 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		},
 	}
 	if err := opener.writeOpenAck(terminalWriteContext, tunnel, ack); err != nil {
+		opener.observeOpenAckLatency(handleStartedAt)
+		log.Printf(
+			"agent traffic open failed event=write_open_ack_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
+				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
+				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
+				TunnelID:           strings.TrimSpace(handoff.TunnelID),
+			}),
+			err,
+		)
 		return HandleResult{}, fmt.Errorf("handle traffic open: write open ack: %w", err)
 	}
+	opener.observeOpenAckLatency(handleStartedAt)
 
 	relayErr := opener.relay.Relay(normalizedContext, tunnel, upstream, handoff.Open.TrafficID)
 	if relayErr != nil {
@@ -173,6 +228,29 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			},
 		}
 		writeResetErr := tunnel.WritePayload(terminalWriteContext, resetPayload)
+		log.Printf(
+			"agent traffic terminal event=write_reset state=reset reset_code=%s %s err=%v",
+			resetCode,
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
+				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
+				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
+				TunnelID:           strings.TrimSpace(handoff.TunnelID),
+			}),
+			errors.Join(relayErr, writeResetErr),
+		)
+		log.Printf(
+			"agent traffic open failed event=relay_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
+				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
+				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
+				TunnelID:           strings.TrimSpace(handoff.TunnelID),
+			}),
+			relayErr,
+		)
 		return HandleResult{}, errors.Join(fmt.Errorf("handle traffic open: relay: %w", relayErr), writeResetErr)
 	}
 
@@ -183,8 +261,29 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		},
 	}
 	if err := tunnel.WritePayload(normalizedContext, closePayload); err != nil {
+		log.Printf(
+			"agent traffic open failed event=write_close_failed %s err=%v",
+			obs.FormatLogFields(obs.LogFields{
+				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
+				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
+				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
+				TunnelID:           strings.TrimSpace(handoff.TunnelID),
+			}),
+			err,
+		)
 		return HandleResult{}, fmt.Errorf("handle traffic open: write close: %w", err)
 	}
+	log.Printf(
+		"agent traffic terminal event=write_close state=closed reason=relay_completed %s",
+		obs.FormatLogFields(obs.LogFields{
+			TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
+			ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+			ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
+			ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
+			TunnelID:           strings.TrimSpace(handoff.TunnelID),
+		}),
+	)
 	return HandleResult{
 		TrafficID: handoff.Open.TrafficID,
 		Endpoint:  selectedEndpoint,
@@ -219,4 +318,22 @@ func copyStringMap(source map[string]string) map[string]string {
 		copied[key] = value
 	}
 	return copied
+}
+
+// observeOpenAckLatency 记录单次 traffic 从进入 Handle 到写出 open_ack 的延迟。
+func (opener *Opener) observeOpenAckLatency(startedAt time.Time) {
+	if opener == nil || opener.metrics == nil {
+		return
+	}
+	// open_ack 延迟统一按 Handle 入口时间到 ack 写出时间计算。
+	opener.metrics.ObserveAgentTrafficOpenAckLatency(time.Since(startedAt))
+}
+
+// observeDialLatency 记录单次 upstream dial 调用的耗时。
+func (opener *Opener) observeDialLatency(startedAt time.Time) {
+	if opener == nil || opener.metrics == nil {
+		return
+	}
+	// upstream dial 延迟按 Dial 调用时长计算，便于定位上游建连瓶颈。
+	opener.metrics.ObserveAgentUpstreamDialLatency(time.Since(startedAt))
 }

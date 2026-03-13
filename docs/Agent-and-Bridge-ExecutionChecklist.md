@@ -169,10 +169,10 @@
 
 ### A10. 观测性与诊断
 
-- [ ] Agent 指标：session、pool、open_ack 延迟、upstream dial 延迟
-- [ ] Bridge 指标：acquire 等待、open timeout/reject/late ack、hybrid fallback、actual endpoint override
-- [ ] 统一日志字段：`trace_id/traffic_id/route_id/service_id/actual_endpoint_*/session_id/session_epoch/connector_id/tunnel_id`
-- [ ] 关键错误路径补齐结构化日志模板
+- [x] Agent 指标：session、pool、open_ack 延迟、upstream dial 延迟
+- [x] Bridge 指标：acquire 等待、open timeout/reject/late ack、hybrid fallback、actual endpoint override
+- [x] 统一日志字段：`trace_id/traffic_id/route_id/service_id/actual_endpoint_*/session_id/session_epoch/connector_id/tunnel_id`
+- [x] 关键错误路径补齐结构化日志模板
 
 验收标准：
 
@@ -181,10 +181,10 @@
 
 ### A11. 配置与初始化覆盖
 
-- [ ] 保持当前默认值：`minIdle=8/maxIdle=32/rateLimit=10/burst=20/...`
-- [ ] Agent 初始化支持外部传入 `tunnelPool` 参数覆盖默认值
-- [ ] 未传字段回落默认值
-- [ ] 首版不做运行时热更新（重启生效）
+- [x] 保持当前默认值：`minIdle=8/maxIdle=32/rateLimit=10/burst=20/...`
+- [x] Agent 初始化支持外部传入 `tunnelPool` 参数覆盖默认值
+- [x] 未传字段回落默认值
+- [x] 首版不做运行时热更新（重启生效）
 
 验收标准：
 
@@ -193,10 +193,10 @@
 
 ### A12. 错误语义与终止行为
 
-- [ ] connector path 错误分类：route miss/service unavailable/no idle/open reject/open timeout/dial 失败/relay reset
-- [ ] external path 错误分类：discovery miss/provider down/refresh 失败/direct dial 失败/relay 失败
-- [ ] idle tunnel 回收触发：TTL、超上限、session draining/stale
-- [ ] close/reset 的状态与日志口径一致
+- [x] connector path 错误分类：route miss/service unavailable/no idle/open reject/open timeout/dial 失败/relay reset
+- [x] external path 错误分类：discovery miss/provider down/refresh 失败/direct dial 失败/relay 失败
+- [x] idle tunnel 回收触发：TTL、超上限、session draining/stale
+- [x] close/reset 的状态与日志口径一致
 
 验收标准：
 
@@ -219,8 +219,8 @@
 ### A14. UI 层与内嵌打包
 
 - [ ] Agent 桌面 UI 层采用 Tauri，并定义与 Agent Runtime 的本地交互边界（UDS / Named Pipe 长连接，支持Linux和Windows两种平台）
-- [ ] Agent 桌面 UI 层通信协议参考 [Agent 与 Tauri 本地通信技术方案](./Agent–TauriLocalCommunicationDesignProposal.md)。
-- [ ] Bridge 管理页面采用 React + shadcn/ui 实现
+- [ ] Agent 桌面 UI 层通信协议详细方案： [Agent 与 Tauri 本地通信技术方案](./Agent–TauriLocalCommunicationDesignProposal.md)。
+- [ ] Bridge 管理页面采用 React + shadcn/ui 实现，详细方案：[Bridge 管理后台技术方案](BridgeAdminBackendTechnicalProposal.md)
 - [ ] 建立 Bridge 管理页面构建产物流程（如 `npm run build` 输出静态资源）
 - [ ] Bridge 服务端实现静态资源内嵌（如 `go:embed`）与管理页面路由
 - [ ] 发布与部署流程改造：Bridge 单包即含管理 UI，不依赖独立 UI 服务部署

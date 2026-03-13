@@ -3,6 +3,8 @@ package connectorproxy
 import (
 	"errors"
 	"fmt"
+
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 )
 
 const (
@@ -12,6 +14,8 @@ const (
 	FailureCodeOpenRejected = "CONNECTOR_OPEN_REJECTED"
 	// FailureCodeOpenAckTimeout 表示 open_ack 超时。
 	FailureCodeOpenAckTimeout = "CONNECTOR_OPEN_ACK_TIMEOUT"
+	// FailureCodeDialFailed 表示 Agent 侧 upstream dial 失败。
+	FailureCodeDialFailed = "CONNECTOR_DIAL_FAILED"
 	// FailureCodeRelayFailed 表示 relay 过程失败。
 	FailureCodeRelayFailed = "CONNECTOR_RELAY_FAILED"
 	// FailureCodeConnectorProxyFailed 表示 connector path 通用失败。
@@ -48,6 +52,9 @@ func (mapper *FailureMapper) Map(err error) MappedFailure {
 	case errors.Is(err, ErrNoIdleTunnel):
 		mapped.HTTPStatus = 503
 		mapped.Code = FailureCodeNoIdleTunnel
+	case isConnectorDialFailed(err):
+		mapped.HTTPStatus = 502
+		mapped.Code = FailureCodeDialFailed
 	case errors.Is(err, ErrTrafficOpenRejected):
 		mapped.HTTPStatus = 503
 		mapped.Code = FailureCodeOpenRejected
@@ -59,6 +66,14 @@ func (mapper *FailureMapper) Map(err error) MappedFailure {
 		mapped.Code = FailureCodeRelayFailed
 	}
 	return mapped
+}
+
+func isConnectorDialFailed(err error) bool {
+	var openRejectedError *OpenRejectedError
+	if !errors.As(err, &openRejectedError) || openRejectedError == nil {
+		return false
+	}
+	return openRejectedError.Ack.ErrorCode == ltfperrors.CodeConnectorDialFailed
 }
 
 // Error 返回结构化错误文本，便于日志输出。

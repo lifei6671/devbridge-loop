@@ -2,8 +2,11 @@ package session
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 )
 
 // State 定义 session 生命周期状态。
@@ -30,6 +33,12 @@ type ReconnectPolicy interface {
 	NextDelay(attempt int) time.Duration
 }
 
+// StateHandler 处理 session 状态变化引发的联动操作。
+type StateHandler interface {
+	// HandleSessionState 根据状态变化执行联动逻辑，例如收敛 tunnel pool。
+	HandleSessionState(state string) (int, error)
+}
+
 // FixedBackoff 是固定间隔的重连策略。
 type FixedBackoff struct {
 	Delay time.Duration
@@ -52,12 +61,15 @@ type Options struct {
 	Heartbeat       HeartbeatScheduler
 	HeartbeatSender Sender
 	ReconnectPolicy ReconnectPolicy
+	Metrics         *obs.Metrics
+	StateHandler    StateHandler
 }
 
 // Manager 管理 session 生命周期与 epoch。
 type Manager struct {
 	mu               sync.RWMutex
 	state            State
+	stateVersion     uint64
 	epoch            uint64
 	lastHeartbeatAt  time.Time
 	lastStateAt      time.Time
@@ -67,18 +79,26 @@ type Manager struct {
 	heartbeatSender  Sender
 	reconnectPolicy  ReconnectPolicy
 	reconnectAttempt int
+	metrics          *obs.Metrics
+	stateHandler     StateHandler
+	stateHandlerMu   sync.Mutex
 }
 
 // NewManager 创建默认的 session 管理器。
 func NewManager() *Manager {
 	// 约定：初始状态为 CONNECTING，epoch 从 1 开始。
 	now := time.Now()
-	return &Manager{
+	manager := &Manager{
 		state:           StateConnecting,
+		stateVersion:    1,
 		epoch:           1,
 		lastStateAt:     now,
 		reconnectPolicy: FixedBackoff{Delay: time.Second},
+		metrics:         obs.DefaultMetrics,
 	}
+	// 初始化时同步写入 session 状态指标。
+	manager.metrics.SetAgentSessionState(string(StateConnecting))
+	return manager
 }
 
 // NewManagerWithOptions 创建带依赖的 session 管理器。
@@ -96,6 +116,14 @@ func NewManagerWithOptions(opts Options) *Manager {
 	if opts.ReconnectPolicy != nil {
 		mgr.reconnectPolicy = opts.ReconnectPolicy
 	}
+	if opts.Metrics != nil {
+		mgr.metrics = opts.Metrics
+	}
+	if opts.StateHandler != nil {
+		mgr.stateHandler = opts.StateHandler
+	}
+	// 注入自定义指标对象后，立即刷新一次当前状态。
+	mgr.metrics.SetAgentSessionState(string(mgr.state))
 	return mgr
 }
 
@@ -132,10 +160,10 @@ func (m *Manager) Run(ctx context.Context) error {
 func (m *Manager) Start(ctx context.Context) error {
 	_ = ctx // skeleton: 暂不使用 ctx，后续接入连接流程
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// 进入 ACTIVE，标记状态切换时间。
-	m.state = StateActive
-	m.lastStateAt = time.Now()
+	stateChanged, stateVersion := m.setStateLocked(StateActive, time.Now())
+	m.mu.Unlock()
+	m.notifyStateHandler(StateActive, stateChanged, stateVersion)
 	return nil
 }
 
@@ -143,29 +171,29 @@ func (m *Manager) Start(ctx context.Context) error {
 func (m *Manager) Stop(ctx context.Context) error {
 	_ = ctx // skeleton: 预留关闭流程
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// 统一收敛到 CLOSED。
-	m.state = StateClosed
-	m.lastStateAt = time.Now()
+	stateChanged, stateVersion := m.setStateLocked(StateClosed, time.Now())
+	m.mu.Unlock()
+	m.notifyStateHandler(StateClosed, stateChanged, stateVersion)
 	return nil
 }
 
 // MarkDraining 将 session 标记为 DRAINING。
 func (m *Manager) MarkDraining() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// 排空阶段：拒绝新流量。
-	m.state = StateDraining
-	m.lastStateAt = time.Now()
+	stateChanged, stateVersion := m.setStateLocked(StateDraining, time.Now())
+	m.mu.Unlock()
+	m.notifyStateHandler(StateDraining, stateChanged, stateVersion)
 }
 
 // MarkStale 将 session 标记为 STALE。
 func (m *Manager) MarkStale() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// 过期阶段：等待关闭或重连。
-	m.state = StateStale
-	m.lastStateAt = time.Now()
+	stateChanged, stateVersion := m.setStateLocked(StateStale, time.Now())
+	m.mu.Unlock()
+	m.notifyStateHandler(StateStale, stateChanged, stateVersion)
 }
 
 // RecordHeartbeat 记录一次心跳到达时间。
@@ -224,9 +252,9 @@ func (m *Manager) State() State {
 func (m *Manager) connectOnce(ctx context.Context) error {
 	m.mu.Lock()
 	// 切换到 CONNECTING 状态。
-	m.state = StateConnecting
-	m.lastStateAt = time.Now()
+	connectingChanged, connectingVersion := m.setStateLocked(StateConnecting, time.Now())
 	m.mu.Unlock()
+	m.notifyStateHandler(StateConnecting, connectingChanged, connectingVersion)
 
 	if m.dialer != nil {
 		// 先建立到底层传输的连接。
@@ -237,9 +265,9 @@ func (m *Manager) connectOnce(ctx context.Context) error {
 
 	m.mu.Lock()
 	// 进入 AUTHENTICATING 状态。
-	m.state = StateAuthenticating
-	m.lastStateAt = time.Now()
+	authenticatingChanged, authenticatingVersion := m.setStateLocked(StateAuthenticating, time.Now())
 	m.mu.Unlock()
+	m.notifyStateHandler(StateAuthenticating, authenticatingChanged, authenticatingVersion)
 
 	if m.authenticator != nil {
 		// 执行鉴权流程。
@@ -250,10 +278,10 @@ func (m *Manager) connectOnce(ctx context.Context) error {
 
 	m.mu.Lock()
 	// 鉴权成功后进入 ACTIVE 状态。
-	m.state = StateActive
-	m.lastStateAt = time.Now()
+	activeChanged, activeVersion := m.setStateLocked(StateActive, time.Now())
 	m.reconnectAttempt = 0
 	m.mu.Unlock()
+	m.notifyStateHandler(StateActive, activeChanged, activeVersion)
 
 	if m.heartbeatSender != nil {
 		// 启动心跳循环，错误由发送方内部处理。
@@ -263,4 +291,41 @@ func (m *Manager) connectOnce(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// setStateLocked 在持锁上下文中切换 session 状态并同步指标。
+func (m *Manager) setStateLocked(state State, stateAt time.Time) (bool, uint64) {
+	stateChanged := m.state != state
+	if stateChanged {
+		m.stateVersion++
+	}
+	m.state = state
+	m.lastStateAt = stateAt
+	if m.metrics != nil {
+		// 状态变更时同步写入 session 状态指标，便于外部实时观测。
+		m.metrics.SetAgentSessionState(string(state))
+	}
+	return stateChanged, m.stateVersion
+}
+
+func (m *Manager) notifyStateHandler(state State, stateChanged bool, stateVersion uint64) {
+	if m == nil || !stateChanged {
+		return
+	}
+	m.stateHandlerMu.Lock()
+	defer m.stateHandlerMu.Unlock()
+
+	m.mu.RLock()
+	stateHandler := m.stateHandler
+	shouldNotify := stateHandler != nil && m.state == state && m.stateVersion == stateVersion
+	if !shouldNotify {
+		m.mu.RUnlock()
+		return
+	}
+	// 在回调执行期间保持读锁，避免版本检查后状态再次推进导致陈旧回调落地。
+	_, err := stateHandler.HandleSessionState(string(state))
+	m.mu.RUnlock()
+	if err != nil {
+		log.Printf("agent session state handler failed state=%s err=%v", state, err)
+	}
 }

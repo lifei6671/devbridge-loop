@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 )
 
@@ -34,6 +36,7 @@ type TunnelAcquirerOptions struct {
 	WaitHint       time.Duration
 	PollInterval   time.Duration
 	Now            func() time.Time
+	Metrics        *obs.Metrics
 	RefillReason   string
 	EnableNoIdleWT bool
 }
@@ -45,6 +48,7 @@ type TunnelAcquirer struct {
 	waitHint       time.Duration
 	pollInterval   time.Duration
 	now            func() time.Time
+	metrics        *obs.Metrics
 	refillReason   string
 	enableNoIdleWT bool
 }
@@ -80,6 +84,7 @@ func NewTunnelAcquirer(options TunnelAcquirerOptions) (*TunnelAcquirer, error) {
 		waitHint:       waitHint,
 		pollInterval:   pollInterval,
 		now:            nowFunction,
+		metrics:        normalizeBridgeMetrics(options.Metrics),
 		refillReason:   refillReason,
 		enableNoIdleWT: enableNoIdleWT,
 	}, nil
@@ -87,6 +92,8 @@ func NewTunnelAcquirer(options TunnelAcquirerOptions) (*TunnelAcquirer, error) {
 
 // AcquireIdleTunnel 为指定 connector 分配一条 idle tunnel。
 func (acquirer *TunnelAcquirer) AcquireIdleTunnel(ctx context.Context, connectorID string) (registry.TunnelRuntime, error) {
+	acquireStartedAt := time.Now()
+	defer acquirer.observeAcquireWait(acquireStartedAt)
 	if acquirer == nil || acquirer.registry == nil {
 		return registry.TunnelRuntime{}, ErrTunnelAcquirerDependencyMissing
 	}
@@ -107,6 +114,10 @@ func (acquirer *TunnelAcquirer) AcquireIdleTunnel(ctx context.Context, connector
 		acquirer.refill.RequestRefill(normalizedConnectorID, acquirer.refillReason)
 	}
 	if !acquirer.enableNoIdleWT || acquirer.waitHint == 0 {
+		log.Printf(
+			"bridge acquire idle failed event=no_idle_tunnel %s",
+			obs.FormatLogFields(obs.LogFields{ConnectorID: normalizedConnectorID}),
+		)
 		return registry.TunnelRuntime{}, fmt.Errorf("acquire idle tunnel: %w: connector_id=%s", ErrNoIdleTunnel, normalizedConnectorID)
 	}
 
@@ -122,6 +133,10 @@ func (acquirer *TunnelAcquirer) AcquireIdleTunnel(ctx context.Context, connector
 
 		remaining := deadline.Sub(acquirer.now())
 		if remaining <= 0 {
+			log.Printf(
+				"bridge acquire idle timeout event=acquire_wait_timeout %s",
+				obs.FormatLogFields(obs.LogFields{ConnectorID: normalizedConnectorID}),
+			)
 			return registry.TunnelRuntime{}, fmt.Errorf(
 				"acquire idle tunnel: %w: connector_id=%s wait_hint=%s",
 				ErrNoIdleTunnel,
@@ -141,4 +156,21 @@ func (acquirer *TunnelAcquirer) AcquireIdleTunnel(ctx context.Context, connector
 		case <-timer.C:
 		}
 	}
+}
+
+// observeAcquireWait 记录一次 acquire idle tunnel 的总耗时。
+func (acquirer *TunnelAcquirer) observeAcquireWait(startedAt time.Time) {
+	if acquirer == nil || acquirer.metrics == nil {
+		return
+	}
+	// acquire 等待时长统一按调用入口到返回时刻计算。
+	acquirer.metrics.ObserveBridgeTunnelAcquireWait(time.Since(startedAt).Milliseconds())
+}
+
+// normalizeBridgeMetrics 归一化 Bridge 指标依赖，未注入时回落默认指标容器。
+func normalizeBridgeMetrics(metrics *obs.Metrics) *obs.Metrics {
+	if metrics == nil {
+		return obs.DefaultMetrics
+	}
+	return metrics
 }

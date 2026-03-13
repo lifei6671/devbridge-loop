@@ -2,9 +2,44 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
+
+type managerTestBlockingOpener struct {
+	started chan struct{}
+	release chan struct{}
+
+	mutex    sync.Mutex
+	sequence int
+}
+
+func newManagerTestBlockingOpener() *managerTestBlockingOpener {
+	return &managerTestBlockingOpener{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (opener *managerTestBlockingOpener) Open(ctx context.Context) (RuntimeTunnel, error) {
+	select {
+	case opener.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-opener.release:
+	}
+
+	opener.mutex.Lock()
+	opener.sequence++
+	tunnelID := opener.sequence
+	opener.mutex.Unlock()
+	return &producerTestTunnel{id: fmt.Sprintf("blocked-%d", tunnelID)}, nil
+}
 
 // TestManagerPrebuildAndConsumeRefill 验证启动预建与消费后补建流程。
 func TestManagerPrebuildAndConsumeRefill(testingObject *testing.T) {
@@ -177,5 +212,138 @@ func TestManagerTTLSweepIdlePath(testingObject *testing.T) {
 	}
 	if idleTunnel.closeCount.Load() != 1 {
 		testingObject.Fatalf("expected ttl reaper close once, got %d", idleTunnel.closeCount.Load())
+	}
+}
+
+// TestManagerHandleSessionStateDrainAndResume 验证 session DRAINING/STALE 会回收 idle 并暂停补池。
+func TestManagerHandleSessionStateDrainAndResume(testingObject *testing.T) {
+	testingObject.Parallel()
+	opener := &producerTestOpener{}
+	manager, err := NewManager(ManagerOptions{
+		Config: ManagerConfig{
+			MinIdle:           2,
+			MaxIdle:           4,
+			IdleTTL:           0,
+			MaxInflightOpens:  2,
+			TunnelOpenRate:    1000,
+			TunnelOpenBurst:   1000,
+			ReconcileInterval: time.Second,
+		},
+		Opener: opener,
+	})
+	if err != nil {
+		testingObject.Fatalf("new manager failed: %v", err)
+	}
+	if _, err := manager.ReconcileNow(context.Background(), "startup"); err != nil {
+		testingObject.Fatalf("startup reconcile failed: %v", err)
+	}
+	if manager.Snapshot().IdleCount != 2 {
+		testingObject.Fatalf("unexpected startup idle count: %d", manager.Snapshot().IdleCount)
+	}
+
+	recycledIdleCount, err := manager.HandleSessionState(SessionStateDraining)
+	if err != nil {
+		testingObject.Fatalf("handle draining state failed: %v", err)
+	}
+	if recycledIdleCount != 2 {
+		testingObject.Fatalf("unexpected recycled idle count: %d", recycledIdleCount)
+	}
+	if manager.Snapshot().IdleCount != 0 {
+		testingObject.Fatalf("expected all idle recycled when draining")
+	}
+	if manager.RequestRefill(2, "manual") {
+		testingObject.Fatalf("expected refill ignored during draining")
+	}
+	afterDrainResult, err := manager.ReconcileNow(context.Background(), "after_draining")
+	if err != nil {
+		testingObject.Fatalf("reconcile in draining failed: %v", err)
+	}
+	if afterDrainResult.After.IdleCount != 0 {
+		testingObject.Fatalf("expected no refill while draining, got idle=%d", afterDrainResult.After.IdleCount)
+	}
+
+	if _, err := manager.HandleSessionState(SessionStateActive); err != nil {
+		testingObject.Fatalf("handle active state failed: %v", err)
+	}
+	afterActiveResult, err := manager.ReconcileNow(context.Background(), "after_active")
+	if err != nil {
+		testingObject.Fatalf("reconcile after active failed: %v", err)
+	}
+	if afterActiveResult.After.IdleCount != 2 {
+		testingObject.Fatalf("expected idle rebuilt after active, got=%d", afterActiveResult.After.IdleCount)
+	}
+}
+
+// TestManagerHandleSessionStateDrainingSerializesWithReconcile 验证 draining 会等待进行中的 reconcile，并最终回收并发新增 idle。
+func TestManagerHandleSessionStateDrainingSerializesWithReconcile(testingObject *testing.T) {
+	testingObject.Parallel()
+	opener := newManagerTestBlockingOpener()
+	manager, err := NewManager(ManagerOptions{
+		Config: ManagerConfig{
+			MinIdle:           1,
+			MaxIdle:           4,
+			IdleTTL:           0,
+			MaxInflightOpens:  1,
+			TunnelOpenRate:    1000,
+			TunnelOpenBurst:   1000,
+			ReconcileInterval: time.Second,
+		},
+		Opener: opener,
+	})
+	if err != nil {
+		testingObject.Fatalf("new manager failed: %v", err)
+	}
+
+	reconcileDone := make(chan error, 1)
+	go func() {
+		_, reconcileErr := manager.ReconcileNow(context.Background(), "startup")
+		reconcileDone <- reconcileErr
+	}()
+
+	select {
+	case <-opener.started:
+	case <-time.After(time.Second):
+		testingObject.Fatalf("timed out waiting for reconcile open to start")
+	}
+
+	drainDone := make(chan struct{})
+	var recycledIdleCount int
+	var drainingErr error
+	go func() {
+		recycledIdleCount, drainingErr = manager.HandleSessionState(SessionStateDraining)
+		close(drainDone)
+	}()
+
+	select {
+	case <-drainDone:
+		testingObject.Fatalf("expected draining to wait for in-flight reconcile")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(opener.release)
+
+	select {
+	case reconcileErr := <-reconcileDone:
+		if reconcileErr != nil {
+			testingObject.Fatalf("reconcile failed: %v", reconcileErr)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("timed out waiting for reconcile completion")
+	}
+
+	select {
+	case <-drainDone:
+	case <-time.After(time.Second):
+		testingObject.Fatalf("timed out waiting for draining completion")
+	}
+
+	if drainingErr != nil {
+		testingObject.Fatalf("handle draining state failed: %v", drainingErr)
+	}
+	if recycledIdleCount != 1 {
+		testingObject.Fatalf("expected recycled idle count 1, got=%d", recycledIdleCount)
+	}
+	if manager.Snapshot().IdleCount != 0 {
+		testingObject.Fatalf("expected no idle after draining, got=%d", manager.Snapshot().IdleCount)
 	}
 }

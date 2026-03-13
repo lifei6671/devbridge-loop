@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 )
 
 var (
@@ -14,6 +16,15 @@ var (
 	ErrManagerDependencyMissing = errors.New("manager dependency missing")
 	// ErrInvalidManagerConfig 表示 Manager 参数配置不合法。
 	ErrInvalidManagerConfig = errors.New("invalid manager config")
+)
+
+const (
+	// SessionStateActive 表示 session 已恢复可接流量。
+	SessionStateActive = "ACTIVE"
+	// SessionStateDraining 表示 session 进入排空状态。
+	SessionStateDraining = "DRAINING"
+	// SessionStateStale 表示 session 进入过期状态。
+	SessionStateStale = "STALE"
 )
 
 // ManagerConfig 定义 TunnelManager 的池治理参数。
@@ -119,6 +130,7 @@ type ManagerOptions struct {
 	Opener      TunnelOpener
 	EventNotify PoolEventNotifier
 	NowFn       func() time.Time
+	Metrics     *obs.Metrics
 }
 
 // ReconcileResult 描述一次池纠偏结果。
@@ -141,6 +153,7 @@ type Manager struct {
 	reaper    *Reaper
 	ttlReaper *TTLReaper
 	nowFn     func() time.Time
+	metrics   *obs.Metrics
 
 	eventNotify PoolEventNotifier
 
@@ -149,6 +162,7 @@ type Manager struct {
 	stateMutex          sync.Mutex
 	pendingTargetIdle   int
 	pendingReason       string
+	suspendRefill       bool
 }
 
 // NewManager 创建 tunnel pool 管理器。
@@ -195,11 +209,17 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		reaper:              reaper,
 		ttlReaper:           ttlReaper,
 		nowFn:               normalizedNowFn,
+		metrics:             obs.DefaultMetrics,
 		eventNotify:         options.EventNotify,
 		refillSignalChannel: make(chan struct{}, 1),
 		pendingTargetIdle:   normalizedConfig.MinIdle,
 		pendingReason:       "startup",
 	}
+	if options.Metrics != nil {
+		manager.metrics = options.Metrics
+	}
+	// 启动前先把当前池快照写入指标，避免冷启动期间指标为空。
+	manager.updatePoolMetrics(manager.registry.Snapshot())
 	return manager, nil
 }
 
@@ -288,6 +308,7 @@ func (manager *Manager) ReconcileNow(ctx context.Context, trigger string) (Recon
 		// 当前 idle 已满足目标时仅更新 pending 状态。
 		manager.clearPendingIfSatisfied(currentSnapshot.IdleCount)
 		result.After = currentSnapshot
+		manager.updatePoolMetrics(result.After)
 		if result.TTLSweep.FirstError != nil {
 			return result, result.TTLSweep.FirstError
 		}
@@ -307,6 +328,7 @@ func (manager *Manager) ReconcileNow(ctx context.Context, trigger string) (Recon
 		return nil
 	})
 	result.After = manager.registry.Snapshot()
+	manager.updatePoolMetrics(result.After)
 	manager.clearPendingIfSatisfied(result.After.IdleCount)
 
 	if result.Produced.Opened > 0 || result.Produced.Failed > 0 || result.TTLSweep.Closed > 0 || result.TrimmedIdleCount > 0 {
@@ -330,6 +352,11 @@ func (manager *Manager) RequestRefill(targetIdle int, reason string) bool {
 		return false
 	}
 	manager.stateMutex.Lock()
+	if manager.suspendRefill {
+		// session 非 ACTIVE 时禁止触发补池。
+		manager.stateMutex.Unlock()
+		return false
+	}
 	updated := false
 	if effectiveTargetIdle > manager.pendingTargetIdle {
 		// 多个请求取更高目标，避免并发叠加过冲。
@@ -364,6 +391,7 @@ func (manager *Manager) AcquireIdle(at time.Time) (*Record, bool) {
 	}
 	// idle 被消费后立刻触发补池。
 	manager.RequestRefill(manager.config.MinIdle, "consume")
+	manager.updatePoolMetrics(manager.registry.Snapshot())
 	manager.emitEvent("idle_acquired")
 	return record, true
 }
@@ -378,12 +406,17 @@ func (manager *Manager) MarkActive(tunnelID string) error {
 	if err := manager.registry.MarkActive(manager.nowFn(), normalizedTunnelID); err != nil {
 		return err
 	}
+	manager.updatePoolMetrics(manager.registry.Snapshot())
 	manager.emitEvent("tunnel_active")
 	return nil
 }
 
 // CloseAndRemove 把 tunnel 收敛到 closed 并摘除记录。
 func (manager *Manager) CloseAndRemove(tunnelID string) error {
+	return manager.closeAndRemove(tunnelID, true, "close")
+}
+
+func (manager *Manager) closeAndRemove(tunnelID string, refill bool, refillReason string) error {
 	normalizedTunnelID := strings.TrimSpace(tunnelID)
 	if normalizedTunnelID == "" {
 		// 空 tunnelID 直接返回 not found。
@@ -403,7 +436,10 @@ func (manager *Manager) CloseAndRemove(tunnelID string) error {
 			if _, removeErr := manager.reaper.RemoveClosedOnly(normalizedTunnelID); removeErr != nil {
 				return errors.Join(err, removeErr)
 			}
-			manager.RequestRefill(manager.config.MinIdle, "close")
+			if refill {
+				manager.RequestRefill(manager.config.MinIdle, refillReason)
+			}
+			manager.updatePoolMetrics(manager.registry.Snapshot())
 			manager.emitEvent("tunnel_closed")
 			return err
 		}
@@ -414,7 +450,10 @@ func (manager *Manager) CloseAndRemove(tunnelID string) error {
 	if _, err := manager.reaper.RemoveClosedOnly(normalizedTunnelID); err != nil {
 		return err
 	}
-	manager.RequestRefill(manager.config.MinIdle, "close")
+	if refill {
+		manager.RequestRefill(manager.config.MinIdle, refillReason)
+	}
+	manager.updatePoolMetrics(manager.registry.Snapshot())
 	manager.emitEvent("tunnel_closed")
 	return nil
 }
@@ -426,6 +465,7 @@ func (manager *Manager) MarkBrokenAndRemove(tunnelID string, reason string) erro
 	}
 	// broken 摘除后触发补池，保持 idle 水位。
 	manager.RequestRefill(manager.config.MinIdle, "broken")
+	manager.updatePoolMetrics(manager.registry.Snapshot())
 	manager.emitEvent("tunnel_broken")
 	return nil
 }
@@ -441,7 +481,8 @@ func (manager *Manager) trimExcessIdle() (int, error) {
 	idleTunnelIDs := manager.registry.IdleIDs(excessIdleCount)
 	trimmedIdleCount := 0
 	for _, tunnelID := range idleTunnelIDs {
-		if err := manager.CloseAndRemove(tunnelID); err != nil {
+		// 超上限回收不触发 refill，避免边回收边补建。
+		if err := manager.closeAndRemove(tunnelID, false, "trim"); err != nil {
 			// 单条回收失败立即返回，避免继续扩大异常面。
 			return trimmedIdleCount, err
 		}
@@ -454,6 +495,10 @@ func (manager *Manager) trimExcessIdle() (int, error) {
 func (manager *Manager) computeTargetIdle() (int, int) {
 	manager.stateMutex.Lock()
 	defer manager.stateMutex.Unlock()
+	if manager.suspendRefill {
+		// session DRAINING/STALE 时暂停补池。
+		return 0, 0
+	}
 	requestedTargetIdle := manager.pendingTargetIdle
 	if requestedTargetIdle < manager.config.MinIdle {
 		// 未显式请求时至少维持 min_idle。
@@ -491,6 +536,64 @@ func (manager *Manager) clampTargetIdle(targetIdle int) int {
 	return effectiveTargetIdle
 }
 
+// HandleSessionState 处理 session 状态变化触发的 idle 回收和补池开关。
+func (manager *Manager) HandleSessionState(state string) (int, error) {
+	if manager == nil {
+		return 0, nil
+	}
+	normalizedState := strings.ToUpper(strings.TrimSpace(state))
+	switch normalizedState {
+	case SessionStateDraining, SessionStateStale:
+		// 与 ReconcileNow 串行，避免 DRAINING/STALE 期间并发补池重新引入 idle。
+		manager.reconcileMutex.Lock()
+		defer manager.reconcileMutex.Unlock()
+
+		manager.stateMutex.Lock()
+		// 进入 DRAINING/STALE 后暂停补池，防止回收后立即补建。
+		manager.suspendRefill = true
+		manager.pendingTargetIdle = 0
+		manager.pendingReason = strings.ToLower(normalizedState)
+		manager.stateMutex.Unlock()
+
+		recycledIdleCount, recycleErr := manager.recycleAllIdleWithoutRefill()
+		manager.updatePoolMetrics(manager.registry.Snapshot())
+		manager.emitEvent("session_" + strings.ToLower(normalizedState))
+		return recycledIdleCount, recycleErr
+	case SessionStateActive:
+		// 与 ReconcileNow 串行，确保恢复补池与上一轮 drain 行为顺序一致。
+		manager.reconcileMutex.Lock()
+		manager.stateMutex.Lock()
+		wasSuspended := manager.suspendRefill
+		manager.suspendRefill = false
+		manager.stateMutex.Unlock()
+		manager.reconcileMutex.Unlock()
+		if wasSuspended {
+			// 恢复 ACTIVE 后按 min_idle 重新补池。
+			manager.RequestRefill(manager.config.MinIdle, "session_active")
+		}
+		manager.emitEvent("session_active")
+		return 0, nil
+	default:
+		return 0, nil
+	}
+}
+
+func (manager *Manager) recycleAllIdleWithoutRefill() (int, error) {
+	snapshot := manager.registry.Snapshot()
+	if snapshot.IdleCount <= 0 {
+		return 0, nil
+	}
+	idleTunnelIDs := manager.registry.IdleIDs(snapshot.IdleCount)
+	recycledIdleCount := 0
+	for _, tunnelID := range idleTunnelIDs {
+		if err := manager.closeAndRemove(tunnelID, false, "session_state"); err != nil {
+			return recycledIdleCount, err
+		}
+		recycledIdleCount++
+	}
+	return recycledIdleCount, nil
+}
+
 // emitEvent 向上层通知一次池状态变化事件。
 func (manager *Manager) emitEvent(trigger string) {
 	manager.stateMutex.Lock()
@@ -505,4 +608,13 @@ func (manager *Manager) emitEvent(trigger string) {
 		normalizedTrigger = "pool_event"
 	}
 	notifier.NotifyEvent(normalizedTrigger)
+}
+
+// updatePoolMetrics 把当前 pool 快照同步到观测指标。
+func (manager *Manager) updatePoolMetrics(snapshot Snapshot) {
+	if manager == nil || manager.metrics == nil {
+		return
+	}
+	// tunnel pool 观测当前只关心 idle/active 两个核心水位。
+	manager.metrics.SetAgentTunnelPoolCounts(snapshot.IdleCount, snapshot.ActiveCount)
 }
