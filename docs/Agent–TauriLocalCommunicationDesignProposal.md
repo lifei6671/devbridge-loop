@@ -224,7 +224,7 @@ flowchart TD
 即：
 
 * Rust Host 与 Go Agent 建立一条长期连接
-* 请求通过 `request_id` 匹配响应
+* 请求通过帧头 `RequestId` 匹配响应
 * Go Agent 可以主动推送事件
 * Rust Host 再将事件转发给前端
 
@@ -353,7 +353,7 @@ runtime/agent/
 * 路由 request
 * 推送 event
 * 管理订阅
-* 做本地握手与轻量鉴权
+* 做本地握手与双向鉴权
 
 ---
 
@@ -419,6 +419,7 @@ src-tauri/
 * 启动 Go Agent
 * 注入 IPC 地址
 * 注入配置路径、日志路径
+* 生成并注入本次启动专用 `session_secret`（用于 IPC challenge-response，进程重启后必须轮换）
 * 处理启动前检查
 * 做单实例约束判断
 
@@ -506,6 +507,31 @@ src-tauri/
 * `BodyLen`：消息体长度
 * `Body`：JSON 内容
 
+### 11.3.1 帧长限制与解析顺序（强制）
+
+首版强制约束：
+
+* `BodyLen` 必须满足 `0 <= BodyLen <= 1048576`（1 MiB）
+* `ping/pong` 的 `BodyLen` 必须为 `0`
+* 超限或非法帧必须返回 `FRAME_TOO_LARGE` 或 `PROTOCOL_ERROR` 并断开连接
+
+解码顺序必须固定为：
+
+1. 读取固定头（不分配大块内存）
+2. 校验 `Magic/Version/Type/Flags/BodyLen`
+3. 校验通过后再按 `BodyLen` 分配并读取 `Body`
+
+不得在 `BodyLen` 未校验前按声明长度直接分配内存。
+
+### 11.3.2 RequestId 关联规则（强制）
+
+`RequestId` 以帧头字段为唯一关联来源：
+
+* `request/response` 必须携带非零 `RequestId`
+* `event/ping/pong` 的 `RequestId` 固定为全零
+* JSON `Body` 不再携带 `request_id` 字段
+* 若收到含 `request_id` 的 JSON 消息体，按 `PROTOCOL_ERROR` 处理并断链
+
 ---
 
 ## 11.4 消息模型
@@ -515,7 +541,6 @@ src-tauri/
 ```json
 {
   "type": "request",
-  "request_id": "req-001",
   "method": "agent.snapshot",
   "timeout_ms": 5000,
   "payload": {}
@@ -529,7 +554,6 @@ src-tauri/
 ```json
 {
   "type": "response",
-  "request_id": "req-001",
   "ok": true,
   "payload": {
     "agent_state": "running"
@@ -542,7 +566,6 @@ src-tauri/
 ```json
 {
   "type": "response",
-  "request_id": "req-001",
   "ok": false,
   "error": {
     "code": "CONFIG_INVALID",
@@ -583,6 +606,12 @@ src-tauri/
 * `agent.start`
 * `agent.stop`
 * `agent.restart`
+
+生命周期语义约束（强制）：
+
+* `agent.start`：将 Supervisor 的 `desired_state` 置为 `running`
+* `agent.stop`：将 `desired_state` 置为 `stopped`，并以 `exit_kind=expected` 结束进程
+* `agent.restart`：按“期望停机后再启动”执行，不计入崩溃自动恢复
 
 ### 12.3 session
 
@@ -815,8 +844,10 @@ sequenceDiagram
 1. Rust 标记宿主状态为 `disconnected`
 2. 前端展示“Agent 离线”
 3. Rust 检查 Agent 进程是否仍存活
-4. 若仍存活，则尝试重连 IPC
-5. 若已退出，则按策略决定是否自动拉起
+4. 若仍存活，则尝试重连 IPC，并重新执行完整握手校验
+5. 重连成功后进入 `resyncing`，强制重新拉取全量 snapshot（agent/session/service/tunnel/traffic）
+6. 全量 snapshot 成功后才进入 `connected` 并恢复事件转发
+7. 若已退出，则按 `desired_state` 决定是否自动拉起
 
 ---
 
@@ -826,7 +857,7 @@ sequenceDiagram
 
 1. Rust Supervisor 记录退出码
 2. 向前端发出 `agent.state.changed = crashed`
-3. 按策略自动拉起 Agent
+3. 仅当 `desired_state=running` 且 `exit_kind=unexpected` 时自动拉起 Agent
 4. 重建 IPC 连接
 5. 重新执行 bootstrap
 6. 重新向前端下发完整 snapshot
@@ -844,6 +875,20 @@ sequenceDiagram
 
 ---
 
+### 16.4 Supervisor 意图状态（强制）
+
+Rust Host 必须维护并持久化最小状态：
+
+* `desired_state`：`running` / `stopped`
+* `exit_kind`：`expected` / `unexpected`
+
+自动恢复判断规则：
+
+* 仅当 `desired_state=running && exit_kind=unexpected` 执行自动拉起
+* 当用户调用 `agent.stop` 或 `app.shutdown` 后，必须禁止自动拉起
+
+---
+
 ## 17. 安全设计
 
 ### 17.1 本地地址设计
@@ -858,6 +903,13 @@ $XDG_RUNTIME_DIR/agent-ui/agent.sock
 
 若系统不提供 `XDG_RUNTIME_DIR`，则退回用户私有运行目录。
 
+实现约束（强制）：
+
+* IPC 目录必须由当前用户创建，权限 `0700`，owner 必须为当前用户
+* `agent.sock` 权限必须为 `0600`，owner 必须为当前用户
+* 创建前必须 `lstat` 检查，若目标路径是符号链接或非 socket 文件则直接失败
+* 退回目录不得使用 `/tmp` 等共享目录，必须使用用户私有目录
+
 #### Windows
 
 建议路径：
@@ -866,30 +918,50 @@ $XDG_RUNTIME_DIR/agent-ui/agent.sock
 \\.\pipe\agent-ui-<user-scope>
 ```
 
+实现约束（强制）：
+
+* Pipe 名称必须包含当前用户作用域（建议使用 SID）
+* Named Pipe 必须使用仅允许当前用户（可选追加 LocalSystem）的 DACL
+* 必须启用拒绝远程客户端策略（`PIPE_REJECT_REMOTE_CLIENTS`）
+* 建连后必须校验客户端令牌 SID 与当前用户一致
+
 ---
 
 ### 17.2 握手设计
 
-本地 IPC 建立后，应执行轻量握手：
+本地 IPC 建立后，必须执行两阶段握手与鉴权：
 
-Rust 发出：
+第一阶段：操作系统级对端身份校验
 
-* `client_name`
-* `protocol_version`
-* `nonce`
+* Linux：通过 `SO_PEERCRED` 校验对端 `uid`（必须等于当前用户），并校验 `pid` 与 Rust 启动的 Agent 进程一致
+* Windows：通过 Named Pipe 对端进程与令牌信息校验 `SID`（必须等于当前用户），并校验 `pid` 与 Rust 启动记录一致
+* 任一校验失败立即断开连接并记录 `PEER_IDENTITY_MISMATCH`
 
-Agent 返回：
+第二阶段：挑战应答（challenge-response）
 
-* `agent_id`
-* `version`
-* `feature_set`
+* Rust 启动 Agent 时生成随机 `session_secret`（至少 32 字节）并注入 Agent，生命周期仅限当前 Agent 进程
+* Rust 发送：
+  * `client_name`
+  * `protocol_version`
+  * `nonce`
+* Agent 返回：
+  * `agent_id`
+  * `version`
+  * `feature_set`
+  * `agent_nonce`
+  * `agent_proof`
+* `agent_proof = HMAC-SHA256(session_secret, client_nonce || agent_nonce || protocol_version || "agent")`
+* Rust 校验通过后再发送 `client_proof`
+* `client_proof = HMAC-SHA256(session_secret, client_nonce || agent_nonce || protocol_version || "host")`
+* Agent 仅在 `client_proof` 校验通过后接受非握手 RPC 方法
 
-握手的目的：
+握手与鉴权的目的：
 
 * 避免连到错误进程
 * 处理协议不兼容
 * 支撑能力协商
 * 提升故障诊断效率
+* 防止本机伪造进程冒充 Agent
 
 ---
 
@@ -1033,4 +1105,3 @@ Rust 只暴露有限 Tauri command，再映射到内部 RPC method。
 4. **采用长期 Local RPC 连接，支持 request/response/event 多路复用**
 5. **本地 RPC 只承载 lifecycle、config、snapshot、event、diagnose，不进入数据面**
 6. **UI 只消费聚合后的快照、事件和诊断结果，不直接接触 Agent 底层运行时流量**
-

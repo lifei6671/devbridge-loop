@@ -184,7 +184,36 @@ flowchart TD
 * `bridge-console-service`
 * `bridge-observer-service`
 
-后台 API 与静态资源统一由 Bridge 本体提供。
+后台 API 与静态资源统一由 Bridge 本体提供，但是必须做好抽象和分层，方便后续拆分。
+
+---
+
+## 5.3 Admin 模块启动开关（强制）
+
+Bridge 启动时必须可显式指定是否启用 Admin 模块，禁止“默认隐式开启”。
+
+建议配置项：
+
+* `admin.enabled`：`true/false`，默认 `false`
+* `admin.listen_addr`：管理入口监听地址（仅在 `admin.enabled=true` 时生效）
+* `admin.base_path`：管理入口前缀（例如 `/admin`）
+
+建议启动参数：
+
+* `--admin-enabled=true|false`
+* `--admin-listen-addr=<host:port>`
+* `--admin-base-path=/admin`
+
+行为约束：
+
+1. 当 `admin.enabled=false` 时：
+   * 不注册 `/api/admin/*` 路由
+   * 不提供管理静态资源页面
+   * 不初始化后台认证、中间件与运维命令处理器
+2. 当 `admin.enabled=true` 时：
+   * 必须显式配置 `admin.listen_addr`
+   * 必须通过认证与权限校验后才允许访问管理接口
+3. 启动日志必须输出 `admin.enabled` 与 `admin.listen_addr`，用于审计与故障排查
 
 ---
 
@@ -699,33 +728,49 @@ web/bridge-admin/
 
 ### Route 列表
 
-* `GET /api/admin/routes`
+* `GET /api/admin/routes?cursor=<cursor>&limit=<n>`
 * `GET /api/admin/routes/:routeId`
 
 ### Connector / Session
 
-* `GET /api/admin/connectors`
+* `GET /api/admin/connectors?cursor=<cursor>&limit=<n>`
 * `GET /api/admin/connectors/:connectorId`
-* `GET /api/admin/sessions`
+* `GET /api/admin/sessions?cursor=<cursor>&limit=<n>&state=<state>`
 * `GET /api/admin/sessions/:sessionId`
 
 ### Tunnel / Traffic
 
 * `GET /api/admin/tunnels/summary`
-* `GET /api/admin/tunnels`
+* `GET /api/admin/tunnels?cursor=<cursor>&limit=<n>&state=<state>&connector_id=<id>`
 * `GET /api/admin/traffic/summary`
-* `GET /api/admin/traffic`
+* `GET /api/admin/traffic?cursor=<cursor>&limit=<n>&route_id=<id>&path=<connector|direct|hybrid>`
+
+### Config
+
+* `GET /api/admin/config/snapshot`
 
 ### Logs / Metrics
 
-* `GET /api/admin/logs/search`
-* `GET /api/admin/metrics/query`
+* `GET /api/admin/logs/search?from=<ts>&to=<ts>&cursor=<cursor>&limit=<n>`
+* `GET /api/admin/metrics/query?from=<ts>&to=<ts>&step=<dur>`
 
 ### Diagnose
 
 * `POST /api/admin/diagnose/route`
 * `POST /api/admin/diagnose/session`
 * `POST /api/admin/diagnose/tunnel`
+
+### 10.2.1 查询分页与窗口约束（强制）
+
+所有列表与检索接口必须满足：
+
+1. 统一支持 `cursor + limit`
+2. 服务端强制 `limit` 上限（建议 `max_limit=200`）
+3. 日志与时序查询必须带 `from/to`，并限制最大时间窗口（建议不超过 24h）
+4. 缺省分页参数时使用保守默认值（建议 `limit=50`）
+5. 禁止返回无界全量数据
+
+这些约束用于避免后台查询放大后挤占 Bridge 数据面资源。
 
 ---
 
@@ -737,6 +782,7 @@ web/bridge-admin/
 * `POST /api/admin/ops/session/:sessionId/drain`
 * `POST /api/admin/ops/connector/:connectorId/drain`
 * `POST /api/admin/ops/diagnose/export`
+* `PUT /api/admin/config`（需并发版本校验）
 
 ### 约束
 
@@ -747,6 +793,8 @@ web/bridge-admin/
 * 有权限校验
 * 有审计记录
 * 有幂等或重复执行保护
+* 配置修改必须带 `if_match_version`，版本不一致返回 `409 Conflict`
+* 诊断包与日志导出仅允许 `admin` 角色
 
 ---
 
@@ -772,6 +820,18 @@ web/bridge-admin/
 
 若是内网使用，也不能完全省略认证层。
 
+### 11.2.1 Cookie 模式 CSRF 防护（强制）
+
+若使用 Session Cookie，所有写操作接口（`POST/PUT/PATCH/DELETE`）必须启用：
+
+1. CSRF Token 校验（双提交或服务端会话绑定均可）
+2. `Origin/Referer` 严格校验
+3. Cookie 安全属性：`HttpOnly + Secure + SameSite(Lax/Strict)`
+
+不得仅依赖“已登录态”放行写操作。
+
+若仅使用 Bearer Token 方案，可不启用 CSRF Token，但必须禁止 Cookie 回退鉴权。
+
 ---
 
 ## 11.3 安全边界
@@ -783,6 +843,30 @@ web/bridge-admin/
 3. 配置修改带版本与操作者信息
 4. 敏感配置脱敏展示
 5. 不提供任意代码执行、任意命令执行能力
+
+### 11.3.1 管理面网络隔离（强制）
+
+除路径隔离外，必须再满足网络层隔离：
+
+1. Admin API 默认使用独立监听地址/端口（`admin.listen_addr`），不得与业务 ingress 共用公网监听
+2. 未启用独立监听时，必须通过明确网络 ACL 限制来源网段
+3. 反向代理场景必须显式配置“仅管理网段可访问管理路由”
+
+禁止把“路径前缀隔离”作为唯一安全边界。
+
+### 11.4 导出与脱敏安全（强制）
+
+日志导出与诊断包导出必须执行统一脱敏策略，至少包括：
+
+* `authorization`、`cookie`、`token`、`secret`、`password`、`private_key` 字段
+* 连接串中的凭据段
+* 可能包含密钥材料的原始配置片段
+
+策略要求：
+
+1. 默认脱敏，不允许通过前端参数关闭
+2. 导出接口仅 `admin` 可调用
+3. 导出下载链接必须短时有效（建议 <= 10 分钟）并记录审计日志
 
 ---
 
@@ -885,6 +969,7 @@ web/bridge-admin/
 
 * ingress 监听
 * 管理入口绑定
+* `admin.enabled` / `admin.listen_addr` / `admin.base_path`
 * 核心 runtime 参数
 
 ### 可 reload 配置
@@ -914,6 +999,13 @@ web/bridge-admin/
 3. 明确告诉用户是否需要 reload / restart
 4. 记录审计日志
 5. 能导出变更前后差异
+6. 带并发版本校验（`if_match_version`）
+
+并发校验规则（强制）：
+
+* `GET /api/admin/config/snapshot` 返回 `config_version`
+* `PUT /api/admin/config` 必须携带 `if_match_version`
+* 若提交版本与当前版本不一致，返回 `409 Conflict` 并附带最新 `config_version`
 
 ---
 

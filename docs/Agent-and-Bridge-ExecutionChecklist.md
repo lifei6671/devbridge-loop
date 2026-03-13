@@ -232,6 +232,55 @@
 - Bridge 二进制单独启动即可访问管理页面（不需要额外前端进程）
 - 升级 Bridge 版本时，管理页面与后端 API 版本保持一致发布
 
+### A15. Agent-Tauri 本地通信与宿主集成
+
+- [ ] Rust Host 进程管理：Agent 启动/停止/守护、单实例检查、崩溃恢复框架
+- [ ] Host 状态机落地：`desired_state(running/stopped)` + `exit_kind(expected/unexpected)`，避免 `agent.stop` 被自动拉起覆盖
+- [ ] 跨平台 IPC 抽象：Linux UDS、Windows Named Pipe（统一客户端/服务端接口）
+- [ ] 长连接多路复用协议：`request/response/event/ping/pong` + 帧头 `RequestId` 关联
+- [ ] 帧协议安全约束：`BodyLen` 上限、`ping/pong` 空 body、先验头再分配内存、非法帧断链
+- [ ] 本地握手与双向鉴权：OS 对端身份校验 + `session_secret` challenge-response（HMAC）
+- [ ] IPC 端点安全策略：UDS 路径/权限（0700/0600、反 symlink）与 Named Pipe DACL/拒绝远程客户端
+- [ ] Agent `localrpc` 服务端：`app/agent/session/service/tunnel/traffic/config/diagnose` 方法域落地
+- [ ] 禁止接口与边界校验：拒绝 `traffic.open/reset`、`tunnel.read/write`、`relay.inject` 等越界调用
+- [ ] Rust `event_bridge`：事件转发、节流/聚合、稳定前端事件模型
+- [ ] 断链重连流程：`disconnected -> reconnecting -> resyncing -> connected`，重连后强制全量 snapshot 对账
+- [ ] 生命周期流程联调：`app.bootstrap` 启动链路、优雅关闭链路、超时回收路径
+- [ ] 宿主观测性：`agent_host_ipc_connected/reconnect_total/rpc_latency_ms/supervisor_restart_total` 指标与结构化日志
+- [ ] 跨平台测试矩阵：Linux/Windows 上的握手、权限、断链重连、状态对账、停止语义
+
+验收标准：
+
+- UI 可稳定完成六类能力：生命周期管理、配置管理、运行态快照、指标日志诊断、运维命令、崩溃恢复重连
+- 未授权进程无法通过本地 IPC 握手与鉴权
+- 断链恢复后 UI 状态与 Agent 真相源一致（无陈旧状态）
+- `agent.stop` 后不会被 Supervisor 误判为崩溃并自动拉起
+
+### A16. Bridge 管理后台（Admin API + Admin UI）
+
+- [ ] Bridge 启动开关：显式支持 `admin.enabled`（默认关闭）与 `admin.listen_addr/admin.base_path` 配置
+- [ ] `admin.enabled=false` 时不注册 `/api/admin/*` 路由、不提供管理静态资源、不初始化后台中间件
+- [ ] 管理面网络隔离：Admin 独立监听地址/端口，禁止仅依赖路径前缀隔离
+- [ ] 后台模块落地：`adminapi/`（鉴权、中间件、路由）+ `adminview/`（快照/事件/诊断视图模型）
+- [ ] 权限模型落地：`viewer/operator/admin` 三角色与接口级权限矩阵
+- [ ] 登录与认证落地：Cookie/Token 方案二选一并明确服务端校验策略
+- [ ] CSRF 防护：Cookie 模式下写接口强制 `CSRF Token + Origin/Referer` 校验 + 安全 Cookie 属性
+- [ ] 只读 API 落地：`bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域
+- [ ] 查询契约落地：列表检索统一 `cursor + limit`，服务端硬上限与日志/时序时间窗口限制
+- [ ] 运维 API 收敛：仅支持 reload/drain/diagnose export 等受控命令，禁止任意脚本执行
+- [ ] 配置并发控制：`config_version + if_match_version` 乐观并发，版本冲突返回 `409`
+- [ ] 审计能力：所有写操作记录操作者、作用域、参数摘要、结果、trace_id、时间戳
+- [ ] 导出安全：日志与诊断包统一脱敏（token/cookie/secret/password/private_key 等）且仅 `admin` 可导出
+- [ ] 页面功能落地：Dashboard、Route、Connector/Session、Tunnel/Traffic、配置运维、日志指标诊断六类页面
+- [ ] 内嵌部署联调：前端构建产物内嵌 Bridge，可独立二进制访问后台并完成端到端操作
+
+验收标准：
+
+- Admin 模块可在启动时显式开关，关闭时管理面不可访问且不占用管理监听
+- 管理后台所有写操作均满足认证、权限、CSRF（Cookie 模式）、审计、幂等/防重约束
+- 管理查询在高基数数据下无无界返回，不影响 Bridge 数据面稳定性
+- 日志/诊断导出默认脱敏且可追溯导出审计记录
+
 ---
 
 ## 五、按阶段推进建议（与技术方案第 15 节对齐）
@@ -250,7 +299,7 @@
 
 ### 阶段四：稳态优化
 
-- A3（调参）、A9（性能优化）、A11（配置治理）、A13（完整门槛）、A14（UI 打包与发布收口）
+- A3（调参）、A9（性能优化）、A11（配置治理）、A13（完整门槛）、A14（UI 打包与发布收口）、A15（宿主稳态与安全收口）、A16（管理后台能力收口）
 
 ---
 
