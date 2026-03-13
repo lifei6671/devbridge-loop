@@ -22,11 +22,23 @@ type tunnelStreamCloseSender interface {
 	CloseSend() error
 }
 
+type tunnelStreamAdapterOptions struct {
+	enableReadPayloadFastPath bool
+}
+
+func defaultTunnelStreamAdapterOptions() tunnelStreamAdapterOptions {
+	return tunnelStreamAdapterOptions{
+		enableReadPayloadFastPath: true,
+	}
+}
+
 // GRPCH2TunnelStream 封装 TunnelEnvelope 的双向字节读写。
 //
 // 该类型用于 binding 内部适配，向 runtime 提供纯 bytes 载荷收发能力。
 type GRPCH2TunnelStream struct {
 	stream tunnelStream
+
+	readPayloadFastPath bool
 
 	stateMutex  sync.Mutex
 	readMutex   sync.Mutex
@@ -47,13 +59,22 @@ func newGRPCH2TunnelStreamWithCancel(
 	stream tunnelStream,
 	cancel context.CancelFunc,
 ) (*GRPCH2TunnelStream, error) {
+	return newGRPCH2TunnelStreamWithOptions(stream, cancel, defaultTunnelStreamAdapterOptions())
+}
+
+func newGRPCH2TunnelStreamWithOptions(
+	stream tunnelStream,
+	cancel context.CancelFunc,
+	options tunnelStreamAdapterOptions,
+) (*GRPCH2TunnelStream, error) {
 	if stream == nil {
 		return nil, fmt.Errorf("new grpc tunnel stream: %w: nil stream", transport.ErrInvalidArgument)
 	}
 	return &GRPCH2TunnelStream{
-		stream:      stream,
-		doneChannel: make(chan struct{}),
-		cancel:      cancel,
+		stream:              stream,
+		readPayloadFastPath: options.enableReadPayloadFastPath,
+		doneChannel:         make(chan struct{}),
+		cancel:              cancel,
 	}, nil
 }
 
@@ -159,6 +180,9 @@ func (stream *GRPCH2TunnelStream) ReadPayload(ctx context.Context) ([]byte, erro
 	}
 	if envelope == nil {
 		return nil, fmt.Errorf("grpc tunnel stream read: %w: nil envelope", transport.ErrInvalidArgument)
+	}
+	if stream.readPayloadFastPath {
+		return envelope.Payload, nil
 	}
 	return append([]byte(nil), envelope.Payload...), nil
 }

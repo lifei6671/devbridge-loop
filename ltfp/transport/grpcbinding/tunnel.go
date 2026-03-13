@@ -21,8 +21,10 @@ type GRPCH2Tunnel struct {
 	state      transport.TunnelState
 	lastError  error
 
-	readMutex   sync.Mutex
-	pendingRead []byte
+	readMutex         sync.Mutex
+	pendingRead       []byte
+	pendingReadOffset int
+	pendingReadPooled bool
 
 	deadlineMutex sync.RWMutex
 	readDeadline  time.Time
@@ -52,10 +54,9 @@ func NewGRPCH2Tunnel(stream *GRPCH2TunnelStream, meta transport.TunnelMeta) (*GR
 		}
 	}
 	tunnel := &GRPCH2Tunnel{
-		stream:      stream,
-		meta:        normalizedMeta,
-		state:       transport.TunnelStateIdle,
-		pendingRead: make([]byte, 0),
+		stream: stream,
+		meta:   normalizedMeta,
+		state:  transport.TunnelStateIdle,
 	}
 	go tunnel.watchStreamDone()
 	return tunnel, nil
@@ -111,9 +112,7 @@ func (tunnel *GRPCH2Tunnel) Read(payload []byte) (int, error) {
 	defer tunnel.readMutex.Unlock()
 
 	for {
-		if len(tunnel.pendingRead) > 0 {
-			readSize := copy(payload, tunnel.pendingRead)
-			tunnel.pendingRead = tunnel.pendingRead[readSize:]
+		if readSize, hasPending := tunnel.copyFromPendingRead(payload); hasPending {
 			return readSize, nil
 		}
 		switch tunnel.State() {
@@ -147,7 +146,7 @@ func (tunnel *GRPCH2Tunnel) Read(payload []byte) (int, error) {
 		}
 		readSize := copy(payload, nextPayload)
 		if readSize < len(nextPayload) {
-			tunnel.pendingRead = append(tunnel.pendingRead[:0], nextPayload[readSize:]...)
+			tunnel.storePendingRead(nextPayload[readSize:])
 		}
 		return readSize, nil
 	}
@@ -346,6 +345,36 @@ func (tunnel *GRPCH2Tunnel) currentWriteDeadline() time.Time {
 	tunnel.deadlineMutex.RLock()
 	defer tunnel.deadlineMutex.RUnlock()
 	return tunnel.writeDeadline
+}
+
+func (tunnel *GRPCH2Tunnel) copyFromPendingRead(payload []byte) (int, bool) {
+	if len(tunnel.pendingRead) == 0 {
+		return 0, false
+	}
+	readSize := copy(payload, tunnel.pendingRead[tunnel.pendingReadOffset:])
+	tunnel.pendingReadOffset += readSize
+	if tunnel.pendingReadOffset >= len(tunnel.pendingRead) {
+		tunnel.releasePendingRead()
+	}
+	return readSize, true
+}
+
+func (tunnel *GRPCH2Tunnel) storePendingRead(payload []byte) {
+	tunnel.releasePendingRead()
+	buffer, pooled := acquireGRPCPayloadBuffer(len(payload))
+	copy(buffer, payload)
+	tunnel.pendingRead = buffer
+	tunnel.pendingReadOffset = 0
+	tunnel.pendingReadPooled = pooled
+}
+
+func (tunnel *GRPCH2Tunnel) releasePendingRead() {
+	if tunnel.pendingReadPooled {
+		releaseGRPCPayloadBuffer(tunnel.pendingRead)
+	}
+	tunnel.pendingRead = nil
+	tunnel.pendingReadOffset = 0
+	tunnel.pendingReadPooled = false
 }
 
 func isDeadlineExceeded(deadline time.Time) bool {

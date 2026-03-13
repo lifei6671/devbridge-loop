@@ -98,6 +98,27 @@ func (stream *fakeTunnelEnvelopeStreamWithoutCloseSend) Context() context.Contex
 	return stream.base.Context()
 }
 
+type fakeTunnelEnvelopeAliasStream struct {
+	envelope *transportgen.TunnelEnvelope
+}
+
+func (stream *fakeTunnelEnvelopeAliasStream) Send(*transportgen.TunnelEnvelope) error {
+	return nil
+}
+
+func (stream *fakeTunnelEnvelopeAliasStream) Recv() (*transportgen.TunnelEnvelope, error) {
+	if stream.envelope == nil {
+		return nil, io.EOF
+	}
+	envelope := stream.envelope
+	stream.envelope = nil
+	return envelope, nil
+}
+
+func (stream *fakeTunnelEnvelopeAliasStream) Context() context.Context {
+	return context.Background()
+}
+
 // TestGRPCH2TunnelStreamWriteReadAndClose 验证 TunnelEnvelope 的读写映射与关闭语义。
 func TestGRPCH2TunnelStreamWriteReadAndClose(testingObject *testing.T) {
 	fakeStream := &fakeTunnelEnvelopeStream{
@@ -183,6 +204,54 @@ func TestGRPCH2TunnelStreamWriteEOFReturnsClosed(testingObject *testing.T) {
 	}
 	if !errors.Is(tunnelStream.Err(), transport.ErrClosed) {
 		testingObject.Fatalf("expected stream err ErrClosed, got %v", tunnelStream.Err())
+	}
+}
+
+// TestGRPCH2TunnelStreamReadPayloadFastPath 验证开启快路径时 ReadPayload 复用底层 payload。
+func TestGRPCH2TunnelStreamReadPayloadFastPath(testingObject *testing.T) {
+	originalPayload := []byte("fast-path")
+	fakeStream := &fakeTunnelEnvelopeAliasStream{
+		envelope: &transportgen.TunnelEnvelope{Payload: originalPayload},
+	}
+	tunnelStream, err := newGRPCH2TunnelStreamWithOptions(
+		fakeStream,
+		nil,
+		tunnelStreamAdapterOptions{enableReadPayloadFastPath: true},
+	)
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel stream failed: %v", err)
+	}
+	readPayload, err := tunnelStream.ReadPayload(context.Background())
+	if err != nil {
+		testingObject.Fatalf("read payload failed: %v", err)
+	}
+	readPayload[0] = 'F'
+	if originalPayload[0] != 'F' {
+		testingObject.Fatalf("expected fast-path payload aliasing")
+	}
+}
+
+// TestGRPCH2TunnelStreamReadPayloadFastPathDisabled 验证关闭快路径时 ReadPayload 返回拷贝。
+func TestGRPCH2TunnelStreamReadPayloadFastPathDisabled(testingObject *testing.T) {
+	originalPayload := []byte("copy-path")
+	fakeStream := &fakeTunnelEnvelopeAliasStream{
+		envelope: &transportgen.TunnelEnvelope{Payload: originalPayload},
+	}
+	tunnelStream, err := newGRPCH2TunnelStreamWithOptions(
+		fakeStream,
+		nil,
+		tunnelStreamAdapterOptions{enableReadPayloadFastPath: false},
+	)
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel stream failed: %v", err)
+	}
+	readPayload, err := tunnelStream.ReadPayload(context.Background())
+	if err != nil {
+		testingObject.Fatalf("read payload failed: %v", err)
+	}
+	readPayload[0] = 'C'
+	if originalPayload[0] == 'C' {
+		testingObject.Fatalf("expected copied payload when fast-path disabled")
 	}
 }
 

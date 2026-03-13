@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
@@ -125,6 +126,28 @@ func TestTransportConfigNormalizeAndValidate(testingObject *testing.T) {
 	if normalizedConfig.MaxCallRecvMsgSize <= 0 || normalizedConfig.MaxCallSendMsgSize <= 0 {
 		testingObject.Fatalf("unexpected normalized config: %+v", normalizedConfig)
 	}
+	if normalizedConfig.ClientKeepAliveTime <= 0 || normalizedConfig.ClientKeepAliveTimeout <= 0 {
+		testingObject.Fatalf("unexpected client keepalive config: %+v", normalizedConfig)
+	}
+	if normalizedConfig.ServerKeepAliveTime <= 0 || normalizedConfig.ServerKeepAliveTimeout <= 0 {
+		testingObject.Fatalf("unexpected server keepalive config: %+v", normalizedConfig)
+	}
+	if normalizedConfig.ServerMinPingInterval <= 0 {
+		testingObject.Fatalf("unexpected server min ping interval: %+v", normalizedConfig)
+	}
+}
+
+// TestTransportConfigNormalizeRejectsNegativeDuration 验证负数 duration 会被拒绝。
+func TestTransportConfigNormalizeRejectsNegativeDuration(testingObject *testing.T) {
+	_, err := (TransportConfig{
+		ClientKeepAliveTime: -time.Second,
+	}).NormalizeAndValidate()
+	if err == nil {
+		testingObject.Fatalf("expected invalid duration error")
+	}
+	if !errors.Is(err, transport.ErrInvalidArgument) {
+		testingObject.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
 }
 
 // TestTransportOpenChannelRejectsNilClient 验证 nil client 会返回参数错误。
@@ -186,4 +209,21 @@ func TestTransportOpenControlAndTunnelStream(testingObject *testing.T) {
 	if len(fakeTunnelStream.base.sendFrames) != 1 {
 		testingObject.Fatalf("expected one sent tunnel envelope, got %d", len(fakeTunnelStream.base.sendFrames))
 	}
+}
+
+// TestTransportDialAndServerOptions 验证 keepalive/消息大小选项可用于构造 grpc 端点。
+func TestTransportDialAndServerOptions(testingObject *testing.T) {
+	binding := NewTransport()
+
+	dialOptions := binding.DialOptions()
+	if len(dialOptions) == 0 {
+		testingObject.Fatalf("expected non-empty dial options")
+	}
+
+	serverOptions := binding.ServerOptions()
+	if len(serverOptions) == 0 {
+		testingObject.Fatalf("expected non-empty server options")
+	}
+	server := grpc.NewServer(serverOptions...)
+	server.Stop()
 }

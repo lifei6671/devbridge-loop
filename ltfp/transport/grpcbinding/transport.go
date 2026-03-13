@@ -3,21 +3,52 @@ package grpcbinding
 import (
 	"context"
 	"fmt"
+	"time"
 
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
 	// defaultMaxCallMessageBytes 为 grpc_h2 首版保守消息大小上限。
 	defaultMaxCallMessageBytes = 4 * 1024 * 1024
+	// defaultClientKeepAliveTime 为客户端 keepalive ping 周期。
+	defaultClientKeepAliveTime = 30 * time.Second
+	// defaultClientKeepAliveTimeout 为客户端 keepalive 响应超时。
+	defaultClientKeepAliveTimeout = 10 * time.Second
+	// defaultServerKeepAliveTime 为服务端 keepalive ping 周期。
+	defaultServerKeepAliveTime = 30 * time.Second
+	// defaultServerKeepAliveTimeout 为服务端 keepalive 响应超时。
+	defaultServerKeepAliveTimeout = 10 * time.Second
+	// defaultServerMinPingInterval 为服务端允许客户端 ping 的最小间隔。
+	defaultServerMinPingInterval = 15 * time.Second
 )
 
 // TransportConfig 描述 grpc_h2 binding 的基础参数。
 type TransportConfig struct {
 	MaxCallRecvMsgSize int
 	MaxCallSendMsgSize int
+
+	// ClientKeepAliveTime 控制客户端侧探活周期。
+	ClientKeepAliveTime time.Duration
+	// ClientKeepAliveTimeout 控制客户端等待 keepalive ack 的超时。
+	ClientKeepAliveTimeout time.Duration
+	// ClientPermitWithoutStream 控制无活跃流时是否允许 keepalive。
+	ClientPermitWithoutStream bool
+
+	// ServerKeepAliveTime 控制服务端探活周期。
+	ServerKeepAliveTime time.Duration
+	// ServerKeepAliveTimeout 控制服务端等待 keepalive ack 的超时。
+	ServerKeepAliveTimeout time.Duration
+	// ServerMinPingInterval 控制服务端允许客户端 ping 的最小间隔。
+	ServerMinPingInterval time.Duration
+	// ServerPermitWithoutStream 控制服务端是否允许无活跃流的客户端 ping。
+	ServerPermitWithoutStream bool
+
+	// DisableReadPayloadFastPath 关闭 TunnelStream 读路径的零拷贝快路径。
+	DisableReadPayloadFastPath bool
 }
 
 // NormalizeAndValidate 归一化并校验配置。
@@ -29,14 +60,71 @@ func (config TransportConfig) NormalizeAndValidate() (TransportConfig, error) {
 	if normalizedConfig.MaxCallSendMsgSize <= 0 {
 		normalizedConfig.MaxCallSendMsgSize = defaultMaxCallMessageBytes
 	}
+	if normalizedConfig.ClientKeepAliveTime < 0 {
+		return TransportConfig{}, fmt.Errorf(
+			"normalize grpc transport config: %w: client_keepalive_time=%s",
+			transport.ErrInvalidArgument,
+			normalizedConfig.ClientKeepAliveTime,
+		)
+	}
+	if normalizedConfig.ClientKeepAliveTimeout < 0 {
+		return TransportConfig{}, fmt.Errorf(
+			"normalize grpc transport config: %w: client_keepalive_timeout=%s",
+			transport.ErrInvalidArgument,
+			normalizedConfig.ClientKeepAliveTimeout,
+		)
+	}
+	if normalizedConfig.ServerKeepAliveTime < 0 {
+		return TransportConfig{}, fmt.Errorf(
+			"normalize grpc transport config: %w: server_keepalive_time=%s",
+			transport.ErrInvalidArgument,
+			normalizedConfig.ServerKeepAliveTime,
+		)
+	}
+	if normalizedConfig.ServerKeepAliveTimeout < 0 {
+		return TransportConfig{}, fmt.Errorf(
+			"normalize grpc transport config: %w: server_keepalive_timeout=%s",
+			transport.ErrInvalidArgument,
+			normalizedConfig.ServerKeepAliveTimeout,
+		)
+	}
+	if normalizedConfig.ServerMinPingInterval < 0 {
+		return TransportConfig{}, fmt.Errorf(
+			"normalize grpc transport config: %w: server_min_ping_interval=%s",
+			transport.ErrInvalidArgument,
+			normalizedConfig.ServerMinPingInterval,
+		)
+	}
+	if normalizedConfig.ClientKeepAliveTime == 0 {
+		normalizedConfig.ClientKeepAliveTime = defaultClientKeepAliveTime
+	}
+	if normalizedConfig.ClientKeepAliveTimeout == 0 {
+		normalizedConfig.ClientKeepAliveTimeout = defaultClientKeepAliveTimeout
+	}
+	if normalizedConfig.ServerKeepAliveTime == 0 {
+		normalizedConfig.ServerKeepAliveTime = defaultServerKeepAliveTime
+	}
+	if normalizedConfig.ServerKeepAliveTimeout == 0 {
+		normalizedConfig.ServerKeepAliveTimeout = defaultServerKeepAliveTimeout
+	}
+	if normalizedConfig.ServerMinPingInterval == 0 {
+		normalizedConfig.ServerMinPingInterval = defaultServerMinPingInterval
+	}
 	return normalizedConfig, nil
 }
 
 // DefaultTransportConfig 返回默认配置。
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
-		MaxCallRecvMsgSize: defaultMaxCallMessageBytes,
-		MaxCallSendMsgSize: defaultMaxCallMessageBytes,
+		MaxCallRecvMsgSize:        defaultMaxCallMessageBytes,
+		MaxCallSendMsgSize:        defaultMaxCallMessageBytes,
+		ClientKeepAliveTime:       defaultClientKeepAliveTime,
+		ClientKeepAliveTimeout:    defaultClientKeepAliveTimeout,
+		ClientPermitWithoutStream: true,
+		ServerKeepAliveTime:       defaultServerKeepAliveTime,
+		ServerKeepAliveTimeout:    defaultServerKeepAliveTimeout,
+		ServerMinPingInterval:     defaultServerMinPingInterval,
+		ServerPermitWithoutStream: true,
 	}
 }
 
@@ -113,12 +201,51 @@ func (binding *Transport) OpenTunnelStream(
 		cancel()
 		return nil, fmt.Errorf("open grpc tunnel stream: %w", err)
 	}
-	tunnelStream, err := newGRPCH2TunnelStreamWithCancel(stream, cancel)
+	tunnelStream, err := newGRPCH2TunnelStreamWithOptions(
+		stream,
+		cancel,
+		tunnelStreamAdapterOptions{
+			enableReadPayloadFastPath: !binding.Config().DisableReadPayloadFastPath,
+		},
+	)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("open grpc tunnel stream: %w", err)
 	}
 	return tunnelStream, nil
+}
+
+// DialOptions 返回创建 gRPC ClientConn 时可复用的默认选项。
+func (binding *Transport) DialOptions() []grpc.DialOption {
+	config := binding.Config()
+	return []grpc.DialOption{
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(config.MaxCallRecvMsgSize),
+			grpc.MaxCallSendMsgSize(config.MaxCallSendMsgSize),
+		),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                config.ClientKeepAliveTime,
+			Timeout:             config.ClientKeepAliveTimeout,
+			PermitWithoutStream: config.ClientPermitWithoutStream,
+		}),
+	}
+}
+
+// ServerOptions 返回创建 gRPC Server 时可复用的默认选项。
+func (binding *Transport) ServerOptions() []grpc.ServerOption {
+	config := binding.Config()
+	return []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(config.MaxCallRecvMsgSize),
+		grpc.MaxSendMsgSize(config.MaxCallSendMsgSize),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    config.ServerKeepAliveTime,
+			Timeout: config.ServerKeepAliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             config.ServerMinPingInterval,
+			PermitWithoutStream: config.ServerPermitWithoutStream,
+		}),
+	}
 }
 
 func (binding *Transport) callOptions() []grpc.CallOption {

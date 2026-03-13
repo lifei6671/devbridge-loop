@@ -18,6 +18,8 @@ const defaultTunnelAcceptorQueueSize = 128
 type TunnelAcceptorConfig struct {
 	IdentityConfig TunnelIdentityConfig
 	QueueSize      int
+	// DisableReadPayloadFastPath 关闭 TunnelStream 读路径快路径。
+	DisableReadPayloadFastPath bool
 }
 
 func (config TunnelAcceptorConfig) normalized() TunnelAcceptorConfig {
@@ -33,6 +35,7 @@ func (config TunnelAcceptorConfig) normalized() TunnelAcceptorConfig {
 type TunnelAcceptor struct {
 	identityConfig TunnelIdentityConfig
 	idGenerator    *tunnelIDGenerator
+	streamOptions  tunnelStreamAdapterOptions
 
 	pendingTunnels chan transport.Tunnel
 	doneChannel    chan struct{}
@@ -50,6 +53,9 @@ func NewTunnelAcceptor(config TunnelAcceptorConfig) *TunnelAcceptor {
 	return &TunnelAcceptor{
 		identityConfig: normalizedConfig.IdentityConfig,
 		idGenerator:    newTunnelIDGenerator(normalizedConfig.IdentityConfig.TunnelIDPrefix),
+		streamOptions: tunnelStreamAdapterOptions{
+			enableReadPayloadFastPath: !normalizedConfig.DisableReadPayloadFastPath,
+		},
 		pendingTunnels: make(chan transport.Tunnel, normalizedConfig.QueueSize),
 		doneChannel:    make(chan struct{}),
 	}
@@ -118,7 +124,11 @@ func (acceptor *TunnelAcceptor) HandleTunnelStream(
 	if stream == nil {
 		return fmt.Errorf("handle grpc tunnel stream: %w: nil stream", transport.ErrInvalidArgument)
 	}
-	tunnelStream, err := newGRPCH2TunnelStream(&serverTunnelStreamAdapter{stream: stream})
+	tunnelStream, err := newGRPCH2TunnelStreamWithOptions(
+		&serverTunnelStreamAdapter{stream: stream},
+		nil,
+		acceptor.streamOptions,
+	)
 	if err != nil {
 		return fmt.Errorf("handle grpc tunnel stream: %w", err)
 	}
