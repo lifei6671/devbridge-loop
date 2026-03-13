@@ -95,11 +95,11 @@
 
 ### A4. Agent traffic 接入与执行
 
-- [ ] `trafficAcceptor` 独占 idle tunnel 的 `ReadFrame`
-- [ ] `TrafficRuntime` 处理 `TrafficOpen`、本地 dial、ack、relay、close/reset
-- [ ] `endpoint_selection_hint` 软引导 + 本地重选
-- [ ] `TrafficOpenAck.metadata` 回传 `actual_endpoint_id/actual_endpoint_addr`
-- [ ] 收到取消信号时中止 dial/relay 并清理 upstream
+- [x] `trafficAcceptor` 独占 idle tunnel 的 `ReadFrame`
+- [x] `TrafficRuntime` 处理 `TrafficOpen`、本地 dial、ack、relay、close/reset
+- [x] `endpoint_selection_hint` 软引导 + 本地重选
+- [x] `TrafficOpenAck.metadata` 回传 `actual_endpoint_id/actual_endpoint_addr`
+- [x] 收到取消信号时中止 dial/relay 并清理 upstream
 
 验收标准：
 
@@ -108,10 +108,10 @@
 
 ### A5. Bridge Ingress 与 RouteResolver
 
-- [ ] 落地三类入口：`l7_shared`、`tls_sni_shared`、`l4_dedicated_port`
-- [ ] RouteResolver 目标分类：`connector_service/external_service/hybrid_group`
-- [ ] 过滤规则：scope 不匹配、service 不健康、connector 离线、session 非 active
-- [ ] 明确 `https` 与 `tlsSni` 共享 listener 的实现约束
+- [x] 落地三类入口：`l7_shared`、`tls_sni_shared`、`l4_dedicated_port`
+- [x] RouteResolver 目标分类：`connector_service/external_service/hybrid_group`
+- [x] 过滤规则：scope 不匹配、service 不健康、connector 离线、session 非 active
+- [x] 明确 `https` 与 `tlsSni` 共享 listener 的实现约束
 
 验收标准：
 

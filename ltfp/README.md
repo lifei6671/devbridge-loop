@@ -1,6 +1,6 @@
 # LTFP 协议共享库
 
-`ltfp` 是 DevBridge Loop 的协议真相源模块，负责承载线协议模型与通用能力。
+`ltfp` 是 DevBridge Loop 的协议源模块，负责承载线协议模型与通用能力。
 
 ## 模块边界
 
@@ -27,14 +27,14 @@
 - `consistency/`：幂等键、版本比较、ACK 构造与重连同步计划
 - `registry/`：canonical/runtime 注册表与快照查询
 - `routing/`：connector/external/hybrid 路由解析
-- `discovery/`：provider 查询、缓存、安全策略、选路与拨号守卫
+- `discovery/`：provider 查询、缓存、安全策略、路由抉择与拨号守卫
 - `export/`：export 准入、endpoint 生成与 projection reconcile
 - `fallback/`：hybrid pre-open fallback 策略判定
 - `ingress/`：L7/SNI/listen_port 匹配与 dedicated 端口校验
 - `observe/`：结构化事件记录与最小指标聚合
 - `adapter/`：本地运行态到 LTFP 消息转换辅助
 - `testkit/`：golden fixtures 与跨模块测试夹具
-- `proto/`：协议 `.proto` 真相源
+- `proto/`：协议 `.proto` 定义
 - `pb/gen/`：由 `proto/` 生成的 Go 绑定
 - `docs/TestMatrix.md`：协议库测试矩阵
 - `docs/ReleaseAndRollback.md`：发布门槛与回滚策略

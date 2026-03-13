@@ -1,6 +1,12 @@
 package app
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
+)
 
 // Config defines top-level runtime settings for the bridge skeleton.
 type Config struct {
@@ -13,6 +19,7 @@ type Config struct {
 type IngressConfig struct {
 	HTTPAddr     string
 	GRPCAddr     string
+	HTTPSAddr    string
 	TLSSNIAddr   string
 	TCPPortRange string
 }
@@ -37,6 +44,7 @@ func DefaultConfig() Config {
 		Ingress: IngressConfig{
 			HTTPAddr:     ":8080",
 			GRPCAddr:     ":8081",
+			HTTPSAddr:    ":8443",
 			TLSSNIAddr:   ":8443",
 			TCPPortRange: "9000-9100",
 		},
@@ -56,5 +64,14 @@ func DefaultConfig() Config {
 
 // Validate ensures required config fields are present.
 func (c Config) Validate() error {
+	if err := ingress.ValidateSharedTLSListenerConstraint(ingress.SharedTLSListenerConfig{
+		HTTPSListenAddr:  c.Ingress.HTTPSAddr,
+		TLSSNIListenAddr: c.Ingress.TLSSNIAddr,
+	}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Admin.ListenAddr) == "" {
+		return fmt.Errorf("validate config: empty admin listen addr")
+	}
 	return nil
 }
