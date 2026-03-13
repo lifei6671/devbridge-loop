@@ -40,6 +40,26 @@ func TestValidateControlEnvelopeRejectUnknownType(t *testing.T) {
 	}
 }
 
+// TestValidateControlEnvelopeRejectMissingSessionID 验证资源级消息缺失 sessionID 会被拒绝。
+func TestValidateControlEnvelopeRejectMissingSessionID(t *testing.T) {
+	t.Parallel()
+
+	codecPayload, err := testkit.GoldenControlEnvelope(pb.ControlMessagePublishService, testkit.GoldenPublishService())
+	if err != nil {
+		t.Fatalf("build golden envelope failed: %v", err)
+	}
+	// 清空 sessionID，触发资源级元信息校验失败。
+	codecPayload.SessionID = ""
+	err = ValidateControlEnvelope(codecPayload)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	// 缺失必填字段应返回统一错误码。
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestValidatePublishService 验证服务发布消息的关键字段校验。
 func TestValidatePublishService(t *testing.T) {
 	t.Parallel()

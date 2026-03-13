@@ -20,7 +20,7 @@ func ValidateControlEnvelope(envelope pb.ControlEnvelope) error {
 	}
 	// 资源级消息强制校验幂等元信息，普通消息不做硬限制。
 	if requiresResourceMeta(envelope.MessageType) {
-		if err := ValidateResourceMeta(envelope.SessionEpoch, envelope.EventID, envelope.ResourceVersion); err != nil {
+		if err := ValidateResourceMeta(envelope.SessionID, envelope.SessionEpoch, envelope.EventID, envelope.ResourceVersion); err != nil {
 			return err
 		}
 	}
@@ -28,7 +28,11 @@ func ValidateControlEnvelope(envelope pb.ControlEnvelope) error {
 }
 
 // ValidateResourceMeta 校验资源级消息的幂等字段。
-func ValidateResourceMeta(sessionEpoch uint64, eventID string, resourceVersion uint64) error {
+func ValidateResourceMeta(sessionID string, sessionEpoch uint64, eventID string, resourceVersion uint64) error {
+	// sessionID 是会话隔离主键，缺失会导致跨会话事件串扰。
+	if strings.TrimSpace(sessionID) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "sessionID is required")
+	}
 	// sessionEpoch 是代际语义核心字段，必须为正数。
 	if sessionEpoch == 0 {
 		return ltfperrors.New(ltfperrors.CodeInvalidSessionEpoch, "sessionEpoch must be greater than 0")

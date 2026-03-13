@@ -59,10 +59,10 @@
 
 ### A1. 控制面骨架（Session/Auth/Heartbeat）
 
-- [ ] Agent `SessionManager`：建连、鉴权、心跳、重连、epoch 防污染
-- [ ] Bridge Session 生命周期视图：`ACTIVE / DRAINING / STALE / CLOSED`
-- [ ] 心跳超时判定与断链收敛行为
-- [ ] 控制面高优先级消息调度框架（heartbeat/auth/refill/control error）
+- [x] Agent `SessionManager`：建连、鉴权、心跳、重连、epoch 防污染
+- [x] Bridge Session 生命周期视图：`ACTIVE / DRAINING / STALE / CLOSED`
+- [x] 心跳超时判定与断链收敛行为
+- [x] 控制面高优先级消息调度框架（heartbeat/auth/refill/control error）
 
 验收标准：
 
@@ -71,10 +71,10 @@
 
 ### A2. 控制面资源一致性与幂等
 
-- [ ] 资源级消息统一携带：`session_id/session_epoch/event_id/resource_version`
-- [ ] ACK 去重与版本比较规则实现
-- [ ] 重放与乱序场景下的幂等处理
-- [ ] full-sync/重连后的状态对账流程
+- [x] 资源级消息统一携带：`session_id/session_epoch/event_id/resource_version`
+- [x] ACK 去重与版本比较规则实现
+- [x] 重放与乱序场景下的幂等处理
+- [x] full-sync/重连后的状态对账流程
 
 验收标准：
 
@@ -83,10 +83,10 @@
 
 ### A3. Agent TunnelManager 与池治理
 
-- [ ] 实现 `minIdle/maxIdle/ttl/maxInflight/rateLimit/burst` 约束
-- [ ] 实现 idle tunnel 预建、消费后补建、broken 摘除
-- [ ] 实现 `TunnelPoolReport` 事件驱动上报 + 周期纠偏
-- [ ] 实现 `TunnelRefillRequest` 合并处理与平滑建连
+- [x] 实现 `minIdle/maxIdle/ttl/maxInflight/rateLimit/burst` 约束
+- [x] 实现 idle tunnel 预建、消费后补建、broken 摘除
+- [x] 实现 `TunnelPoolReport` 事件驱动上报 + 周期纠偏
+- [x] 实现 `TunnelRefillRequest` 合并处理与平滑建连
 
 验收标准：
 
