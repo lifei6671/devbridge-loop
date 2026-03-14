@@ -145,3 +145,37 @@ func TestProducerOpenBatchCleanupOnHandlerError(testingObject *testing.T) {
 		testingObject.Fatalf("expected cleanup close once, got %d", createdTunnels[0].closeCount.Load())
 	}
 }
+
+// TestTokenBucketConsumeOrDelayRespectsRateLimit 验证令牌桶在节流场景下返回稳定等待时长。
+func TestTokenBucketConsumeOrDelayRespectsRateLimit(testingObject *testing.T) {
+	testingObject.Parallel()
+	bucket := newTokenBucket(2, 2)
+	baseNow := time.Unix(1_700_000_300, 0).UTC()
+
+	bucket.mutex.Lock()
+	// 固定初始状态，避免依赖真实时钟导致抖动。
+	bucket.tokens = 2
+	bucket.lastRefill = baseNow
+	bucket.mutex.Unlock()
+
+	// 桶内第一枚令牌应立即可用。
+	if waitDuration := bucket.consumeOrDelay(baseNow); waitDuration != 0 {
+		testingObject.Fatalf("expected first token immediate, wait=%s", waitDuration)
+	}
+	// 桶内第二枚令牌同样应立即可用。
+	if waitDuration := bucket.consumeOrDelay(baseNow); waitDuration != 0 {
+		testingObject.Fatalf("expected second token immediate, wait=%s", waitDuration)
+	}
+	// 第三次请求需等待半秒补充一枚令牌。
+	if waitDuration := bucket.consumeOrDelay(baseNow); waitDuration != 500*time.Millisecond {
+		testingObject.Fatalf("expected wait=500ms, got=%s", waitDuration)
+	}
+	// 经过 250ms 仅补半枚令牌，仍应剩余 250ms 等待。
+	if waitDuration := bucket.consumeOrDelay(baseNow.Add(250 * time.Millisecond)); waitDuration != 250*time.Millisecond {
+		testingObject.Fatalf("expected wait=250ms after half refill, got=%s", waitDuration)
+	}
+	// 经过总计 500ms 后应补满一枚令牌并可立即通过。
+	if waitDuration := bucket.consumeOrDelay(baseNow.Add(500 * time.Millisecond)); waitDuration != 0 {
+		testingObject.Fatalf("expected immediate pass after full refill, wait=%s", waitDuration)
+	}
+}

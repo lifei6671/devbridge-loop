@@ -159,6 +159,55 @@ func TestTunnelAcquirerNoIdleTimeoutAndRefill(testingObject *testing.T) {
 	}
 }
 
+// TestTunnelAcquirerBurstNoIdleFastFail 验证突发 no-idle 请求会快速失败且每次都触发补池信号。
+func TestTunnelAcquirerBurstNoIdleFastFail(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	refillRequester := &connectorProxyTestRefillRequester{}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry:       tunnelRegistry,
+		Refill:         refillRequester,
+		EnableNoIdleWT: false,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+
+	const burstRequests = 64
+	startedAt := time.Now()
+	var waitGroup sync.WaitGroup
+	errChannel := make(chan error, burstRequests)
+	for index := 0; index < burstRequests; index++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			// 并发压入 no-idle 场景，验证快速失败路径稳定性。
+			_, acquireErr := acquirer.AcquireIdleTunnel(context.Background(), "connector-burst")
+			errChannel <- acquireErr
+		}()
+	}
+	waitGroup.Wait()
+	close(errChannel)
+
+	noIdleCount := 0
+	for acquireErr := range errChannel {
+		// 每个请求都应返回 no-idle 语义，不能出现挂起或未知错误。
+		if !errors.Is(acquireErr, ErrNoIdleTunnel) {
+			testingObject.Fatalf("expected no idle tunnel error, got=%v", acquireErr)
+		}
+		noIdleCount++
+	}
+	if noIdleCount != burstRequests {
+		testingObject.Fatalf("unexpected no-idle count: got=%d want=%d", noIdleCount, burstRequests)
+	}
+	if len(refillRequester.Calls()) != burstRequests {
+		testingObject.Fatalf("expected refill called per request, got=%d", len(refillRequester.Calls()))
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		testingObject.Fatalf("expected burst fast-fail within 500ms, elapsed=%s", elapsed)
+	}
+}
+
 // TestTunnelAcquirerWaitHintUsesInjectedClock 验证等待剩余时间使用注入时钟计算，不会被系统时钟偏移立即超时。
 func TestTunnelAcquirerWaitHintUsesInjectedClock(testingObject *testing.T) {
 	testingObject.Parallel()

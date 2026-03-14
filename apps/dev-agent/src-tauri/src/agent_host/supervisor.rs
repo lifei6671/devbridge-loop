@@ -434,20 +434,14 @@ pub fn app_bootstrap_impl(
     })
 }
 
-/// 执行 app.shutdown：禁止自动拉起并释放单实例锁。
+/// 执行 app.shutdown：禁止自动拉起并停止 Agent。
 pub fn app_shutdown_impl(
     app: &AppHandle,
     state: &Arc<AppRuntimeState>,
 ) -> Result<AgentRuntimeSnapshot, String> {
     state.shutdown_requested.store(true, Ordering::SeqCst);
-    let snapshot = stop_agent_sequence(app, state, "app.shutdown.completed")?;
-    let mut guard = state
-        .single_instance
-        .lock()
-        .map_err(|_| "释放单实例锁失败：single_instance 锁异常".to_string())?;
-    // 丢弃 guard 会触发 Drop 清理 lock 文件。
-    *guard = None;
-    Ok(snapshot)
+    // 保持单实例锁直到宿主进程退出，避免运行中的实例释放锁后被第二个实例并发启动。
+    stop_agent_sequence(app, state, "app.shutdown.completed")
 }
 
 /// 执行 agent.start 命令。

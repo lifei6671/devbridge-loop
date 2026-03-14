@@ -205,11 +205,18 @@
 
 ### A13. 测试矩阵与发布门槛
 
-- [ ] 单元测试：状态机、并发边界、timeout/cancel、ack 去重、参数回落
-- [ ] 集成测试：握手、心跳、pool、open/ack/data/close/reset、late ack、hybrid pre-open fallback
-- [ ] 压测：突发 no-idle、refill 节流、慢读回压、大包 relay
-- [ ] 与 [ltfp/docs/TestMatrix.md](../ltfp/docs/TestMatrix.md) 对齐补齐 case 编号与结果
-- [ ] 发布门槛：单测/集测/关键压测全部通过
+- [x] 单元测试：状态机、并发边界、timeout/cancel、ack 去重、参数回落
+- [x] 集成测试：握手、心跳、pool、open/ack/data/close/reset、late ack、hybrid pre-open fallback
+- [x] 压测：突发 no-idle、refill 节流、慢读回压、大包 relay
+- [x] 与 [ltfp/docs/TestMatrix.md](../ltfp/docs/TestMatrix.md) 对齐补齐 case 编号与结果
+- [x] 发布门槛：单测/集测/关键压测全部通过
+
+执行记录（2026-03-13）：
+
+- `cd agent-core && go test ./runtime/agent/control ./runtime/agent/session ./runtime/agent/tunnel ./runtime/agent/traffic -count=1` 通过
+- `cd cloud-bridge && go test ./runtime/bridge/connectorproxy ./runtime/bridge/routing ./runtime/bridge/control ./runtime/bridge/registry -count=1` 通过
+- `cd ltfp && make test-integration` 通过
+- case 编号与结果已同步到 [ltfp/docs/TestMatrix.md](../ltfp/docs/TestMatrix.md) 的 `Agent/Bridge A13 对齐用例` 章节
 
 验收标准：
 
@@ -218,13 +225,21 @@
 
 ### A14. UI 层与内嵌打包
 
+注：按当前执行口径，前 3 项分别归属 A15（Agent-Tauri）与 A16（Bridge Admin 能力）跟踪，本节实际开发范围为第 4-7 项。
+
 - [ ] Agent 桌面 UI 层采用 Tauri，并定义与 Agent Runtime 的本地交互边界（UDS / Named Pipe 长连接，支持Linux和Windows两种平台）
 - [ ] Agent 桌面 UI 层通信协议详细方案： [Agent 与 Tauri 本地通信技术方案](./Agent–TauriLocalCommunicationDesignProposal.md)。
 - [ ] Bridge 管理页面采用 React + shadcn/ui 实现，详细方案：[Bridge 管理后台技术方案](BridgeAdminBackendTechnicalProposal.md)
-- [ ] 建立 Bridge 管理页面构建产物流程（如 `npm run build` 输出静态资源）
-- [ ] Bridge 服务端实现静态资源内嵌（如 `go:embed`）与管理页面路由
-- [ ] 发布与部署流程改造：Bridge 单包即含管理 UI，不依赖独立 UI 服务部署
-- [ ] 补齐内嵌资源版本标识与缓存策略（静态资源 hash / cache-control）
+- [x] 建立 Bridge 管理页面构建产物流程（如 `npm run build` 输出静态资源）
+- [x] Bridge 服务端实现静态资源内嵌（如 `go:embed`）与管理页面路由
+- [x] 发布与部署流程改造：Bridge 单包即含管理 UI，不依赖独立 UI 服务部署
+- [x] 补齐内嵌资源版本标识与缓存策略（静态资源 hash / cache-control）
+
+执行记录（2026-03-13）：
+
+- `make build-cloud-bridge` 已串联 `cloud-bridge/web` 构建与 `cloud-bridge` 二进制打包（单包包含 UI）
+- Bridge Admin UI 路由已挂载到独立管理端口的 `/admin` 与 `/admin/*`
+- UI 响应新增 `X-Bridge-UI-Version`，并按 `HTML no-cache / hash 资源 immutable` 输出 `Cache-Control`
 
 验收标准：
 
@@ -234,20 +249,52 @@
 
 ### A15. Agent-Tauri 本地通信与宿主集成
 
-- [ ] Rust Host 进程管理：Agent 启动/停止/守护、单实例检查、崩溃恢复框架
-- [ ] Host 状态机落地：`desired_state(running/stopped)` + `exit_kind(expected/unexpected)`，避免 `agent.stop` 被自动拉起覆盖
-- [ ] 跨平台 IPC 抽象：Linux UDS、Windows Named Pipe（统一客户端/服务端接口）
-- [ ] 长连接多路复用协议：`request/response/event/ping/pong` + 帧头 `RequestId` 关联
-- [ ] 帧协议安全约束：`BodyLen` 上限、`ping/pong` 空 body、先验头再分配内存、非法帧断链
-- [ ] 本地握手与双向鉴权：OS 对端身份校验 + `session_secret` challenge-response（HMAC）
-- [ ] IPC 端点安全策略：UDS 路径/权限（0700/0600、反 symlink）与 Named Pipe DACL/拒绝远程客户端
+- [x] Rust Host 进程管理：Agent 启动/停止/守护、单实例检查、崩溃恢复框架
+- [x] Host 状态机落地：`desired_state(running/stopped)` + `exit_kind(expected/unexpected)`，避免 `agent.stop` 被自动拉起覆盖
+- [x] 跨平台 IPC 抽象：Linux UDS、Windows Named Pipe（统一客户端/服务端接口）
+- [x] 长连接多路复用协议：`request/response/event/ping/pong` + 帧头 `RequestId` 关联
+- [x] 帧协议安全约束：`BodyLen` 上限、`ping/pong` 空 body、先验头再分配内存、非法帧断链
+- [x] `session_secret` challenge-response（HMAC-SHA256）：`app.auth.begin/app.auth.complete` 双向 proof 校验
+- [x] OS 对端身份校验：Linux `SO_PEERCRED` / Windows Named Pipe 对端令牌 SID + PID
+- [x] IPC 端点安全策略：UDS 路径/权限（0700/0600、反 symlink）与 Named Pipe DACL/拒绝远程客户端
 - [ ] Agent `localrpc` 服务端：`app/agent/session/service/tunnel/traffic/config/diagnose` 方法域落地
-- [ ] 禁止接口与边界校验：拒绝 `traffic.open/reset`、`tunnel.read/write`、`relay.inject` 等越界调用
-- [ ] Rust `event_bridge`：事件转发、节流/聚合、稳定前端事件模型
-- [ ] 断链重连流程：`disconnected -> reconnecting -> resyncing -> connected`，重连后强制全量 snapshot 对账
-- [ ] 生命周期流程联调：`app.bootstrap` 启动链路、优雅关闭链路、超时回收路径
-- [ ] 宿主观测性：`agent_host_ipc_connected/reconnect_total/rpc_latency_ms/supervisor_restart_total` 指标与结构化日志
+- [x] 禁止接口与边界校验：拒绝 `traffic.open/reset`、`tunnel.read/write`、`relay.inject` 等越界调用
+- [x] Rust `event_bridge`：事件转发、节流/聚合、稳定前端事件模型
+- [x] 断链重连流程：`disconnected -> reconnecting -> resyncing -> connected`，重连后强制全量 snapshot 对账
+- [x] 生命周期流程联调：`app.bootstrap` 启动链路、优雅关闭链路、超时回收路径
+- [x] 宿主观测性：`agent_host_ipc_connected/reconnect_total/rpc_latency_ms/supervisor_restart_total` 指标与结构化日志
+- [x] 配置管理与真实 runtime 打通：`agent_id/bridge_addr/tunnel_pool_*` 可配置并直连 `agent-core`，IPC transport 平台绑定只读
 - [ ] 跨平台测试矩阵：Linux/Windows 上的握手、权限、断链重连、状态对账、停止语义
+
+执行记录（2026-03-13）：
+
+- `apps/dev-agent/src-tauri/src/main.rs` 已落地 Supervisor 骨架：单实例锁、`desired_state + exit_kind` 状态机、崩溃恢复回拉与 `app_bootstrap/agent_start/agent_stop/agent_restart/app_shutdown` 命令链路
+- 事件桥统一为 `agent-runtime-changed`，增加节流窗口与 dropped 聚合计数，前端订阅模型固定
+- 宿主观测性已接入 `agent_host_ipc_connected/agent_host_ipc_reconnect_total/agent_host_rpc_latency_ms/agent_host_supervisor_restart_total` 快照字段与 `host_logs_snapshot` 结构化日志查询
+- `apps/dev-agent/src/App.tsx` 与 `apps/dev-agent/src/index.css` 已按方案边界改造 UI（宿主控制/快照/事件/日志），并联通 Tauri command
+- `apps/dev-agent/src/App.tsx` 与 `apps/dev-agent/src/index.css` 已完成白色主题重设计：总览/运行控制/配置管理/服务列表/通道列表/诊断中心均对齐当前可用 command，不展示越界数据面能力
+- 已校正配置写入链路：`host_config_update` 仅支持真实可生效的宿主启动字段（`runtime_program/runtime_args/ipc_transport/ipc_endpoint`），前端配置页已去除虚构 Bridge 三项并提示“重启生效”
+- 已完成 UI 风格升级：`apps/dev-agent/src/App.tsx` 与 `index.css` 切换为 shadcn 风格组件化布局（侧栏/顶栏/统计卡/表格），仅使用现有真实 command 与 snapshot/event/logs 数据
+- Win11 启动稳态已增强：单实例锁改为 OS 文件锁（`fs2::FileExt::try_lock_exclusive`）避免残留锁文件导致秒退；启动失败落地 `startup.log` 并弹出 Windows 错误提示框
+- 已补齐本地 RPC 帧协议实现：`Magic/Version/Type/Flags/RequestId/BodyLen/Body`，支持 `request/response/event/ping/pong` 并按 `RequestId` 关联
+- 已落地帧安全约束：`BodyLen<=1MiB`、`ping/pong` 空 body、先验头后分配 body、JSON 禁止 `request_id` 字段、非法帧返回 `PROTOCOL_ERROR`
+- 已接入本地握手 challenge-response：`ipc_client.connect` 启动 `app.auth.begin/app.auth.complete` 双向 HMAC 校验，mock runtime 在鉴权通过前拒绝 `app.bootstrap/agent.snapshot` 等业务方法
+- 已接入 OS 对端身份校验：Linux `SO_PEERCRED` 强校验 `uid/pid`；Windows 强校验 `NamedPipe server pid + Token SID`
+- 已补齐 IPC 端点安全策略：UDS 目录/锁文件权限强制收敛并校验 owner，默认运行目录不再回落共享 `/tmp`；Windows Named Pipe 端点作用域优先使用当前用户 SID，服务端采用 `PIPE_REJECT_REMOTE_CLIENTS + DACL(current user + LocalSystem)`
+- mock runtime 已接入 UDS localrpc listener，启动链路改为真实 `app.bootstrap -> agent.snapshot -> ping` 对账，不再依赖纯 sleep 模拟
+- 已落地方法域白名单与越界拒绝：拒绝 `traffic.open/reset`、`tunnel.read/write`、`relay.inject`、`runtime.takeover`
+- 已完成 `ipc_client` 跨平台传输抽象：Linux `UDS` 与 Windows `Named Pipe` 统一为 `LocalRpcStream`，mock runtime 已新增 Named Pipe 服务端分支
+- `apps/dev-agent/src-tauri/src` 已按方案 10.1 调整目录结构：`commands/`、`agent_host/`、`state/`，并将 `main.rs` 收敛为入口组装层
+- 已新增连接模型落地清单：[Agent-Tauri 连接模型可执行清单](./Agent-TauriConnectionModelExecutionChecklist.md)，对齐方案 7.3 与第 8 节边界并持续跟踪
+- `supervisor` 已补齐事件泵：周期 `ping + drain_events`，将 Agent 原生事件聚合后转发为前端稳定事件 `agent-runtime-changed`
+- 已完成真实配置链路：配置页新增 `agent_id/bridge_addr/tunnel_pool_*`，`host_config_update`、`launcher` 与 `agent-core main` 串联 `DEV_AGENT_CFG_*` 环境变量并在 runtime 启动阶段生效
+- 已完成 UI 收敛：右侧主内容区移除“当前视图”标题，IPC 传输方式改为平台绑定只读展示（Windows `named_pipe` / Unix `uds`）
+- 验证记录：
+  - `cd apps/dev-agent/src-tauri && cargo check` 通过
+  - `cd apps/dev-agent/src-tauri && cargo check --target x86_64-pc-windows-gnu` 通过
+  - `cd apps/dev-agent/src-tauri && cargo test --bin dev-agent -- --nocapture` 通过
+  - `make build-dev-agent-tauri-cross TAURI_TARGET=x86_64-pc-windows-gnu` 通过
+  - `cd apps/dev-agent && npm run build` 通过
 
 验收标准：
 

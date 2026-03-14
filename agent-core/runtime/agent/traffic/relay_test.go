@@ -191,6 +191,56 @@ func TestStreamRelayBidirectionalAndClose(testingObject *testing.T) {
 	}
 }
 
+// TestStreamRelayLargePayloadFragmentation 验证大包从 upstream 转发到 tunnel 时会按帧上限切片且不丢字节。
+func TestStreamRelayLargePayloadFragmentation(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnel := newRelayTestTunnel()
+	upstream := newRelayTestUpstream(nil)
+	relay := NewStreamRelay(StreamRelayOptions{
+		BufferFrames:        16,
+		MaxDataFrameBytes:   1024,
+		BackpressureTimeout: 200 * time.Millisecond,
+	})
+	largePayload := bytes.Repeat([]byte("z"), 64*1024+257)
+
+	relayResultChannel := make(chan error, 1)
+	go func() {
+		relayResultChannel <- relay.Relay(context.Background(), tunnel, upstream, "traffic-large")
+	}()
+
+	// 先推入大包，触发 upstream->tunnel 分片写入路径。
+	upstream.PushReadData(largePayload)
+	waitUntil(testingObject, 2*time.Second, func() bool {
+		// 持续观察直到 tunnel 侧累计写满目标字节数。
+		return len(flattenTunnelData(tunnel.Writes())) >= len(largePayload)
+	})
+
+	writes := tunnel.Writes()
+	for _, payload := range writes {
+		if len(payload.Data) == 0 {
+			continue
+		}
+		// 每个数据帧都必须受 MaxDataFrameBytes 约束。
+		if len(payload.Data) > 1024 {
+			testingObject.Fatalf("unexpected frame size over limit: %d", len(payload.Data))
+		}
+	}
+	if merged := flattenTunnelData(writes); !bytes.Equal(merged, largePayload) {
+		testingObject.Fatalf("unexpected merged payload size=%d want=%d", len(merged), len(largePayload))
+	}
+
+	// 关闭上游让 relay 收敛到 EOF 终态，避免 goroutine 泄漏。
+	_ = upstream.Close()
+	select {
+	case err := <-relayResultChannel:
+		if err != nil {
+			testingObject.Fatalf("expected relay finishes without error, got=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		testingObject.Fatalf("timed out waiting relay completion for large payload")
+	}
+}
+
 // TestStreamRelayBackpressureTimeout 验证慢下游导致有界缓冲超时后返回反压错误。
 func TestStreamRelayBackpressureTimeout(testingObject *testing.T) {
 	testingObject.Parallel()
