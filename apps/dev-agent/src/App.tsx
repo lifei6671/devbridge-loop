@@ -2,38 +2,59 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Activity,
-  AlertTriangle,
+  Bell,
   Cable,
-  Search,
-  Server,
-  Settings2,
+  ChartNoAxesCombined,
+  Cloud,
+  Cpu,
+  Gauge,
+  HardDrive,
+  Layers,
+  Link2,
+  Logs,
+  Network,
+  RefreshCcw,
+  Settings,
   ShieldCheck,
-  SquareTerminal,
-  Waypoints,
+  SquareMousePointer,
+  Upload,
+  Download,
   Wrench,
-  Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 
+import { NetworkRateValue } from "@/components/traffic/network_rate_value";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Toaster } from "@/components/ui/sonner";
+import { useSystemResources } from "@/features/system/use_system_resources";
+import { bytesPerSecToMiB, formatBytesToGiB } from "@/features/traffic/format";
+import { useTrafficStats } from "@/features/traffic/use_traffic_stats";
 import { cn } from "@/lib/utils";
 import { registerManagedListener } from "@/runtime_subscription";
 
 type DesiredState = "running" | "stopped";
 type ExitKind = "expected" | "unexpected";
 type ConnectionState = "disconnected" | "reconnecting" | "resyncing" | "connected";
-type RuntimeCommand = "agent_start" | "agent_stop" | "agent_restart" | "agent_crash_inject" | "app_shutdown";
-type NavKey = "dashboard" | "runtime" | "config" | "services" | "tunnels" | "diagnostics";
+type AgentRuntimeCommand = "agent_start" | "agent_stop" | "agent_restart" | "agent_crash_inject" | "app_shutdown";
+type BridgeSessionCommand = "session_reconnect" | "session_drain";
+type RuntimeCommand = AgentRuntimeCommand | BridgeSessionCommand;
+type NavKey = "overview" | "services" | "tunnels" | "traffic" | "connections" | "diagnose" | "settings";
 
 interface HostMetricsSnapshot {
   agent_host_ipc_connected: boolean;
   agent_host_ipc_reconnect_total: number;
   agent_host_rpc_latency_ms: number;
   agent_host_supervisor_restart_total: number;
+  agent_bridge_last_heartbeat_at_ms: number | null;
+  agent_bridge_next_retry_at_ms: number | null;
+  agent_bridge_retry_backoff_ms: number;
+  agent_bridge_retry_fail_streak: number;
+  agent_bridge_last_reconnect_error: string | null;
 }
 
 interface AgentRuntimeSnapshot {
@@ -53,6 +74,7 @@ interface HostConfigSnapshot {
   runtime_args: string[];
   agent_id: string;
   bridge_addr: string;
+  bridge_transport: string;
   tunnel_pool_min_idle: number;
   tunnel_pool_max_idle: number;
   tunnel_pool_max_inflight: number;
@@ -64,21 +86,6 @@ interface HostConfigSnapshot {
   ipc_endpoint: string;
   allowed_method_domains: string[];
   denied_low_level_methods: string[];
-}
-
-interface HostRuntimeConfigDraft {
-  runtimeProgram: string;
-  runtimeArgsText: string;
-  agentId: string;
-  bridgeAddr: string;
-  tunnelPoolMinIdleText: string;
-  tunnelPoolMaxIdleText: string;
-  tunnelPoolMaxInflightText: string;
-  tunnelPoolTtlMsText: string;
-  tunnelPoolOpenRateText: string;
-  tunnelPoolOpenBurstText: string;
-  tunnelPoolReconcileGapMsText: string;
-  ipcEndpoint: string;
 }
 
 interface AppBootstrapPayload {
@@ -99,6 +106,23 @@ interface AgentRuntimeChangedEvent {
   reason: string;
   dropped_event_count: number;
   snapshot: AgentRuntimeSnapshot;
+}
+
+interface SessionSnapshot {
+  state: string;
+  session_id: string | null;
+  session_epoch: number | null;
+  last_heartbeat_at_ms: number | null;
+  last_heartbeat_sent_at_ms: number | null;
+  last_heartbeat_at_text: string | null;
+  reconnect_total: number | null;
+  retry_fail_streak: number | null;
+  retry_backoff_ms: number | null;
+  next_retry_at_ms: number | null;
+  last_error: string | null;
+  updated_at_ms: number;
+  source: string;
+  unavailable_reason: string | null;
 }
 
 interface ServiceListItem {
@@ -122,68 +146,78 @@ interface TunnelListItem {
   updated_at_ms: number;
 }
 
+interface HostConfigUpdateInput {
+  runtime_program: string;
+  runtime_args: string[];
+  agent_id: string;
+  bridge_addr: string;
+  bridge_transport: string;
+  tunnel_pool_min_idle: number;
+  tunnel_pool_max_idle: number;
+  tunnel_pool_max_inflight: number;
+  tunnel_pool_ttl_ms: number;
+  tunnel_pool_open_rate: number;
+  tunnel_pool_open_burst: number;
+  tunnel_pool_reconcile_gap_ms: number;
+  ipc_endpoint: string;
+}
+
+interface SettingsDraft {
+  runtimeProgram: string;
+  runtimeArgsText: string;
+  agentId: string;
+  bridgeAddr: string;
+  transport: string;
+  authMode: string;
+  endpoint: string;
+  tunnelPoolMinIdleText: string;
+  tunnelPoolMaxIdleText: string;
+  tunnelPoolMaxInflightText: string;
+  tunnelPoolTtlMsText: string;
+  tunnelPoolOpenRateText: string;
+  tunnelPoolOpenBurstText: string;
+  tunnelPoolReconcileGapMsText: string;
+}
+
 interface NavItem {
   key: NavKey;
   title: string;
-  description: string;
   icon: LucideIcon;
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { key: "dashboard", title: "总览", description: "运行态摘要", icon: Activity },
-  { key: "runtime", title: "运行控制", description: "生命周期 + IPC", icon: Wrench },
-  { key: "config", title: "配置管理", description: "agent-core + IPC", icon: Settings2 },
-  { key: "services", title: "服务列表", description: "服务健康与端点", icon: Server },
-  { key: "tunnels", title: "通道列表", description: "通道状态与延迟", icon: Waypoints },
-  { key: "diagnostics", title: "诊断中心", description: "事件与宿主日志", icon: SquareTerminal },
+  { key: "overview", title: "总览", icon: Activity },
+  { key: "services", title: "服务", icon: Layers },
+  { key: "tunnels", title: "隧道", icon: Network },
+  { key: "traffic", title: "流量", icon: ChartNoAxesCombined },
+  { key: "connections", title: "连接", icon: Link2 },
+  { key: "diagnose", title: "日志与诊断", icon: Logs },
+  { key: "settings", title: "设置", icon: Settings },
 ];
 
-const TABLE_HEADER_CLASS = "px-4 py-3 text-left text-xs font-semibold tracking-wide text-[#5f6d87]";
-const TABLE_CELL_CLASS = "px-4 py-3 text-sm text-[#27344d]";
+const TABLE_HEAD_CLASS = "px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.08em] text-[#66748f]";
+const TABLE_CELL_CLASS = "px-4 py-3 text-sm text-[#293145]";
 
-/** 将毫秒时间戳转换为易读时间文本。 */
-function formatTime(ts: number | null): string {
-  if (!ts) {
-    return "--";
+function normalizeErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
   }
-  // 统一按本地时区显示，方便用户对照本机日志时间线。
-  return new Date(ts).toLocaleString("zh-CN", { hour12: false });
+  return String(error);
 }
 
-/** 将启动时间转换为“时:分”粒度的运行时长。 */
-function formatUptime(startedAtMs: number | null): string {
-  if (!startedAtMs) {
-    return "--";
-  }
-  const diffMs = Math.max(0, Date.now() - startedAtMs);
-  const totalSeconds = Math.floor(diffMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
-  return `${seconds}s`;
+function authModeFromTransport(_transport: string): string {
+  return "hmac_auth_v1";
 }
 
-/** 规范化参数输入字符串，避免空白字符导致伪变更。 */
-function normalizeArgsText(text: string): string[] {
-  return text
-    .split(/\s+/)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-}
-
-/** 将宿主配置快照映射为前端可编辑表单草稿。 */
-function toHostRuntimeConfigDraft(snapshot: HostConfigSnapshot): HostRuntimeConfigDraft {
+function toSettingsDraft(snapshot: HostConfigSnapshot): SettingsDraft {
   return {
     runtimeProgram: snapshot.runtime_program,
     runtimeArgsText: snapshot.runtime_args.join(" "),
     agentId: snapshot.agent_id,
     bridgeAddr: snapshot.bridge_addr,
+    transport: snapshot.bridge_transport,
+    authMode: authModeFromTransport(snapshot.ipc_transport),
+    endpoint: snapshot.ipc_endpoint,
     tunnelPoolMinIdleText: String(snapshot.tunnel_pool_min_idle),
     tunnelPoolMaxIdleText: String(snapshot.tunnel_pool_max_idle),
     tunnelPoolMaxInflightText: String(snapshot.tunnel_pool_max_inflight),
@@ -191,15 +225,20 @@ function toHostRuntimeConfigDraft(snapshot: HostConfigSnapshot): HostRuntimeConf
     tunnelPoolOpenRateText: String(snapshot.tunnel_pool_open_rate),
     tunnelPoolOpenBurstText: String(snapshot.tunnel_pool_open_burst),
     tunnelPoolReconcileGapMsText: String(snapshot.tunnel_pool_reconcile_gap_ms),
-    ipcEndpoint: snapshot.ipc_endpoint,
   };
 }
 
-/** 解析正整数文本配置：用于 tunnel pool 的整数参数。 */
+function normalizeRuntimeArgsText(text: string): string[] {
+  return text
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
 function parsePositiveInteger(text: string, fieldLabel: string): number {
   const normalized = text.trim();
   if (!/^\d+$/.test(normalized)) {
-    throw new Error(`${fieldLabel} 必须是非负整数`);
+    throw new Error(`${fieldLabel} 必须是正整数`);
   }
   const parsedValue = Number.parseInt(normalized, 10);
   if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
@@ -208,7 +247,6 @@ function parsePositiveInteger(text: string, fieldLabel: string): number {
   return parsedValue;
 }
 
-/** 解析允许为零的整数文本配置：用于 min_idle / ttl_ms。 */
 function parseNonNegativeInteger(text: string, fieldLabel: string): number {
   const normalized = text.trim();
   if (!/^\d+$/.test(normalized)) {
@@ -221,7 +259,6 @@ function parseNonNegativeInteger(text: string, fieldLabel: string): number {
   return parsedValue;
 }
 
-/** 解析正浮点文本配置：用于 tunnel pool 开闸速率。 */
 function parsePositiveFloat(text: string, fieldLabel: string): number {
   const normalized = text.trim();
   if (normalized.length === 0) {
@@ -234,41 +271,87 @@ function parsePositiveFloat(text: string, fieldLabel: string): number {
   return parsedValue;
 }
 
-/** 返回连接状态对应的中文文案。 */
-function statusText(state: ConnectionState): string {
-  if (state === "connected") {
-    return "已连接";
-  }
-  if (state === "resyncing") {
-    return "对账中";
-  }
-  if (state === "reconnecting") {
-    return "重连中";
-  }
-  return "已断开";
+function SettingsField(props: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+}): JSX.Element {
+  return (
+    <label className="block space-y-1.5">
+      <div className="flex items-end justify-between gap-3">
+        <span className="text-sm font-medium text-[#44516d]">{props.label}</span>
+        {props.hint ? <span className="text-[11px] text-[#8290a8]">{props.hint}</span> : null}
+      </div>
+      {props.children}
+    </label>
+  );
 }
 
-/** 将连接状态映射为徽章样式。 */
-function statusBadgeVariant(state: ConnectionState): "success" | "warning" | "danger" | "secondary" {
-  if (state === "connected") {
-    return "success";
+function formatTime(tsMs: number | null): string {
+  if (!tsMs) {
+    return "--";
   }
-  if (state === "resyncing") {
-    return "warning";
-  }
-  if (state === "reconnecting") {
-    return "secondary";
-  }
-  return "danger";
+  return new Date(tsMs).toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-/** 将服务状态映射为徽章样式。 */
-function serviceBadgeVariant(status: string): "success" | "warning" | "danger" | "secondary" {
-  const normalized = status.toLowerCase();
-  if (normalized.includes("healthy") || normalized.includes("running")) {
+function formatDateTime(tsMs: number | null): string {
+  if (!tsMs) {
+    return "--";
+  }
+  return new Date(tsMs).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatUptime(startedAtMs: number | null): string {
+  if (!startedAtMs) {
+    return "--";
+  }
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+  const hour = Math.floor(totalSeconds / 3600);
+  const minute = Math.floor((totalSeconds % 3600) / 60);
+  const second = totalSeconds % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}`;
+}
+
+function formatRelativeMs(tsMs: number | null, nowTsMs: number): string {
+  if (!tsMs) {
+    return "--";
+  }
+  const diffMs = Math.max(0, nowTsMs - tsMs);
+  const diffSeconds = Math.floor(diffMs / 1000);
+  if (diffSeconds < 60) {
+    return `${diffSeconds} 秒前`;
+  }
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  if (diffMinutes < 60) {
+    return `${diffMinutes} 分钟前`;
+  }
+  const diffHours = Math.floor(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours} 小时前`;
+  }
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays} 天前`;
+}
+
+function formatCountdownText(remainingMs: number): string {
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    return "0 秒";
+  }
+  const remainingSeconds = Math.ceil(remainingMs / 1000);
+  const minute = Math.floor(remainingSeconds / 60);
+  const second = remainingSeconds % 60;
+  if (minute <= 0) {
+    return `${second} 秒`;
+  }
+  return `${minute} 分 ${String(second).padStart(2, "0")} 秒`;
+}
+
+function serviceVariant(status: string): "success" | "warning" | "danger" | "secondary" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized.includes("run") || normalized.includes("healthy")) {
     return "success";
   }
-  if (normalized.includes("degraded") || normalized.includes("warning")) {
+  if (normalized.includes("degraded") || normalized.includes("warn")) {
     return "warning";
   }
   if (normalized.includes("idle") || normalized.includes("pending")) {
@@ -277,32 +360,166 @@ function serviceBadgeVariant(status: string): "success" | "warning" | "danger" |
   return "danger";
 }
 
-/** 将通道状态映射为徽章样式。 */
-function tunnelBadgeVariant(state: string): "success" | "warning" | "danger" | "secondary" {
-  const normalized = state.toLowerCase();
+function formatServiceStatus(status: string): string {
+  const trimmed = status.trim();
+  if (!trimmed) {
+    return "未知";
+  }
+  if (/[\u4e00-\u9fa5]/.test(trimmed)) {
+    return trimmed;
+  }
+  const normalized = trimmed.toLowerCase();
+  if (normalized.includes("healthy")) {
+    return "健康";
+  }
+  if (normalized.includes("running") || normalized.includes("run")) {
+    return "运行中";
+  }
+  if (normalized.includes("degraded")) {
+    return "性能降级";
+  }
+  if (normalized.includes("warning") || normalized.includes("warn")) {
+    return "告警";
+  }
+  if (normalized.includes("idle")) {
+    return "空闲";
+  }
+  if (normalized.includes("pending")) {
+    return "等待中";
+  }
+  if (
+    normalized.includes("stop")
+    || normalized.includes("down")
+    || normalized.includes("fail")
+    || normalized.includes("error")
+  ) {
+    return "异常";
+  }
+  if (normalized.includes("unknown")) {
+    return "未知";
+  }
+  return trimmed;
+}
+
+function tunnelVariant(state: string): "success" | "warning" | "danger" | "secondary" {
+  const normalized = state.trim().toLowerCase();
   if (normalized.includes("active") || normalized.includes("connected")) {
     return "success";
   }
-  if (normalized.includes("idle") || normalized.includes("pending")) {
+  if (normalized.includes("idle")) {
     return "secondary";
   }
-  if (normalized.includes("reconnecting") || normalized.includes("resync")) {
+  if (normalized.includes("reconnect") || normalized.includes("resync")) {
     return "warning";
   }
   return "danger";
 }
 
-/** 简单关键词匹配：用于顶部搜索框过滤当前数据视图。 */
-function matchesKeyword(value: string, keyword: string): boolean {
-  if (!keyword) {
-    return true;
+function formatTunnelState(state: string): string {
+  const trimmed = state.trim();
+  if (!trimmed) {
+    return "未知";
   }
-  // 统一转小写后匹配，避免大小写导致命中不一致。
-  return value.toLowerCase().includes(keyword);
+  if (/[\u4e00-\u9fa5]/.test(trimmed)) {
+    return trimmed;
+  }
+  const normalized = trimmed.toLowerCase();
+  if (
+    normalized.includes("active")
+    || normalized.includes("connected")
+    || normalized.includes("in_use")
+    || normalized.includes("inuse")
+  ) {
+    return "已连接";
+  }
+  if (normalized.includes("idle")) {
+    return "空闲";
+  }
+  if (normalized.includes("reconnect")) {
+    return "重连中";
+  }
+  if (normalized.includes("resync")) {
+    return "对账中";
+  }
+  if (normalized.includes("init") || normalized.includes("starting")) {
+    return "初始化中";
+  }
+  if (normalized.includes("pending")) {
+    return "等待中";
+  }
+  if (
+    normalized.includes("closed")
+    || normalized.includes("stop")
+    || normalized.includes("fail")
+    || normalized.includes("error")
+    || normalized.includes("timeout")
+  ) {
+    return "异常";
+  }
+  if (normalized.includes("unknown")) {
+    return "未知";
+  }
+  return trimmed;
 }
 
-/** 渲染左侧导航项。 */
-function SidebarNavItem(props: {
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, value));
+}
+
+function normalizeSessionState(state: string | null | undefined): string {
+  return state?.trim().toUpperCase() ?? "";
+}
+
+function isBridgeConnectedSessionState(state: string): boolean {
+  return (
+    state === "ACTIVE"
+    || state === "READY"
+    || state === "AUTHENTICATED"
+    || state === "CONNECTED"
+  );
+}
+
+function MiniLineChart(props: {
+  valuesA: number[];
+  valuesB: number[];
+  className?: string;
+}): JSX.Element {
+  const width = 360;
+  const height = 120;
+  const maxValue = Math.max(1, ...props.valuesA, ...props.valuesB);
+
+  const toPoints = (values: number[]): string =>
+    values
+      .map((value, index) => {
+        const x = (index / Math.max(1, values.length - 1)) * width;
+        const y = height - (value / maxValue) * (height - 10) - 5;
+        return `${x},${y}`;
+      })
+      .join(" ");
+
+  return (
+    <svg className={cn("h-[150px] w-full", props.className)} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="upload-area" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor="#2563eb" stopOpacity="0.32" />
+          <stop offset="100%" stopColor="#2563eb" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polyline points={toPoints(props.valuesA)} fill="none" stroke="#1d63e8" strokeWidth="2.5" />
+      <polyline points={toPoints(props.valuesB)} fill="none" stroke="#27b15d" strokeWidth="2.5" />
+      <polyline
+        points={`${toPoints(props.valuesA)} ${width},${height} 0,${height}`}
+        fill="url(#upload-area)"
+        stroke="none"
+      />
+    </svg>
+  );
+}
+
+function NavButton(props: {
   item: NavItem;
   active: boolean;
   onClick: () => void;
@@ -310,201 +527,236 @@ function SidebarNavItem(props: {
   const Icon = props.item.icon;
   return (
     <button
-      className={cn(
-        "flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition-colors",
-        props.active
-          ? "border-[#c7d7f5] bg-[#eaf1ff] text-[#1f4ea8]"
-          : "border-transparent text-[#27344d] hover:border-[#d8e0ef] hover:bg-[#f7f9fd]",
-      )}
       onClick={props.onClick}
+      className={cn(
+        "group flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition",
+        props.active
+          ? "border-[#5f8ce0]/60 bg-gradient-to-r from-[#2f5ca7] to-[#29569e] text-white shadow-[0_8px_18px_rgba(27,76,154,0.36)]"
+          : "border-transparent text-[#d7deee] hover:border-white/20 hover:bg-white/10 hover:text-white",
+      )}
     >
-      <span className={cn("rounded-xl border p-2", props.active ? "border-[#bfd1f4] bg-white" : "border-[#d9e1ee] bg-white") }>
-        <Icon size={16} />
+      <span
+        className={cn(
+          "inline-flex h-8 w-8 items-center justify-center rounded-lg border",
+          props.active ? "border-white/30 bg-white/15" : "border-white/20 bg-[#1f2d47]",
+        )}
+      >
+        <Icon size={17} />
       </span>
-      <span className="flex flex-col">
-        <strong className="text-[18px] leading-tight">{props.item.title}</strong>
-        <small className="mt-0.5 text-xs text-[#6b7790]">{props.item.description}</small>
-      </span>
+      <span className="text-[15px] font-semibold leading-tight">{props.item.title}</span>
     </button>
   );
 }
 
-/** 渲染摘要指标卡。 */
-function SummaryMetricCard(props: {
-  title: string;
-  value: string;
-  subtitle: string;
-  icon: LucideIcon;
-  tone?: "neutral" | "success" | "warning" | "danger";
-}): JSX.Element {
-  const Icon = props.icon;
-  const toneClass =
-    props.tone === "success"
-      ? "text-[#11865f]"
-      : props.tone === "warning"
-        ? "text-[#9a6c18]"
-        : props.tone === "danger"
-          ? "text-[#bf4545]"
-          : "text-[#27344d]";
-
+function InfoRow(props: { label: string; value: string; valueClassName?: string }): JSX.Element {
   return (
-    <Card>
-      <CardContent className="flex h-full flex-col gap-2 p-5">
-        <div className="flex items-center gap-2 text-[#5f6d87]">
-          <Icon size={18} />
-          <span className="text-sm font-medium">{props.title}</span>
-        </div>
-        <p className={cn("text-[42px] font-semibold leading-none", toneClass)}>{props.value}</p>
-        <p className="text-xs text-[#74819a]">{props.subtitle}</p>
-      </CardContent>
-    </Card>
+    <div className="flex items-center justify-between gap-3 border-b border-[#ebeff6] py-2.5 last:border-b-0">
+      <span className="text-sm text-[#4f5b74]">{props.label}</span>
+      <span className={cn("text-base font-semibold text-[#1f293d]", props.valueClassName)}>{props.value}</span>
+    </div>
   );
 }
 
-/** 渲染健康检查条目。 */
-function HealthCheckRow(props: {
+interface ConnectionBadgeSummary {
   label: string;
-  detail: string;
-  level: "ok" | "warn" | "fail";
-}): JSX.Element {
-  const badgeVariant = props.level === "ok" ? "success" : props.level === "warn" ? "warning" : "danger";
-  return (
-    <li className="flex items-center justify-between border-b border-[#edf1f7] py-2 text-sm last:border-b-0">
-      <span className="font-medium text-[#2a3851]">{props.label}</span>
-      <Badge variant={badgeVariant}>{props.detail}</Badge>
-    </li>
-  );
+  variant: "success" | "warning" | "danger" | "secondary";
 }
 
-/** 应用主界面：保持真实 Agent 功能边界，仅重做视觉风格。 */
 export default function App(): JSX.Element {
-  const [activeNav, setActiveNav] = useState<NavKey>("dashboard");
+  const [activeNav, setActiveNav] = useState<NavKey>("overview");
   const [runtimeSnapshot, setRuntimeSnapshot] = useState<AgentRuntimeSnapshot | null>(null);
+  const [sessionSnapshot, setSessionSnapshot] = useState<SessionSnapshot | null>(null);
   const [hostConfig, setHostConfig] = useState<HostConfigSnapshot | null>(null);
   const [hostLogs, setHostLogs] = useState<HostLogEntry[]>([]);
-  const [eventFeed, setEventFeed] = useState<AgentRuntimeChangedEvent[]>([]);
   const [serviceItems, setServiceItems] = useState<ServiceListItem[]>([]);
   const [tunnelItems, setTunnelItems] = useState<TunnelListItem[]>([]);
-  const [busyCommand, setBusyCommand] = useState<string | null>(null);
-  const [errorText, setErrorText] = useState<string>("");
-  const [searchText, setSearchText] = useState<string>("");
-  const [configSaving, setConfigSaving] = useState<boolean>(false);
-  const [configDraft, setConfigDraft] = useState<HostRuntimeConfigDraft>({
-    runtimeProgram: "",
-    runtimeArgsText: "",
-    agentId: "",
-    bridgeAddr: "",
-    tunnelPoolMinIdleText: "8",
-    tunnelPoolMaxIdleText: "32",
-    tunnelPoolMaxInflightText: "4",
-    tunnelPoolTtlMsText: "90000",
-    tunnelPoolOpenRateText: "10",
-    tunnelPoolOpenBurstText: "20",
-    tunnelPoolReconcileGapMsText: "1000",
-    ipcEndpoint: "",
-  });
+  const [busyCommand, setBusyCommand] = useState<RuntimeCommand | null>(null);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [nowTsMs, setNowTsMs] = useState(() => Date.now());
+  const [settingsDraft, setSettingsDraft] = useState<SettingsDraft | null>(null);
+  const shownHostLogToastKeysRef = useRef<Set<string>>(new Set());
+  const shownRuntimeErrorRef = useRef<string | null>(null);
+  const { trafficSnapshot, trafficHistory, refreshTrafficStats } = useTrafficStats();
+  const { systemResourceSnapshot, refreshSystemResourceStats } = useSystemResources();
 
-  /** 拉取宿主结构化日志，展示最近日志上下文。 */
+  const notify = useCallback(
+    (type: "success" | "warning" | "error", title: string, description?: string) => {
+      if (type === "success") {
+        toast.success(title, { description });
+        return;
+      }
+      if (type === "warning") {
+        toast.warning(title, { description });
+        return;
+      }
+      toast.error(title, { description });
+    },
+    [],
+  );
+
+  const refreshTrafficStatsSafely = useCallback(async () => {
+    try {
+      await refreshTrafficStats();
+    } catch (error) {
+      notify("warning", "流量采样失败", normalizeErrorMessage(error));
+    }
+  }, [notify, refreshTrafficStats]);
+
+  const refreshSystemResourceStatsSafely = useCallback(async () => {
+    try {
+      await refreshSystemResourceStats();
+    } catch (error) {
+      notify("warning", "系统资源采样失败", normalizeErrorMessage(error));
+    }
+  }, [notify, refreshSystemResourceStats]);
+
   const refreshHostLogs = useCallback(async () => {
     const logs = await invoke<HostLogEntry[]>("host_logs_snapshot");
-    // 只保留最近 20 条，避免面板过长影响可读性。
-    setHostLogs(logs.slice(-20).reverse());
+    setHostLogs(logs.slice(-18).reverse());
   }, []);
 
-  /** 拉取运行态快照，作为兜底轮询同步。 */
   const refreshSnapshot = useCallback(async () => {
     const snapshot = await invoke<AgentRuntimeSnapshot>("agent_snapshot");
     setRuntimeSnapshot(snapshot);
   }, []);
 
-  /** 拉取宿主配置快照，并同步到配置编辑草稿。 */
   const refreshHostConfig = useCallback(async () => {
-    const snapshot = await invoke<HostConfigSnapshot>("host_config_snapshot");
-    setHostConfig(snapshot);
-    // 每次拉新后同步草稿，确保表单和后端真相源一致。
-    setConfigDraft(toHostRuntimeConfigDraft(snapshot));
+    const config = await invoke<HostConfigSnapshot>("host_config_snapshot");
+    setHostConfig(config);
   }, []);
 
-  /** 拉取服务列表快照。 */
+  const refreshSessionSnapshot = useCallback(async () => {
+    const snapshot = await invoke<SessionSnapshot>("session_snapshot");
+    setSessionSnapshot(snapshot);
+  }, []);
+
   const refreshServiceList = useCallback(async () => {
     const items = await invoke<ServiceListItem[]>("service_list_snapshot");
     setServiceItems(items);
   }, []);
 
-  /** 拉取通道列表快照。 */
   const refreshTunnelList = useCallback(async () => {
     const items = await invoke<TunnelListItem[]>("tunnel_list_snapshot");
     setTunnelItems(items);
   }, []);
 
-  /** 执行 bootstrap 链路：启动宿主并拉回配置、状态与列表快照。 */
   const bootstrap = useCallback(async () => {
     const payload = await invoke<AppBootstrapPayload>("app_bootstrap");
     setRuntimeSnapshot(payload.snapshot);
     setHostConfig(payload.host_config);
-    setConfigDraft(toHostRuntimeConfigDraft(payload.host_config));
-    // 并行刷新多个只读视图，缩短首屏等待时间。
-    await Promise.all([refreshHostLogs(), refreshServiceList(), refreshTunnelList()]);
-  }, [refreshHostLogs, refreshServiceList, refreshTunnelList]);
+    await Promise.all([
+      refreshHostLogs(),
+      refreshSessionSnapshot(),
+      refreshServiceList(),
+      refreshTunnelList(),
+      refreshTrafficStatsSafely(),
+      refreshSystemResourceStatsSafely(),
+    ]);
+  }, [refreshHostLogs, refreshServiceList, refreshSessionSnapshot, refreshSystemResourceStatsSafely, refreshTrafficStatsSafely, refreshTunnelList]);
 
-  /** 执行生命周期命令并刷新视图。 */
   const runCommand = useCallback(
     async (command: RuntimeCommand) => {
       setBusyCommand(command);
-      setErrorText("");
       try {
-        // 命令返回的是最新 snapshot，可直接用于主视图同步。
-        const snapshot = await invoke<AgentRuntimeSnapshot>(command);
-        setRuntimeSnapshot(snapshot);
-        await Promise.all([refreshHostLogs(), refreshServiceList(), refreshTunnelList(), refreshHostConfig()]);
+        if (command === "session_reconnect" || command === "session_drain") {
+          const session = await invoke<SessionSnapshot>(command);
+          setSessionSnapshot(session);
+          const nextState = normalizeSessionState(session.state);
+          const stateLabel = session.state?.trim() || "--";
+          const unavailableDetail = session.unavailable_reason?.trim();
+          if (command === "session_reconnect") {
+            if (isBridgeConnectedSessionState(nextState)) {
+              notify("success", "Bridge 会话已连接", `当前状态: ${stateLabel}`);
+            } else {
+              notify(
+                "warning",
+                "重连请求已发送，等待 Bridge 会话恢复",
+                unavailableDetail ? `当前状态: ${stateLabel}，原因: ${unavailableDetail}` : `当前状态: ${stateLabel}`,
+              );
+            }
+          } else if (nextState === "CLOSED" || nextState === "DRAINING" || nextState === "DISCONNECTED") {
+            notify("success", "Bridge 会话已断开", `当前状态: ${stateLabel}`);
+          } else {
+            notify("warning", "断开请求已发送", `当前状态: ${stateLabel}`);
+          }
+        } else {
+          const snapshot = await invoke<AgentRuntimeSnapshot>(command);
+          setRuntimeSnapshot(snapshot);
+          const commandLabelMap: Record<AgentRuntimeCommand, string> = {
+            agent_start: "启动内核",
+            agent_stop: "停止内核",
+            agent_restart: "重启内核",
+            agent_crash_inject: "注入崩溃",
+            app_shutdown: "关闭应用",
+          };
+          notify("success", `${commandLabelMap[command]}成功`);
+        }
+        await Promise.all([
+          refreshSnapshot(),
+          refreshHostLogs(),
+          refreshSessionSnapshot(),
+          refreshServiceList(),
+          refreshTunnelList(),
+          refreshHostConfig(),
+          refreshTrafficStatsSafely(),
+          refreshSystemResourceStatsSafely(),
+        ]);
       } catch (error) {
-        // 命令失败时统一在顶部给出中文错误提示。
-        setErrorText(String(error));
+        notify("error", "操作执行失败", normalizeErrorMessage(error));
       } finally {
         setBusyCommand(null);
       }
     },
-    [refreshHostConfig, refreshHostLogs, refreshServiceList, refreshTunnelList],
+    [
+      notify,
+      refreshHostConfig,
+      refreshHostLogs,
+      refreshServiceList,
+      refreshSessionSnapshot,
+      refreshSnapshot,
+      refreshSystemResourceStatsSafely,
+      refreshTrafficStatsSafely,
+      refreshTunnelList,
+    ],
   );
 
-  /** 页面初始化：bootstrap + 事件订阅 + 轮询兜底。 */
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
     let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+
     const pollTimer = window.setInterval(() => {
-      // 事件桥失联时，通过轮询保证 UI 仍能逐步收敛到真实状态。
       void refreshSnapshot();
+      void refreshSessionSnapshot();
       void refreshHostLogs();
       void refreshServiceList();
       void refreshTunnelList();
-    }, 2500);
+      void refreshTrafficStatsSafely();
+      void refreshSystemResourceStatsSafely();
+    }, 3000);
 
     void (async () => {
       try {
         await bootstrap();
       } catch (error) {
         if (!disposed) {
-          setErrorText(String(error));
+          notify("error", "初始化失败", normalizeErrorMessage(error));
         }
       }
       if (disposed) {
         return;
       }
       try {
-        const nextUnlisten = await registerManagedListener<AgentRuntimeChangedEvent>(
+        unlisten = await registerManagedListener<AgentRuntimeChangedEvent>(
           listen,
           "agent-runtime-changed",
           (payload) => {
             setRuntimeSnapshot(payload.snapshot);
-            // 仅保留最近 30 条事件，防止长时间驻留导致面板过重。
-            setEventFeed((prev) => [payload, ...prev].slice(0, 30));
           },
           () => disposed,
         );
-        unlisten = nextUnlisten;
       } catch (error) {
         if (!disposed) {
-          setErrorText(String(error));
+          notify("error", "事件订阅失败", normalizeErrorMessage(error));
         }
       }
     })();
@@ -516,846 +768,1203 @@ export default function App(): JSX.Element {
         void unlisten();
       }
     };
-  }, [bootstrap, refreshHostLogs, refreshServiceList, refreshSnapshot, refreshTunnelList]);
+  }, [
+    bootstrap,
+    notify,
+    refreshHostLogs,
+    refreshServiceList,
+    refreshSessionSnapshot,
+    refreshSnapshot,
+    refreshSystemResourceStatsSafely,
+    refreshTrafficStatsSafely,
+    refreshTunnelList,
+  ]);
 
-  /** 搜索关键词：统一小写处理，避免重复转换。 */
-  const searchKeyword = useMemo(() => searchText.trim().toLowerCase(), [searchText]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowTsMs(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
-  /** 过滤服务列表：仅基于真实快照字段进行匹配。 */
-  const filteredServiceItems = useMemo(() => {
-    return serviceItems.filter((item) => {
-      const haystack = `${item.service_name} ${item.service_id} ${item.protocol} ${item.status} ${item.last_error ?? ""}`;
-      return matchesKeyword(haystack, searchKeyword);
-    });
-  }, [searchKeyword, serviceItems]);
-
-  /** 过滤通道列表：用于总览和通道页共享。 */
-  const filteredTunnelItems = useMemo(() => {
-    return tunnelItems.filter((item) => {
-      const haystack = `${item.tunnel_id} ${item.service_id} ${item.state} ${item.local_addr} ${item.remote_addr} ${item.last_error ?? ""}`;
-      return matchesKeyword(haystack, searchKeyword);
-    });
-  }, [searchKeyword, tunnelItems]);
-
-  /** 过滤日志列表：支持按模块、消息、级别检索。 */
-  const filteredHostLogs = useMemo(() => {
-    return hostLogs.filter((log) => {
-      const haystack = `${log.level} ${log.module} ${log.code} ${log.message}`;
-      return matchesKeyword(haystack, searchKeyword);
-    });
-  }, [hostLogs, searchKeyword]);
-
-  /** 过滤事件列表：支持按 reason 检索。 */
-  const filteredEventFeed = useMemo(() => {
-    return eventFeed.filter((event) => {
-      const haystack = `${event.reason} ${event.snapshot.last_error ?? ""}`;
-      return matchesKeyword(haystack, searchKeyword);
-    });
-  }, [eventFeed, searchKeyword]);
-
-  /** 计算状态条文案，集中处理空状态。 */
-  const statusLabel = useMemo(() => {
-    if (!runtimeSnapshot) {
-      return "初始化中";
+  useEffect(() => {
+    if (!hostConfig) {
+      return;
     }
-    return statusText(runtimeSnapshot.connection_state);
-  }, [runtimeSnapshot]);
+    setSettingsDraft(toSettingsDraft(hostConfig));
+  }, [hostConfig]);
 
-  /** 计算运行时长文案，给顶部状态栏展示。 */
-  const uptimeLabel = useMemo(() => {
-    if (!runtimeSnapshot?.process_alive) {
-      return "--";
+  useEffect(() => {
+    const runtimeError = runtimeSnapshot?.last_error?.trim() ?? "";
+    if (!runtimeError) {
+      return;
     }
-    return formatUptime(runtimeSnapshot.started_at_ms);
-  }, [runtimeSnapshot?.process_alive, runtimeSnapshot?.started_at_ms, runtimeSnapshot?.updated_at_ms]);
+    if (shownRuntimeErrorRef.current === runtimeError) {
+      return;
+    }
+    shownRuntimeErrorRef.current = runtimeError;
+    notify("error", "运行异常", runtimeError);
+  }, [notify, runtimeSnapshot?.last_error]);
 
-  /** 统计最近 24 小时 ERROR 数量，用于风险提示。 */
-  const errorsIn24h = useMemo(() => {
-    const beginMs = Date.now() - 24 * 60 * 60 * 1000;
-    return hostLogs.filter((log) => log.ts_ms >= beginMs && log.level.toLowerCase().includes("error")).length;
-  }, [hostLogs]);
+  useEffect(() => {
+    hostLogs.forEach((log) => {
+      const dedupeKey = `${log.ts_ms}-${log.code}`;
+      if (shownHostLogToastKeysRef.current.has(dedupeKey)) {
+        return;
+      }
+      if (log.code === "HOST_CONFIG_YAML_INVALID") {
+        shownHostLogToastKeysRef.current.add(dedupeKey);
+        notify("warning", "配置文件异常，已回退默认值", log.message);
+      }
+      if (log.level.toLowerCase().includes("error")) {
+        shownHostLogToastKeysRef.current.add(dedupeKey);
+        notify("error", `${log.module}.${log.code}`, log.message);
+      }
+    });
+  }, [hostLogs, notify]);
 
-  /** 统计最近 24 小时 WARNING 数量，用于底部状态栏。 */
-  const warningsIn24h = useMemo(() => {
-    const beginMs = Date.now() - 24 * 60 * 60 * 1000;
-    return hostLogs.filter((log) => log.ts_ms >= beginMs && log.level.toLowerCase().includes("warn")).length;
-  }, [hostLogs]);
+  const filteredServices = serviceItems;
+  const filteredTunnels = tunnelItems;
 
-  /** 统计健康服务数量，用于总览卡片和健康检查。 */
-  const healthyServiceCount = useMemo(() => {
-    return serviceItems.filter((item) => serviceBadgeVariant(item.status) === "success").length;
-  }, [serviceItems]);
+  const connectionState = runtimeSnapshot?.connection_state ?? "disconnected";
+  const connected = connectionState === "connected";
+  const connectionMetrics = runtimeSnapshot?.metrics;
+  const nextRetryAtMs = sessionSnapshot?.next_retry_at_ms ?? connectionMetrics?.agent_bridge_next_retry_at_ms ?? null;
+  const retryDelayMs = nextRetryAtMs ? Math.max(0, nextRetryAtMs - nowTsMs) : 0;
+  const hasRetryDelay = retryDelayMs > 0;
+  const retryBackoffMs = sessionSnapshot?.retry_backoff_ms ?? connectionMetrics?.agent_bridge_retry_backoff_ms ?? 0;
+  const retryFailStreak = sessionSnapshot?.retry_fail_streak ?? connectionMetrics?.agent_bridge_retry_fail_streak ?? 0;
+  const lastReconnectError = sessionSnapshot?.last_error ?? sessionSnapshot?.unavailable_reason ?? connectionMetrics?.agent_bridge_last_reconnect_error ?? null;
+  const sessionStateRaw = sessionSnapshot?.state?.trim() ?? "";
+  const sessionStateUpper = sessionStateRaw.toUpperCase();
+  const bridgeConnected = useMemo(
+    () =>
+      sessionStateUpper === "ACTIVE"
+      || sessionStateUpper === "READY"
+      || sessionStateUpper === "AUTHENTICATED"
+      || sessionStateUpper === "CONNECTED",
+    [sessionStateUpper],
+  );
+  const bridgeHeartbeatText = sessionSnapshot?.last_heartbeat_at_ms
+    ? formatRelativeMs(sessionSnapshot.last_heartbeat_at_ms, nowTsMs)
+    : sessionSnapshot?.last_heartbeat_at_text || "--";
+  const bridgeHeartbeatSentText = sessionSnapshot?.last_heartbeat_sent_at_ms
+    ? formatRelativeMs(sessionSnapshot.last_heartbeat_sent_at_ms, nowTsMs)
+    : "--";
+  const retryCountdownText = formatCountdownText(retryDelayMs);
+  const bridgeHeartbeatAgeMs = sessionSnapshot?.last_heartbeat_at_ms
+    ? Math.max(0, nowTsMs - sessionSnapshot.last_heartbeat_at_ms)
+    : null;
 
-  /** 统计活跃通道数量，用于总览卡片和健康检查。 */
-  const activeTunnelCount = useMemo(() => {
-    return tunnelItems.filter((item) => tunnelBadgeVariant(item.state) === "success").length;
+  const tunnelStats = useMemo(() => {
+    const total = tunnelItems.length;
+    const idle = tunnelItems.filter((item) => item.state.toLowerCase().includes("idle")).length;
+    const inUse = tunnelItems.filter((item) => {
+      const state = item.state.toLowerCase();
+      return state.includes("active") || state.includes("connected") || state.includes("in_use");
+    }).length;
+    const safeInUse = inUse > 0 ? inUse : Math.max(0, total - idle);
+    return { total, idle, inUse: safeInUse };
   }, [tunnelItems]);
 
-  /** 输出健康检查列表，避免在 JSX 中堆积条件判断。 */
-  const healthChecks = useMemo(() => {
-    const connected = runtimeSnapshot?.connection_state === "connected";
-    const latencyMs = runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0;
-    const restartTotal = runtimeSnapshot?.metrics.agent_host_supervisor_restart_total ?? 0;
-    const lastError = runtimeSnapshot?.last_error;
+  const serviceHealthStats = useMemo(() => {
+    let success = 0;
+    let warning = 0;
+    let danger = 0;
+    let secondary = 0;
+    serviceItems.forEach((item) => {
+      const variant = serviceVariant(item.status);
+      if (variant === "success") {
+        success += 1;
+      } else if (variant === "warning") {
+        warning += 1;
+      } else if (variant === "danger") {
+        danger += 1;
+      } else {
+        secondary += 1;
+      }
+    });
+    return { success, warning, danger, secondary };
+  }, [serviceItems]);
 
-    return [
-      {
-        label: "IPC 通道",
-        detail: connected ? "OK" : "未连通",
-        level: connected ? "ok" : "fail",
-      },
-      {
-        label: "RPC 延迟",
-        detail: `${latencyMs.toFixed(1)} ms`,
-        level: latencyMs > 250 ? "warn" : "ok",
-      },
-      {
-        label: "服务健康",
-        detail: `${healthyServiceCount}/${serviceItems.length}`,
-        level: healthyServiceCount === serviceItems.length ? "ok" : serviceItems.length === 0 ? "warn" : "fail",
-      },
-      {
-        label: "活跃通道",
-        detail: `${activeTunnelCount}/${tunnelItems.length}`,
-        level: activeTunnelCount > 0 ? "ok" : "warn",
-      },
-      {
-        label: "Supervisor 重启",
-        detail: `${restartTotal}`,
-        level: restartTotal > 0 ? "warn" : "ok",
-      },
-      {
-        label: "最近错误",
-        detail: lastError ?? "无",
-        level: lastError ? "fail" : "ok",
-      },
-    ] as const;
-  }, [activeTunnelCount, healthyServiceCount, runtimeSnapshot, serviceItems.length, tunnelItems.length]);
+  const tunnelHealthStats = useMemo(() => {
+    let success = 0;
+    let warning = 0;
+    let danger = 0;
+    let secondary = 0;
+    tunnelItems.forEach((item) => {
+      const variant = tunnelVariant(item.state);
+      if (variant === "success") {
+        success += 1;
+      } else if (variant === "warning") {
+        warning += 1;
+      } else if (variant === "danger") {
+        danger += 1;
+      } else {
+        secondary += 1;
+      }
+    });
+    return { success, warning, danger, secondary };
+  }, [tunnelItems]);
 
-  /** 判断配置表单是否有未保存修改。 */
-  const configDirty = useMemo(() => {
-    if (!hostConfig) {
+  const kernelConnectionSummary = useMemo<ConnectionBadgeSummary>(() => {
+    if (connectionState === "connected") {
+      return { label: "内核 IPC 已连接", variant: "success" };
+    }
+    if (connectionState === "reconnecting") {
+      return { label: "内核 IPC 重连中", variant: "warning" };
+    }
+    if (connectionState === "resyncing") {
+      return { label: "内核 IPC 对账中", variant: "warning" };
+    }
+    return { label: "内核 IPC 未连接", variant: "danger" };
+  }, [connectionState]);
+
+  const serviceConnectionSummary = useMemo<ConnectionBadgeSummary>(() => {
+    if (!connected) {
+      return { label: "等待内核 IPC 建链", variant: "secondary" };
+    }
+    if (sessionStateUpper === "" || sessionStateUpper === "UNAVAILABLE") {
+      return { label: "Bridge 状态未知", variant: "secondary" };
+    }
+    if (
+      sessionStateUpper === "CONNECTING"
+      || sessionStateUpper === "RECONNECTING"
+      || sessionStateUpper === "RESYNCING"
+      || sessionStateUpper === "AUTHENTICATING"
+    ) {
+      return { label: "服务连接重试中", variant: "warning" };
+    }
+    if (
+      sessionStateUpper === "STALE"
+      || sessionStateUpper === "FAILED"
+      || sessionStateUpper === "CLOSED"
+      || sessionStateUpper === "DRAINING"
+    ) {
+      return { label: "服务连接异常", variant: "danger" };
+    }
+    if (hasRetryDelay || retryFailStreak > 0) {
+      return { label: "服务连接重试中", variant: "warning" };
+    }
+    if (bridgeHeartbeatAgeMs !== null && bridgeHeartbeatAgeMs > 12_000) {
+      return { label: "服务连接不稳定", variant: "warning" };
+    }
+    if (serviceItems.length === 0) {
+      return { label: "未注册服务", variant: "secondary" };
+    }
+    if (serviceHealthStats.danger > 0 || tunnelHealthStats.danger > 0) {
+      return { label: "服务部分异常", variant: "warning" };
+    }
+    return { label: "服务连接正常", variant: "success" };
+  }, [
+    bridgeHeartbeatAgeMs,
+    connected,
+    hasRetryDelay,
+    retryFailStreak,
+    sessionStateUpper,
+    serviceHealthStats.danger,
+    serviceItems.length,
+    tunnelHealthStats.danger,
+  ]);
+  const overviewStatusTone = useMemo(() => {
+    if (kernelConnectionSummary.variant === "success") {
+      return { borderClass: "border-[#27b15d]", textClass: "text-[#27b15d]" };
+    }
+    if (kernelConnectionSummary.variant === "warning") {
+      return { borderClass: "border-[#d28b2d]", textClass: "text-[#d28b2d]" };
+    }
+    if (kernelConnectionSummary.variant === "danger") {
+      return { borderClass: "border-[#c94f4f]", textClass: "text-[#c94f4f]" };
+    }
+    return { borderClass: "border-[#8f9ab2]", textClass: "text-[#8f9ab2]" };
+  }, [kernelConnectionSummary.variant]);
+
+  const donutBackground = useMemo(() => {
+    const total = Math.max(1, tunnelStats.total);
+    const idlePct = (tunnelStats.idle / total) * 100;
+    const inUsePct = (tunnelStats.inUse / total) * 100;
+    const unknownPct = Math.max(0, 100 - idlePct - inUsePct);
+    return `conic-gradient(#17a751 0% ${idlePct}%, #1f67e5 ${idlePct}% ${idlePct + inUsePct}%, #8cb2ea ${idlePct + inUsePct}% ${idlePct + inUsePct + unknownPct}%)`;
+  }, [tunnelStats.idle, tunnelStats.inUse, tunnelStats.total]);
+
+  const trafficSeries = useMemo(() => {
+    const source = trafficHistory.slice(-12);
+    if (source.length === 0) {
+      const upload = bytesPerSecToMiB(trafficSnapshot.upload_bytes_per_sec);
+      const download = bytesPerSecToMiB(trafficSnapshot.download_bytes_per_sec);
+      return {
+        upload: [upload],
+        download: [download],
+      };
+    }
+    return {
+      upload: source.map((item) => bytesPerSecToMiB(item.uploadBytesPerSec)),
+      download: source.map((item) => bytesPerSecToMiB(item.downloadBytesPerSec)),
+    };
+  }, [trafficHistory, trafficSnapshot.download_bytes_per_sec, trafficSnapshot.upload_bytes_per_sec]);
+
+  const trafficSummary = useMemo(
+    () => ({
+      uploadGb: formatBytesToGiB(trafficSnapshot.upload_total_bytes),
+      downloadGb: formatBytesToGiB(trafficSnapshot.download_total_bytes),
+      uploadRateBps: trafficSnapshot.upload_bytes_per_sec,
+      downloadRateBps: trafficSnapshot.download_bytes_per_sec,
+      source: trafficSnapshot.source,
+    }),
+    [
+      trafficSnapshot.download_bytes_per_sec,
+      trafficSnapshot.download_total_bytes,
+      trafficSnapshot.source,
+      trafficSnapshot.upload_bytes_per_sec,
+      trafficSnapshot.upload_total_bytes,
+    ],
+  );
+
+  const systemMetrics = useMemo(() => {
+    const cpu = clampPercent(systemResourceSnapshot.cpu_percent);
+    const memory = clampPercent(systemResourceSnapshot.memory_percent);
+    const disk = clampPercent(systemResourceSnapshot.disk_percent);
+    return { cpu, memory, disk };
+  }, [
+    systemResourceSnapshot.cpu_percent,
+    systemResourceSnapshot.disk_percent,
+    systemResourceSnapshot.memory_percent,
+  ]);
+
+  const recentLogs = useMemo(() => hostLogs.slice(0, 3), [hostLogs]);
+
+  const agentVersion = useMemo(() => {
+    const entry = hostLogs.find((log) => log.message.toLowerCase().includes("version"));
+    if (!entry) {
+      return "v1.2.x";
+    }
+    const matched = entry.message.match(/v\d+\.\d+\.\d+/i);
+    return matched?.[0] ?? "v1.2.x";
+  }, [hostLogs]);
+
+  const settingsDirty = useMemo(() => {
+    if (!hostConfig || !settingsDraft) {
       return false;
     }
-    const draftArgs = normalizeArgsText(configDraft.runtimeArgsText);
     return (
-      hostConfig.runtime_program !== configDraft.runtimeProgram.trim() ||
-      hostConfig.agent_id !== configDraft.agentId.trim() ||
-      hostConfig.bridge_addr !== configDraft.bridgeAddr.trim() ||
-      String(hostConfig.tunnel_pool_min_idle) !== configDraft.tunnelPoolMinIdleText.trim() ||
-      String(hostConfig.tunnel_pool_max_idle) !== configDraft.tunnelPoolMaxIdleText.trim() ||
-      String(hostConfig.tunnel_pool_max_inflight) !== configDraft.tunnelPoolMaxInflightText.trim() ||
-      String(hostConfig.tunnel_pool_ttl_ms) !== configDraft.tunnelPoolTtlMsText.trim() ||
-      String(hostConfig.tunnel_pool_open_rate) !== configDraft.tunnelPoolOpenRateText.trim() ||
-      String(hostConfig.tunnel_pool_open_burst) !== configDraft.tunnelPoolOpenBurstText.trim() ||
-      String(hostConfig.tunnel_pool_reconcile_gap_ms) !== configDraft.tunnelPoolReconcileGapMsText.trim() ||
-      hostConfig.ipc_endpoint !== configDraft.ipcEndpoint.trim() ||
-      JSON.stringify(hostConfig.runtime_args) !== JSON.stringify(draftArgs)
+      settingsDraft.runtimeProgram.trim() !== hostConfig.runtime_program ||
+      settingsDraft.runtimeArgsText.trim() !== hostConfig.runtime_args.join(" ") ||
+      settingsDraft.agentId.trim() !== hostConfig.agent_id ||
+      settingsDraft.bridgeAddr.trim() !== hostConfig.bridge_addr ||
+      settingsDraft.transport.trim() !== hostConfig.bridge_transport ||
+      settingsDraft.endpoint.trim() !== hostConfig.ipc_endpoint ||
+      settingsDraft.tunnelPoolMinIdleText.trim() !== String(hostConfig.tunnel_pool_min_idle) ||
+      settingsDraft.tunnelPoolMaxIdleText.trim() !== String(hostConfig.tunnel_pool_max_idle) ||
+      settingsDraft.tunnelPoolMaxInflightText.trim() !== String(hostConfig.tunnel_pool_max_inflight) ||
+      settingsDraft.tunnelPoolTtlMsText.trim() !== String(hostConfig.tunnel_pool_ttl_ms) ||
+      settingsDraft.tunnelPoolOpenRateText.trim() !== String(hostConfig.tunnel_pool_open_rate) ||
+      settingsDraft.tunnelPoolOpenBurstText.trim() !== String(hostConfig.tunnel_pool_open_burst) ||
+      settingsDraft.tunnelPoolReconcileGapMsText.trim() !== String(hostConfig.tunnel_pool_reconcile_gap_ms)
     );
-  }, [configDraft, hostConfig]);
+  }, [hostConfig, settingsDraft]);
 
-  /** 提交宿主运行配置更新：保存真实启动参数并在重启后生效。 */
-  const saveHostRuntimeConfig = useCallback(async () => {
-    setConfigSaving(true);
-    setErrorText("");
+  const resetSettingsDraft = useCallback(() => {
+    if (!hostConfig) {
+      return;
+    }
+    setSettingsDraft(toSettingsDraft(hostConfig));
+  }, [hostConfig]);
+
+  const saveSettings = useCallback(async () => {
+    if (!hostConfig || !settingsDraft) {
+      return;
+    }
+    setSavingSettings(true);
     try {
-      const normalizedAgentId = configDraft.agentId.trim();
-      const normalizedBridgeAddr = configDraft.bridgeAddr.trim();
-      if (!normalizedAgentId) {
-        throw new Error("agent_id 不能为空");
-      }
-      if (!normalizedBridgeAddr) {
-        throw new Error("bridge_addr 不能为空");
-      }
-      // 在前端先做一次数字解析，避免明显错误请求打到后端。
-      const tunnelPoolMinIdle = parseNonNegativeInteger(configDraft.tunnelPoolMinIdleText, "tunnel_pool_min_idle");
-      const tunnelPoolMaxIdle = parsePositiveInteger(configDraft.tunnelPoolMaxIdleText, "tunnel_pool_max_idle");
-      const tunnelPoolMaxInflight = parsePositiveInteger(configDraft.tunnelPoolMaxInflightText, "tunnel_pool_max_inflight");
-      const tunnelPoolTtlMs = parseNonNegativeInteger(configDraft.tunnelPoolTtlMsText, "tunnel_pool_ttl_ms");
-      const tunnelPoolOpenRate = parsePositiveFloat(configDraft.tunnelPoolOpenRateText, "tunnel_pool_open_rate");
-      const tunnelPoolOpenBurst = parsePositiveInteger(configDraft.tunnelPoolOpenBurstText, "tunnel_pool_open_burst");
-      const tunnelPoolReconcileGapMs = parsePositiveInteger(
-        configDraft.tunnelPoolReconcileGapMsText,
-        "tunnel_pool_reconcile_gap_ms",
-      );
-      const snapshot = await invoke<HostConfigSnapshot>("host_config_update", {
-        input: {
-          runtime_program: configDraft.runtimeProgram.trim(),
-          runtime_args: normalizeArgsText(configDraft.runtimeArgsText),
-          agent_id: normalizedAgentId,
-          bridge_addr: normalizedBridgeAddr,
-          tunnel_pool_min_idle: tunnelPoolMinIdle,
-          tunnel_pool_max_idle: tunnelPoolMaxIdle,
-          tunnel_pool_max_inflight: tunnelPoolMaxInflight,
-          tunnel_pool_ttl_ms: tunnelPoolTtlMs,
-          tunnel_pool_open_rate: tunnelPoolOpenRate,
-          tunnel_pool_open_burst: tunnelPoolOpenBurst,
-          tunnel_pool_reconcile_gap_ms: tunnelPoolReconcileGapMs,
-          ipc_endpoint: configDraft.ipcEndpoint.trim(),
-        },
-      });
+      const payload: HostConfigUpdateInput = {
+        runtime_program: settingsDraft.runtimeProgram.trim(),
+        runtime_args: normalizeRuntimeArgsText(settingsDraft.runtimeArgsText),
+        agent_id: settingsDraft.agentId.trim(),
+        bridge_addr: settingsDraft.bridgeAddr.trim(),
+        bridge_transport: settingsDraft.transport.trim(),
+        tunnel_pool_min_idle: parseNonNegativeInteger(
+          settingsDraft.tunnelPoolMinIdleText,
+          "tunnel_pool_min_idle",
+        ),
+        tunnel_pool_max_idle: parsePositiveInteger(settingsDraft.tunnelPoolMaxIdleText, "tunnel_pool_max_idle"),
+        tunnel_pool_max_inflight: parsePositiveInteger(
+          settingsDraft.tunnelPoolMaxInflightText,
+          "tunnel_pool_max_inflight",
+        ),
+        tunnel_pool_ttl_ms: parseNonNegativeInteger(settingsDraft.tunnelPoolTtlMsText, "tunnel_pool_ttl_ms"),
+        tunnel_pool_open_rate: parsePositiveFloat(settingsDraft.tunnelPoolOpenRateText, "tunnel_pool_open_rate"),
+        tunnel_pool_open_burst: parsePositiveInteger(settingsDraft.tunnelPoolOpenBurstText, "tunnel_pool_open_burst"),
+        tunnel_pool_reconcile_gap_ms: parsePositiveInteger(
+          settingsDraft.tunnelPoolReconcileGapMsText,
+          "tunnel_pool_reconcile_gap_ms",
+        ),
+        ipc_endpoint: settingsDraft.endpoint.trim(),
+      };
+      const snapshot = await invoke<HostConfigSnapshot>("host_config_update", { input: payload });
       setHostConfig(snapshot);
-      // 保存成功后以服务端返回值回填，防止前端草稿与后端规范化值不一致。
-      setConfigDraft(toHostRuntimeConfigDraft(snapshot));
+      setSettingsDraft(toSettingsDraft(snapshot));
+      notify("success", "配置保存成功", "已写入本地 YAML 文件，重连/重启后生效");
       await refreshHostLogs();
     } catch (error) {
-      // 更新失败直接在顶部显示，便于用户立即感知。
-      setErrorText(String(error));
+      notify("error", "配置保存失败", normalizeErrorMessage(error));
     } finally {
-      setConfigSaving(false);
+      setSavingSettings(false);
     }
-  }, [configDraft, refreshHostLogs]);
+  }, [hostConfig, notify, refreshHostLogs, settingsDraft]);
 
-  /** 渲染运行控制面板：仅调用已实现的真实命令。 */
-  const renderRuntimePanel = useCallback((): JSX.Element => {
-    const actionButtons: Array<{ command: RuntimeCommand; label: string; variant: "default" | "secondary" | "outline" | "destructive" }> = [
-      { command: "agent_start", label: "启动 Agent", variant: "default" },
-      { command: "agent_stop", label: "停止 Agent", variant: "outline" },
-      { command: "agent_restart", label: "重启 Agent", variant: "secondary" },
-      { command: "agent_crash_inject", label: "崩溃演练", variant: "destructive" },
-      { command: "app_shutdown", label: "关闭宿主", variant: "outline" },
+  const renderServicesTable = (): JSX.Element => (
+    <Card className="overflow-hidden">
+      <CardHeader className="flex flex-row items-center justify-between pb-3">
+        <div>
+          <CardTitle className="text-[28px] leading-none tracking-[-0.02em]">服务列表</CardTitle>
+          <CardDescription className="mt-1 text-xs">快照来源 `service_list_snapshot`</CardDescription>
+        </div>
+        <Button
+          className="h-9 rounded-lg bg-[#1f67e5] px-4 text-sm font-semibold hover:bg-[#1a58c7]"
+          onClick={() => notify("warning", "功能规划中", "新增服务入口将随 config.replace 一并接入")}
+        >
+          + 新增服务
+        </Button>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0">
+            <thead>
+              <tr className="bg-[#f4f6fb]">
+                <th className={TABLE_HEAD_CLASS}>名称</th>
+                <th className={TABLE_HEAD_CLASS}>本地地址</th>
+                <th className={TABLE_HEAD_CLASS}>公网地址</th>
+                <th className={TABLE_HEAD_CLASS}>状态</th>
+                <th className={TABLE_HEAD_CLASS}>流量</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredServices.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={5}>
+                    当前没有可展示的服务
+                  </td>
+                </tr>
+              ) : null}
+              {filteredServices.map((item) => {
+                const tunnel = filteredTunnels.find((entry) => entry.service_id === item.service_id);
+                return (
+                  <tr key={item.service_id} className="border-t border-[#edf1f8]">
+                    <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
+                    <td className={TABLE_CELL_CLASS}>{tunnel?.local_addr ?? "--"}</td>
+                    <td className={TABLE_CELL_CLASS}>{tunnel?.remote_addr ?? "--"}</td>
+                    <td className={TABLE_CELL_CLASS}>
+                      <Badge variant={serviceVariant(item.status)} title={item.status}>
+                        {formatServiceStatus(item.status)}
+                      </Badge>
+                    </td>
+                    <td className={TABLE_CELL_CLASS}>
+                      <span
+                        className={cn(
+                          "inline-flex h-7 w-12 items-center rounded-full p-1 transition",
+                          serviceVariant(item.status) === "success" ? "bg-[#1f67e5]" : "bg-[#bcc5d7]",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "h-5 w-5 rounded-full bg-white transition",
+                            serviceVariant(item.status) === "success" ? "translate-x-5" : "translate-x-0",
+                          )}
+                        />
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderLogsCard = (): JSX.Element => (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
+        <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">最近日志</CardTitle>
+        <button
+          className="text-base font-semibold text-[#1d63e8]"
+          onClick={() => setActiveNav("diagnose")}
+        >
+          查看全部
+        </button>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3">
+          {recentLogs.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-[#dbe1ed] bg-[#fbfcff] px-4 py-6 text-sm text-[#7a879f]">暂无日志</p>
+          ) : null}
+          {recentLogs.map((log, index) => (
+            <div key={`${log.ts_ms}-${index}`} className="flex items-start gap-3 border-b border-[#edf1f7] pb-3 last:border-b-0">
+              <span
+                className={cn(
+                  "mt-1 h-3 w-3 rounded-full",
+                  log.level.toLowerCase().includes("error")
+                    ? "bg-[#d84a4a]"
+                    : log.level.toLowerCase().includes("warn")
+                      ? "bg-[#f3a33b]"
+                      : "bg-[#29b262]",
+                )}
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-[#76839b]">{formatTime(log.ts_ms)} · {log.module}.{log.code}</p>
+                <p className="mt-1 truncate text-base text-[#2a344a]">{log.message}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderTrafficCard = (): JSX.Element => (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">流量概览</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="mb-3 grid grid-cols-2 gap-3">
+          <div className="rounded-xl border border-[#e5eaf4] bg-[#f9fbff] px-3 py-2">
+            <p className="flex items-center gap-2 text-sm text-[#33405b]"><Upload size={16} className="text-[#1f67e5]" />上传 <strong className="text-xl text-[#273249]">{trafficSummary.uploadGb} GB</strong></p>
+            <div className="mt-1 text-xs text-[#7a879f]">
+              ≈{" "}
+              <NetworkRateValue
+                bytesPerSec={trafficSummary.uploadRateBps}
+                valueClassName="text-xs font-semibold text-[#5e6a84]"
+                unitClassName="text-[11px] text-[#7a879f]"
+              />
+            </div>
+          </div>
+          <div className="rounded-xl border border-[#e5eaf4] bg-[#f9fbff] px-3 py-2">
+            <p className="flex items-center gap-2 text-sm text-[#33405b]"><Download size={16} className="text-[#29b262]" />下载 <strong className="text-xl text-[#273249]">{trafficSummary.downloadGb} GB</strong></p>
+            <div className="mt-1 text-xs text-[#7a879f]">
+              ≈{" "}
+              <NetworkRateValue
+                bytesPerSec={trafficSummary.downloadRateBps}
+                valueClassName="text-xs font-semibold text-[#5e6a84]"
+                unitClassName="text-[11px] text-[#7a879f]"
+              />
+            </div>
+          </div>
+        </div>
+        <MiniLineChart valuesA={trafficSeries.upload} valuesB={trafficSeries.download} />
+        <p className="mt-2 text-[11px] text-[#8390a8]">数据来源: {trafficSummary.source}</p>
+      </CardContent>
+    </Card>
+  );
+
+  const renderSystemResourceCard = (): JSX.Element => {
+    const items = [
+      { label: "CPU", value: systemMetrics.cpu, color: "bg-[#29b262]" },
+      { label: "内存", value: systemMetrics.memory, color: "bg-[#1f67e5]" },
+      { label: "磁盘", value: systemMetrics.disk, color: "bg-[#f09f36]" },
     ];
 
     return (
       <Card>
         <CardHeader>
-          <CardTitle>运行控制</CardTitle>
-          <CardDescription>生命周期命令 + IPC 连接态监控</CardDescription>
+          <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">系统资源</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid grid-cols-2 gap-3 xl:grid-cols-3">
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">连接状态</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{statusLabel}</p>
+        <CardContent className="space-y-3">
+          {items.map((item) => (
+            <div key={item.label}>
+              <div className="mb-1 flex items-center justify-between text-sm">
+                <span className="font-semibold text-[#38445f]">{item.label}</span>
+                <span className="font-semibold text-[#2b344b]">{item.value.toFixed(0)}%</span>
+              </div>
+              <div className="h-2.5 overflow-hidden rounded-full bg-[#e6ebf4]">
+                <div className={cn("h-full rounded-full", item.color)} style={{ width: `${item.value}%` }} />
+              </div>
             </div>
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">Desired State</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{runtimeSnapshot?.desired_state ?? "--"}</p>
-            </div>
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">Exit Kind</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{runtimeSnapshot?.exit_kind ?? "--"}</p>
-            </div>
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">PID</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{runtimeSnapshot?.pid ?? "--"}</p>
-            </div>
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">启动时间</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{formatTime(runtimeSnapshot?.started_at_ms ?? null)}</p>
-            </div>
-            <div className="rounded-xl border border-[#e1e7f2] bg-[#f9fbff] px-3 py-2">
-              <p className="text-xs text-[#71809b]">最近更新</p>
-              <p className="mt-1 text-sm font-semibold text-[#1f2a44]">{formatTime(runtimeSnapshot?.updated_at_ms ?? null)}</p>
-            </div>
-          </div>
+          ))}
+        </CardContent>
+      </Card>
+    );
+  };
 
-          <div className="flex flex-wrap gap-2">
-            {actionButtons.map((action) => (
+  const renderTunnelPanel = (): JSX.Element => (
+    <Card className="overflow-hidden">
+      <CardHeader>
+        <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">隧道详情</CardTitle>
+        <CardDescription className="text-xs">快照来源 `tunnel_list_snapshot`</CardDescription>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-separate border-spacing-0">
+            <thead>
+              <tr className="bg-[#f4f6fb]">
+                <th className={TABLE_HEAD_CLASS}>隧道 ID</th>
+                <th className={TABLE_HEAD_CLASS}>服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>本地地址</th>
+                <th className={TABLE_HEAD_CLASS}>远端地址</th>
+                <th className={TABLE_HEAD_CLASS}>状态</th>
+                <th className={TABLE_HEAD_CLASS}>延迟</th>
+                <th className={TABLE_HEAD_CLASS}>更新时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredTunnels.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={7}>
+                    当前没有可展示的隧道
+                  </td>
+                </tr>
+              ) : null}
+              {filteredTunnels.map((item) => (
+                <tr key={item.tunnel_id} className="border-t border-[#edf1f8]">
+                  <td className={TABLE_CELL_CLASS}>{item.tunnel_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.local_addr}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.remote_addr}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    <Badge variant={tunnelVariant(item.state)} title={item.state}>
+                      {formatTunnelState(item.state)}
+                    </Badge>
+                  </td>
+                  <td className={TABLE_CELL_CLASS}>{item.latency_ms} ms</td>
+                  <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderConfigPanel = (): JSX.Element => {
+    if (!hostConfig || !settingsDraft) {
+      return (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">统一设置</CardTitle>
+            <CardDescription className="text-xs">正在加载 Agent 与 Bridge 参数...</CardDescription>
+          </CardHeader>
+        </Card>
+      );
+    }
+
+    return (
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">统一设置</CardTitle>
+          <CardDescription className="text-xs">在一个页面分别配置 Agent 内核参数与 Bridge 服务端参数</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          <section className="space-y-3">
+            <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Agent 内核参数</h4>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <SettingsField label="Agent ID" hint="必填">
+                <Input
+                  value={settingsDraft.agentId}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, agentId: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：agent-local"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="Runtime 程序路径" hint="Agent 可执行文件路径">
+                <Input
+                  value={settingsDraft.runtimeProgram}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, runtimeProgram: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：/usr/local/bin/dev-agent-core"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="Runtime 参数" hint="空格分隔">
+                <Input
+                  value={settingsDraft.runtimeArgsText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, runtimeArgsText: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：--config /etc/dev-agent/config.yaml"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="IPC 端点" hint="按平台规则校验">
+                <Input
+                  value={settingsDraft.endpoint}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, endpoint: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：/tmp/dev-agent/agent.sock"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="Bridge 传输方式" hint="tcp_framed 与 grpc_h2 已打通（grpc_h2 默认监听 :39082）">
+                <select
+                  value={settingsDraft.transport}
+                  className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, transport: event.target.value } : prev,
+                    )
+                  }
+                >
+                  <option value="tcp_framed">tcp_framed（已支持）</option>
+                  <option value="grpc_h2">grpc_h2（已支持）</option>
+                </select>
+              </SettingsField>
+              <SettingsField label="认证方式" hint="LocalRPC 握手鉴权">
+                <select
+                  value={settingsDraft.authMode}
+                  disabled
+                  className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-[#f3f6fb] px-3 text-sm text-[#43506b]"
+                >
+                  <option value="hmac_auth_v1">hmac_auth_v1 (app.auth)</option>
+                </select>
+              </SettingsField>
+            </div>
+          </section>
+
+          <section className="space-y-3">
+            <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Bridge 服务端参数</h4>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <SettingsField label="Bridge 地址" hint="必填">
+                <Input
+                  value={settingsDraft.bridgeAddr}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, bridgeAddr: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：bridge.example.com:443"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+            </div>
+          </section>
+
+          <section className="space-y-3">
+            <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Tunnel 池参数</h4>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <SettingsField label="最小空闲数">
+                <Input
+                  value={settingsDraft.tunnelPoolMinIdleText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolMinIdleText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="最大空闲数">
+                <Input
+                  value={settingsDraft.tunnelPoolMaxIdleText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolMaxIdleText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="最大并发打开数">
+                <Input
+                  value={settingsDraft.tunnelPoolMaxInflightText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolMaxInflightText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="TTL（毫秒）">
+                <Input
+                  value={settingsDraft.tunnelPoolTtlMsText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolTtlMsText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="打开速率">
+                <Input
+                  value={settingsDraft.tunnelPoolOpenRateText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolOpenRateText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="decimal"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="打开突发值">
+                <Input
+                  value={settingsDraft.tunnelPoolOpenBurstText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolOpenBurstText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="对账间隔（毫秒）">
+                <Input
+                  value={settingsDraft.tunnelPoolReconcileGapMsText}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, tunnelPoolReconcileGapMsText: event.target.value } : prev,
+                    )
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+            </div>
+          </section>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#e2e8f2] bg-[#f8fbff] px-3 py-2.5">
+            <p className="text-xs text-[#697792]">
+              保存后立即写入宿主；Bridge 相关参数在下次重连生效，Agent 内核参数在重启后生效。
+            </p>
+            <div className="flex items-center gap-2">
               <Button
-                key={action.command}
-                disabled={Boolean(busyCommand)}
-                variant={action.variant}
-                onClick={() => void runCommand(action.command)}
+                variant="outline"
+                className="h-9 rounded-lg text-xs"
+                disabled={!settingsDirty || savingSettings}
+                onClick={resetSettingsDraft}
               >
-                {action.label}
+                重置
               </Button>
-            ))}
-          </div>
-
-          <div className="rounded-xl border border-dashed border-[#d8e0ee] bg-[#f8fbff] px-3 py-2 text-xs text-[#67748f]">
-            <p>IPC：{hostConfig?.ipc_transport ?? "--"} / {hostConfig?.ipc_endpoint ?? "--"}</p>
-            <p className="mt-1">Runtime：{hostConfig?.runtime_program ?? "--"}</p>
+              <Button
+                className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
+                disabled={!settingsDirty || savingSettings}
+                onClick={() => void saveSettings()}
+              >
+                {savingSettings ? "保存中..." : "保存配置"}
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>
     );
-  }, [busyCommand, hostConfig, runCommand, runtimeSnapshot, statusLabel]);
+  };
 
-  /** 渲染配置面板：仅编辑真实可生效字段。 */
-  const renderConfigPanel = useCallback((): JSX.Element => {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>配置管理</CardTitle>
-          <CardDescription>直连 Go runtime 的真实配置，保存后重启 Agent 生效</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <label className="block space-y-1">
-            <span className="text-sm text-[#5f6d87]">Agent 程序路径</span>
-            <Input
-              value={configDraft.runtimeProgram}
-              onChange={(event) =>
-                setConfigDraft((prev) => ({
-                  ...prev,
-                  runtimeProgram: event.target.value,
-                }))
-              }
-              placeholder="例如：C:\\path\\to\\agent-core.exe"
-            />
-          </label>
+  const renderDiagnosePanel = (): JSX.Element => (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">日志与诊断</CardTitle>
+        <CardDescription className="text-xs">结构化日志字段（时间/级别/模块/错误码）</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="agent-scroll max-h-[560px] overflow-y-auto rounded-xl border border-[#e5eaf4]">
+          <table className="min-w-full border-separate border-spacing-0">
+            <thead>
+              <tr className="bg-[#f4f6fb]">
+                <th className={TABLE_HEAD_CLASS}>时间</th>
+                <th className={TABLE_HEAD_CLASS}>级别</th>
+                <th className={TABLE_HEAD_CLASS}>模块</th>
+                <th className={TABLE_HEAD_CLASS}>错误码</th>
+                <th className={TABLE_HEAD_CLASS}>消息</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hostLogs.map((log, index) => (
+                <tr key={`${log.ts_ms}-${index}`} className="border-t border-[#edf1f8]">
+                  <td className={TABLE_CELL_CLASS}>{formatDateTime(log.ts_ms)}</td>
+                  <td className={TABLE_CELL_CLASS}><Badge variant={log.level.toLowerCase().includes("error") ? "danger" : log.level.toLowerCase().includes("warn") ? "warning" : "success"}>{log.level}</Badge></td>
+                  <td className={TABLE_CELL_CLASS}>{log.module}</td>
+                  <td className={TABLE_CELL_CLASS}>{log.code}</td>
+                  <td className={TABLE_CELL_CLASS}>{log.message}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
 
-          <label className="block space-y-1">
-            <span className="text-sm text-[#5f6d87]">启动参数（空格分隔）</span>
-            <textarea
-              className="min-h-[88px] w-full rounded-xl border border-[#d8dfeb] bg-white px-3 py-2 text-sm text-[#1f2a44] outline-none transition-colors placeholder:text-[#9aa6bc] focus:border-[#9fb4e4] focus:ring-2 focus:ring-[#dfe9ff]"
-              value={configDraft.runtimeArgsText}
-              onChange={(event) =>
-                setConfigDraft((prev) => ({
-                  ...prev,
-                  runtimeArgsText: event.target.value,
-                }))
-              }
-              placeholder="例如：--config C:\\path\\agent.yaml"
-            />
-          </label>
-
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">agent_id</span>
-              <Input
-                value={configDraft.agentId}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    agentId: event.target.value,
-                  }))
-                }
-                placeholder="例如：agent-local"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">bridge_addr</span>
-              <Input
-                value={configDraft.bridgeAddr}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    bridgeAddr: event.target.value,
-                  }))
-                }
-                placeholder="例如：127.0.0.1:39080"
-              />
-            </label>
+  const renderOverview = (): JSX.Element => (
+    <div className="space-y-3.5">
+      <Card className="rounded-2xl border-[#dce3ef]">
+        <CardContent className="grid grid-cols-1 gap-3 px-4 py-3 sm:grid-cols-2 lg:grid-cols-[1.25fr_0.72fr_0.72fr_0.72fr_0.52fr]">
+          <div className="flex items-center gap-3 lg:border-r lg:border-[#e4e8f0] lg:pr-3.5">
+            <span
+              className={cn(
+                "inline-flex h-9 w-9 items-center justify-center rounded-full border-2",
+                overviewStatusTone.borderClass,
+                overviewStatusTone.textClass,
+              )}
+            >
+              <ShieldCheck size={20} />
+            </span>
+            <div>
+              <p className="text-[29px] font-semibold leading-none tracking-[-0.01em] text-[#1f2b40]">{kernelConnectionSummary.label}</p>
+              <p className="mt-1 text-xs text-[#6d7893]">Bridge 服务: {serviceConnectionSummary.label}</p>
+              <p className="mt-1 text-xs text-[#6d7893]">
+                心跳发送: {bridgeHeartbeatSentText} / 收到: {bridgeHeartbeatText}
+              </p>
+            </div>
           </div>
-
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_min_idle</span>
-              <Input
-                value={configDraft.tunnelPoolMinIdleText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolMinIdleText: event.target.value,
-                  }))
-                }
-                placeholder="默认 8"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_max_idle</span>
-              <Input
-                value={configDraft.tunnelPoolMaxIdleText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolMaxIdleText: event.target.value,
-                  }))
-                }
-                placeholder="默认 32"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_max_inflight</span>
-              <Input
-                value={configDraft.tunnelPoolMaxInflightText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolMaxInflightText: event.target.value,
-                  }))
-                }
-                placeholder="默认 4"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_ttl_ms</span>
-              <Input
-                value={configDraft.tunnelPoolTtlMsText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolTtlMsText: event.target.value,
-                  }))
-                }
-                placeholder="默认 90000"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_open_rate</span>
-              <Input
-                value={configDraft.tunnelPoolOpenRateText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolOpenRateText: event.target.value,
-                  }))
-                }
-                placeholder="默认 10"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_open_burst</span>
-              <Input
-                value={configDraft.tunnelPoolOpenBurstText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolOpenBurstText: event.target.value,
-                  }))
-                }
-                placeholder="默认 20"
-              />
-            </label>
-
-            <label className="block space-y-1 lg:col-span-2">
-              <span className="text-sm text-[#5f6d87]">tunnel_pool_reconcile_gap_ms</span>
-              <Input
-                value={configDraft.tunnelPoolReconcileGapMsText}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    tunnelPoolReconcileGapMsText: event.target.value,
-                  }))
-                }
-                placeholder="默认 1000"
-              />
-            </label>
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">IPC 传输方式（平台绑定）</span>
-              <Input value={hostConfig?.ipc_transport ?? "--"} readOnly />
-            </label>
-
-            <label className="block space-y-1">
-              <span className="text-sm text-[#5f6d87]">IPC 端点</span>
-              <Input
-                value={configDraft.ipcEndpoint}
-                onChange={(event) =>
-                  setConfigDraft((prev) => ({
-                    ...prev,
-                    ipcEndpoint: event.target.value,
-                  }))
-                }
-                placeholder="UDS 路径或 \\.\\pipe\\agent-ui-xxx"
-              />
-            </label>
-          </div>
-
-          <div className="rounded-xl border border-dashed border-[#d8e0ee] bg-[#f8fbff] px-3 py-2 text-xs text-[#67748f]">
-            <p>当前生效：{hostConfig?.runtime_program ?? "--"}</p>
-            <p className="mt-1">agent_id / bridge_addr：{hostConfig?.agent_id ?? "--"} / {hostConfig?.bridge_addr ?? "--"}</p>
-            <p className="mt-1">
-              tunnel_pool：min={hostConfig?.tunnel_pool_min_idle ?? "--"} max={hostConfig?.tunnel_pool_max_idle ?? "--"} inflight={hostConfig?.tunnel_pool_max_inflight ?? "--"}
+          <div className="lg:border-r lg:border-[#e4e8f0] lg:pr-3.5">
+            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#58637b]">延迟</p>
+            <p className="mt-1 text-[34px] font-semibold leading-none text-[#202b40]">
+              {(runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0).toFixed(0)}
+              <span className="ml-1 text-sm text-[#27b15d]">ms</span>
             </p>
-            <p className="mt-1">当前 IPC：{hostConfig?.ipc_transport ?? "--"} / {hostConfig?.ipc_endpoint ?? "--"}</p>
-            <p className="mt-1">说明：配置将通过宿主环境变量直连注入真实 Go runtime，不是仅宿主本地参数。</p>
           </div>
-
-          <div>
-            <Button disabled={!configDirty || configSaving} onClick={() => void saveHostRuntimeConfig()}>
-              {configSaving ? "保存中..." : "保存配置"}
+          <div className="lg:border-r lg:border-[#e4e8f0] lg:pr-3.5">
+            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#58637b]">上传</p>
+            <div className="mt-1 flex items-center gap-2">
+              <Upload size={18} className="text-[#1d63e8]" />
+              <NetworkRateValue
+                bytesPerSec={trafficSummary.uploadRateBps}
+                valueClassName="text-[32px] font-semibold leading-none text-[#202b40]"
+                unitClassName="text-sm text-[#5b667d]"
+              />
+            </div>
+          </div>
+          <div className="lg:border-r lg:border-[#e4e8f0] lg:pr-3.5">
+            <p className="text-xs font-medium uppercase tracking-[0.08em] text-[#58637b]">下载</p>
+            <div className="mt-1 flex items-center gap-2">
+              <Download size={18} className="text-[#3bb96e]" />
+              <NetworkRateValue
+                bytesPerSec={trafficSummary.downloadRateBps}
+                valueClassName="text-[32px] font-semibold leading-none text-[#202b40]"
+                unitClassName="text-sm text-[#5b667d]"
+              />
+            </div>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Button
+              className="h-9 rounded-lg bg-[#1f67e5] px-3 text-sm font-semibold hover:bg-[#1958c6]"
+              disabled={Boolean(busyCommand)}
+              onClick={() => void runCommand("session_reconnect")}
+            >
+              <RefreshCcw size={15} className="mr-1" /> 立即重连
+            </Button>
+            <Button className="h-9 rounded-lg text-sm" variant="outline" onClick={() => setActiveNav("connections")}>
+              连接详情
             </Button>
           </div>
         </CardContent>
       </Card>
-    );
-  }, [configDirty, configDraft, configSaving, hostConfig, saveHostRuntimeConfig]);
 
-  /** 渲染服务列表面板。 */
-  const renderServicePanel = useCallback((): JSX.Element => {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>服务列表</CardTitle>
-          <CardDescription>来源于 `service_list_snapshot`，不暴露数据面原始读写</CardDescription>
-        </CardHeader>
-        <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="min-w-full border-separate border-spacing-0">
-              <thead>
-                <tr className="bg-[#f7f9fd]">
-                  <th className={TABLE_HEADER_CLASS}>服务名</th>
-                  <th className={TABLE_HEADER_CLASS}>Service ID</th>
-                  <th className={TABLE_HEADER_CLASS}>协议</th>
-                  <th className={TABLE_HEADER_CLASS}>状态</th>
-                  <th className={TABLE_HEADER_CLASS}>端点数</th>
-                  <th className={TABLE_HEADER_CLASS}>更新时间</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredServiceItems.length === 0 ? (
-                  <tr>
-                    <td className="px-4 py-8 text-center text-sm text-[#8290a9]" colSpan={6}>
-                      暂无服务数据
-                    </td>
-                  </tr>
-                ) : null}
-                {filteredServiceItems.map((item) => (
-                  <tr key={item.service_id} className="border-t border-[#edf1f7]">
-                    <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
-                    <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
-                    <td className={TABLE_CELL_CLASS}>{item.protocol.toUpperCase()}</td>
-                    <td className={TABLE_CELL_CLASS}>
-                      <Badge variant={serviceBadgeVariant(item.status)}>{item.status}</Badge>
-                    </td>
-                    <td className={TABLE_CELL_CLASS}>{item.endpoint_count}</td>
-                    <td className={TABLE_CELL_CLASS}>{formatTime(item.updated_at_ms)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }, [filteredServiceItems]);
-
-  /** 渲染通道列表面板。 */
-  const renderTunnelPanel = useCallback((): JSX.Element => {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>通道列表</CardTitle>
-          <CardDescription>来源于 `tunnel_list_snapshot`，聚合展示状态、路由与延迟</CardDescription>
-        </CardHeader>
-        <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="min-w-full border-separate border-spacing-0">
-              <thead>
-                <tr className="bg-[#f7f9fd]">
-                  <th className={TABLE_HEADER_CLASS}>Tunnel ID</th>
-                  <th className={TABLE_HEADER_CLASS}>Service ID</th>
-                  <th className={TABLE_HEADER_CLASS}>本地地址</th>
-                  <th className={TABLE_HEADER_CLASS}>远端地址</th>
-                  <th className={TABLE_HEADER_CLASS}>状态</th>
-                  <th className={TABLE_HEADER_CLASS}>延迟</th>
-                  <th className={TABLE_HEADER_CLASS}>更新时间</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredTunnelItems.length === 0 ? (
-                  <tr>
-                    <td className="px-4 py-8 text-center text-sm text-[#8290a9]" colSpan={7}>
-                      暂无通道数据
-                    </td>
-                  </tr>
-                ) : null}
-                {filteredTunnelItems.map((item) => (
-                  <tr key={item.tunnel_id} className="border-t border-[#edf1f7]">
-                    <td className={TABLE_CELL_CLASS}>{item.tunnel_id}</td>
-                    <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
-                    <td className={TABLE_CELL_CLASS}>{item.local_addr}</td>
-                    <td className={TABLE_CELL_CLASS}>{item.remote_addr}</td>
-                    <td className={TABLE_CELL_CLASS}>
-                      <Badge variant={tunnelBadgeVariant(item.state)}>{item.state}</Badge>
-                    </td>
-                    <td className={TABLE_CELL_CLASS}>{item.latency_ms} ms</td>
-                    <td className={TABLE_CELL_CLASS}>{formatTime(item.updated_at_ms)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }, [filteredTunnelItems]);
-
-  /** 渲染诊断面板，展示事件桥与宿主日志。 */
-  const renderDiagnosticsPanel = useCallback((): JSX.Element => {
-    return (
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-[1.42fr_0.98fr]">
         <Card>
-          <CardHeader>
-            <CardTitle>事件桥</CardTitle>
-            <CardDescription>来源于 `agent-runtime-changed` 事件</CardDescription>
+          <CardHeader className="pb-1.5">
+            <CardTitle className="text-[25px] leading-none tracking-[-0.01em]">Agent 信息</CardTitle>
           </CardHeader>
           <CardContent>
-            <ul className="agent-scroll max-h-[430px] space-y-2 overflow-y-auto pr-1">
-              {filteredEventFeed.length === 0 ? (
-                <li className="rounded-xl border border-dashed border-[#dbe2ef] bg-[#fafcff] px-3 py-3 text-sm text-[#8190a9]">
-                  暂无事件，等待状态变化...
-                </li>
-              ) : null}
-              {filteredEventFeed.map((item, index) => (
-                <li key={`${item.reason}-${index}`} className="rounded-xl border border-[#e6ebf4] bg-[#fbfcff] px-3 py-2">
-                  <p className="text-sm font-medium text-[#2a3851]">{item.reason}</p>
-                  <p className="mt-1 text-xs text-[#72819b]">
-                    dropped={item.dropped_event_count} | {formatTime(item.snapshot.updated_at_ms)}
+            <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-[1fr_1.08fr]">
+              <div>
+                <div className="rounded-xl border border-[#e5eaf4] bg-[#f9fbff] p-3.5">
+                  <div className="mb-2.5 flex items-center gap-2 text-sm font-semibold text-[#26324a]">
+                    <Gauge size={16} className="text-[#1d63e8]" /> 宿主状态
+                  </div>
+                  <p className="text-sm text-[#495674]">
+                    进程 PID: <strong className="text-[#1f2b40]">{runtimeSnapshot?.pid ?? "--"}</strong>
                   </p>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>宿主日志</CardTitle>
-            <CardDescription>来源于 `host_logs_snapshot` 结构化日志</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ul className="agent-scroll max-h-[430px] space-y-2 overflow-y-auto pr-1">
-              {filteredHostLogs.length === 0 ? (
-                <li className="rounded-xl border border-dashed border-[#dbe2ef] bg-[#fafcff] px-3 py-3 text-sm text-[#8190a9]">
-                  暂无日志
-                </li>
-              ) : null}
-              {filteredHostLogs.map((log, index) => (
-                <li key={`${log.ts_ms}-${index}`} className="rounded-xl border border-[#e6ebf4] bg-[#fbfcff] px-3 py-2">
-                  <p className="text-sm font-medium text-[#2a3851]">
-                    [{log.level}] {log.module}.{log.code}
+                  <p className="mt-1 text-sm text-[#495674]">
+                    重连总次数: <strong className="text-[#1f2b40]">{runtimeSnapshot?.metrics.agent_host_ipc_reconnect_total ?? 0}</strong>
                   </p>
-                  <p className="mt-1 text-xs text-[#72819b]">{log.message}</p>
-                  <p className="mt-1 text-xs text-[#8a97ad]">{formatTime(log.ts_ms)}</p>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }, [filteredEventFeed, filteredHostLogs]);
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <Button
+                    className="h-9 flex-1 rounded-lg text-sm"
+                    variant="outline"
+                    disabled={Boolean(busyCommand)}
+                    onClick={() => void runCommand("agent_restart")}
+                  >
+                    <RefreshCcw size={14} className="mr-1" /> 重启
+                  </Button>
+                  <Button
+                    className="h-9 flex-1 rounded-lg text-sm"
+                    variant="outline"
+                    disabled={Boolean(busyCommand)}
+                    onClick={() => void runCommand("agent_start")}
+                  >
+                    <Wrench size={14} className="mr-1" /> 刷新
+                  </Button>
+                </div>
+              </div>
 
-  /** 渲染总览：对齐参考图的统计卡 + 表格 + 诊断分区布局。 */
-  const renderDashboard = useCallback((): JSX.Element => {
-    const connectionState = runtimeSnapshot?.connection_state ?? "disconnected";
-    const rpcLatencyMs = runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0;
-
-    return (
-      <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-5">
-          <SummaryMetricCard
-            title="Client Status"
-            value={runtimeSnapshot?.process_alive ? "Running" : "Stopped"}
-            subtitle={`Desired: ${runtimeSnapshot?.desired_state ?? "--"}`}
-            icon={Cable}
-            tone={runtimeSnapshot?.process_alive ? "success" : "danger"}
-          />
-          <SummaryMetricCard
-            title="Active Tunnels"
-            value={`${activeTunnelCount} / ${tunnelItems.length}`}
-            subtitle="活跃通道 / 总通道"
-            icon={Waypoints}
-            tone={activeTunnelCount > 0 ? "success" : "warning"}
-          />
-          <SummaryMetricCard
-            title="Service Healthy"
-            value={`${healthyServiceCount} / ${serviceItems.length}`}
-            subtitle="健康服务 / 总服务"
-            icon={ShieldCheck}
-            tone={healthyServiceCount === serviceItems.length && serviceItems.length > 0 ? "success" : "warning"}
-          />
-          <SummaryMetricCard
-            title="RPC Latency"
-            value={`${rpcLatencyMs.toFixed(1)} ms`}
-            subtitle={`Reconnect: ${runtimeSnapshot?.metrics.agent_host_ipc_reconnect_total ?? 0}`}
-            icon={Zap}
-            tone={connectionState === "connected" ? "neutral" : "warning"}
-          />
-          <SummaryMetricCard
-            title="Recent Errors"
-            value={`${errorsIn24h}`}
-            subtitle="最近 24h 结构化日志 ERROR"
-            icon={AlertTriangle}
-            tone={errorsIn24h > 0 ? "danger" : "success"}
-          />
-        </div>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>通道概览</CardTitle>
-            <CardDescription>来源于 `tunnel_list_snapshot`，仅展示真实运行态字段</CardDescription>
-          </CardHeader>
-          <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <table className="min-w-full border-separate border-spacing-0">
-                <thead>
-                  <tr className="bg-[#f7f9fd]">
-                    <th className={TABLE_HEADER_CLASS}>Name</th>
-                    <th className={TABLE_HEADER_CLASS}>Service</th>
-                    <th className={TABLE_HEADER_CLASS}>Local Target</th>
-                    <th className={TABLE_HEADER_CLASS}>Remote Address</th>
-                    <th className={TABLE_HEADER_CLASS}>Status</th>
-                    <th className={TABLE_HEADER_CLASS}>Latency</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredTunnelItems.length === 0 ? (
-                    <tr>
-                      <td className="px-4 py-8 text-center text-sm text-[#8290a9]" colSpan={6}>
-                        暂无通道数据
-                      </td>
-                    </tr>
-                  ) : null}
-                  {filteredTunnelItems.map((item) => (
-                    <tr key={item.tunnel_id} className="border-t border-[#edf1f7]">
-                      <td className={TABLE_CELL_CLASS}>{item.tunnel_id}</td>
-                      <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
-                      <td className={TABLE_CELL_CLASS}>{item.local_addr}</td>
-                      <td className={TABLE_CELL_CLASS}>{item.remote_addr}</td>
-                      <td className={TABLE_CELL_CLASS}>
-                        <Badge variant={tunnelBadgeVariant(item.state)}>{item.state}</Badge>
-                      </td>
-                      <td className={TABLE_CELL_CLASS}>{item.latency_ms} ms</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div className="space-y-1">
+                <InfoRow label="Agent ID" value={hostConfig?.agent_id ?? "--"} />
+                <InfoRow label="版本" value={agentVersion} valueClassName="text-[#17a751]" />
+                <InfoRow label="运行时长" value={formatUptime(runtimeSnapshot?.started_at_ms ?? null)} />
+              </div>
             </div>
           </CardContent>
         </Card>
 
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>最近日志</CardTitle>
-              <CardDescription>结构化日志（按时间倒序）</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ul className="agent-scroll max-h-[250px] space-y-2 overflow-y-auto pr-1">
-                {filteredHostLogs.slice(0, 12).map((log, index) => (
-                  <li key={`${log.ts_ms}-${index}`} className="rounded-xl border border-[#e6ebf4] bg-[#fbfcff] px-3 py-2">
-                    <p className="text-sm font-medium text-[#2a3851]">{formatTime(log.ts_ms)} · {log.module}.{log.code}</p>
-                    <p className="mt-1 text-xs text-[#72819b]">{log.message}</p>
-                  </li>
-                ))}
-                {filteredHostLogs.length === 0 ? (
-                  <li className="rounded-xl border border-dashed border-[#dbe2ef] bg-[#fafcff] px-3 py-3 text-sm text-[#8190a9]">
-                    暂无日志
-                  </li>
-                ) : null}
-              </ul>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>健康检查</CardTitle>
-              <CardDescription>连接、延迟、服务、通道与错误综合评估</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ul>
-                {healthChecks.map((item) => (
-                  <HealthCheckRow key={item.label} label={item.label} detail={item.detail} level={item.level} />
-                ))}
-              </ul>
-            </CardContent>
-          </Card>
-        </div>
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-1.5">
+            <CardTitle className="text-[25px] leading-none tracking-[-0.01em]">隧道池</CardTitle>
+            <Button variant="outline" className="h-8 rounded-lg px-3 text-xs" onClick={() => setActiveNav("tunnels")}>
+              管理
+            </Button>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-[126px_1fr] gap-3.5">
+              <div className="flex items-center justify-center">
+                <div className="grid h-24 w-24 place-items-center rounded-full" style={{ background: donutBackground }}>
+                  <div className="h-[70px] w-[70px] rounded-full bg-white" />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <InfoRow label="总数" value={String(tunnelStats.total)} />
+                <InfoRow label="空闲" value={String(tunnelStats.idle)} valueClassName="text-[#17a751]" />
+                <InfoRow label="使用中" value={String(tunnelStats.inUse)} valueClassName="text-[#1f67e5]" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       </div>
-    );
-  }, [activeTunnelCount, errorsIn24h, filteredHostLogs, filteredTunnelItems, healthChecks, healthyServiceCount, runtimeSnapshot, serviceItems.length, tunnelItems.length]);
 
-  /** 根据导航选择渲染对应主内容。 */
-  const renderMainContent = useCallback((): JSX.Element => {
-    if (activeNav === "runtime") {
-      return renderRuntimePanel();
-    }
-    if (activeNav === "config") {
-      return renderConfigPanel();
-    }
+      <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-[1.56fr_0.96fr]">
+        {renderServicesTable()}
+        {renderTrafficCard()}
+      </div>
+
+      <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-[1.56fr_0.96fr]">
+        {renderLogsCard()}
+        {renderSystemResourceCard()}
+      </div>
+    </div>
+  );
+
+  const renderConnectionsPanel = (): JSX.Element => (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">Bridge 连接状态</CardTitle>
+          <CardDescription className="text-xs">展示 Agent 与 Bridge 的实时连接健康信息</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+            <InfoRow label="内核 IPC 状态" value={kernelConnectionSummary.label} />
+            <InfoRow label="Bridge 服务状态" value={serviceConnectionSummary.label} />
+            <InfoRow label="Bridge 会话状态" value={sessionStateRaw || "--"} />
+            <InfoRow label="Bridge 地址" value={hostConfig?.bridge_addr ?? "--"} valueClassName="text-[#1f67e5]" />
+            <InfoRow
+              label="本地 RPC 延迟"
+              value={`${(runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0).toFixed(0)} ms`}
+            />
+            <InfoRow label="最后发送心跳" value={bridgeHeartbeatSentText} />
+            <InfoRow label="最后收到心跳" value={bridgeHeartbeatText} />
+            <InfoRow label="Session ID" value={sessionSnapshot?.session_id ?? "--"} />
+            <InfoRow label="Session Epoch" value={sessionSnapshot?.session_epoch ? String(sessionSnapshot.session_epoch) : "--"} />
+            <InfoRow label="会话重连次数" value={String(sessionSnapshot?.reconnect_total ?? runtimeSnapshot?.metrics.agent_host_ipc_reconnect_total ?? 0)} />
+            <InfoRow label="连续失败次数" value={String(retryFailStreak)} />
+            <InfoRow label="退避窗口" value={retryBackoffMs > 0 ? `${Math.ceil(retryBackoffMs / 1000)} 秒` : "--"} />
+            <InfoRow label="下次自动重试" value={hasRetryDelay ? retryCountdownText : "无等待中任务"} />
+            <InfoRow
+              label="重试计划时间"
+              value={nextRetryAtMs ? formatDateTime(nextRetryAtMs) : "--"}
+            />
+          </div>
+          {lastReconnectError ? (
+            <div className="rounded-lg border border-[#f1d4d4] bg-[#fff6f6] px-3 py-2.5 text-xs text-[#ba4b4b]">
+              最近重连失败原因: {lastReconnectError}
+            </div>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
+              disabled={Boolean(busyCommand)}
+              onClick={() => void runCommand("session_reconnect")}
+            >
+              <RefreshCcw size={14} className="mr-1" />
+              立即重连
+            </Button>
+            <Button
+              variant="outline"
+              className="h-9 rounded-lg text-xs"
+              disabled={Boolean(busyCommand)}
+              onClick={() => void runCommand(bridgeConnected ? "session_drain" : "session_reconnect")}
+            >
+              {bridgeConnected ? "断开服务" : "建立服务"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      {renderTunnelPanel()}
+    </div>
+  );
+
+  const renderPageByNav = (): JSX.Element => {
     if (activeNav === "services") {
-      return renderServicePanel();
+      return renderServicesTable();
     }
     if (activeNav === "tunnels") {
       return renderTunnelPanel();
     }
-    if (activeNav === "diagnostics") {
-      return renderDiagnosticsPanel();
+    if (activeNav === "connections") {
+      return renderConnectionsPanel();
     }
-    return renderDashboard();
-  }, [activeNav, renderConfigPanel, renderDashboard, renderDiagnosticsPanel, renderRuntimePanel, renderServicePanel, renderTunnelPanel]);
-
-  const connectionState = runtimeSnapshot?.connection_state ?? "disconnected";
+    if (activeNav === "traffic") {
+      return (
+        <div className="space-y-4">
+          {renderTrafficCard()}
+          {renderSystemResourceCard()}
+        </div>
+      );
+    }
+    if (activeNav === "settings") {
+      return renderConfigPanel();
+    }
+    if (activeNav === "diagnose") {
+      return renderDiagnosePanel();
+    }
+    return renderOverview();
+  };
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#edf1f6] text-[#1f2a44]">
-      <header className="border-b border-[#d9dfeb] bg-[#f3f6fa] px-6 py-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            {/* 按反馈移除副标题，并压缩标题高度。 */}
-            <h1 className="text-[34px] font-semibold leading-none tracking-[-0.02em] text-[#1d2740]">Agent Console</h1>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <div className="relative min-w-[250px]">
-              <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#8b96ad]" />
-              <Input
-                className="h-10 rounded-xl bg-white pl-9"
-                placeholder="搜索服务/通道/日志/事件"
-                value={searchText}
-                onChange={(event) => setSearchText(event.target.value)}
-              />
+    <div className="h-screen w-screen overflow-hidden bg-[radial-gradient(circle_at_top_left,#f2f5fb_0%,#e8edf6_48%,#e0e7f2_100%)]">
+      <div className="agent-ui-scale flex h-full overflow-hidden text-[#1f2b40]">
+        <aside className="flex w-[248px] shrink-0 flex-col border-r border-[#223350] bg-[radial-gradient(circle_at_top_left,#1f2d4d_0%,#16243c_56%,#121b2f_100%)] px-4 py-4 text-[#e8eefb] lg:w-[258px]">
+          <div className="mb-5 flex items-center gap-3">
+            <div className="grid h-10 w-10 place-items-center rounded-xl bg-[#2e6de7] text-white shadow-[0_8px_20px_rgba(46,109,231,0.35)]">
+              <Cloud size={20} />
             </div>
-            <Badge variant={statusBadgeVariant(connectionState)}>{statusLabel}</Badge>
-            <Badge variant="outline">Uptime {uptimeLabel}</Badge>
-            <Badge variant="outline">PID {runtimeSnapshot?.pid ?? "--"}</Badge>
+            <div>
+              <p className="text-[32px] font-semibold leading-tight tracking-[-0.015em] text-white">DevBridge Agent</p>
+            </div>
           </div>
-        </div>
-      </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[290px_minmax(0,1fr)]">
-        <aside className="flex min-h-0 flex-col border-r border-[#d9dfeb] bg-[#f3f6fa] p-4">
-          <p className="mb-3 px-1 text-xs font-semibold tracking-[0.2em] text-[#8090aa]">设置导航</p>
-          <nav className="space-y-2">
+          <nav className="space-y-1.5">
             {NAV_ITEMS.map((item) => (
-              <SidebarNavItem key={item.key} item={item} active={item.key === activeNav} onClick={() => setActiveNav(item.key)} />
+              <NavButton key={item.key} item={item} active={item.key === activeNav} onClick={() => setActiveNav(item.key)} />
             ))}
           </nav>
 
-          <Card className="mt-auto">
-            <CardContent className="space-y-1 p-4">
-              <p className="flex items-center gap-2 text-sm text-[#55627b]">
-                <span className="h-2.5 w-2.5 rounded-full bg-[#18a164]" />
-                {statusLabel}
+          <div className="mt-auto space-y-3 rounded-2xl border border-white/12 bg-white/6 p-3.5 backdrop-blur">
+            <div>
+              <p className="text-xs uppercase tracking-[0.1em] text-[#b9c8e6]">Agent {agentVersion}</p>
+              <p className="mt-1 flex items-center gap-2 text-lg font-semibold text-white">
+                <span className={cn("h-2.5 w-2.5 rounded-full", runtimeSnapshot?.process_alive ? "bg-[#2fca6f]" : "bg-[#e06d6d]")} />
+                {runtimeSnapshot?.process_alive ? "运行中" : "已停止"}
               </p>
-              <p className="text-xs text-[#7a879f]">Transport: {hostConfig?.ipc_transport ?? "--"}</p>
-              <p className="text-xs text-[#7a879f]">Endpoint: {hostConfig?.ipc_endpoint ?? "--"}</p>
-            </CardContent>
-          </Card>
+            </div>
+            <div>
+              <div className="mb-1.5 flex items-center justify-between text-xs text-[#b4c1de]">
+                <span>存储</span>
+                <span>{tunnelStats.total.toFixed(1)} / {(hostConfig?.tunnel_pool_max_idle ?? 5).toFixed(1)} GB</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-[#2e6de7]"
+                  style={{ width: `${Math.min(100, (tunnelStats.total / Math.max(1, hostConfig?.tunnel_pool_max_idle ?? 1)) * 100)}%` }}
+                />
+              </div>
+            </div>
+            <div className="flex items-center gap-2 text-[#d8e1f2]">
+              <button className="grid h-8 w-8 place-items-center rounded-lg border border-white/15 bg-white/10 transition hover:bg-white/20">
+                <SquareMousePointer size={14} />
+              </button>
+              <button className="grid h-8 w-8 place-items-center rounded-lg border border-white/15 bg-white/10 transition hover:bg-white/20">
+                <Bell size={14} />
+              </button>
+              <button
+                className="grid h-8 w-8 place-items-center rounded-lg border border-white/15 bg-white/10 transition hover:bg-white/20"
+                onClick={() => setActiveNav("settings")}
+              >
+                <Settings size={14} />
+              </button>
+            </div>
+          </div>
         </aside>
 
-        <main className="agent-scroll min-h-0 overflow-y-auto px-5 py-4">
-          {errorText ? (
-            <div className="mb-4 rounded-xl border border-[#efc6c6] bg-[#fff4f4] px-3 py-2 text-sm text-[#ad4040]">{errorText}</div>
-          ) : null}
+        <main className="flex min-w-0 flex-1 flex-col">
+          <header className="border-b border-[#d7deeb] bg-white/80 px-4 py-3 backdrop-blur-xl lg:px-5">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Badge variant={kernelConnectionSummary.variant} className="px-3 py-1 text-xs font-semibold">
+                {kernelConnectionSummary.label}
+              </Badge>
+              <Badge variant={serviceConnectionSummary.variant} className="px-3 py-1 text-xs font-semibold">
+                {serviceConnectionSummary.label}
+              </Badge>
 
-          {renderMainContent()}
+              <span className="text-sm text-[#5f6c86]">
+                Bridge 地址: <strong className="text-[#1f67e5]">{hostConfig?.bridge_addr ?? "--"}</strong>
+              </span>
+              <span className="text-xs text-[#6c7891]">心跳: {bridgeHeartbeatSentText}</span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#f2f6ff] px-2 py-1 text-xs text-[#475677]">
+                注册服务 <strong className="text-[#22304a]">{serviceItems.length}</strong>
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#eefbf3] px-2 py-1 text-xs text-[#2b7a52]">
+                运行服务 <strong className="text-[#19653f]">{serviceHealthStats.success}</strong>
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#f2f6ff] px-2 py-1 text-xs text-[#475677]">
+                隧道总数 <strong className="text-[#22304a]">{tunnelStats.total}</strong>
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[#edf6ff] px-2 py-1 text-xs text-[#2f5ea9]">
+                活跃隧道 <strong className="text-[#204985]">{tunnelStats.inUse}</strong>
+              </span>
+              {serviceHealthStats.danger > 0 || tunnelHealthStats.danger > 0 ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-[#fff4f4] px-2 py-1 text-xs text-[#c24747]">
+                  异常项 <strong>{serviceHealthStats.danger + tunnelHealthStats.danger}</strong>
+                </span>
+              ) : null}
+              <Button
+                variant="outline"
+                className="h-9 rounded-lg text-xs"
+                disabled={Boolean(busyCommand)}
+                onClick={() => void runCommand("session_reconnect")}
+              >
+                <RefreshCcw size={14} className="mr-1" /> 重连
+              </Button>
+              <Button
+                variant="outline"
+                className="h-9 rounded-lg border-[#f2d3d3] text-xs text-[#d54b4b] hover:bg-[#fff4f4]"
+                disabled={Boolean(busyCommand)}
+                onClick={() => void runCommand(bridgeConnected ? "session_drain" : "session_reconnect")}
+              >
+                {bridgeConnected ? "断开服务" : "建立服务"}
+              </Button>
+            </div>
+          </header>
+
+          <section className="agent-scroll min-h-0 flex-1 overflow-y-auto px-4 py-3.5 lg:px-5">
+            <div className="mb-2.5 flex items-center justify-end gap-2 text-[11px] text-[#6e7a93]">
+              <span className="inline-flex items-center gap-1 rounded-full bg-white/65 px-2 py-1">
+                <Cable size={12} /> IPC {hostConfig?.ipc_transport ?? "--"}
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-white/65 px-2 py-1">
+                <Cpu size={12} /> PID {runtimeSnapshot?.pid ?? "--"}
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-white/65 px-2 py-1">
+                <HardDrive size={12} /> 更新时间 {formatTime(runtimeSnapshot?.updated_at_ms ?? null)}
+              </span>
+            </div>
+
+            {renderPageByNav()}
+          </section>
         </main>
       </div>
-
-      <footer className="border-t border-[#d9dfeb] bg-[#f3f6fa] px-5 py-2 text-xs text-[#64728d]">
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
-          <span className="inline-flex items-center gap-1.5">
-            <span className={cn("h-2 w-2 rounded-full", connectionState === "connected" ? "bg-[#18a164]" : "bg-[#c84b4b]")} />
-            Last Update {formatTime(runtimeSnapshot?.updated_at_ms ?? null)}
-          </span>
-          <span>Reconnect {runtimeSnapshot?.metrics.agent_host_ipc_reconnect_total ?? 0}</span>
-          <span>Service {serviceItems.length} / Tunnel {tunnelItems.length}</span>
-          <span>Logs {warningsIn24h} warning / {errorsIn24h} error</span>
-        </div>
-      </footer>
+      <Toaster />
     </div>
   );
 }

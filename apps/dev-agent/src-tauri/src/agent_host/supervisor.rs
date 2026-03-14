@@ -26,12 +26,64 @@ use super::launcher::ensure_secure_dir;
 use super::launcher::{generate_session_secret, prepare_ipc_endpoint, spawn_agent_process};
 use crate::state::app_state::{
     build_runtime_snapshot, current_host_config_snapshot, current_runtime_config, now_ms,
-    push_host_log, AgentRuntimeSnapshot, AppBootstrapPayload, AppRuntimeState, ConnectionState,
-    DesiredState, ExitKind, RESTART_BACKOFF_MS, STOP_TIMEOUT_MS, SUPERVISOR_POLL_MS,
+    push_host_log, push_rpc_latency_sample, AgentRuntimeSnapshot, AppBootstrapPayload,
+    AppRuntimeState, ConnectionState, DesiredState, ExitKind, HostRuntimeConfig, STOP_TIMEOUT_MS,
+    SUPERVISOR_POLL_MS,
 };
 
 /// 后台事件泵间隔：主动触发一次 ping 以携带服务端事件。
 const IPC_EVENT_PUMP_INTERVAL_MS: u64 = 1_000;
+/// 连接失败后的重试步长：5 秒。
+const IPC_RETRY_STEP_BACKOFF_MS: u64 = 5_000;
+/// 连接失败后的重试上限：60 秒。
+const IPC_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+/// 退避步数：5/10/15/.../60，共 12 档，之后从 5 秒循环。
+const IPC_RETRY_STEP_COUNT: u32 = 12;
+
+fn compute_retry_backoff_ms(fail_streak: u32) -> u64 {
+    if fail_streak == 0 {
+        return 0;
+    }
+    let step_index = fail_streak.saturating_sub(1) % IPC_RETRY_STEP_COUNT + 1;
+    (u64::from(step_index) * IPC_RETRY_STEP_BACKOFF_MS).min(IPC_RETRY_MAX_BACKOFF_MS)
+}
+
+/// 判定是否必须执行“严格 peer pid 一致性校验”。
+///
+/// `go run ...` 模式下，spawn 出来的通常是 go 包装进程，真正监听 IPC 的是其子进程，
+/// 因此不能用“精确 pid 一致”作为强校验条件。
+fn should_enforce_strict_peer_pid(runtime_config: &HostRuntimeConfig) -> bool {
+    let program_name = runtime_config
+        .runtime_program
+        .file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_go_runtime_wrapper = (program_name == "go" || program_name == "go.exe")
+        && runtime_config
+            .runtime_args
+            .first()
+            .map(|value| value.trim().eq_ignore_ascii_case("run"))
+            .unwrap_or(false);
+    !is_go_runtime_wrapper
+}
+
+fn clear_retry_state(supervisor: &mut crate::state::app_state::SupervisorState) {
+    supervisor.next_retry_at_ms = None;
+    supervisor.retry_backoff_ms = 0;
+    supervisor.retry_fail_streak = 0;
+    supervisor.last_reconnect_error = None;
+}
+
+fn mark_reconnect_failure(
+    supervisor: &mut crate::state::app_state::SupervisorState,
+    error_message: &str,
+) {
+    supervisor.retry_fail_streak = supervisor.retry_fail_streak.saturating_add(1);
+    let backoff_ms = compute_retry_backoff_ms(supervisor.retry_fail_streak);
+    supervisor.retry_backoff_ms = backoff_ms;
+    supervisor.next_retry_at_ms = Some(now_ms().saturating_add(backoff_ms));
+    supervisor.last_reconnect_error = Some(error_message.to_string());
+}
 
 /// 设置连接状态并生成快照，供事件桥统一下发。
 fn set_connection_state(
@@ -76,6 +128,7 @@ fn start_agent_sequence(
                 supervisor.pending_auto_restart =
                     matches!(supervisor.desired_state, DesiredState::Running);
                 supervisor.last_error = Some(err.clone());
+                mark_reconnect_failure(&mut supervisor, &err);
                 supervisor.updated_at_ms = now_ms();
                 push_host_log(
                     &mut supervisor,
@@ -105,6 +158,7 @@ fn start_agent_sequence(
         supervisor.expecting_exit = false;
         supervisor.pending_auto_restart = false;
         supervisor.last_error = None;
+        supervisor.next_retry_at_ms = None;
         supervisor.updated_at_ms = now_ms();
         supervisor.child = Some(child);
         supervisor.pid = supervisor.child.as_ref().map(std::process::Child::id);
@@ -127,11 +181,18 @@ fn start_agent_sequence(
     };
     emit_runtime_changed(app, state, "ipc.reconnecting", reconnecting_snapshot, true);
 
+    let enforce_strict_peer_pid = should_enforce_strict_peer_pid(&runtime_config);
+    let expected_peer_pid = if enforce_strict_peer_pid {
+        Some(spawned_pid)
+    } else {
+        None
+    };
+
     let mut rpc_client = match LocalRpcClient::connect(
         &runtime_config.ipc_transport,
         &runtime_config.ipc_endpoint,
         &session_secret,
-        Some(spawned_pid),
+        expected_peer_pid,
     ) {
         Ok(client) => client,
         Err(err) => {
@@ -144,6 +205,7 @@ fn start_agent_sequence(
                 supervisor.pending_auto_restart =
                     matches!(supervisor.desired_state, DesiredState::Running);
                 supervisor.last_error = Some(err.clone());
+                mark_reconnect_failure(&mut supervisor, &err);
                 supervisor.updated_at_ms = now_ms();
                 let child_to_kill = supervisor.child.take();
                 supervisor.pid = None;
@@ -176,6 +238,7 @@ fn start_agent_sequence(
             supervisor.pending_auto_restart =
                 matches!(supervisor.desired_state, DesiredState::Running);
             supervisor.last_error = Some(err.clone());
+            mark_reconnect_failure(&mut supervisor, &err);
             supervisor.updated_at_ms = now_ms();
             let child_to_kill = supervisor.child.take();
             supervisor.pid = None;
@@ -216,6 +279,7 @@ fn start_agent_sequence(
             supervisor.pending_auto_restart =
                 matches!(supervisor.desired_state, DesiredState::Running);
             supervisor.last_error = Some(err.clone());
+            mark_reconnect_failure(&mut supervisor, &err);
             supervisor.updated_at_ms = now_ms();
             let child_to_kill = supervisor.child.take();
             supervisor.pid = None;
@@ -237,6 +301,7 @@ fn start_agent_sequence(
         return Err(err);
     }
 
+    let ping_start = Instant::now();
     if let Err(err) = rpc_client.ping() {
         let (snapshot, child_to_kill) = {
             let mut supervisor = state
@@ -247,6 +312,7 @@ fn start_agent_sequence(
             supervisor.pending_auto_restart =
                 matches!(supervisor.desired_state, DesiredState::Running);
             supervisor.last_error = Some(err.clone());
+            mark_reconnect_failure(&mut supervisor, &err);
             supervisor.updated_at_ms = now_ms();
             let child_to_kill = supervisor.child.take();
             supervisor.pid = None;
@@ -267,6 +333,7 @@ fn start_agent_sequence(
         emit_runtime_changed(app, state, "rpc.ping.failed", snapshot, true);
         return Err(err);
     }
+    let ping_latency_ms = ping_start.elapsed().as_millis() as u64;
 
     let event_total = rpc_client.drain_events().len();
     {
@@ -274,6 +341,9 @@ fn start_agent_sequence(
             .supervisor
             .lock()
             .map_err(|_| "保存 IPC 客户端时锁异常".to_string())?;
+        clear_retry_state(&mut supervisor);
+        supervisor.last_heartbeat_at_ms = Some(now_ms());
+        push_rpc_latency_sample(&mut supervisor, ping_latency_ms);
         push_host_log(
             &mut supervisor,
             "info",
@@ -284,6 +354,15 @@ fn start_agent_sequence(
                 rpc_client.describe()
             ),
         );
+        if !enforce_strict_peer_pid {
+            push_host_log(
+                &mut supervisor,
+                "warn",
+                "ipc_client",
+                "PEER_PID_STRICT_CHECK_SKIPPED",
+                "当前 runtime 使用 go run 包装进程，已跳过精确 peer pid 校验；仍保留 OS 用户身份与会话密钥握手校验",
+            );
+        }
         // 初始化事件泵时间戳，避免刚连上就重复 ping。
         supervisor.last_ipc_event_pump_ms = now_ms();
         supervisor.ipc_client = Some(rpc_client);
@@ -322,6 +401,7 @@ fn stop_agent_sequence(
         supervisor.expecting_exit = true;
         supervisor.pending_auto_restart = false;
         supervisor.last_error = None;
+        clear_retry_state(&mut supervisor);
         supervisor.updated_at_ms = now_ms();
         push_host_log(
             &mut supervisor,
@@ -487,6 +567,7 @@ pub fn agent_crash_inject_impl(
         supervisor.connection_state = ConnectionState::Disconnected;
         supervisor.expecting_exit = false;
         supervisor.pending_auto_restart = true;
+        mark_reconnect_failure(&mut supervisor, "agent.crash.injected");
         supervisor.updated_at_ms = now_ms();
         push_host_log(
             &mut supervisor,
@@ -550,6 +631,7 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                                 if expected {
                                     supervisor.pending_auto_restart = false;
                                     supervisor.last_error = None;
+                                    clear_retry_state(&mut supervisor);
                                     push_host_log(
                                         &mut supervisor,
                                         "info",
@@ -563,10 +645,12 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                                         true,
                                     ));
                                 } else {
+                                    let error_message =
+                                        format!("Agent 进程异常退出，status={status}");
                                     supervisor.pending_auto_restart =
                                         matches!(supervisor.desired_state, DesiredState::Running);
-                                    supervisor.last_error =
-                                        Some(format!("Agent 进程异常退出，status={status}"));
+                                    supervisor.last_error = Some(error_message.clone());
+                                    mark_reconnect_failure(&mut supervisor, &error_message);
                                     push_host_log(
                                         &mut supervisor,
                                         "error",
@@ -603,7 +687,10 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                     }
                 }
 
-                {
+                let (pump_emit, pump_child_to_kill) = {
+                    let mut emit_after_pump: Option<(String, AgentRuntimeSnapshot, bool)> = None;
+                    let mut child_to_kill = None;
+
                     let mut supervisor = match state.supervisor.lock() {
                         Ok(guard) => guard,
                         Err(_) => {
@@ -619,42 +706,85 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                         if let Some(mut ipc_client) = supervisor.ipc_client.take() {
                             if need_pump {
                                 supervisor.last_ipc_event_pump_ms = now;
-                                if let Err(err) = ipc_client.ping() {
-                                    push_host_log(
-                                        &mut supervisor,
-                                        "warn",
-                                        "ipc_client",
-                                        "RPC_EVENT_PUMP_FAILED",
-                                        format!("事件泵 ping 失败: {err}"),
-                                    );
+                                let ping_start = Instant::now();
+                                match ipc_client.ping() {
+                                    Ok(()) => {
+                                        supervisor.last_heartbeat_at_ms = Some(now_ms());
+                                        push_rpc_latency_sample(
+                                            &mut supervisor,
+                                            ping_start.elapsed().as_millis() as u64,
+                                        );
+                                        clear_retry_state(&mut supervisor);
+                                        supervisor.last_error = None;
+                                        supervisor.connection_state = ConnectionState::Connected;
+                                    }
+                                    Err(err) => {
+                                        let error_message = format!("事件泵 ping 失败: {err}");
+                                        supervisor.connection_state = ConnectionState::Disconnected;
+                                        supervisor.pending_auto_restart = matches!(
+                                            supervisor.desired_state,
+                                            DesiredState::Running
+                                        );
+                                        supervisor.last_error = Some(error_message.clone());
+                                        mark_reconnect_failure(&mut supervisor, &error_message);
+                                        supervisor.updated_at_ms = now_ms();
+                                        push_host_log(
+                                            &mut supervisor,
+                                            "warn",
+                                            "ipc_client",
+                                            "RPC_EVENT_PUMP_FAILED",
+                                            error_message,
+                                        );
+                                        child_to_kill = supervisor.child.take();
+                                        supervisor.pid = None;
+                                        emit_after_pump = Some((
+                                            "ipc.healthcheck.failed".to_string(),
+                                            build_runtime_snapshot(&supervisor),
+                                            true,
+                                        ));
+                                        ipc_client.close();
+                                    }
                                 }
                             }
-                            let drained_events = ipc_client.drain_events();
-                            for event in drained_events {
-                                let event_name = event
-                                    .get("event")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown");
-                                let event_seq =
-                                    event.get("seq").and_then(Value::as_u64).unwrap_or(0);
-                                push_host_log(
-                                    &mut supervisor,
-                                    "info",
-                                    "event_bridge",
-                                    "AGENT_EVENT_FORWARDED",
-                                    format!("转发 Agent 事件: event={event_name}, seq={event_seq}"),
-                                );
-                                supervisor.updated_at_ms = now_ms();
-                                forwarded_events.push((
-                                    format!("agent.event.{event_name}"),
-                                    build_runtime_snapshot(&supervisor),
-                                    false,
-                                ));
+
+                            if emit_after_pump.is_none() {
+                                let drained_events = ipc_client.drain_events();
+                                for event in drained_events {
+                                    let event_name = event
+                                        .get("event")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("unknown");
+                                    let event_seq =
+                                        event.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                                    push_host_log(
+                                        &mut supervisor,
+                                        "info",
+                                        "event_bridge",
+                                        "AGENT_EVENT_FORWARDED",
+                                        format!(
+                                            "转发 Agent 事件: event={event_name}, seq={event_seq}"
+                                        ),
+                                    );
+                                    supervisor.updated_at_ms = now_ms();
+                                    forwarded_events.push((
+                                        format!("agent.event.{event_name}"),
+                                        build_runtime_snapshot(&supervisor),
+                                        false,
+                                    ));
+                                }
+                                // 处理结束后放回 IPC 客户端，保持长连接可复用。
+                                supervisor.ipc_client = Some(ipc_client);
                             }
-                            // 处理结束后放回 IPC 客户端，保持长连接可复用。
-                            supervisor.ipc_client = Some(ipc_client);
                         }
                     }
+                    (emit_after_pump, child_to_kill)
+                };
+                if let Some(mut child) = pump_child_to_kill {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some((reason, snapshot, force)) = pump_emit {
+                    emit_runtime_changed(&app, &state, &reason, snapshot, force);
                 }
 
                 if let Some((reason, snapshot, force)) = emit_item {
@@ -678,9 +808,9 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                         && supervisor.child.is_none()
                     {
                         let now = now_ms();
-                        if now.saturating_sub(supervisor.last_restart_attempt_ms)
-                            >= RESTART_BACKOFF_MS
-                        {
+                        let retry_deadline = supervisor.next_retry_at_ms.unwrap_or(now);
+                        if now >= retry_deadline {
+                            supervisor.next_retry_at_ms = None;
                             supervisor.last_restart_attempt_ms = now;
                             supervisor.restart_total += 1;
                             push_host_log(
@@ -713,6 +843,9 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                             };
                             supervisor.pending_auto_restart = true;
                             supervisor.last_error = Some(err.clone());
+                            if supervisor.next_retry_at_ms.is_none() {
+                                mark_reconnect_failure(&mut supervisor, &err);
+                            }
                             supervisor.updated_at_ms = now_ms();
                             push_host_log(
                                 &mut supervisor,
@@ -871,6 +1004,34 @@ fn run_mock_localrpc_server_loop(
     let mut last_client_nonce = String::new();
     let mut last_agent_nonce = String::new();
     let mut negotiated_protocol_version = AUTH_PROTOCOL_VERSION.to_string();
+    let runtime_agent_id =
+        std::env::var("DEV_AGENT_CFG_AGENT_ID").unwrap_or_else(|_| "agent-local".to_string());
+    let runtime_bridge_addr = std::env::var("DEV_AGENT_CFG_BRIDGE_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:39080".to_string());
+    let runtime_ipc_transport = std::env::var("DEV_AGENT_IPC_TRANSPORT")
+        .unwrap_or_else(|_| if cfg!(windows) { "named_pipe" } else { "uds" }.to_string());
+    let runtime_ipc_endpoint = std::env::var("DEV_AGENT_IPC_ENDPOINT").unwrap_or_default();
+    let tunnel_pool_min_idle =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE").unwrap_or_else(|_| "8".to_string());
+    let tunnel_pool_max_idle =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_MAX_IDLE").unwrap_or_else(|_| "32".to_string());
+    let tunnel_pool_max_inflight =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_MAX_INFLIGHT").unwrap_or_else(|_| "4".to_string());
+    let tunnel_pool_ttl_ms =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_TTL_MS").unwrap_or_else(|_| "90000".to_string());
+    let tunnel_pool_open_rate =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_OPEN_RATE").unwrap_or_else(|_| "10".to_string());
+    let tunnel_pool_open_burst =
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_OPEN_BURST").unwrap_or_else(|_| "20".to_string());
+    let tunnel_pool_reconcile_gap_ms = std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_RECONCILE_GAP_MS")
+        .unwrap_or_else(|_| "1000".to_string());
+    let session_unavailable_reason =
+        "bridge transport not wired in embedded localrpc runtime".to_string();
+    let mut session_state = "UNAVAILABLE".to_string();
+    let mut session_id: Option<String> = None;
+    let mut session_epoch: Option<u64> = None;
+    let mut session_reconnect_total = 0_u64;
+    let mut session_last_heartbeat_at_ms: Option<u64> = None;
     loop {
         if let Some(limit_ms) = crash_after_ms {
             if start_instant.elapsed().as_millis() >= u128::from(limit_ms) {
@@ -997,53 +1158,112 @@ fn run_mock_localrpc_server_loop(
                         "started_at_ms": started_at_ms,
                         "uptime_ms": now_ms().saturating_sub(started_at_ms),
                     })
-                } else if method == "service.list" {
-                    // mock 数据用于前端联调服务列表页面。
+                } else if method == "session.snapshot" {
                     json!({
-                        "services": [
-                            {
-                                "service_id": "svc-dev-api",
-                                "service_name": "dev-api",
-                                "protocol": "http",
-                                "status": "healthy",
-                                "endpoint_count": 2,
-                                "updated_at_ms": now_ms(),
-                            },
-                            {
-                                "service_id": "svc-metrics",
-                                "service_name": "metrics-gateway",
-                                "protocol": "tcp",
-                                "status": "degraded",
-                                "endpoint_count": 1,
-                                "last_error": "上游健康检查超时",
-                                "updated_at_ms": now_ms(),
-                            }
-                        ]
+                        "state": session_state,
+                        "session_id": session_id,
+                        "session_epoch": session_epoch,
+                        "last_heartbeat_at_ms": session_last_heartbeat_at_ms,
+                        "reconnect_total": session_reconnect_total,
+                        "updated_at_ms": now_ms(),
+                        "source": "localrpc.embedded",
+                        "unavailable_reason": session_unavailable_reason,
+                    })
+                } else if method == "session.reconnect" {
+                    let next_epoch = session_epoch.unwrap_or(0).saturating_add(1);
+                    session_epoch = Some(next_epoch);
+                    session_reconnect_total = session_reconnect_total.saturating_add(1);
+                    session_id = Some(format!("embedded-session-{next_epoch}"));
+                    session_last_heartbeat_at_ms = Some(now_ms());
+                    // 当前内置 localrpc 内核仅保证 IPC 层可用；Bridge 侧状态仍按 UNAVAILABLE 暴露。
+                    session_state = "UNAVAILABLE".to_string();
+                    json!({
+                        "state": session_state,
+                        "session_id": session_id,
+                        "session_epoch": session_epoch,
+                        "last_heartbeat_at_ms": session_last_heartbeat_at_ms,
+                        "reconnect_total": session_reconnect_total,
+                        "updated_at_ms": now_ms(),
+                        "source": "localrpc.embedded",
+                        "unavailable_reason": session_unavailable_reason,
+                    })
+                } else if method == "session.drain" {
+                    session_state = "CLOSED".to_string();
+                    session_last_heartbeat_at_ms = None;
+                    json!({
+                        "state": session_state,
+                        "session_id": session_id,
+                        "session_epoch": session_epoch,
+                        "last_heartbeat_at_ms": session_last_heartbeat_at_ms,
+                        "reconnect_total": session_reconnect_total,
+                        "updated_at_ms": now_ms(),
+                        "source": "localrpc.embedded",
+                        "unavailable_reason": session_unavailable_reason,
+                    })
+                } else if method == "service.list" {
+                    json!({
+                        "services": [],
+                        "updated_at_ms": now_ms(),
+                        "source": "localrpc.embedded",
                     })
                 } else if method == "tunnel.list" {
-                    // mock 数据用于前端联调通道列表页面。
                     json!({
-                        "tunnels": [
-                            {
-                                "tunnel_id": "tnl-001",
-                                "service_id": "svc-dev-api",
-                                "state": "active",
-                                "local_addr": "127.0.0.1:18080",
-                                "remote_addr": "https://api-dev.example.com",
-                                "latency_ms": 52,
-                                "updated_at_ms": now_ms(),
-                            },
-                            {
-                                "tunnel_id": "tnl-002",
-                                "service_id": "svc-metrics",
-                                "state": "idle",
-                                "local_addr": "127.0.0.1:19090",
-                                "remote_addr": "tcp://metrics-dev.example.com:443",
-                                "latency_ms": 88,
-                                "last_error": "最近一次重连后等待流量",
-                                "updated_at_ms": now_ms(),
-                            }
-                        ]
+                        "tunnels": [],
+                        "updated_at_ms": now_ms(),
+                        "source": "localrpc.embedded",
+                    })
+                } else if method == "traffic.stats.snapshot" {
+                    // mock 数据用于前端联调网速与流量图表。
+                    let uptime_ms = now_ms().saturating_sub(started_at_ms);
+                    let upload_bytes_per_sec =
+                        1_550_000.0 + ((uptime_ms / 1_300) % 9) as f64 * 120_000.0;
+                    let download_bytes_per_sec =
+                        1_120_000.0 + ((uptime_ms / 1_100) % 7) as f64 * 150_000.0;
+                    let elapsed_seconds = (uptime_ms as f64 / 1000.0).max(1.0);
+                    json!({
+                        "upload_bytes_per_sec": upload_bytes_per_sec,
+                        "download_bytes_per_sec": download_bytes_per_sec,
+                        "upload_total_bytes": (elapsed_seconds * upload_bytes_per_sec) as u64,
+                        "download_total_bytes": (elapsed_seconds * download_bytes_per_sec) as u64,
+                        "sample_window_ms": 1000,
+                        "interface_count": 2,
+                        "updated_at_ms": now_ms(),
+                    })
+                } else if method == "config.snapshot" {
+                    json!({
+                        "agent_id": runtime_agent_id,
+                        "bridge_addr": runtime_bridge_addr,
+                        "ipc_transport": runtime_ipc_transport,
+                        "ipc_endpoint": runtime_ipc_endpoint,
+                        "tunnel_pool": {
+                            "min_idle": tunnel_pool_min_idle,
+                            "max_idle": tunnel_pool_max_idle,
+                            "max_inflight": tunnel_pool_max_inflight,
+                            "ttl_ms": tunnel_pool_ttl_ms,
+                            "open_rate": tunnel_pool_open_rate,
+                            "open_burst": tunnel_pool_open_burst,
+                            "reconcile_gap_ms": tunnel_pool_reconcile_gap_ms,
+                        },
+                        "updated_at_ms": now_ms(),
+                    })
+                } else if method == "diagnose.snapshot" {
+                    json!({
+                        "health": "degraded",
+                        "bridge_state": session_state,
+                        "bridge_unavailable_reason": session_unavailable_reason,
+                        "started_at_ms": started_at_ms,
+                        "updated_at_ms": now_ms(),
+                    })
+                } else if method == "diagnose.logs" {
+                    json!({
+                        "logs": [{
+                            "ts_ms": now_ms(),
+                            "level": "warn",
+                            "module": "embedded.localrpc",
+                            "code": "BRIDGE_UNAVAILABLE",
+                            "message": session_unavailable_reason,
+                        }],
+                        "updated_at_ms": now_ms(),
                     })
                 } else if method == "app.ping" {
                     json!({"pong": true})
@@ -1377,4 +1597,88 @@ fn run_mock_localrpc_named_pipe_server(
         }
     }
     run_mock_localrpc_server_loop(&mut stream, crash_after_ms, session_secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        clear_retry_state, compute_retry_backoff_ms, mark_reconnect_failure,
+        should_enforce_strict_peer_pid, IPC_RETRY_MAX_BACKOFF_MS, IPC_RETRY_STEP_BACKOFF_MS,
+    };
+    use crate::state::app_state::{HostRuntimeConfig, SupervisorState};
+    use std::path::PathBuf;
+
+    fn build_runtime_config_for_pid_check(
+        program: &str,
+        runtime_args: Vec<String>,
+    ) -> HostRuntimeConfig {
+        HostRuntimeConfig {
+            runtime_program: PathBuf::from(program),
+            runtime_args,
+            agent_id: "agent-local".to_string(),
+            bridge_addr: "127.0.0.1:39080".to_string(),
+            bridge_transport: "tcp_framed".to_string(),
+            tunnel_pool_min_idle: 8,
+            tunnel_pool_max_idle: 32,
+            tunnel_pool_max_inflight: 4,
+            tunnel_pool_ttl_ms: 90_000,
+            tunnel_pool_open_rate: 10.0,
+            tunnel_pool_open_burst: 20,
+            tunnel_pool_reconcile_gap_ms: 1_000,
+            ipc_transport: "uds".to_string(),
+            ipc_endpoint: "/tmp/dev-agent/agent.sock".to_string(),
+        }
+    }
+
+    #[test]
+    fn retry_backoff_should_step_and_cycle() {
+        assert_eq!(compute_retry_backoff_ms(0), 0);
+        assert_eq!(compute_retry_backoff_ms(1), IPC_RETRY_STEP_BACKOFF_MS);
+        assert_eq!(compute_retry_backoff_ms(2), IPC_RETRY_STEP_BACKOFF_MS * 2);
+        assert_eq!(compute_retry_backoff_ms(12), IPC_RETRY_MAX_BACKOFF_MS);
+        // 13 次失败后按 5 秒重新开始循环。
+        assert_eq!(compute_retry_backoff_ms(13), IPC_RETRY_STEP_BACKOFF_MS);
+    }
+
+    #[test]
+    fn mark_reconnect_failure_should_update_retry_fields() {
+        let mut supervisor = SupervisorState::new();
+        mark_reconnect_failure(&mut supervisor, "connect timeout");
+        assert_eq!(supervisor.retry_fail_streak, 1);
+        assert_eq!(supervisor.retry_backoff_ms, IPC_RETRY_STEP_BACKOFF_MS);
+        assert!(supervisor.next_retry_at_ms.is_some());
+        assert_eq!(
+            supervisor.last_reconnect_error.as_deref(),
+            Some("connect timeout")
+        );
+    }
+
+    #[test]
+    fn clear_retry_state_should_reset_retry_fields() {
+        let mut supervisor = SupervisorState::new();
+        mark_reconnect_failure(&mut supervisor, "first failure");
+        mark_reconnect_failure(&mut supervisor, "second failure");
+        assert!(supervisor.retry_fail_streak >= 2);
+        clear_retry_state(&mut supervisor);
+        assert_eq!(supervisor.retry_fail_streak, 0);
+        assert_eq!(supervisor.retry_backoff_ms, 0);
+        assert!(supervisor.next_retry_at_ms.is_none());
+        assert!(supervisor.last_reconnect_error.is_none());
+    }
+
+    #[test]
+    fn strict_peer_pid_should_be_disabled_for_go_run_wrapper() {
+        let runtime_config = build_runtime_config_for_pid_check(
+            "go",
+            vec!["run".to_string(), "./agent-core/cmd/agent-core".to_string()],
+        );
+        assert!(!should_enforce_strict_peer_pid(&runtime_config));
+    }
+
+    #[test]
+    fn strict_peer_pid_should_remain_enabled_for_binary_runtime() {
+        let runtime_config =
+            build_runtime_config_for_pid_check("/usr/local/bin/agent-core", vec![]);
+        assert!(should_enforce_strict_peer_pid(&runtime_config));
+    }
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -13,8 +14,9 @@ import (
 
 // Runtime wires the bridge runtime subsystems together.
 type Runtime struct {
-	cfg         Config
-	adminServer *http.Server
+	cfg           Config
+	adminServer   *http.Server
+	controlServer *controlPlaneServer
 }
 
 // Bootstrap prepares the runtime graph. It is intentionally minimal in the skeleton.
@@ -28,8 +30,13 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 		// 管理页面默认挂载到 /admin 前缀，保持后续 API 路径可扩展。
 		RegisterAdminUIRoutes(adminMux, AdminUIBasePath(), UIHandler())
 	}
+	controlServer, err := newControlPlaneServer(cfg.ControlPlane)
+	if err != nil {
+		return nil, err
+	}
 	return &Runtime{
-		cfg: cfg,
+		cfg:           cfg,
+		controlServer: controlServer,
 		adminServer: &http.Server{
 			Addr:    cfg.Admin.ListenAddr,
 			Handler: adminMux,
@@ -45,24 +52,32 @@ func (r *Runtime) Run(ctx context.Context) error {
 		normalizedContext = context.Background()
 	}
 	log.Printf(
-		"bridge runtime starting admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
+		"bridge runtime starting control_addr=%s control_grpc_addr=%s admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
+		r.cfg.ControlPlane.ListenAddr,
+		r.cfg.ControlPlane.GRPCH2ListenAddr,
 		r.cfg.Admin.ListenAddr,
 		r.cfg.Admin.UIEnabled,
 		AdminUIBasePath(),
 		web.EmbeddedVersion(),
 	)
 
-	serverErrChannel := make(chan error, 1)
+	serverErrChannel := make(chan error, 2)
+	go func() {
+		if r.controlServer == nil {
+			return
+		}
+		if err := r.controlServer.run(normalizedContext); err != nil && !errors.Is(err, context.Canceled) {
+			serverErrChannel <- fmt.Errorf("run bridge runtime: control plane failed: %w", err)
+		}
+	}()
 	go func() {
 		if r.adminServer == nil {
-			close(serverErrChannel)
 			return
 		}
 		if err := r.adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// 管理端口启动失败直接上抛，阻止半启动状态。
 			serverErrChannel <- fmt.Errorf("run bridge runtime: listen admin server: %w", err)
 		}
-		close(serverErrChannel)
 	}()
 
 	select {
@@ -78,13 +93,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 		if !open {
 			return nil
 		}
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = r.Shutdown(shutdownContext)
 		return runErr
 	}
 }
 
 // Shutdown 执行管理端口优雅关闭。
 func (r *Runtime) Shutdown(ctx context.Context) error {
-	if r == nil || r.adminServer == nil {
+	if r == nil {
 		return nil
 	}
 	normalizedContext := ctx
@@ -92,8 +110,15 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		// 兜底上下文，确保可被调用方直接复用。
 		normalizedContext = context.Background()
 	}
-	if err := r.adminServer.Shutdown(normalizedContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("shutdown bridge runtime: %w", err)
+	if r.adminServer != nil {
+		if err := r.adminServer.Shutdown(normalizedContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("shutdown bridge runtime: %w", err)
+		}
+	}
+	if r.controlServer != nil {
+		if err := r.controlServer.shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
+			return fmt.Errorf("shutdown bridge control plane: %w", err)
+		}
 	}
 	return nil
 }

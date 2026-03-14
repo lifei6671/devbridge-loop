@@ -1,0 +1,75 @@
+name: dev-agent-a15-matrix
+
+on:
+  pull_request:
+    paths:
+      - "apps/dev-agent/**"
+      - ".github/workflows/dev-agent-a15-matrix.yml"
+      - "docs/Agent-and-Bridge-ExecutionChecklist.md"
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/dev-agent/**"
+      - ".github/workflows/dev-agent-a15-matrix.yml"
+      - "docs/Agent-and-Bridge-ExecutionChecklist.md"
+
+jobs:
+  tauri-host-matrix:
+    name: tauri-host-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/dev-agent/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Linux dependencies for Tauri host build
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            patchelf
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/dev-agent/src-tauri
+
+      - name: Install UI deps
+        run: npm ci --prefix apps/dev-agent
+
+      - name: Build UI
+        run: npm run build --prefix apps/dev-agent
+
+      - name: Cargo check (host target)
+        run: cargo check --manifest-path apps/dev-agent/src-tauri/Cargo.toml --locked
+
+      - name: Cargo unit tests (host target)
+        run: cargo test --manifest-path apps/dev-agent/src-tauri/Cargo.toml --bin dev-agent -- --nocapture
+
+      - name: Cargo check (windows-gnu cross target on Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check \
+            --manifest-path apps/dev-agent/src-tauri/Cargo.toml \
+            --target x86_64-pc-windows-gnu \
+            --locked

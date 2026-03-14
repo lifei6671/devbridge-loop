@@ -7,6 +7,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -314,6 +316,11 @@ pub fn spawn_agent_process(
     config: &crate::state::app_state::HostRuntimeConfig,
     session_secret: &str,
 ) -> Result<Child, String> {
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    #[cfg(windows)]
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
     validate_hex_token(session_secret, 64, "session_secret")?;
     let mut command = Command::new(&config.runtime_program);
     command.args(&config.runtime_args);
@@ -324,6 +331,7 @@ pub fn spawn_agent_process(
     // 注入 agent-core 核心配置，确保真实 Go runtime 直接读取并生效。
     command.env("DEV_AGENT_CFG_AGENT_ID", &config.agent_id);
     command.env("DEV_AGENT_CFG_BRIDGE_ADDR", &config.bridge_addr);
+    command.env("DEV_AGENT_CFG_BRIDGE_TRANSPORT", &config.bridge_transport);
     command.env(
         "DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE",
         config.tunnel_pool_min_idle.to_string(),
@@ -357,6 +365,11 @@ pub fn spawn_agent_process(
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        // 避免 GUI 宿主拉起控制台子进程时弹出黑色命令行窗口。
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
     command
         .spawn()
         .map_err(|err| format!("启动 Agent 进程失败: {err}"))
@@ -407,4 +420,31 @@ pub fn ensure_single_instance_guard(state: &Arc<AppRuntimeState>) -> Result<(), 
         *guard = Some(acquire_single_instance_guard()?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_ipc_endpoint, validate_named_pipe_endpoint};
+
+    #[test]
+    fn default_named_pipe_endpoint_should_use_windows_pipe_prefix() {
+        let endpoint = default_ipc_endpoint("named_pipe");
+        assert!(
+            endpoint.starts_with(r"\\.\pipe\agent-ui-"),
+            "unexpected endpoint: {endpoint}"
+        );
+        assert!(!endpoint.contains('/'));
+    }
+
+    #[test]
+    fn named_pipe_endpoint_validation_should_accept_valid_value() {
+        let endpoint = r"\\.\pipe\agent-ui-test-user";
+        assert!(validate_named_pipe_endpoint(endpoint).is_ok());
+    }
+
+    #[test]
+    fn named_pipe_endpoint_validation_should_reject_invalid_prefix() {
+        let endpoint = r"\\server\pipe\agent-ui-test-user";
+        assert!(validate_named_pipe_endpoint(endpoint).is_err());
+    }
 }

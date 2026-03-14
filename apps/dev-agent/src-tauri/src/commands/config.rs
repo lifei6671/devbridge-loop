@@ -18,6 +18,7 @@ pub struct HostConfigUpdateInput {
     pub runtime_args: Vec<String>,
     pub agent_id: String,
     pub bridge_addr: String,
+    pub bridge_transport: String,
     pub tunnel_pool_min_idle: u32,
     pub tunnel_pool_max_idle: u32,
     pub tunnel_pool_max_inflight: u32,
@@ -118,6 +119,7 @@ pub fn host_config_update(
         let runtime_args = normalize_runtime_args(&input.runtime_args);
         let agent_id = validate_required_text("agent_id", &input.agent_id)?;
         let bridge_addr = validate_required_text("bridge_addr", &input.bridge_addr)?;
+        let bridge_transport = validate_required_text("bridge_transport", &input.bridge_transport)?;
         let ipc_transport = current_runtime_config(&shared)?.ipc_transport;
         let ipc_endpoint = validate_ipc_endpoint(&ipc_transport, &input.ipc_endpoint)?;
 
@@ -127,6 +129,7 @@ pub fn host_config_update(
             runtime_args,
             agent_id,
             bridge_addr,
+            bridge_transport,
             tunnel_pool_min_idle: input.tunnel_pool_min_idle,
             tunnel_pool_max_idle: input.tunnel_pool_max_idle,
             tunnel_pool_max_inflight: input.tunnel_pool_max_inflight,
@@ -154,7 +157,7 @@ pub fn host_config_update(
                 format!(
                     "配置已更新 runtime_program={} agent_id={} bridge_addr={} \
 tunnel_pool(min_idle={},max_idle={},max_inflight={},ttl_ms={},open_rate={},open_burst={},reconcile_gap_ms={}) \
-ipc_transport={} ipc_endpoint={} ts={}",
+bridge_transport={} ipc_transport={} ipc_endpoint={} ts={}",
                     input.runtime_program.trim(),
                     input.agent_id.trim(),
                     input.bridge_addr.trim(),
@@ -165,6 +168,7 @@ ipc_transport={} ipc_endpoint={} ts={}",
                     input.tunnel_pool_open_rate,
                     input.tunnel_pool_open_burst,
                     input.tunnel_pool_reconcile_gap_ms,
+                    input.bridge_transport.trim(),
                     ipc_transport,
                     ipc_endpoint,
                     now_ms()

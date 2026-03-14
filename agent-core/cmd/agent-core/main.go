@@ -19,6 +19,7 @@ import (
 const (
 	envAgentID                  = "DEV_AGENT_CFG_AGENT_ID"
 	envBridgeAddr               = "DEV_AGENT_CFG_BRIDGE_ADDR"
+	envBridgeTransport          = "DEV_AGENT_CFG_BRIDGE_TRANSPORT"
 	envTunnelPoolMinIdle        = "DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE"
 	envTunnelPoolMaxIdle        = "DEV_AGENT_CFG_TUNNEL_POOL_MAX_IDLE"
 	envTunnelPoolMaxInflight    = "DEV_AGENT_CFG_TUNNEL_POOL_MAX_INFLIGHT"
@@ -55,6 +56,10 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	resolvedConfig := defaultConfig
 	resolvedConfig.AgentID = stringEnvOrDefault(envAgentID, defaultConfig.AgentID)
 	resolvedConfig.BridgeAddr = stringEnvOrDefault(envBridgeAddr, defaultConfig.BridgeAddr)
+	resolvedConfig.BridgeTransport = stringEnvOrDefault(
+		envBridgeTransport,
+		defaultConfig.BridgeTransport,
+	)
 
 	minIdle, err := intEnvOrDefault(envTunnelPoolMinIdle, defaultConfig.TunnelPool.MinIdle)
 	if err != nil {
@@ -94,6 +99,9 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	}
 	if strings.TrimSpace(resolvedConfig.BridgeAddr) == "" {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAddr)
+	}
+	if strings.TrimSpace(resolvedConfig.BridgeTransport) == "" {
+		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeTransport)
 	}
 	if minIdle < 0 {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于等于 0", envTunnelPoolMinIdle)

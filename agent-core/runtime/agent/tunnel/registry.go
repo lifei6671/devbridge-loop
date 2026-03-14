@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -288,6 +289,42 @@ func (registry *Registry) IdleIDs(limit int) []string {
 		}
 	}
 	return result
+}
+
+// List 返回 tunnel 记录快照列表，按更新时间倒序输出。
+func (registry *Registry) List(limit int) []Record {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+
+	totalCount := len(registry.records)
+	if totalCount == 0 {
+		return nil
+	}
+	effectiveLimit := limit
+	if effectiveLimit <= 0 || effectiveLimit > totalCount {
+		effectiveLimit = totalCount
+	}
+
+	items := make([]Record, 0, totalCount)
+	for _, record := range registry.records {
+		clonedRecord := cloneRecord(record)
+		if clonedRecord == nil {
+			continue
+		}
+		items = append(items, *clonedRecord)
+	}
+	sort.Slice(items, func(leftIndex int, rightIndex int) bool {
+		leftRecord := items[leftIndex]
+		rightRecord := items[rightIndex]
+		if leftRecord.UpdatedAt.Equal(rightRecord.UpdatedAt) {
+			return leftRecord.TunnelID < rightRecord.TunnelID
+		}
+		return leftRecord.UpdatedAt.After(rightRecord.UpdatedAt)
+	})
+	if len(items) > effectiveLimit {
+		items = items[:effectiveLimit]
+	}
+	return items
 }
 
 func (registry *Registry) transition(now time.Time, tunnelID string, targetState State, message string) error {

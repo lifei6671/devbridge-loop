@@ -99,16 +99,15 @@ pub fn tunnel_list_snapshot(
             match ipc_client.request("tunnel.list", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS) {
                 Ok(value) => value,
                 Err(err) => {
-                    if err.contains("METHOD_NOT_ALLOWED") {
-                        // 真实 Agent 尚未落地该方法时，回退为空列表并记录告警。
+                    if err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND") {
                         push_host_log(
                             &mut supervisor,
-                            "warn",
+                            "error",
                             "commands.tunnel",
                             "TUNNEL_LIST_METHOD_NOT_READY",
-                            "tunnel.list 尚未可用，已回退为空列表",
+                            format!("tunnel.list 尚未在当前 Agent 实现: {err}"),
                         );
-                        return Ok(Vec::new());
+                        return Err(format!("当前 Agent 未实现 tunnel.list: {err}"));
                     }
                     return Err(format!("读取通道列表失败: {err}"));
                 }

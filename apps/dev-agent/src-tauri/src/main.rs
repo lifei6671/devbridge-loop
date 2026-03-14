@@ -15,13 +15,14 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use agent_host::launcher::{ensure_single_instance_guard, resolve_runtime_dir};
-use agent_host::supervisor::{run_mock_agent_runtime_if_requested, spawn_supervisor_monitor};
+use agent_host::supervisor::{app_shutdown_impl, spawn_supervisor_monitor};
 use commands::{
     agent_crash_inject, agent_restart, agent_snapshot, agent_start, agent_stop, app_bootstrap,
     app_shutdown, host_config_snapshot, host_config_update, host_logs_snapshot,
-    service_list_snapshot, tunnel_list_snapshot,
+    service_list_snapshot, session_drain, session_reconnect, session_snapshot,
+    system_resource_snapshot, traffic_stats_snapshot, tunnel_list_snapshot,
 };
-use state::app_state::{now_ms, AppRuntimeState, HostRuntimeConfig};
+use state::app_state::{now_ms, push_host_log, AppRuntimeState, HostRuntimeConfig};
 
 /// 计算启动日志文件路径：默认放到运行目录下的 logs 目录。
 fn startup_log_path() -> PathBuf {
@@ -93,22 +94,30 @@ fn report_fatal_startup_error(context: &str, err: &str) {
     }
 }
 
-/// 程序入口：先处理 mock runtime，再启动 Tauri 宿主。
+/// 程序入口：启动 Tauri 宿主并拉起真实 Agent runtime。
 fn main() {
-    if run_mock_agent_runtime_if_requested() {
-        return;
-    }
-
-    let runtime_config = match HostRuntimeConfig::from_env() {
-        Ok(config) => config,
+    let (runtime_config, config_warning) = match HostRuntimeConfig::load_with_yaml_fallback() {
+        Ok(payload) => payload,
         Err(err) => {
             report_fatal_startup_error("初始化宿主运行配置失败", &err);
             std::process::exit(1);
         }
     };
     let shared_state = Arc::new(AppRuntimeState::new(runtime_config));
+    if let Some(warning) = config_warning {
+        append_startup_log("warn", &warning);
+        if let Ok(mut supervisor) = shared_state.supervisor.lock() {
+            push_host_log(
+                &mut supervisor,
+                "warn",
+                "startup",
+                "HOST_CONFIG_YAML_INVALID",
+                warning,
+            );
+        }
+    }
 
-    let run_result = tauri::Builder::default()
+    let app = match tauri::Builder::default()
         .manage(shared_state.clone())
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
@@ -127,14 +136,37 @@ fn main() {
             host_config_snapshot,
             host_config_update,
             host_logs_snapshot,
+            session_snapshot,
+            session_reconnect,
+            session_drain,
             service_list_snapshot,
+            system_resource_snapshot,
+            traffic_stats_snapshot,
             tunnel_list_snapshot,
             agent_crash_inject
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+    {
+        Ok(app) => app,
+        Err(err) => {
+            report_fatal_startup_error("初始化 dev-agent Tauri 宿主失败", &err.to_string());
+            std::process::exit(1);
+        }
+    };
 
-    if let Err(err) = run_result {
-        report_fatal_startup_error("运行 dev-agent Tauri 宿主失败", &err.to_string());
-        std::process::exit(1);
-    }
+    let mut exit_cleanup_done = false;
+    app.run(move |app_handle, run_event| {
+        let should_cleanup = matches!(
+            run_event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        );
+        if !should_cleanup || exit_cleanup_done {
+            return;
+        }
+        exit_cleanup_done = true;
+        let runtime_state = app_handle.state::<Arc<AppRuntimeState>>().inner().clone();
+        if let Err(err) = app_shutdown_impl(app_handle, &runtime_state) {
+            append_startup_log("error", &format!("退出时执行 app_shutdown 失败: {err}"));
+        }
+    });
 }

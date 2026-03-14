@@ -35,6 +35,8 @@ type ObservabilityConfig struct {
 }
 
 type ControlPlaneConfig struct {
+	ListenAddr       string
+	GRPCH2ListenAddr string
 	HeartbeatTimeout time.Duration
 }
 
@@ -49,7 +51,7 @@ func DefaultConfig() Config {
 			TCPPortRange: "9000-9100",
 		},
 		Admin: AdminConfig{
-			ListenAddr: ":39080",
+			ListenAddr: ":39081",
 			UIEnabled:  true,
 		},
 		Observability: ObservabilityConfig{
@@ -57,6 +59,8 @@ func DefaultConfig() Config {
 			LogLevel:    "info",
 		},
 		ControlPlane: ControlPlaneConfig{
+			ListenAddr:       ":39080",
+			GRPCH2ListenAddr: ":39082",
 			HeartbeatTimeout: 30 * time.Second,
 		},
 	}
@@ -72,6 +76,15 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Admin.ListenAddr) == "" {
 		return fmt.Errorf("validate config: empty admin listen addr")
+	}
+	if strings.TrimSpace(c.ControlPlane.ListenAddr) == "" {
+		return fmt.Errorf("validate config: empty control plane listen addr")
+	}
+	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == "" {
+		return fmt.Errorf("validate config: empty grpc_h2 control plane listen addr")
+	}
+	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == strings.TrimSpace(c.ControlPlane.ListenAddr) {
+		return fmt.Errorf("validate config: grpc_h2 listen addr must be different from tcp listen addr")
 	}
 	return nil
 }

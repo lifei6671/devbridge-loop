@@ -3,12 +3,20 @@ package app
 import (
 	"testing"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 // TestDefaultConfigTunnelPoolValues 验证 tunnelPool 默认值保持文档约定不变。
 func TestDefaultConfigTunnelPoolValues(testingObject *testing.T) {
 	testingObject.Parallel()
 	defaultConfig := DefaultConfig()
+	if defaultConfig.BridgeTransport != transport.BindingTypeTCPFramed.String() {
+		testingObject.Fatalf(
+			"unexpected default bridge transport: %s",
+			defaultConfig.BridgeTransport,
+		)
+	}
 	if defaultConfig.TunnelPool.MinIdle != 8 {
 		testingObject.Fatalf("unexpected default min_idle: %d", defaultConfig.TunnelPool.MinIdle)
 	}
@@ -20,6 +28,32 @@ func TestDefaultConfigTunnelPoolValues(testingObject *testing.T) {
 	}
 	if defaultConfig.TunnelPool.OpenBurst != 20 {
 		testingObject.Fatalf("unexpected default open_burst: %d", defaultConfig.TunnelPool.OpenBurst)
+	}
+}
+
+// TestValidateRejectsUnknownBridgeTransport 验证非法 bridge_transport 会被拒绝。
+func TestValidateRejectsUnknownBridgeTransport(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.BridgeTransport = "custom_binding_x"
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for unknown bridge_transport")
+	}
+}
+
+// TestValidateRejectsUnwiredBridgeTransport 验证已定义但尚未接线的 transport 会被拒绝。
+func TestValidateRejectsUnwiredBridgeTransport(testingObject *testing.T) {
+	testingObject.Parallel()
+	testCases := []string{
+		transport.BindingTypeQUICNative.String(),
+		transport.BindingTypeH3Stream.String(),
+	}
+	for _, bridgeTransport := range testCases {
+		config := DefaultConfig()
+		config.BridgeTransport = bridgeTransport
+		if err := config.Validate(); err == nil {
+			testingObject.Fatalf("expected validate error for unwired bridge_transport=%s", bridgeTransport)
+		}
 	}
 }
 

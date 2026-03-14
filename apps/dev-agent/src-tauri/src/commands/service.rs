@@ -101,16 +101,15 @@ pub fn service_list_snapshot(
             match ipc_client.request("service.list", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS) {
                 Ok(value) => value,
                 Err(err) => {
-                    if err.contains("METHOD_NOT_ALLOWED") {
-                        // 真实 Agent 尚未落地该方法时，回退为空列表并记录告警。
+                    if err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND") {
                         push_host_log(
                             &mut supervisor,
-                            "warn",
+                            "error",
                             "commands.service",
                             "SERVICE_LIST_METHOD_NOT_READY",
-                            "service.list 尚未可用，已回退为空列表",
+                            format!("service.list 尚未在当前 Agent 实现: {err}"),
                         );
-                        return Ok(Vec::new());
+                        return Err(format!("当前 Agent 未实现 service.list: {err}"));
                     }
                     return Err(format!("读取服务列表失败: {err}"));
                 }

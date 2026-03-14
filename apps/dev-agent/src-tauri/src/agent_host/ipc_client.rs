@@ -19,7 +19,7 @@ use super::router::validate_localrpc_method;
 use crate::state::app_state::now_ms;
 
 /// 本地 IPC 建连超时时间。
-const LOCAL_RPC_CONNECT_TIMEOUT_MS: u64 = 1800;
+const LOCAL_RPC_CONNECT_TIMEOUT_MS: u64 = 6000;
 /// 本地 IPC 默认请求超时时间。
 pub const LOCAL_RPC_DEFAULT_TIMEOUT_MS: u64 = 1200;
 
@@ -155,6 +155,13 @@ fn connect_local_rpc_stream(transport: &str, endpoint: &str) -> Result<LocalRpcS
                     Ok(file) => return Ok(LocalRpcStream::NamedPipe(file)),
                     Err(err) => {
                         if Instant::now() >= deadline {
+                            if err.raw_os_error() == Some(2) {
+                                return Err(format!(
+                                    "连接本地 Named Pipe 失败: {err}。\
+ 这表示 UI 与 Agent 内核的 IPC 尚未建立（endpoint={endpoint}）；\
+ 可能是内核进程未成功启动，或当前 runtime 尚未实现 localrpc listener。"
+                                ));
+                            }
                             return Err(format!("连接本地 Named Pipe 失败: {err}"));
                         }
                         // 让出时间片，等待 Agent 侧完成 pipe 监听创建。
@@ -341,16 +348,12 @@ impl LocalRpcClient {
 
     /// 执行操作系统级对端身份校验，防止连接到非预期进程。
     fn verify_os_peer_identity(&self, expected_peer_pid: Option<u32>) -> Result<(), String> {
-        let Some(expected_pid) = expected_peer_pid else {
-            // 未提供预期 PID 时仅跳过校验；生产链路应始终传入 Agent 子进程 PID。
-            return Ok(());
-        };
-        self.verify_expected_peer_pid(expected_pid)
+        self.verify_expected_peer_pid(expected_peer_pid)
     }
 
     /// Linux 平台：通过 SO_PEERCRED 校验对端 uid/pid。
     #[cfg(all(unix, target_os = "linux"))]
-    fn verify_expected_peer_pid(&self, expected_peer_pid: u32) -> Result<(), String> {
+    fn verify_expected_peer_pid(&self, expected_peer_pid: Option<u32>) -> Result<(), String> {
         use std::os::fd::AsRawFd;
 
         #[repr(C)]
@@ -418,17 +421,19 @@ impl LocalRpcClient {
             ));
         }
         let actual_pid = peer_cred.pid as u32;
-        if actual_pid != expected_peer_pid {
-            return Err(format!(
-                "PEER_IDENTITY_MISMATCH: pid 不匹配，expected_pid={expected_peer_pid}, actual_pid={actual_pid}"
-            ));
+        if let Some(expected_peer_pid) = expected_peer_pid {
+            if actual_pid != expected_peer_pid {
+                return Err(format!(
+                    "PEER_IDENTITY_MISMATCH: pid 不匹配，expected_pid={expected_peer_pid}, actual_pid={actual_pid}"
+                ));
+            }
         }
         Ok(())
     }
 
     /// Windows 平台：校验 Named Pipe 服务端 PID 与进程令牌 SID。
     #[cfg(windows)]
-    fn verify_expected_peer_pid(&self, expected_peer_pid: u32) -> Result<(), String> {
+    fn verify_expected_peer_pid(&self, expected_peer_pid: Option<u32>) -> Result<(), String> {
         use std::os::windows::io::AsRawHandle;
 
         type Handle = *mut std::ffi::c_void;
@@ -577,10 +582,12 @@ impl LocalRpcClient {
                 std::io::Error::last_os_error()
             ));
         }
-        if actual_peer_pid != expected_peer_pid {
-            return Err(format!(
-                "PEER_IDENTITY_MISMATCH: pid 不匹配，expected_pid={expected_peer_pid}, actual_pid={actual_peer_pid}"
-            ));
+        if let Some(expected_peer_pid) = expected_peer_pid {
+            if actual_peer_pid != expected_peer_pid {
+                return Err(format!(
+                    "PEER_IDENTITY_MISMATCH: pid 不匹配，expected_pid={expected_peer_pid}, actual_pid={actual_peer_pid}"
+                ));
+            }
         }
 
         let current_sid_buffer = read_process_sid_buffer(std::process::id())?;
@@ -596,14 +603,14 @@ impl LocalRpcClient {
 
     /// 其他平台先跳过对端身份校验（当前方案仅要求 Linux/Windows）。
     #[cfg(all(unix, not(target_os = "linux")))]
-    fn verify_expected_peer_pid(&self, expected_peer_pid: u32) -> Result<(), String> {
+    fn verify_expected_peer_pid(&self, expected_peer_pid: Option<u32>) -> Result<(), String> {
         let _ = expected_peer_pid;
         Ok(())
     }
 
     /// 其他平台先跳过对端身份校验（当前方案仅要求 Linux/Windows）。
     #[cfg(not(any(unix, windows)))]
-    fn verify_expected_peer_pid(&self, expected_peer_pid: u32) -> Result<(), String> {
+    fn verify_expected_peer_pid(&self, expected_peer_pid: Option<u32>) -> Result<(), String> {
         let _ = expected_peer_pid;
         Ok(())
     }

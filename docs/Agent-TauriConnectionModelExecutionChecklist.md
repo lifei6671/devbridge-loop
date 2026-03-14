@@ -130,20 +130,21 @@
 - [x] Windows Named Pipe 实装（当前 Linux UDS 为主）
 - [x] `session_secret` challenge-response（HMAC-SHA256）
 - [x] OS 对端身份校验（Linux `SO_PEERCRED` / Windows 对端令牌 SID + PID）
-- [ ] 跨平台权限测试矩阵（Linux/Windows）
+- [x] 跨平台权限测试矩阵（Linux/Windows）
 
 说明：
 
-- 除 C8-1/C8-2/C8-3 外，其余遗留在 A15 总清单中仍保持未勾选状态，避免提前“虚完成”。
+- C8 项已全部完成；A15 总清单以 `Agent-and-Bridge-ExecutionChecklist.md` 为最终勾选口径。
 
 ---
 
-## 3. 执行记录（2026-03-13）
+## 3. 执行记录（2026-03-13 / 2026-03-14）
 
 - 已完成 C1~C7 的代码落地与编译验证
 - 已完成 C8-1（Windows Named Pipe 实装）：`ipc_client` 已支持 `uds/named_pipe` 双分支，mock runtime 新增 Named Pipe 服务端分支
 - 已完成 C8-2（`session_secret` challenge-response）：`ipc_client.connect` 接入 `app.auth.begin/app.auth.complete` 双向 HMAC 校验，mock runtime 在鉴权成功前拒绝业务方法
 - 已完成 C8-3（OS 对端身份校验）：Linux 使用 `SO_PEERCRED(uid/pid)` 校验，Windows 使用 `GetNamedPipeServerProcessId + Token SID` 校验
+- 已完成 C8-4（跨平台权限测试矩阵）：新增 `.github/workflows/dev-agent-a15-matrix.yml`，Linux/Windows 双平台执行 `cargo check + cargo test + npm run build`，Linux 增补 `x86_64-pc-windows-gnu` 交叉检查
 - 已完成 C6 白色版 UI 重设计：`App.tsx/index.css` 重构为“左侧导航 + 顶部状态栏 + 白色卡片仪表盘”，并保持仅展示 snapshot/event/logs/metrics 视图模型
 - 已校正配置管理能力：`host_config_update` 与前端配置页仅保留真实生效字段（`runtime_program/runtime_args/ipc_transport/ipc_endpoint`），移除 mock/虚构 Bridge 三项配置（重启 Agent 生效）
 - 已完成控制台视觉重构：采用 shadcn 风格 `Card/Button/Input/Badge` 组件与浅灰桌面壳布局，保持左侧导航/顶部搜索/指标卡/表格分区，不新增任何未实现命令

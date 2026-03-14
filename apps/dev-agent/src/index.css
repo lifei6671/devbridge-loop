@@ -4,6 +4,7 @@
 
 :root {
   color-scheme: light;
+  --agent-ui-scale: 0.84;
 }
 
 * {
@@ -21,6 +22,14 @@ body {
 #root {
   height: 100vh;
   overflow: hidden;
+}
+
+/* 统一缩放主界面，快速收敛所有卡片/按钮/排版尺寸。 */
+.agent-ui-scale {
+  width: calc(100vw / var(--agent-ui-scale));
+  height: calc(100vh / var(--agent-ui-scale));
+  transform: scale(var(--agent-ui-scale));
+  transform-origin: left top;
 }
 
 /* 统一滚动条视觉：降低噪音，贴近参考图的浅灰风格。 */

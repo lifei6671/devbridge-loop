@@ -4,16 +4,19 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 // Config defines top-level runtime settings for the agent skeleton.
 type Config struct {
-	AgentID        string
-	BridgeAddr     string
-	Session        SessionConfig
-	TunnelPool     TunnelPoolConfig
-	Observability  ObservabilityConfig
-	ControlChannel ControlChannelConfig
+	AgentID         string
+	BridgeAddr      string
+	BridgeTransport string
+	Session         SessionConfig
+	TunnelPool      TunnelPoolConfig
+	Observability   ObservabilityConfig
+	ControlChannel  ControlChannelConfig
 }
 
 type SessionConfig struct {
@@ -58,10 +61,11 @@ type ControlChannelConfig struct {
 // DefaultConfig returns a runnable baseline configuration.
 func DefaultConfig() Config {
 	return Config{
-		AgentID:    "agent-local",
-		BridgeAddr: "127.0.0.1:39080",
+		AgentID:         "agent-local",
+		BridgeAddr:      "127.0.0.1:39080",
+		BridgeTransport: transport.BindingTypeTCPFramed.String(),
 		Session: SessionConfig{
-			HeartbeatInterval: 10 * time.Second,
+			HeartbeatInterval: 5 * time.Second,
 			AuthTimeout:       5 * time.Second,
 		},
 		TunnelPool: TunnelPoolConfig{
@@ -92,6 +96,13 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.BridgeAddr) == "" {
 		// bridge 地址缺失时无法建连。
 		return fmt.Errorf("validate config: empty bridge_addr")
+	}
+	switch strings.TrimSpace(c.BridgeTransport) {
+	case transport.BindingTypeTCPFramed.String(),
+		transport.BindingTypeGRPCH2.String():
+		// 当前 agent runtime 仅支持 tcp_framed / grpc_h2。
+	default:
+		return fmt.Errorf("validate config: unsupported bridge_transport=%s", c.BridgeTransport)
 	}
 	if c.TunnelPool.MinIdle < 0 {
 		// min_idle 不允许为负值。
