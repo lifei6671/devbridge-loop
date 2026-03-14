@@ -265,6 +265,21 @@ func (registry *TunnelRegistry) Snapshot() TunnelSnapshot {
 	return snapshot
 }
 
+// List 返回当前全部 tunnel 运行态快照。
+func (registry *TunnelRegistry) List() []TunnelRuntime {
+	if registry == nil {
+		return []TunnelRuntime{}
+	}
+	registry.mutex.RLock()
+	defer registry.mutex.RUnlock()
+	result := make([]TunnelRuntime, 0, len(registry.byTunnelID))
+	for _, runtime := range registry.byTunnelID {
+		// 返回副本，避免调用方篡改注册表内部状态。
+		result = append(result, cloneTunnelRuntime(runtime))
+	}
+	return result
+}
+
 // PurgeBySession 按 session 摘除 tunnel 记录并关闭底层连接。
 func (registry *TunnelRegistry) PurgeBySession(now time.Time, sessionID string, reason string) []TunnelRuntime {
 	if registry == nil {

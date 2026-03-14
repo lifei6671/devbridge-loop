@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::State;
 
-use crate::agent_host::ipc_client::LOCAL_RPC_DEFAULT_TIMEOUT_MS;
+use crate::agent_host::ipc_client::{LocalRpcClient, LOCAL_RPC_DEFAULT_TIMEOUT_MS};
 use crate::state::app_state::{now_ms, push_host_log, with_rpc_metrics, AppRuntimeState};
 
 /// Bridge 会话快照：用于 UI 展示 Agent 与 Bridge 的真实连接状态。
@@ -139,30 +139,86 @@ fn is_method_unavailable(err: &str) -> bool {
         || err.contains("NOT_IMPLEMENTED")
 }
 
+/// 从 supervisor 短暂取出 IPC 客户端，避免在 RPC 等待期间持有全局锁。
+fn take_ipc_client(
+    state: &Arc<AppRuntimeState>,
+    lock_error_message: &str,
+) -> Result<Option<LocalRpcClient>, String> {
+    let mut supervisor = state
+        .supervisor
+        .lock()
+        .map_err(|_| lock_error_message.to_string())?;
+    Ok(supervisor.ipc_client.take())
+}
+
+/// 将 IPC 客户端归还到 supervisor，保证后续命令仍可复用同一连接。
+fn restore_ipc_client(
+    state: &Arc<AppRuntimeState>,
+    ipc_client: LocalRpcClient,
+    lock_error_message: &str,
+) -> Result<(), String> {
+    let mut supervisor = state
+        .supervisor
+        .lock()
+        .map_err(|_| lock_error_message.to_string())?;
+    supervisor.ipc_client = Some(ipc_client);
+    Ok(())
+}
+
+/// 写入会话命令相关宿主日志。
+fn push_session_host_log(
+    state: &Arc<AppRuntimeState>,
+    level: &str,
+    code: &str,
+    message: impl Into<String>,
+    lock_error_message: &str,
+) -> Result<(), String> {
+    let mut supervisor = state
+        .supervisor
+        .lock()
+        .map_err(|_| lock_error_message.to_string())?;
+    push_host_log(
+        &mut supervisor,
+        level,
+        "commands.session",
+        code,
+        message.into(),
+    );
+    Ok(())
+}
+
+/// 执行 `session.reconnect/session.drain` 等会话动作，采用短锁模式避免阻塞其他命令。
 fn apply_session_action(
-    supervisor: &mut crate::state::app_state::SupervisorState,
+    state: &Arc<AppRuntimeState>,
     method: &str,
     success_log_code: &str,
     success_message: &str,
     source: &str,
 ) -> Result<SessionSnapshot, String> {
-    let Some(mut ipc_client) = supervisor.ipc_client.take() else {
+    let Some(mut ipc_client) =
+        take_ipc_client(state, &format!("执行 {method} 失败：supervisor 锁异常"))?
+    else {
         return Err("IPC 未建立连接，无法执行 Bridge 会话动作".to_string());
     };
 
+    // 第一步：先执行动作命令（reconnect/drain）。
     let action_result = ipc_client.request(method, json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS);
     match action_result {
         Ok(_) => {
-            push_host_log(
-                supervisor,
+            push_session_host_log(
+                state,
                 "info",
-                "commands.session",
                 success_log_code,
                 success_message,
-            );
+                &format!("执行 {method} 失败：supervisor 锁异常"),
+            )?;
         }
         Err(err) => {
-            supervisor.ipc_client = Some(ipc_client);
+            restore_ipc_client(
+                state,
+                ipc_client,
+                &format!("执行 {method} 失败：supervisor 锁异常"),
+            )?;
             if is_method_unavailable(&err) {
                 return Err(format!("当前 Agent 未实现 {method}: {err}"));
             }
@@ -170,6 +226,7 @@ fn apply_session_action(
         }
     }
 
+    // 第二步：动作执行后拉取最新 session.snapshot，保证前端立即看到收敛状态。
     let snapshot =
         match ipc_client.request("session.snapshot", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS) {
             Ok(payload) => {
@@ -194,7 +251,11 @@ fn apply_session_action(
             }
         };
 
-    supervisor.ipc_client = Some(ipc_client);
+    restore_ipc_client(
+        state,
+        ipc_client,
+        &format!("执行 {method} 失败：supervisor 锁异常"),
+    )?;
     Ok(snapshot)
 }
 
@@ -203,11 +264,8 @@ fn apply_session_action(
 pub fn session_snapshot(state: State<'_, Arc<AppRuntimeState>>) -> Result<SessionSnapshot, String> {
     let shared = state.inner().clone();
     with_rpc_metrics(&shared, || {
-        let mut supervisor = shared
-            .supervisor
-            .lock()
-            .map_err(|_| "读取会话快照失败：supervisor 锁异常".to_string())?;
-        let Some(ipc_client) = supervisor.ipc_client.as_mut() else {
+        let Some(mut ipc_client) = take_ipc_client(&shared, "读取会话快照失败：supervisor 锁异常")?
+        else {
             return Ok(session_unavailable_snapshot(
                 "DISCONNECTED",
                 "host.ipc_disconnected",
@@ -215,38 +273,42 @@ pub fn session_snapshot(state: State<'_, Arc<AppRuntimeState>>) -> Result<Sessio
             ));
         };
 
-        let payload =
-            match ipc_client.request("session.snapshot", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS) {
-                Ok(value) => value,
-                Err(err) => {
-                    if is_method_unavailable(&err) {
-                        push_host_log(
-                            &mut supervisor,
-                            "warn",
-                            "commands.session",
-                            "SESSION_SNAPSHOT_METHOD_NOT_READY",
-                            "session.snapshot 尚未可用，当前返回不可用状态",
-                        );
-                        return Ok(session_unavailable_snapshot(
-                            "UNAVAILABLE",
-                            "rpc.method_unavailable",
-                            Some(err),
-                        ));
-                    }
-                    push_host_log(
-                        &mut supervisor,
+        // 在无锁状态执行 RPC，避免读超时阻塞其他命令。
+        let snapshot_result =
+            ipc_client.request("session.snapshot", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS);
+        restore_ipc_client(&shared, ipc_client, "读取会话快照失败：supervisor 锁异常")?;
+
+        let payload = match snapshot_result {
+            Ok(value) => value,
+            Err(err) => {
+                if is_method_unavailable(&err) {
+                    push_session_host_log(
+                        &shared,
                         "warn",
-                        "commands.session",
-                        "SESSION_SNAPSHOT_FAILED",
-                        format!("读取 session.snapshot 失败: {err}"),
-                    );
+                        "SESSION_SNAPSHOT_METHOD_NOT_READY",
+                        "session.snapshot 尚未可用，当前返回不可用状态",
+                        "读取会话快照失败：supervisor 锁异常",
+                    )?;
                     return Ok(session_unavailable_snapshot(
                         "UNAVAILABLE",
-                        "rpc.request_failed",
+                        "rpc.method_unavailable",
                         Some(err),
                     ));
                 }
-            };
+                push_session_host_log(
+                    &shared,
+                    "warn",
+                    "SESSION_SNAPSHOT_FAILED",
+                    format!("读取 session.snapshot 失败: {err}"),
+                    "读取会话快照失败：supervisor 锁异常",
+                )?;
+                return Ok(session_unavailable_snapshot(
+                    "UNAVAILABLE",
+                    "rpc.request_failed",
+                    Some(err),
+                ));
+            }
+        };
         Ok(parse_session_snapshot(&payload))
     })
 }
@@ -258,12 +320,8 @@ pub fn session_reconnect(
 ) -> Result<SessionSnapshot, String> {
     let shared = state.inner().clone();
     with_rpc_metrics(&shared, || {
-        let mut supervisor = shared
-            .supervisor
-            .lock()
-            .map_err(|_| "执行 session.reconnect 失败：supervisor 锁异常".to_string())?;
         apply_session_action(
-            &mut supervisor,
+            &shared,
             "session.reconnect",
             "SESSION_RECONNECT_TRIGGERED",
             "已触发 Bridge 会话重连",
@@ -277,12 +335,8 @@ pub fn session_reconnect(
 pub fn session_drain(state: State<'_, Arc<AppRuntimeState>>) -> Result<SessionSnapshot, String> {
     let shared = state.inner().clone();
     with_rpc_metrics(&shared, || {
-        let mut supervisor = shared
-            .supervisor
-            .lock()
-            .map_err(|_| "执行 session.drain 失败：supervisor 锁异常".to_string())?;
         apply_session_action(
-            &mut supervisor,
+            &shared,
             "session.drain",
             "SESSION_DRAIN_TRIGGERED",
             "已触发 Bridge 会话断开",

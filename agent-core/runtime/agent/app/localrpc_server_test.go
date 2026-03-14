@@ -74,3 +74,45 @@ func TestDispatchRequestTrafficStatsSnapshot(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected download_total_bytes: %+v", resultPayload["download_total_bytes"])
 	}
 }
+
+// TestDispatchRequestDiagnoseLogs 验证 localrpc diagnose.logs 返回 runtime 诊断事件源。
+func TestDispatchRequestDiagnoseLogs(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtimeInstance := &Runtime{
+		cfg: Config{
+			AgentID: "agent-u4",
+		},
+	}
+	runtimeInstance.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:   "error",
+		Module:  "agent.runtime.bridge",
+		Code:    "BRIDGE_STATE_STALE",
+		Message: "heartbeat timeout",
+	})
+	server := &localRPCServer{runtime: runtimeInstance}
+	payload, failure := server.dispatchRequest(localRPCRequestBody{
+		Method:  "diagnose.logs",
+		Payload: json.RawMessage(`{}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch diagnose.logs failed: code=%s message=%s", failure.code, failure.message)
+	}
+	resultPayload, ok := payload.(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected payload type: %T", payload)
+	}
+	items, ok := resultPayload["items"].([]map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected items payload type: %T", resultPayload["items"])
+	}
+	if len(items) == 0 {
+		testingObject.Fatalf("expected diagnose.logs returns runtime events")
+	}
+	if items[0]["code"] != "BRIDGE_STATE_STALE" {
+		testingObject.Fatalf("unexpected diagnose event code: %+v", items[0]["code"])
+	}
+	if resultPayload["source"] != "agent.runtime.diagnose" {
+		testingObject.Fatalf("unexpected diagnose source: %+v", resultPayload["source"])
+	}
+}

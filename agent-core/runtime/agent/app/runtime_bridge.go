@@ -372,16 +372,29 @@ func (r *Runtime) requestBridgeReconnect(resetBackoff bool) {
 	if r == nil {
 		return
 	}
+	var sessionID string
+	var sessionEpoch uint64
 	r.bridgeMu.Lock()
 	r.bridgeDesiredUp = true
 	r.bridgeState = "RECONNECTING"
 	r.updatedAt = time.Now().UTC()
+	sessionID = r.bridgeSession
+	sessionEpoch = r.bridgeEpoch
 	if resetBackoff {
 		r.retryFailStreak = 0
 		r.retryBackoff = 0
 		r.nextRetryAt = time.Time{}
 	}
 	r.bridgeMu.Unlock()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "warn",
+		Module:       "agent.runtime.bridge",
+		Code:         "SESSION_RECONNECT_REQUESTED",
+		Message:      fmt.Sprintf("bridge reconnect requested reset_backoff=%t", resetBackoff),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  "RECONNECTING",
+	})
 	r.enqueueBridgeCommand(bridgeCommand{kind: bridgeCommandReconnect, resetBackoff: resetBackoff})
 }
 
@@ -389,27 +402,53 @@ func (r *Runtime) requestBridgeDrain() {
 	if r == nil {
 		return
 	}
+	var sessionID string
+	var sessionEpoch uint64
 	r.bridgeMu.Lock()
 	r.bridgeDesiredUp = false
 	r.bridgeState = "DRAINING"
 	r.updatedAt = time.Now().UTC()
+	sessionID = r.bridgeSession
+	sessionEpoch = r.bridgeEpoch
 	r.bridgeMu.Unlock()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_STATE_DRAINING",
+		Message:      "bridge session drain requested",
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  "DRAINING",
+	})
 	r.enqueueBridgeCommand(bridgeCommand{kind: bridgeCommandDrain})
 }
 
 func (r *Runtime) setBridgeConnecting() {
 	r.bridgeMu.Lock()
-	defer r.bridgeMu.Unlock()
+	sessionID := r.bridgeSession
+	sessionEpoch := r.bridgeEpoch
 	r.bridgeState = "CONNECTING"
 	r.updatedAt = time.Now().UTC()
+	r.bridgeMu.Unlock()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_STATE_CONNECTING",
+		Message:      "bridge control channel is connecting",
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  "CONNECTING",
+	})
 }
 
 func (r *Runtime) setBridgeConnected(sessionID string) {
 	var currentSessionID string
 	var currentSessionEpoch uint64
+	wasReconnect := false
 	r.bridgeMu.Lock()
 	if r.bridgeSession != "" {
 		r.reconnects++
+		wasReconnect = true
 	}
 	r.bridgeSession = sessionID
 	r.bridgeEpoch++
@@ -430,6 +469,26 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 	currentSessionID = r.bridgeSession
 	currentSessionEpoch = r.bridgeEpoch
 	r.bridgeMu.Unlock()
+	if wasReconnect {
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:        "info",
+			Module:       "agent.runtime.bridge",
+			Code:         "BRIDGE_RECONNECT_ESTABLISHED",
+			Message:      "bridge reconnect completed and session switched",
+			SessionID:    currentSessionID,
+			SessionEpoch: currentSessionEpoch,
+			BridgeState:  "ACTIVE",
+		})
+	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_STATE_ACTIVE",
+		Message:      "bridge control channel is active",
+		SessionID:    currentSessionID,
+		SessionEpoch: currentSessionEpoch,
+		BridgeState:  "ACTIVE",
+	})
 	if r.refillHandler != nil {
 		// 会话重连后立即刷新补池处理器上下文，避免旧代际请求污染。
 		r.refillHandler.SetSession(currentSessionID, currentSessionEpoch)
@@ -446,34 +505,73 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 
 func (r *Runtime) setBridgeRetrying(connectErr error, failStreak uint32, backoff time.Duration) {
 	r.bridgeMu.Lock()
-	defer r.bridgeMu.Unlock()
 	now := time.Now().UTC()
 	r.bridgeState = "RECONNECTING"
 	r.updatedAt = now
 	r.retryFailStreak = failStreak
 	r.retryBackoff = backoff
+	sessionID := r.bridgeSession
+	sessionEpoch := r.bridgeEpoch
 	if backoff > 0 {
 		r.nextRetryAt = now.Add(backoff)
 	} else {
 		r.nextRetryAt = time.Time{}
 	}
+	lastError := ""
 	if connectErr != nil {
-		r.lastErr = connectErr.Error()
+		lastError = connectErr.Error()
+		r.lastErr = lastError
 	}
+	r.bridgeMu.Unlock()
+	message := fmt.Sprintf(
+		"bridge retry scheduled fail_streak=%d backoff_ms=%d",
+		failStreak,
+		durationToMillis(backoff),
+	)
+	if strings.TrimSpace(lastError) != "" {
+		message = fmt.Sprintf("%s error=%s", message, lastError)
+	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "warn",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_RETRY_SCHEDULED",
+		Message:      message,
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  "RECONNECTING",
+	})
 }
 
 func (r *Runtime) setBridgeLost(readErr error) {
 	r.bridgeMu.Lock()
-	defer r.bridgeMu.Unlock()
+	sessionID := r.bridgeSession
+	sessionEpoch := r.bridgeEpoch
 	r.bridgeState = "STALE"
 	r.updatedAt = time.Now().UTC()
+	errorText := ""
 	if readErr != nil {
-		r.lastErr = readErr.Error()
+		errorText = readErr.Error()
+		r.lastErr = errorText
 	}
+	r.bridgeMu.Unlock()
+	if strings.TrimSpace(errorText) == "" {
+		errorText = "bridge control channel became stale"
+	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "error",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_STATE_STALE",
+		Message:      errorText,
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  "STALE",
+	})
 }
 
 func (r *Runtime) setBridgeDrained() {
 	r.bridgeMu.Lock()
+	closedSessionID := r.bridgeSession
+	closedSessionEpoch := r.bridgeEpoch
 	r.bridgeDesiredUp = false
 	r.bridgeState = "CLOSED"
 	r.bridgeSession = ""
@@ -482,6 +580,15 @@ func (r *Runtime) setBridgeDrained() {
 	r.retryBackoff = 0
 	r.nextRetryAt = time.Time{}
 	r.bridgeMu.Unlock()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.bridge",
+		Code:         "BRIDGE_STATE_CLOSED",
+		Message:      "bridge session drained and closed",
+		SessionID:    closedSessionID,
+		SessionEpoch: closedSessionEpoch,
+		BridgeState:  "CLOSED",
+	})
 	if r.refillHandler != nil {
 		// 会话关闭后清空补池处理器会话上下文，拒绝陈旧请求。
 		r.refillHandler.SetSession("", 0)
@@ -746,24 +853,47 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		// runtime 尚未初始化补池处理器时直接忽略，避免 nil 依赖触发崩溃。
 		return nil
 	}
+	sessionID := strings.TrimSpace(envelope.SessionID)
+	sessionEpoch := envelope.SessionEpoch
+	requestID := strings.TrimSpace(envelope.RequestID)
 	if len(envelope.Payload) == 0 {
-		return errors.New("tunnel refill payload is empty")
+		err := errors.New("tunnel refill payload is empty")
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:        "error",
+			Module:       "agent.runtime.refill",
+			Code:         "TUNNEL_REFILL_PAYLOAD_INVALID",
+			Message:      err.Error(),
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			RequestID:    requestID,
+		})
+		return err
 	}
 	var refillPayload pb.TunnelRefillRequest
 	if err := json.Unmarshal(envelope.Payload, &refillPayload); err != nil {
-		return fmt.Errorf("unmarshal tunnel refill payload failed: %w", err)
+		wrappedErr := fmt.Errorf("unmarshal tunnel refill payload failed: %w", err)
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:        "error",
+			Module:       "agent.runtime.refill",
+			Code:         "TUNNEL_REFILL_PAYLOAD_INVALID",
+			Message:      wrappedErr.Error(),
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			RequestID:    requestID,
+		})
+		return wrappedErr
 	}
 
 	// 兼容 envelope 与 payload 字段来源：payload 缺失时回落 envelope 元信息。
-	sessionID := strings.TrimSpace(refillPayload.SessionID)
+	sessionID = strings.TrimSpace(refillPayload.SessionID)
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(envelope.SessionID)
 	}
-	sessionEpoch := refillPayload.SessionEpoch
+	sessionEpoch = refillPayload.SessionEpoch
 	if sessionEpoch == 0 {
 		sessionEpoch = envelope.SessionEpoch
 	}
-	requestID := strings.TrimSpace(refillPayload.RequestID)
+	requestID = strings.TrimSpace(refillPayload.RequestID)
 	if requestID == "" {
 		requestID = strings.TrimSpace(envelope.RequestID)
 	}
@@ -779,9 +909,40 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		Reason:             control.TunnelRefillReason(strings.TrimSpace(refillPayload.Reason)),
 		Timestamp:          requestTimestamp,
 	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.refill",
+		Code:         "TUNNEL_REFILL_REQUEST_RECEIVED",
+		Message:      fmt.Sprintf("receive tunnel refill request idle_delta=%d", refillRequest.RequestedIdleDelta),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		RequestID:    requestID,
+		Reason:       string(refillRequest.Reason),
+	})
 	if _, err := r.refillHandler.Handle(ctx, refillRequest); err != nil {
-		return fmt.Errorf("handle tunnel refill request failed: %w", err)
+		wrappedErr := fmt.Errorf("handle tunnel refill request failed: %w", err)
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:        "error",
+			Module:       "agent.runtime.refill",
+			Code:         "TUNNEL_REFILL_REJECTED",
+			Message:      wrappedErr.Error(),
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			RequestID:    requestID,
+			Reason:       string(refillRequest.Reason),
+		})
+		return wrappedErr
 	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.refill",
+		Code:         "TUNNEL_REFILL_APPLIED",
+		Message:      fmt.Sprintf("tunnel refill applied idle_delta=%d", refillRequest.RequestedIdleDelta),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		RequestID:    requestID,
+		Reason:       string(refillRequest.Reason),
+	})
 	return nil
 }
 
@@ -809,11 +970,31 @@ func (r *Runtime) handleControlErrorEnvelope(envelope pb.ControlEnvelope) error 
 			errorText = normalizedScope + " | " + errorText
 		}
 	}
+	sessionID := strings.TrimSpace(envelope.SessionID)
+	sessionEpoch := envelope.SessionEpoch
+	bridgeState := ""
 	r.bridgeMu.Lock()
 	// 将控制面错误写入 runtime 真相源，供 session.snapshot 与诊断视图消费。
 	r.lastErr = errorText
 	r.updatedAt = time.Now().UTC()
+	if sessionID == "" {
+		sessionID = r.bridgeSession
+	}
+	if sessionEpoch == 0 {
+		sessionEpoch = r.bridgeEpoch
+	}
+	bridgeState = r.bridgeState
 	r.bridgeMu.Unlock()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "error",
+		Module:       "agent.runtime.control",
+		Code:         "BRIDGE_CONTROL_ERROR",
+		Message:      errorText,
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  bridgeState,
+		RequestID:    strings.TrimSpace(envelope.RequestID),
+	})
 	return nil
 }
 
@@ -978,7 +1159,31 @@ func (r *Runtime) reportTunnelPoolNow(ctx context.Context, trigger string) {
 		return
 	}
 	// Reporter 失败不应中断主流程，留给周期/事件上报继续纠偏。
-	_ = r.tunnelReporter.ReportNow(ctx, trigger)
+	if err := r.tunnelReporter.ReportNow(ctx, trigger); err != nil {
+		sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:        "warn",
+			Module:       "agent.runtime.refill",
+			Code:         "TUNNEL_POOL_REPORT_FAILED",
+			Message:      fmt.Sprintf("tunnel pool report failed trigger=%s error=%v", strings.TrimSpace(trigger), err),
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			BridgeState:  bridgeState,
+			Trigger:      strings.TrimSpace(trigger),
+		})
+		return
+	}
+	sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.refill",
+		Code:         "TUNNEL_POOL_REPORT_TRIGGERED",
+		Message:      fmt.Sprintf("tunnel pool report triggered trigger=%s", strings.TrimSpace(trigger)),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  bridgeState,
+		Trigger:      strings.TrimSpace(trigger),
+	})
 }
 
 // sendBusinessControlEnvelope 将业务 envelope 编码为控制帧并发送到 Bridge。
@@ -1469,6 +1674,8 @@ func (r *Runtime) diagnoseSnapshotPayload() map[string]any {
 		tunnelPoolSnapshot = r.tunnelRegistry.Snapshot()
 	}
 	sessionSnapshot := r.sessionSnapshot()
+	events := r.snapshotDiagnoseEvents(runtimeDiagnoseDefaultLogLimit)
+	summary := summarizeDiagnoseEvents(events)
 	return map[string]any{
 		"state":               sessionSnapshot.state,
 		"last_error":          sessionSnapshot.lastError,
@@ -1477,6 +1684,15 @@ func (r *Runtime) diagnoseSnapshotPayload() map[string]any {
 		"next_retry_at_ms":    sessionSnapshot.nextRetryAtMS,
 		"tunnel_idle_count":   tunnelPoolSnapshot.IdleCount,
 		"tunnel_active_count": tunnelPoolSnapshot.ActiveCount,
+		"event_total":         summary.EventTotal,
+		"event_error_count":   summary.ErrorCount,
+		"event_state_changes": summary.StateChangeCount,
+		"event_reconnects":    summary.ReconnectCount,
+		"event_refill_total":  summary.RefillEventCount,
+		"last_event_at_ms":    summary.LastEventAtMS,
+		"last_event_code":     summary.LastEventCode,
+		"last_event_message":  summary.LastEventMessage,
 		"updated_at_ms":       runtimeNowMillis(),
+		"source":              "agent.runtime.diagnose",
 	}
 }

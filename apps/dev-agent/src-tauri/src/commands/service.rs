@@ -113,6 +113,39 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
         .collect()
 }
 
+/// 通过短锁方式读取 `service.list`，避免在 IPC 阻塞期间长期占用 supervisor 锁。
+fn request_service_list_payload(state: &Arc<AppRuntimeState>) -> Result<Option<Value>, String> {
+    let mut ipc_client = {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "读取服务列表失败：supervisor 锁异常".to_string())?;
+        let Some(ipc_client) = supervisor.ipc_client.take() else {
+            // Agent 尚未连上时保持空列表语义，不视为错误。
+            return Ok(None);
+        };
+        ipc_client
+    };
+
+    // 在无锁状态执行 IPC 请求，防止其他命令被该请求阻塞。
+    let request_result =
+        ipc_client.request("service.list", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS);
+
+    {
+        // 无论请求成功失败都要归还 client，避免后续命令拿不到连接。
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "读取服务列表失败：supervisor 锁异常".to_string())?;
+        supervisor.ipc_client = Some(ipc_client);
+    }
+
+    match request_result {
+        Ok(payload) => Ok(Some(payload)),
+        Err(err) => Err(err),
+    }
+}
+
 /// Tauri command：读取服务列表快照。
 #[tauri::command]
 pub fn service_list_snapshot(
@@ -120,20 +153,15 @@ pub fn service_list_snapshot(
 ) -> Result<Vec<ServiceListItem>, String> {
     let shared = state.inner().clone();
     with_rpc_metrics(&shared, || {
-        let mut supervisor = shared
-            .supervisor
-            .lock()
-            .map_err(|_| "读取服务列表失败：supervisor 锁异常".to_string())?;
-        let Some(ipc_client) = supervisor.ipc_client.as_mut() else {
-            // Agent 尚未连上时返回空列表，避免前端页面直接报错。
-            return Ok(Vec::new());
-        };
-
-        let payload =
-            match ipc_client.request("service.list", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS) {
-                Ok(value) => value,
-                Err(err) => {
-                    if err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND") {
+        let payload = match request_service_list_payload(&shared) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                // Agent 尚未连上时返回空列表，保持原有行为。
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                if err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND") {
+                    if let Ok(mut supervisor) = shared.supervisor.lock() {
                         push_host_log(
                             &mut supervisor,
                             "error",
@@ -141,19 +169,27 @@ pub fn service_list_snapshot(
                             "SERVICE_LIST_METHOD_NOT_READY",
                             format!("service.list 尚未在当前 Agent 实现: {err}"),
                         );
-                        return Err(format!("当前 Agent 未实现 service.list: {err}"));
                     }
-                    return Err(format!("读取服务列表失败: {err}"));
+                    return Err(format!("当前 Agent 未实现 service.list: {err}"));
                 }
-            };
+                return Err(format!("读取服务列表失败: {err}"));
+            }
+        };
+
         let items = parse_service_list(&payload);
-        push_host_log(
-            &mut supervisor,
-            "info",
-            "commands.service",
-            "SERVICE_LIST_SNAPSHOT",
-            format!("服务列表快照已刷新，items={}", items.len()),
-        );
+        {
+            let mut supervisor = shared
+                .supervisor
+                .lock()
+                .map_err(|_| "读取服务列表失败：supervisor 锁异常".to_string())?;
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "commands.service",
+                "SERVICE_LIST_SNAPSHOT",
+                format!("服务列表快照已刷新，items={}", items.len()),
+            );
+        }
         Ok(items)
     })
 }

@@ -101,6 +101,40 @@ interface HostLogEntry {
   message: string;
 }
 
+interface DiagnoseLogEntry {
+  ts_ms: number;
+  level: string;
+  module: string;
+  code: string;
+  message: string;
+  session_id?: string | null;
+  session_epoch?: number | null;
+  bridge_state?: string | null;
+  request_id?: string | null;
+  trigger?: string | null;
+  reason?: string | null;
+}
+
+interface DiagnoseSnapshot {
+  state: string;
+  last_error: string | null;
+  retry_fail_streak: number;
+  retry_backoff_ms: number;
+  next_retry_at_ms: number | null;
+  tunnel_idle_count: number;
+  tunnel_active_count: number;
+  event_total: number;
+  event_error_count: number;
+  event_state_changes: number;
+  event_reconnects: number;
+  event_refill_total: number;
+  last_event_at_ms: number | null;
+  last_event_code: string | null;
+  last_event_message: string | null;
+  updated_at_ms: number;
+  source: string;
+}
+
 interface AgentRuntimeChangedEvent {
   schema_version: number;
   reason: string;
@@ -598,6 +632,8 @@ export default function App(): JSX.Element {
   const [sessionSnapshot, setSessionSnapshot] = useState<SessionSnapshot | null>(null);
   const [hostConfig, setHostConfig] = useState<HostConfigSnapshot | null>(null);
   const [hostLogs, setHostLogs] = useState<HostLogEntry[]>([]);
+  const [diagnoseSnapshot, setDiagnoseSnapshot] = useState<DiagnoseSnapshot | null>(null);
+  const [diagnoseLogs, setDiagnoseLogs] = useState<DiagnoseLogEntry[]>([]);
   const [serviceItems, setServiceItems] = useState<ServiceListItem[]>([]);
   const [tunnelItems, setTunnelItems] = useState<TunnelListItem[]>([]);
   const [busyCommand, setBusyCommand] = useState<RuntimeCommand | null>(null);
@@ -645,6 +681,18 @@ export default function App(): JSX.Element {
     setHostLogs(logs.slice(-18).reverse());
   }, []);
 
+  // 读取 runtime 诊断聚合快照（状态 + 事件计数）。
+  const refreshDiagnoseSnapshot = useCallback(async () => {
+    const snapshot = await invoke<DiagnoseSnapshot>("diagnose_snapshot");
+    setDiagnoseSnapshot(snapshot);
+  }, []);
+
+  // 读取 runtime 诊断事件流，默认仅保留前端可视窗口大小。
+  const refreshDiagnoseLogs = useCallback(async () => {
+    const logs = await invoke<DiagnoseLogEntry[]>("diagnose_logs_snapshot");
+    setDiagnoseLogs(logs.slice(0, 64));
+  }, []);
+
   const refreshSnapshot = useCallback(async () => {
     const snapshot = await invoke<AgentRuntimeSnapshot>("agent_snapshot");
     setRuntimeSnapshot(snapshot);
@@ -676,13 +724,24 @@ export default function App(): JSX.Element {
     setHostConfig(payload.host_config);
     await Promise.all([
       refreshHostLogs(),
+      refreshDiagnoseSnapshot(),
+      refreshDiagnoseLogs(),
       refreshSessionSnapshot(),
       refreshServiceList(),
       refreshTunnelList(),
       refreshTrafficStatsSafely(),
       refreshSystemResourceStatsSafely(),
     ]);
-  }, [refreshHostLogs, refreshServiceList, refreshSessionSnapshot, refreshSystemResourceStatsSafely, refreshTrafficStatsSafely, refreshTunnelList]);
+  }, [
+    refreshDiagnoseLogs,
+    refreshDiagnoseSnapshot,
+    refreshHostLogs,
+    refreshServiceList,
+    refreshSessionSnapshot,
+    refreshSystemResourceStatsSafely,
+    refreshTrafficStatsSafely,
+    refreshTunnelList,
+  ]);
 
   const runCommand = useCallback(
     async (command: RuntimeCommand) => {
@@ -724,6 +783,8 @@ export default function App(): JSX.Element {
         await Promise.all([
           refreshSnapshot(),
           refreshHostLogs(),
+          refreshDiagnoseSnapshot(),
+          refreshDiagnoseLogs(),
           refreshSessionSnapshot(),
           refreshServiceList(),
           refreshTunnelList(),
@@ -740,6 +801,8 @@ export default function App(): JSX.Element {
     [
       notify,
       refreshHostConfig,
+      refreshDiagnoseLogs,
+      refreshDiagnoseSnapshot,
       refreshHostLogs,
       refreshServiceList,
       refreshSessionSnapshot,
@@ -758,6 +821,8 @@ export default function App(): JSX.Element {
       void refreshSnapshot();
       void refreshSessionSnapshot();
       void refreshHostLogs();
+      void refreshDiagnoseSnapshot();
+      void refreshDiagnoseLogs();
       void refreshServiceList();
       void refreshTunnelList();
       void refreshTrafficStatsSafely();
@@ -800,6 +865,8 @@ export default function App(): JSX.Element {
     };
   }, [
     bootstrap,
+    refreshDiagnoseLogs,
+    refreshDiagnoseSnapshot,
     notify,
     refreshHostLogs,
     refreshServiceList,
@@ -1589,9 +1656,15 @@ export default function App(): JSX.Element {
     <Card>
       <CardHeader>
         <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">日志与诊断</CardTitle>
-        <CardDescription className="text-xs">结构化日志字段（时间/级别/模块/错误码）</CardDescription>
+        <CardDescription className="text-xs">优先展示 runtime 诊断事件，宿主日志作为兜底补充</CardDescription>
       </CardHeader>
       <CardContent>
+        <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-4">
+          <InfoRow label="诊断状态" value={diagnoseSnapshot?.state ?? "--"} />
+          <InfoRow label="事件总数" value={String(diagnoseSnapshot?.event_total ?? 0)} />
+          <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} />
+          <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} />
+        </div>
         <div className="agent-scroll max-h-[560px] overflow-y-auto rounded-xl border border-[#e5eaf4]">
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
@@ -1604,7 +1677,8 @@ export default function App(): JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {hostLogs.map((log, index) => (
+              {/* 优先展示 runtime diagnose.logs，runtime 不可用时回落宿主日志。 */}
+              {(diagnoseLogs.length > 0 ? diagnoseLogs : hostLogs).map((log, index) => (
                 <tr key={`${log.ts_ms}-${index}`} className="border-t border-[#edf1f8]">
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(log.ts_ms)}</td>
                   <td className={TABLE_CELL_CLASS}><Badge variant={log.level.toLowerCase().includes("error") ? "danger" : log.level.toLowerCase().includes("warn") ? "warning" : "success"}>{log.level}</Badge></td>

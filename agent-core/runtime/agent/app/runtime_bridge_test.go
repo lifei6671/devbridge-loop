@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +119,21 @@ func (tunnel *runtimeBridgeTestTunnel) ID() string {
 func (tunnel *runtimeBridgeTestTunnel) Close() error {
 	_ = tunnel
 	return nil
+}
+
+// testHasDiagnoseCode 判断 diagnose.logs 返回体中是否包含指定事件码。
+func testHasDiagnoseCode(payload map[string]any, eventCode string) bool {
+	items, ok := payload["items"].([]map[string]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		codeValue, _ := item["code"].(string)
+		if codeValue == eventCode {
+			return true
+		}
+	}
+	return false
 }
 
 // TestComputeBridgeRetryBackoffWithJitter 验证指数退避基线为 1/2/4/8 秒。
@@ -263,6 +279,13 @@ func TestHandleBridgeBusinessControlFrameTunnelRefillRequest(testingObject *test
 			control.TunnelRefillReasonLowWatermark,
 		)
 	}
+	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_REQUEST_RECEIVED") {
+		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_REQUEST_RECEIVED")
+	}
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_APPLIED") {
+		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_APPLIED")
+	}
 }
 
 // TestHandleBridgeBusinessControlFrameControlError 验证控制面错误消息会写入 runtime 最近错误字段。
@@ -295,6 +318,10 @@ func TestHandleBridgeBusinessControlFrameControlError(testingObject *testing.T) 
 	sessionSnapshot := runtime.sessionSnapshot()
 	if sessionSnapshot.lastError == "" {
 		testingObject.Fatalf("expected last_error to be updated")
+	}
+	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "BRIDGE_CONTROL_ERROR") {
+		testingObject.Fatalf("expected diagnose logs contain BRIDGE_CONTROL_ERROR")
 	}
 }
 
@@ -539,5 +566,64 @@ func TestTrafficStatsSnapshotPayloadUsesRuntimeMetrics(testingObject *testing.T)
 	}
 	if downloadBytesPerSec <= 0 {
 		testingObject.Fatalf("expected download_bytes_per_sec > 0, got=%f", downloadBytesPerSec)
+	}
+}
+
+// TestDiagnoseSnapshotPayloadUsesEventSource 验证 diagnose.snapshot 聚合 runtime 事件源。
+func TestDiagnoseSnapshotPayloadUsesEventSource(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		cfg: Config{
+			AgentID: "agent-u4",
+		},
+	}
+	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:   "info",
+		Module:  "agent.runtime.bridge",
+		Code:    "BRIDGE_STATE_ACTIVE",
+		Message: "bridge active",
+	})
+	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:   "warn",
+		Module:  "agent.runtime.bridge",
+		Code:    "BRIDGE_RETRY_SCHEDULED",
+		Message: "retry scheduled",
+	})
+	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:   "info",
+		Module:  "agent.runtime.refill",
+		Code:    "TUNNEL_REFILL_APPLIED",
+		Message: "refill applied",
+	})
+	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:   "error",
+		Module:  "agent.runtime.control",
+		Code:    "BRIDGE_CONTROL_ERROR",
+		Message: "control error",
+	})
+
+	payload := runtime.diagnoseSnapshotPayload()
+	if payload["event_total"] != uint64(4) {
+		testingObject.Fatalf("unexpected event_total: %+v", payload["event_total"])
+	}
+	if payload["event_error_count"] != uint64(1) {
+		testingObject.Fatalf("unexpected event_error_count: %+v", payload["event_error_count"])
+	}
+	if payload["event_state_changes"] != uint64(1) {
+		testingObject.Fatalf("unexpected event_state_changes: %+v", payload["event_state_changes"])
+	}
+	if payload["event_reconnects"] != uint64(1) {
+		testingObject.Fatalf("unexpected event_reconnects: %+v", payload["event_reconnects"])
+	}
+	if payload["event_refill_total"] != uint64(1) {
+		testingObject.Fatalf("unexpected event_refill_total: %+v", payload["event_refill_total"])
+	}
+	lastEventCode, _ := payload["last_event_code"].(string)
+	if strings.TrimSpace(lastEventCode) == "" {
+		testingObject.Fatalf("expected last_event_code is not empty")
+	}
+	if payload["source"] != "agent.runtime.diagnose" {
+		testingObject.Fatalf("unexpected diagnose source: %+v", payload["source"])
 	}
 }

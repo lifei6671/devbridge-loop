@@ -313,19 +313,19 @@
 
 ### A16. Bridge 管理后台（Admin API + Admin UI）
 
-- [ ] Bridge 启动开关：显式支持 `admin.enabled`（默认关闭）与 `admin.listen_addr/admin.base_path` 配置
-- [ ] `admin.enabled=false` 时不注册 `/api/admin/*` 路由、不提供管理静态资源、不初始化后台中间件
-- [ ] 管理面网络隔离：Admin 独立监听地址/端口，禁止仅依赖路径前缀隔离
-- [ ] 后台模块落地：`adminapi/`（鉴权、中间件、路由）+ `adminview/`（快照/事件/诊断视图模型）
-- [ ] 权限模型落地：`viewer/operator/admin` 三角色与接口级权限矩阵
-- [ ] 登录与认证落地：Cookie/Token 方案二选一并明确服务端校验策略
+- [x] Bridge 启动开关：显式支持 `admin.enabled`（默认关闭）与 `admin.listen_addr/admin.base_path` 配置
+- [x] `admin.enabled=false` 时不注册 `/api/admin/*` 路由、不提供管理静态资源、不初始化后台中间件
+- [x] 管理面网络隔离：Admin 独立监听地址/端口，禁止仅依赖路径前缀隔离
+- [x] 后台模块落地：`adminapi/`（鉴权、中间件、路由）+ `adminview/`（快照/事件/诊断视图模型）
+- [x] 权限模型落地：`viewer/operator/admin` 三角色与接口级权限矩阵
+- [x] 登录与认证落地：Cookie/Token 方案二选一并明确服务端校验策略
 - [ ] CSRF 防护：Cookie 模式下写接口强制 `CSRF Token + Origin/Referer` 校验 + 安全 Cookie 属性
-- [ ] 只读 API 落地：`bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域
-- [ ] 查询契约落地：列表检索统一 `cursor + limit`，服务端硬上限与日志/时序时间窗口限制
-- [ ] 运维 API 收敛：仅支持 reload/drain/diagnose export 等受控命令，禁止任意脚本执行
-- [ ] 配置并发控制：`config_version + if_match_version` 乐观并发，版本冲突返回 `409`
-- [ ] 审计能力：所有写操作记录操作者、作用域、参数摘要、结果、trace_id、时间戳
-- [ ] 导出安全：日志与诊断包统一脱敏（token/cookie/secret/password/private_key 等）且仅 `admin` 可导出
+- [x] 只读 API 落地：`bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域
+- [x] 查询契约落地：列表检索统一 `cursor + limit`，服务端硬上限与日志/时序时间窗口限制
+- [x] 运维 API 收敛：仅支持 reload/drain/diagnose export 等受控命令，禁止任意脚本执行
+- [x] 配置并发控制：`config_version + if_match_version` 乐观并发，版本冲突返回 `409`
+- [x] 审计能力：所有写操作记录操作者、作用域、参数摘要、结果、trace_id、时间戳
+- [x] 导出安全：日志与诊断包统一脱敏（token/cookie/secret/password/private_key 等）且仅 `admin` 可导出
 - [ ] 页面功能落地：Dashboard、Route、Connector/Session、Tunnel/Traffic、配置运维、日志指标诊断六类页面
 - [ ] 内嵌部署联调：前端构建产物内嵌 Bridge，可独立二进制访问后台并完成端到端操作
 

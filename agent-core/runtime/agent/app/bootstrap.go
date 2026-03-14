@@ -72,6 +72,9 @@ type Runtime struct {
 	trafficStatsLastAt   time.Time
 	trafficUploadLast    uint64
 	trafficDownloadLast  uint64
+	diagnoseMu           sync.RWMutex
+	diagnoseEvents       []runtimeDiagnoseEvent
+	diagnoseUpdatedAt    time.Time
 	metrics              *obs.Metrics
 
 	ipcServer  *localRPCServer
@@ -106,6 +109,7 @@ func BootstrapWithOptions(ctx context.Context, cfg Config, options BootstrapOpti
 		controlPublisher:   control.NewPublisher("", 0, 0),
 		healthReporter:     control.NewHealthReporter(control.HealthReporterOptions{}),
 		tunnelAssociations: make(map[string]tunnelAssociation),
+		diagnoseEvents:     make([]runtimeDiagnoseEvent, 0, runtimeDiagnoseEventBufferSize),
 		metrics:            obs.NewMetrics(),
 		shutdownCh:         make(chan struct{}),
 	}, nil

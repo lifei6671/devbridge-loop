@@ -121,22 +121,26 @@
   - 建议代码入口：`agent-core/runtime/agent/obs/`、`agent-core/runtime/agent/app/localrpc_server.go`、`apps/dev-agent/src-tauri/src/commands/traffic.rs`。
   - 完成记录（2026-03-14）：Agent runtime 已在 `traffic relay` 路径累计真实上/下行字节并通过 `traffic.stats.snapshot` 输出速率与累计值（`upload/download_bytes_per_sec` + totals）；`localrpc` 已移除占位 0 返回；Tauri `traffic_stats_snapshot` 改为优先读取 Agent RPC 快照，宿主网卡采样仅在 RPC 不可用时回退，并保留 `source` 字段区分来源，避免语义混淆；新增单测覆盖 runtime 快照与 localrpc 分发路径。
 
-- [ ] `UAB-U4` `diagnose.logs` 与诊断快照接入 runtime 事件源
+- [x] `UAB-U4` `diagnose.logs` 与诊断快照接入 runtime 事件源
   - 目标：去掉空日志占位，至少提供控制面状态变化、错误、重连、补池事件。
   - 参考文档：`技术方案` 的 `13.3`、`12`；`Agent-TauriConnectionModelExecutionChecklist` 的事件/诊断相关条目。
   - 建议代码入口：`agent-core/runtime/agent/app/localrpc_server.go`、`agent-core/runtime/agent/app/runtime_bridge.go`、`apps/dev-agent/src/App.tsx`。
+  - 完成记录（2026-03-14）：Agent runtime 已新增诊断事件缓冲（默认保留最近 256 条）并在控制面状态迁移、重连退避、Bridge 错误上报、`TunnelRefillRequest` 处理和 `TunnelPoolReport` 触发路径落事件；`diagnose.logs` 已改为返回 runtime 事件真相源（含 `ts_ms/level/module/code/message` 与 session/refill 元信息），移除空数组占位；`diagnose.snapshot` 已补充事件聚合统计（错误数、状态变化数、重连数、补池事件数、最近事件信息）；Tauri 已新增 `diagnose_snapshot/diagnose_logs_snapshot` 短锁命令并接入前端“日志与诊断”页优先展示 runtime 事件流（宿主日志兜底）；新增单测覆盖补池/错误事件写入、快照聚合与 localrpc `diagnose.logs` 分发行为。
 
 ### P3：Bridge 管理后台能力收口（独立于主链路）
 
-- [ ] `UAB-A1` 落地 `admin.enabled` 默认关闭与管理面独立开关
+- [x] `UAB-A1` 落地 `admin.enabled` 默认关闭与管理面独立开关
   - 目标：`admin.enabled=false` 时不注册 Admin API/UI 路由，不初始化管理中间件。
   - 参考文档：`Agent-and-Bridge-ExecutionChecklist` 的 `A16`；`BridgeAdminBackendTechnicalProposal.md`。
   - 建议代码入口：`cloud-bridge/runtime/bridge/app/config.go`、`cloud-bridge/runtime/bridge/app/bootstrap.go`。
+  - 完成记录（2026-03-14）：`AdminConfig` 已新增 `enabled` 总开关并默认关闭；`config.Validate` 调整为仅在 `admin.enabled=true` 时校验 `admin.listen_addr`；`bootstrap` 调整为仅在管理面开启时初始化 admin mux/server（关闭时 `adminServer=nil`，不会注册 UI 路由）；新增 `bootstrap_test.go` 覆盖默认关闭、校验分支与 `adminServer` 初始化行为。
 
 - [ ] `UAB-A2` 分阶段补齐 Admin API 的鉴权、权限、审计与导出脱敏
   - 目标：先做只读域，再做受控写接口，最终满足 A16 验收标准。
   - 参考文档：`Agent-and-Bridge-ExecutionChecklist` 的 `A16` 全项；`BridgeAdminBackendTechnicalProposal.md`。
   - 建议代码入口：`cloud-bridge/runtime/bridge/app/`（后续可拆 `adminapi/` 与 `adminview/`）。
+  - 阶段记录（2026-03-14）：已完成第一阶段只读域与鉴权骨架：新增 `runtime/bridge/adminapi`（Bearer Token 鉴权、`viewer/operator/admin` 角色校验、请求审计日志、`cursor+limit` 分页硬上限、日志/指标时间窗口限制）与 `runtime/bridge/adminview`（overview/routes/connectors/sessions/tunnels/traffic/diagnose 聚合模型）；管理面已注册只读接口 `bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域；`config.snapshot` 默认返回脱敏 token。后续待补：受控写接口、CSRF（Cookie 模式）、配置并发控制、导出脱敏与角色限制。
+  - 阶段记录（2026-03-14，第二阶段）：已补齐受控写接口与并发语义骨架：新增 `POST /api/admin/ops/config/reload`、`POST /api/admin/ops/session/:sessionId/drain`、`POST /api/admin/ops/connector/:connectorId/drain`、`PUT /api/admin/config`（`if_match_version` 冲突返回 `409`）与 `POST /api/admin/ops/diagnose/export` + 短时下载链路；写操作审计新增参数摘要字段；导出默认执行敏感键与连接串凭据脱敏，且导出接口仅 `admin` 角色可调用。新增 `adminapi` 与 `app` 层单测覆盖权限、冲突、导出脱敏与 drain 生命周期副作用。后续待补：Cookie 模式 CSRF、管理面网络隔离强制校验、导出链路更细粒度审计策略。
 
 ---
 

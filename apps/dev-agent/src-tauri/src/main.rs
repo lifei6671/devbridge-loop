@@ -18,9 +18,10 @@ use agent_host::launcher::{ensure_single_instance_guard, resolve_runtime_dir};
 use agent_host::supervisor::{app_shutdown_impl, spawn_supervisor_monitor};
 use commands::{
     agent_crash_inject, agent_restart, agent_snapshot, agent_start, agent_stop, app_bootstrap,
-    app_shutdown, host_config_snapshot, host_config_update, host_logs_snapshot,
-    service_list_snapshot, session_drain, session_reconnect, session_snapshot,
-    system_resource_snapshot, traffic_stats_snapshot, tunnel_list_snapshot,
+    app_shutdown, diagnose_logs_snapshot, diagnose_snapshot, host_config_snapshot,
+    host_config_update, host_logs_snapshot, service_list_snapshot, session_drain,
+    session_reconnect, session_snapshot, system_resource_snapshot, traffic_stats_snapshot,
+    tunnel_list_snapshot,
 };
 use state::app_state::{now_ms, push_host_log, AppRuntimeState, HostRuntimeConfig};
 
@@ -136,6 +137,8 @@ fn main() {
             host_config_snapshot,
             host_config_update,
             host_logs_snapshot,
+            diagnose_snapshot,
+            diagnose_logs_snapshot,
             session_snapshot,
             session_reconnect,
             session_drain,

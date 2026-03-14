@@ -11,6 +11,10 @@
 5. 提供有限、受控的运维管理能力
 6. 保证后台能力不会破坏 Bridge 运行时关键不变量
 
+执行落地清单请配合使用：
+
+* [BridgeAdminBackendExecutionChecklist.md](./BridgeAdminBackendExecutionChecklist.md)
+
 本文档不重新定义 Bridge 与 Agent 的运行时协议，不改变既有运行时结构：
 
 * Bridge 继续负责 ingress、route resolve、session/service/tunnel registry、connector proxy、direct proxy 与 hybrid fallback。

@@ -421,7 +421,8 @@ func (server *localRPCServer) dispatchRequest(
 	case "diagnose.snapshot":
 		return server.runtime.diagnoseSnapshotPayload(), nil
 	case "diagnose.logs":
-		return map[string]any{"items": []map[string]any{}}, nil
+		// 诊断日志返回 runtime 事件真相源，替代空占位。
+		return server.runtime.diagnoseLogsPayload(), nil
 	default:
 		return nil, &localRPCFailure{code: "METHOD_NOT_ALLOWED", message: fmt.Sprintf("method %s is not allowed", requestBody.Method)}
 	}
