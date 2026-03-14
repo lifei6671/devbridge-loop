@@ -414,16 +414,8 @@ func (server *localRPCServer) dispatchRequest(
 	case "tunnel.list":
 		return server.runtime.tunnelListPayload(), nil
 	case "traffic.stats.snapshot":
-		return map[string]any{
-			"upload_bytes_per_sec":   float64(0),
-			"download_bytes_per_sec": float64(0),
-			"upload_total_bytes":     uint64(0),
-			"download_total_bytes":   uint64(0),
-			"sample_window_ms":       uint64(0),
-			"interface_count":        uint64(0),
-			"updated_at_ms":          runtimeNowMillis(),
-			"source":                 "agent.runtime",
-		}, nil
+		// traffic 指标优先返回 runtime 数据面真实链路统计，避免占位值误导 UI。
+		return server.runtime.trafficStatsSnapshotPayload(), nil
 	case "config.snapshot":
 		return server.runtime.configSnapshotPayload(server.ipcTransport, server.ipcEndpoint), nil
 	case "diagnose.snapshot":

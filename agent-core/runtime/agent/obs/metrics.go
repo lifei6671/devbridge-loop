@@ -17,6 +17,10 @@ const (
 	MetricAgentTrafficOpenAckLatencyMs = "agent_traffic_open_ack_latency_ms"
 	// MetricAgentUpstreamDialLatencyMs 表示 Agent upstream dial 延迟。
 	MetricAgentUpstreamDialLatencyMs = "agent_upstream_dial_latency_ms"
+	// MetricAgentTrafficUploadTotalBytes 表示 Agent runtime 上行累计字节数。
+	MetricAgentTrafficUploadTotalBytes = "agent_traffic_upload_total_bytes"
+	// MetricAgentTrafficDownloadTotalBytes 表示 Agent runtime 下行累计字节数。
+	MetricAgentTrafficDownloadTotalBytes = "agent_traffic_download_total_bytes"
 )
 
 const (
@@ -41,6 +45,9 @@ type Metrics struct {
 
 	agentUpstreamDialLatencyTotalMs atomic.Int64
 	agentUpstreamDialLatencyCount   atomic.Uint64
+
+	agentTrafficUploadTotalBytes   atomic.Uint64
+	agentTrafficDownloadTotalBytes atomic.Uint64
 }
 
 // NewMetrics 创建 Agent 运行时指标容器。
@@ -154,6 +161,44 @@ func (metrics *Metrics) AgentUpstreamDialLatencyCount() uint64 {
 		return 0
 	}
 	return metrics.agentUpstreamDialLatencyCount.Load()
+}
+
+// AddAgentTrafficUploadBytes 累加 Agent runtime 上行字节数。
+func (metrics *Metrics) AddAgentTrafficUploadBytes(byteCount int) {
+	if metrics == nil {
+		return
+	}
+	if byteCount <= 0 {
+		return
+	}
+	metrics.agentTrafficUploadTotalBytes.Add(uint64(byteCount))
+}
+
+// AddAgentTrafficDownloadBytes 累加 Agent runtime 下行字节数。
+func (metrics *Metrics) AddAgentTrafficDownloadBytes(byteCount int) {
+	if metrics == nil {
+		return
+	}
+	if byteCount <= 0 {
+		return
+	}
+	metrics.agentTrafficDownloadTotalBytes.Add(uint64(byteCount))
+}
+
+// AgentTrafficUploadTotalBytes 返回 Agent runtime 上行累计字节数。
+func (metrics *Metrics) AgentTrafficUploadTotalBytes() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.agentTrafficUploadTotalBytes.Load()
+}
+
+// AgentTrafficDownloadTotalBytes 返回 Agent runtime 下行累计字节数。
+func (metrics *Metrics) AgentTrafficDownloadTotalBytes() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.agentTrafficDownloadTotalBytes.Load()
 }
 
 // encodeAgentSessionState 把 session 状态字符串编码为可原子存储的整数值。

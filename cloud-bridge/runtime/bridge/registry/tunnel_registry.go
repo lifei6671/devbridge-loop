@@ -265,6 +265,54 @@ func (registry *TunnelRegistry) Snapshot() TunnelSnapshot {
 	return snapshot
 }
 
+// PurgeBySession 按 session 摘除 tunnel 记录并关闭底层连接。
+func (registry *TunnelRegistry) PurgeBySession(now time.Time, sessionID string, reason string) []TunnelRuntime {
+	if registry == nil {
+		return nil
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" {
+		return nil
+	}
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	normalizedReason := strings.TrimSpace(reason)
+
+	registry.mutex.Lock()
+	purged := make([]TunnelRuntime, 0)
+	for tunnelID, runtime := range registry.byTunnelID {
+		if strings.TrimSpace(runtime.SessionID) != normalizedSessionID {
+			continue
+		}
+		// 先从 idle 索引和主索引移除，避免后续被再次分配。
+		registry.removeIdleLocked(runtime.ConnectorID, tunnelID)
+		if runtime.State != TunnelStateClosed && runtime.State != TunnelStateBroken {
+			runtime.State = TunnelStateBroken
+		}
+		if normalizedReason != "" && strings.TrimSpace(runtime.LastError) == "" {
+			runtime.LastError = normalizedReason
+		}
+		runtime.UpdatedAt = normalizedNow
+		purged = append(purged, cloneTunnelRuntime(runtime))
+		delete(registry.byTunnelID, tunnelID)
+	}
+	if len(purged) > 0 {
+		registry.updatedAt = normalizedNow
+	}
+	registry.mutex.Unlock()
+
+	// 在锁外关闭底层 tunnel，避免 IO 阻塞影响注册表写路径。
+	for _, runtime := range purged {
+		if runtime.Tunnel == nil {
+			continue
+		}
+		_ = runtime.Tunnel.Close()
+	}
+	return purged
+}
+
 func (registry *TunnelRegistry) transition(now time.Time, tunnelID string, target TunnelState, message string) error {
 	if registry == nil {
 		return ErrTunnelRegistryDependencyMissing

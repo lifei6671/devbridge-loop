@@ -26,6 +26,10 @@ const (
 	ControlMessageUnpublishServiceAck ControlMessageType = "UnpublishServiceAck"
 	// ControlMessageServiceHealthReport 表示上报健康状态。
 	ControlMessageServiceHealthReport ControlMessageType = "ServiceHealthReport"
+	// ControlMessageTunnelPoolReport 表示 Agent 上报 tunnel 池状态。
+	ControlMessageTunnelPoolReport ControlMessageType = "TunnelPoolReport"
+	// ControlMessageTunnelRefillRequest 表示 Bridge 请求 Agent 补池。
+	ControlMessageTunnelRefillRequest ControlMessageType = "TunnelRefillRequest"
 	// ControlMessageRouteAssign 表示下发 route。
 	ControlMessageRouteAssign ControlMessageType = "RouteAssign"
 	// ControlMessageRouteAssignAck 表示 route 下发 ACK。
@@ -136,6 +140,8 @@ func IsKnownControlMessageType(messageType ControlMessageType) bool {
 	case ControlMessageHeartbeat, ControlMessagePublishService, ControlMessagePublishServiceAck:
 		return true
 	case ControlMessageUnpublishService, ControlMessageUnpublishServiceAck, ControlMessageServiceHealthReport:
+		return true
+	case ControlMessageTunnelPoolReport, ControlMessageTunnelRefillRequest:
 		return true
 	case ControlMessageRouteAssign, ControlMessageRouteAssignAck, ControlMessageRouteRevoke, ControlMessageRouteRevokeAck:
 		return true

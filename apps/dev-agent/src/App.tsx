@@ -346,20 +346,38 @@ function formatCountdownText(remainingMs: number): string {
   return `${minute} 分 ${String(second).padStart(2, "0")} 秒`;
 }
 
+// 将服务状态映射为 UI 颜色语义，优先保证“活跃/异常/中性”可读性。
 function serviceVariant(status: string): "success" | "warning" | "danger" | "secondary" {
   const normalized = status.trim().toLowerCase();
-  if (normalized.includes("run") || normalized.includes("healthy")) {
+  if (
+    normalized.includes("unhealthy")
+    || normalized.includes("inactive")
+    || normalized.includes("down")
+    || normalized.includes("fail")
+    || normalized.includes("error")
+    || normalized.includes("stale")
+  ) {
+    return "danger";
+  }
+  if (
+    normalized.includes("run")
+    || normalized.includes("healthy")
+    || normalized.includes("active")
+    || normalized.includes("ready")
+  ) {
     return "success";
   }
   if (normalized.includes("degraded") || normalized.includes("warn")) {
     return "warning";
   }
-  if (normalized.includes("idle") || normalized.includes("pending")) {
+  if (normalized.includes("idle") || normalized.includes("pending") || normalized.includes("unknown")) {
     return "secondary";
   }
-  return "danger";
+  // 未识别状态统一作为中性态展示，避免误判为故障。
+  return "secondary";
 }
 
+// 将协议状态值规范为中文展示文案。
 function formatServiceStatus(status: string): string {
   const trimmed = status.trim();
   if (!trimmed) {
@@ -369,8 +387,17 @@ function formatServiceStatus(status: string): string {
     return trimmed;
   }
   const normalized = trimmed.toLowerCase();
+  if (normalized.includes("unhealthy")) {
+    return "不健康";
+  }
+  if (normalized.includes("inactive")) {
+    return "未激活";
+  }
   if (normalized.includes("healthy")) {
     return "健康";
+  }
+  if (normalized.includes("active")) {
+    return "已发布";
   }
   if (normalized.includes("running") || normalized.includes("run")) {
     return "运行中";
@@ -386,6 +413,9 @@ function formatServiceStatus(status: string): string {
   }
   if (normalized.includes("pending")) {
     return "等待中";
+  }
+  if (normalized.includes("stale")) {
+    return "陈旧";
   }
   if (
     normalized.includes("stop")
@@ -1133,51 +1163,36 @@ export default function App(): JSX.Element {
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
               <tr className="bg-[#f4f6fb]">
+                <th className={TABLE_HEAD_CLASS}>服务 ID</th>
                 <th className={TABLE_HEAD_CLASS}>名称</th>
-                <th className={TABLE_HEAD_CLASS}>本地地址</th>
-                <th className={TABLE_HEAD_CLASS}>公网地址</th>
+                <th className={TABLE_HEAD_CLASS}>协议</th>
+                <th className={TABLE_HEAD_CLASS}>Endpoint 数</th>
                 <th className={TABLE_HEAD_CLASS}>状态</th>
-                <th className={TABLE_HEAD_CLASS}>流量</th>
+                <th className={TABLE_HEAD_CLASS}>更新时间</th>
               </tr>
             </thead>
             <tbody>
               {filteredServices.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={5}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={6}>
                     当前没有可展示的服务
                   </td>
                 </tr>
               ) : null}
-              {filteredServices.map((item) => {
-                const tunnel = filteredTunnels.find((entry) => entry.service_id === item.service_id);
-                return (
-                  <tr key={item.service_id} className="border-t border-[#edf1f8]">
-                    <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
-                    <td className={TABLE_CELL_CLASS}>{tunnel?.local_addr ?? "--"}</td>
-                    <td className={TABLE_CELL_CLASS}>{tunnel?.remote_addr ?? "--"}</td>
-                    <td className={TABLE_CELL_CLASS}>
-                      <Badge variant={serviceVariant(item.status)} title={item.status}>
-                        {formatServiceStatus(item.status)}
-                      </Badge>
-                    </td>
-                    <td className={TABLE_CELL_CLASS}>
-                      <span
-                        className={cn(
-                          "inline-flex h-7 w-12 items-center rounded-full p-1 transition",
-                          serviceVariant(item.status) === "success" ? "bg-[#1f67e5]" : "bg-[#bcc5d7]",
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            "h-5 w-5 rounded-full bg-white transition",
-                            serviceVariant(item.status) === "success" ? "translate-x-5" : "translate-x-0",
-                          )}
-                        />
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
+              {filteredServices.map((item) => (
+                <tr key={item.service_id} className="border-t border-[#edf1f8]">
+                  <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.protocol || "--"}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.endpoint_count}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    <Badge variant={serviceVariant(item.status)} title={item.status}>
+                      {formatServiceStatus(item.status)}
+                    </Badge>
+                  </td>
+                  <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -1328,7 +1343,7 @@ export default function App(): JSX.Element {
                       {formatTunnelState(item.state)}
                     </Badge>
                   </td>
-                  <td className={TABLE_CELL_CLASS}>{item.latency_ms} ms</td>
+                  <td className={TABLE_CELL_CLASS}>{item.latency_ms > 0 ? `${item.latency_ms} ms` : "--"}</td>
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
                 </tr>
               ))}

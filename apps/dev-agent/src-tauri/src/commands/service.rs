@@ -40,6 +40,27 @@ fn value_u64_or(payload: &Value, key: &str, default_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+/// 从 `endpoints` 数组推断协议字段，兼容 `service_type` 未填场景。
+fn infer_protocol_from_endpoints(payload: &Value) -> Option<String> {
+    let endpoints = payload.get("endpoints")?.as_array()?;
+    for endpoint in endpoints {
+        let Some(protocol_value) = endpoint.get("protocol").and_then(Value::as_str) else {
+            continue;
+        };
+        let trimmed = protocol_value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// 从 `endpoints` 数组推断 endpoint 数量，兼容后端未显式返回 `endpoint_count`。
+fn infer_endpoint_count(payload: &Value) -> Option<u64> {
+    let endpoints = payload.get("endpoints")?.as_array()?;
+    Some(endpoints.len() as u64)
+}
+
 /// 将 localrpc 返回体解析为服务列表，兼容 array/object 两种外层结构。
 fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
     let raw_items = if let Some(items) = payload.get("services").and_then(Value::as_array) {
@@ -61,16 +82,27 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
             } else {
                 service_id
             };
+            let health_status = value_str_or(item, &["health_status"], "");
+            let lifecycle_status = value_str_or(item, &["status"], "unknown");
+            let normalized_health = health_status.trim().to_ascii_lowercase();
+            let effective_status = if health_status.is_empty() || normalized_health == "unknown" {
+                // 健康状态未知时回落到生命周期状态，避免 UI 误判为异常。
+                lifecycle_status
+            } else {
+                health_status
+            };
             ServiceListItem {
                 service_id: normalized_service_id.clone(),
                 service_name: value_str_or(
                     item,
-                    &["service_name", "name", "display_name"],
+                    &["service_name", "name", "display_name", "service_key"],
                     &normalized_service_id,
                 ),
-                protocol: value_str_or(item, &["protocol"], "tcp"),
-                status: value_str_or(item, &["status"], "unknown"),
-                endpoint_count: value_u64_or(item, "endpoint_count", 0),
+                protocol: infer_protocol_from_endpoints(item)
+                    .unwrap_or_else(|| value_str_or(item, &["protocol", "service_type"], "tcp")),
+                status: effective_status,
+                endpoint_count: infer_endpoint_count(item)
+                    .unwrap_or_else(|| value_u64_or(item, "endpoint_count", 0)),
                 last_error: item
                     .get("last_error")
                     .and_then(Value::as_str)
@@ -124,4 +156,57 @@ pub fn service_list_snapshot(
         );
         Ok(items)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_service_list;
+    use serde_json::json;
+
+    /// 验证 `service.list` 可从真实 payload 解析协议、状态与 endpoint 数量。
+    #[test]
+    fn parse_service_list_from_runtime_payload() {
+        let payload = json!({
+            "services": [
+                {
+                    "service_id": "svc-1",
+                    "service_name": "order-service",
+                    "service_type": "http",
+                    "status": "ACTIVE",
+                    "health_status": "HEALTHY",
+                    "endpoints": [
+                        {"protocol": "http", "host": "127.0.0.1", "port": 18080},
+                        {"protocol": "http", "host": "127.0.0.1", "port": 18081}
+                    ],
+                    "updated_at_ms": 1700000000000u64
+                }
+            ]
+        });
+
+        let items = parse_service_list(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].service_id, "svc-1");
+        assert_eq!(items[0].service_name, "order-service");
+        assert_eq!(items[0].protocol, "http");
+        assert_eq!(items[0].status, "HEALTHY");
+        assert_eq!(items[0].endpoint_count, 2);
+    }
+
+    /// 验证缺失 `endpoint_count` 时可回退 `endpoints` 数组长度。
+    #[test]
+    fn parse_service_list_fallback_endpoint_count() {
+        let payload = json!([
+            {
+                "service_id": "svc-2",
+                "service_key": "dev/demo/pay-service",
+                "status": "ACTIVE",
+                "endpoints": [{"protocol": "tcp", "host": "127.0.0.1", "port": 19090}]
+            }
+        ]);
+
+        let items = parse_service_list(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].endpoint_count, 1);
+        assert_eq!(items[0].protocol, "tcp");
+    }
 }

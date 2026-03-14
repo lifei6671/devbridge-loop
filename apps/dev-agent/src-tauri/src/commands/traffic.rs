@@ -247,6 +247,18 @@ fn value_u64_or(payload: &Value, keys: &[&str], default_value: u64) -> u64 {
     default_value
 }
 
+fn value_str_or(payload: &Value, keys: &[&str], default_value: &str) -> String {
+    for key in keys {
+        if let Some(value) = payload.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    default_value.to_string()
+}
+
 /// 尝试解析 agent 返回的 traffic.stats.snapshot（若已实现则优先使用）。
 fn parse_rpc_traffic_snapshot(payload: &Value) -> Option<TrafficStatsSnapshot> {
     let upload_bytes_per_sec = value_f64_or(
@@ -293,8 +305,42 @@ fn parse_rpc_traffic_snapshot(payload: &Value) -> Option<TrafficStatsSnapshot> {
         sample_window_ms: value_u64_or(payload, &["sample_window_ms", "window_ms"], 0),
         interface_count: value_u64_or(payload, &["interface_count"], 0),
         updated_at_ms: value_u64_or(payload, &["updated_at_ms"], now_ms()),
-        source: "agent.rpc".to_string(),
+        source: value_str_or(payload, &["source"], "agent.rpc"),
     })
+}
+
+/// 通过 IPC 拉取 agent traffic.stats.snapshot，避免长时间持有 supervisor 锁。
+fn request_rpc_traffic_snapshot(state: &Arc<AppRuntimeState>) -> Result<TrafficStatsSnapshot, String> {
+    let mut ipc_client = {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "读取流量统计失败：supervisor 锁异常".to_string())?;
+        supervisor
+            .ipc_client
+            .take()
+            .ok_or_else(|| "agent ipc client unavailable".to_string())?
+    };
+
+    let request_result = ipc_client.request(
+        "traffic.stats.snapshot",
+        json!({}),
+        LOCAL_RPC_DEFAULT_TIMEOUT_MS,
+    );
+
+    {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "读取流量统计失败：supervisor 锁异常".to_string())?;
+        supervisor.ipc_client = Some(ipc_client);
+    }
+
+    match request_result {
+        Ok(payload) => parse_rpc_traffic_snapshot(&payload)
+            .ok_or_else(|| "traffic.stats.snapshot payload invalid".to_string()),
+        Err(err) => Err(err),
+    }
 }
 
 fn sample_host_traffic(
@@ -330,50 +376,16 @@ pub fn traffic_stats_snapshot(
 ) -> Result<TrafficStatsSnapshot, String> {
     let shared = state.inner().clone();
     with_rpc_metrics(&shared, || {
-        // 优先宿主网卡采样，确保 UI 默认展示系统真实网速。
-        match sample_host_traffic(&shared, None) {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(host_err) => {
-                let rpc_payload = {
-                    let mut supervisor = shared
-                        .supervisor
-                        .lock()
-                        .map_err(|_| "读取流量统计失败：supervisor 锁异常".to_string())?;
-                    if let Some(client) = supervisor.ipc_client.as_mut() {
-                        match client.request(
-                            "traffic.stats.snapshot",
-                            json!({}),
-                            LOCAL_RPC_DEFAULT_TIMEOUT_MS,
-                        ) {
-                            Ok(payload) => Some(payload),
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(payload) = rpc_payload {
-                    if let Some(snapshot) = parse_rpc_traffic_snapshot(&payload) {
-                        if let Ok(mut supervisor) = shared.supervisor.lock() {
-                            push_host_log(
-                                &mut supervisor,
-                                "warn",
-                                "commands.traffic",
-                                "TRAFFIC_STATS_FALLBACK_RPC",
-                                format!(
-                                    "系统网速采样失败，已回退 traffic.stats.snapshot: {host_err}"
-                                ),
-                            );
-                        }
-                        return Ok(snapshot);
-                    }
-                }
-
-                return Err(format!(
-                    "读取流量统计失败：系统采样不可用，且 traffic.stats.snapshot 不可用（{host_err}）"
-                ));
-            }
+        // UAB-U3: 先使用 Agent runtime 链路指标，宿主网卡仅作为回退视角。
+        let rpc_result = request_rpc_traffic_snapshot(&shared);
+        match rpc_result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(rpc_err) => match sample_host_traffic(&shared, Some(&rpc_err)) {
+                Ok(snapshot) => Ok(snapshot),
+                Err(host_err) => Err(format!(
+                    "读取流量统计失败：traffic.stats.snapshot 不可用（{rpc_err}），且系统采样不可用（{host_err}）"
+                )),
+            },
         }
     })
 }

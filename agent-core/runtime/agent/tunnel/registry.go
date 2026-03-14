@@ -157,6 +157,43 @@ func (registry *Registry) AcquireIdle(now time.Time) (*Record, bool) {
 	return nil, false
 }
 
+// ActivateIdleByID 按 tunnelID 将 idle tunnel 原子切换到 active。
+//
+// 说明：
+// 1. 该方法用于 Agent 侧 acceptor 在收到首帧 TrafficOpen 后的激活路径。
+// 2. 状态迁移在同一把锁内完成，保持 `idle -> reserved -> active` 顺序一致。
+func (registry *Registry) ActivateIdleByID(now time.Time, tunnelID string) (*Record, error) {
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return nil, ErrTunnelNotFound
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	record, exists := registry.records[normalizedTunnelID]
+	if !exists {
+		return nil, ErrTunnelNotFound
+	}
+	if record.State != StateIdle {
+		return nil, ErrInvalidStateTransition
+	}
+
+	// 第一步：idle -> reserved，先摘除 idle 队列索引，避免被重复分配。
+	registry.removeIdleOrderLocked(normalizedTunnelID)
+	record.State = StateReserved
+	record.UpdatedAt = now
+	record.IdleSince = time.Time{}
+	registry.stateChangeSeq++
+	record.StateChangeSeq = registry.stateChangeSeq
+
+	// 第二步：reserved -> active，表示已移交 traffic runtime 消费。
+	record.State = StateActive
+	record.UpdatedAt = now
+	registry.stateChangeSeq++
+	record.StateChangeSeq = registry.stateChangeSeq
+	registry.updatedAt = now
+	return cloneRecord(record), nil
+}
+
 // MarkActive 将 reserved tunnel 切换为 active。
 func (registry *Registry) MarkActive(now time.Time, tunnelID string) error {
 	return registry.transition(now, strings.TrimSpace(tunnelID), StateActive, "")

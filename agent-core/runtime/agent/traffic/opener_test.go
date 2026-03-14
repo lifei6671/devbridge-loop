@@ -84,6 +84,10 @@ type openerTestTunnelIO struct {
 
 	writes                   []pb.StreamPayload
 	failWriteWhenContextDone bool
+
+	doneMutex   sync.Mutex
+	doneOnce    sync.Once
+	doneChannel chan struct{}
 }
 
 // ReadPayload 测试中不依赖 tunnel 读路径。
@@ -104,6 +108,29 @@ func (ioAdapter *openerTestTunnelIO) WritePayload(ctx context.Context, payload p
 	defer ioAdapter.mutex.Unlock()
 	ioAdapter.writes = append(ioAdapter.writes, payload)
 	return nil
+}
+
+// Done 返回测试 tunnel 的关闭信号。
+func (ioAdapter *openerTestTunnelIO) Done() <-chan struct{} {
+	ioAdapter.doneMutex.Lock()
+	defer ioAdapter.doneMutex.Unlock()
+	if ioAdapter.doneChannel == nil {
+		ioAdapter.doneChannel = make(chan struct{})
+	}
+	return ioAdapter.doneChannel
+}
+
+// CloseTunnel 主动触发测试 tunnel Done 事件。
+func (ioAdapter *openerTestTunnelIO) CloseTunnel() {
+	ioAdapter.doneMutex.Lock()
+	if ioAdapter.doneChannel == nil {
+		ioAdapter.doneChannel = make(chan struct{})
+	}
+	doneChannel := ioAdapter.doneChannel
+	ioAdapter.doneMutex.Unlock()
+	ioAdapter.doneOnce.Do(func() {
+		close(doneChannel)
+	})
 }
 
 // Writes 返回已写 payload 副本。
@@ -368,6 +395,79 @@ func TestOpenerHandleDialCanceled(testingObject *testing.T) {
 	}
 	if acceptor.IsReaderOwned("tunnel-2") {
 		testingObject.Fatalf("expected reader ownership released after canceled dial")
+	}
+}
+
+// TestOpenerHandleTunnelDoneSignalCancelsDial 验证 tunnel Done 信号可中止 pre-open 拨号。
+func TestOpenerHandleTunnelDoneSignalCancelsDial(testingObject *testing.T) {
+	testingObject.Parallel()
+	opener, err := NewOpener(OpenerOptions{
+		Selector: &openerTestSelector{
+			endpoint: Endpoint{
+				ID:   "endpoint-tunnel-done",
+				Addr: "10.0.0.9:8080",
+			},
+		},
+		Dialer: &openerTestDialer{
+			dialFunc: func(ctx context.Context, endpoint Endpoint) (io.ReadWriteCloser, error) {
+				_ = endpoint
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		},
+		Relay: &openerTestRelay{
+			relayFunc: func(ctx context.Context, tunnel TunnelIO, upstream io.ReadWriteCloser, trafficID string) error {
+				_ = ctx
+				_ = tunnel
+				_ = upstream
+				_ = trafficID
+				return nil
+			},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new opener failed: %v", err)
+	}
+	acceptor := NewAcceptor()
+	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-done-1", &acceptorTestReader{
+		payload: pb.StreamPayload{
+			OpenReq: &pb.TrafficOpen{
+				TrafficID: "traffic-tunnel-done",
+				ServiceID: "svc-td",
+			},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("wait traffic open failed: %v", err)
+	}
+	tunnelIO := &openerTestTunnelIO{
+		failWriteWhenContextDone: true,
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		tunnelIO.CloseTunnel()
+	}()
+
+	startedAt := time.Now()
+	_, err = opener.Handle(context.Background(), handoff, tunnelIO)
+	if err == nil {
+		testingObject.Fatalf("expected tunnel done cancels dial with error")
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 200*time.Millisecond {
+		testingObject.Fatalf("expected dial canceled quickly after tunnel done, elapsed=%s", elapsed)
+	}
+	writes := tunnelIO.Writes()
+	if len(writes) != 1 {
+		testingObject.Fatalf("unexpected tunnel write count: %d", len(writes))
+	}
+	if writes[0].OpenAck == nil || writes[0].OpenAck.Success {
+		testingObject.Fatalf("expected open ack reject on tunnel done cancel")
+	}
+	if writes[0].OpenAck.ErrorCode != ltfperrors.CodeConnectorDialFailed {
+		testingObject.Fatalf("unexpected open ack error code: %s", writes[0].OpenAck.ErrorCode)
+	}
+	if acceptor.IsReaderOwned("tunnel-done-1") {
+		testingObject.Fatalf("expected reader ownership released after tunnel done cancel")
 	}
 }
 

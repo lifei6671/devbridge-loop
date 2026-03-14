@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -60,6 +61,7 @@ type StreamRelayOptions struct {
 	BufferFrames        int
 	MaxDataFrameBytes   int
 	BackpressureTimeout time.Duration
+	Metrics             *obs.Metrics
 }
 
 // StreamRelay 是 Agent 侧默认双向 relay 实现。
@@ -72,6 +74,7 @@ type StreamRelay struct {
 	bufferFrames        int
 	maxDataFrameBytes   int
 	backpressureTimeout time.Duration
+	metrics             *obs.Metrics
 }
 
 // NewStreamRelay 创建默认 relay。
@@ -88,10 +91,16 @@ func NewStreamRelay(options StreamRelayOptions) *StreamRelay {
 	if backpressureTimeout <= 0 {
 		backpressureTimeout = defaultRelayBackpressure
 	}
+	metrics := options.Metrics
+	if metrics == nil {
+		// 未显式注入时回落默认指标容器，保证 runtime 指标链路可用。
+		metrics = obs.DefaultMetrics
+	}
 	return &StreamRelay{
 		bufferFrames:        bufferFrames,
 		maxDataFrameBytes:   maxDataFrameBytes,
 		backpressureTimeout: backpressureTimeout,
+		metrics:             metrics,
 	}
 }
 
@@ -224,6 +233,8 @@ func (relay *StreamRelay) writeTunnelDataToUpstream(
 			if err := writeAll(ctx, upstream, chunk); err != nil {
 				return fmt.Errorf("write upstream data: %w", err)
 			}
+			// tunnel->upstream 视为 Agent runtime 下行字节。
+			relay.observeDownloadBytes(len(chunk))
 		}
 	}
 }
@@ -279,6 +290,8 @@ func (relay *StreamRelay) writeUpstreamDataToTunnel(
 			if err := tunnel.WritePayload(ctx, payload); err != nil {
 				return fmt.Errorf("write tunnel data: traffic_id=%s: %w", trafficID, err)
 			}
+			// upstream->tunnel 视为 Agent runtime 上行字节。
+			relay.observeUploadBytes(len(chunk))
 		}
 	}
 }
@@ -324,4 +337,20 @@ func writeAll(ctx context.Context, writer io.Writer, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// observeUploadBytes 记录 runtime 上行累计字节。
+func (relay *StreamRelay) observeUploadBytes(byteCount int) {
+	if relay == nil || relay.metrics == nil {
+		return
+	}
+	relay.metrics.AddAgentTrafficUploadBytes(byteCount)
+}
+
+// observeDownloadBytes 记录 runtime 下行累计字节。
+func (relay *StreamRelay) observeDownloadBytes(byteCount int) {
+	if relay == nil || relay.metrics == nil {
+		return
+	}
+	relay.metrics.AddAgentTrafficDownloadBytes(byteCount)
 }

@@ -17,6 +17,7 @@ type Runtime struct {
 	cfg           Config
 	adminServer   *http.Server
 	controlServer *controlPlaneServer
+	dataPlane     *runtimeDataPlane
 }
 
 // Bootstrap prepares the runtime graph. It is intentionally minimal in the skeleton.
@@ -25,18 +26,30 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 		return nil, err
 	}
 	_ = ctx
+	// 先初始化数据面主链路依赖，确保控制面可复用同一份注册表真相源。
+	dataPlane, err := newRuntimeDataPlane(cfg)
+	if err != nil {
+		return nil, err
+	}
 	adminMux := http.NewServeMux()
 	if cfg.Admin.UIEnabled {
 		// 管理页面默认挂载到 /admin 前缀，保持后续 API 路径可扩展。
 		RegisterAdminUIRoutes(adminMux, AdminUIBasePath(), UIHandler())
 	}
-	controlServer, err := newControlPlaneServer(cfg.ControlPlane)
+	// 控制面与数据面共享注册表，避免“控制面更新了、数据面看不到”的分裂状态。
+	controlServer, err := newControlPlaneServer(cfg.ControlPlane, controlPlaneDependencies{
+		sessionRegistry: dataPlane.sessionRegistry,
+		serviceRegistry: dataPlane.serviceRegistry,
+		routeRegistry:   dataPlane.routeRegistry,
+		tunnelRegistry:  dataPlane.tunnelRegistry,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &Runtime{
 		cfg:           cfg,
 		controlServer: controlServer,
+		dataPlane:     dataPlane,
 		adminServer: &http.Server{
 			Addr:    cfg.Admin.ListenAddr,
 			Handler: adminMux,

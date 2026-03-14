@@ -181,6 +181,44 @@ type ServiceHealthReport struct {
 	Metadata            map[string]string      `json:"metadata,omitempty"`
 }
 
+// TunnelPoolReport 描述 Agent 向 Bridge 上报 tunnel 池状态的控制面消息。
+type TunnelPoolReport struct {
+	// SessionID 标识当前池状态归属的会话。
+	SessionID string `json:"sessionId,omitempty"`
+	// SessionEpoch 用于防止旧会话状态覆盖新会话。
+	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
+	// IdleCount 表示当前 idle tunnel 数量。
+	IdleCount int `json:"idleCount"`
+	// InUseCount 表示当前已被消费中的 tunnel 数量。
+	InUseCount int `json:"inUseCount"`
+	// TargetIdleCount 表示 Agent 期望维持的 idle 目标值。
+	TargetIdleCount int `json:"targetIdleCount"`
+	// Trigger 标识本次上报触发来源（事件或周期纠偏）。
+	Trigger string `json:"trigger,omitempty"`
+	// TimestampUnix 为上报发生时刻（Unix 秒）。
+	TimestampUnix int64 `json:"timestampUnix"`
+	// Metadata 承载扩展诊断字段。
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// TunnelRefillRequest 描述 Bridge 请求 Agent 扩容 tunnel 池的控制面消息。
+type TunnelRefillRequest struct {
+	// SessionID 标识补池请求归属的会话。
+	SessionID string `json:"sessionId,omitempty"`
+	// SessionEpoch 用于和 Agent 当前会话做代际匹配。
+	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
+	// RequestID 是补池请求幂等键。
+	RequestID string `json:"requestId"`
+	// RequestedIdleDelta 表示希望补齐的 idle 增量。
+	RequestedIdleDelta int `json:"requestedIdleDelta"`
+	// Reason 标识触发补池的原因。
+	Reason string `json:"reason,omitempty"`
+	// TimestampUnix 为请求创建时刻（Unix 秒）。
+	TimestampUnix int64 `json:"timestampUnix"`
+	// Metadata 承载扩展诊断字段。
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
 // ConnectorServiceTarget 描述 connector service 目标。
 type ConnectorServiceTarget struct {
 	ServiceKey string            `json:"serviceKey"`

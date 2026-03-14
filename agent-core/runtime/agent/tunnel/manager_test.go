@@ -86,6 +86,57 @@ func TestManagerPrebuildAndConsumeRefill(testingObject *testing.T) {
 	}
 }
 
+// TestManagerActivateIdleByTunnelID 验证可按 tunnelID 直接激活 idle 并触发补池。
+func TestManagerActivateIdleByTunnelID(testingObject *testing.T) {
+	testingObject.Parallel()
+	opener := &producerTestOpener{}
+	manager, err := NewManager(ManagerOptions{
+		Config: ManagerConfig{
+			MinIdle:           1,
+			MaxIdle:           4,
+			IdleTTL:           0,
+			MaxInflightOpens:  2,
+			TunnelOpenRate:    1000,
+			TunnelOpenBurst:   1000,
+			ReconcileInterval: time.Second,
+		},
+		Opener: opener,
+	})
+	if err != nil {
+		testingObject.Fatalf("new manager failed: %v", err)
+	}
+	if _, err := manager.ReconcileNow(context.Background(), "startup"); err != nil {
+		testingObject.Fatalf("startup reconcile failed: %v", err)
+	}
+	idleIDs := manager.registry.IdleIDs(1)
+	if len(idleIDs) != 1 {
+		testingObject.Fatalf("expected one idle tunnel, got=%d", len(idleIDs))
+	}
+	if err := manager.ActivateIdle(idleIDs[0]); err != nil {
+		testingObject.Fatalf("activate idle failed: %v", err)
+	}
+
+	snapshotAfterActivate := manager.Snapshot()
+	if snapshotAfterActivate.IdleCount != 0 || snapshotAfterActivate.ActiveCount != 1 {
+		testingObject.Fatalf(
+			"unexpected snapshot after activate: idle=%d active=%d",
+			snapshotAfterActivate.IdleCount,
+			snapshotAfterActivate.ActiveCount,
+		)
+	}
+	refillResult, err := manager.ReconcileNow(context.Background(), "after_activate")
+	if err != nil {
+		testingObject.Fatalf("reconcile after activate failed: %v", err)
+	}
+	if refillResult.After.IdleCount != 1 || refillResult.After.ActiveCount != 1 {
+		testingObject.Fatalf(
+			"unexpected snapshot after refill: idle=%d active=%d",
+			refillResult.After.IdleCount,
+			refillResult.After.ActiveCount,
+		)
+	}
+}
+
 // TestManagerBrokenRemoveAndRefill 验证 broken 摘除后会触发补池。
 func TestManagerBrokenRemoveAndRefill(testingObject *testing.T) {
 	testingObject.Parallel()

@@ -26,6 +26,13 @@ func TestIsKnownControlMessageType(t *testing.T) {
 	if !IsKnownControlMessageType(ControlMessagePublishService) {
 		t.Fatalf("expected known message type")
 	}
+	// 控制面池治理消息也应纳入已知类型集合。
+	if !IsKnownControlMessageType(ControlMessageTunnelPoolReport) {
+		t.Fatalf("expected tunnel pool report message type to be known")
+	}
+	if !IsKnownControlMessageType(ControlMessageTunnelRefillRequest) {
+		t.Fatalf("expected tunnel refill request message type to be known")
+	}
 	// 非协议内消息类型应返回 false。
 	if IsKnownControlMessageType(ControlMessageType("Unknown")) {
 		t.Fatalf("expected unknown message type")

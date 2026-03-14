@@ -7,6 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/control"
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/traffic"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
@@ -44,13 +48,31 @@ type Runtime struct {
 	tunnelIDSequence  uint64
 	bridgeCommandChan chan bridgeCommand
 
-	controlChannel transport.ControlChannel
-	tcpTransport   *tcpbinding.Transport
-	grpcTransport  *grpcbinding.Transport
-	grpcClient     transportgen.GRPCH2TransportServiceClient
-	grpcConn       *grpc.ClientConn
-	tunnelRegistry *tunnel.Registry
-	tunnelManager  *tunnel.Manager
+	controlChannel   transport.ControlChannel
+	tcpTransport     *tcpbinding.Transport
+	grpcTransport    *grpcbinding.Transport
+	grpcClient       transportgen.GRPCH2TransportServiceClient
+	grpcConn         *grpc.ClientConn
+	tunnelRegistry   *tunnel.Registry
+	tunnelManager    *tunnel.Manager
+	refillHandler    *control.RefillHandler
+	serviceCatalog   *service.Catalog
+	controlPublisher *control.Publisher
+	tunnelReporter   *control.TunnelReporter
+	healthReporter   *control.HealthReporter
+	trafficAcceptor  *traffic.Acceptor
+	trafficOpener    *traffic.Opener
+
+	trafficWakeupChannel chan struct{}
+	trafficWorkersMutex  sync.Mutex
+	trafficWorkers       map[string]struct{}
+	tunnelAssocMutex     sync.RWMutex
+	tunnelAssociations   map[string]tunnelAssociation
+	trafficStatsMutex    sync.Mutex
+	trafficStatsLastAt   time.Time
+	trafficUploadLast    uint64
+	trafficDownloadLast  uint64
+	metrics              *obs.Metrics
 
 	ipcServer  *localRPCServer
 	shutdownCh chan struct{}
@@ -73,14 +95,19 @@ func BootstrapWithOptions(ctx context.Context, cfg Config, options BootstrapOpti
 	if err := resolvedConfig.Validate(); err != nil {
 		return nil, err
 	}
-	_ = ctx
+	serviceCatalog := service.NewCatalog()
 	return &Runtime{
-		cfg:               resolvedConfig,
-		bridgeDesiredUp:   true,
-		bridgeState:       "CONNECTING",
-		updatedAt:         time.Now().UTC(),
-		bridgeCommandChan: make(chan bridgeCommand, 8),
-		shutdownCh:        make(chan struct{}),
+		cfg:                resolvedConfig,
+		bridgeDesiredUp:    true,
+		bridgeState:        "CONNECTING",
+		updatedAt:          time.Now().UTC(),
+		bridgeCommandChan:  make(chan bridgeCommand, 8),
+		serviceCatalog:     serviceCatalog,
+		controlPublisher:   control.NewPublisher("", 0, 0),
+		healthReporter:     control.NewHealthReporter(control.HealthReporterOptions{}),
+		tunnelAssociations: make(map[string]tunnelAssociation),
+		metrics:            obs.NewMetrics(),
+		shutdownCh:         make(chan struct{}),
 	}, nil
 }
 
@@ -101,6 +128,9 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return err
 	}
 	if err := r.initTunnelManager(); err != nil {
+		return err
+	}
+	if err := r.initTrafficRuntime(); err != nil {
 		return err
 	}
 	ipcServer, err := newLocalRPCServer(r)
@@ -131,6 +161,17 @@ func (r *Runtime) Run(ctx context.Context) error {
 	go func() {
 		tunnelErrChan <- r.tunnelManager.Start(runContext)
 	}()
+	if r.tunnelReporter != nil {
+		go func() {
+			// reporter 发送失败不应导致 runtime 退出，后续周期会继续纠偏。
+			_ = r.tunnelReporter.Run(runContext)
+		}()
+	}
+
+	trafficErrChan := make(chan error, 1)
+	go func() {
+		trafficErrChan <- r.runTrafficAcceptorLoop(runContext)
+	}()
 
 	serverErrChan := make(chan error, 1)
 	go func() {
@@ -159,6 +200,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 			return nil
 		}
 		return tunnelErr
+	case trafficErr := <-trafficErrChan:
+		_ = ipcServer.Close()
+		if errors.Is(trafficErr, context.Canceled) {
+			return nil
+		}
+		return trafficErr
 	}
 }
 

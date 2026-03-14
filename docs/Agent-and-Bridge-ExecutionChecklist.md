@@ -8,6 +8,7 @@
 
 - 本清单以 Agent/Bridge 运行时实现为主，不替代传输层专项清单 [LTFP-TransportExecutionChecklist.md](./LTFP-TransportExecutionChecklist.md)。
 - 本清单默认全部未勾选；如已有实现，可按“验收标准”回填勾选状态。
+- 当前 `UI -> Agent -> Bridge` 链路未实现项可参考 [UI-Agent-Bridge-Unimplemented-Checklist.md](./UI-Agent-Bridge-Unimplemented-Checklist.md)。
 
 ---
 

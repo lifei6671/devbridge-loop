@@ -78,7 +78,11 @@ func (handler *PublishHandler) HandlePublish(envelope pb.ControlEnvelope, messag
 	})
 	if decision.Status == pb.EventStatusAccepted {
 		// accepted 才会写入注册表，duplicate/rejected 都无副作用。
-		snapshot := buildServiceSnapshot(message, envelope.ResourceVersion)
+		snapshot := buildServiceSnapshot(
+			message,
+			envelope.ResourceVersion,
+			handler.resolveConnectorID(envelope),
+		)
 		handler.serviceRegistry.Upsert(handler.now(), snapshot)
 	}
 
@@ -188,13 +192,14 @@ func (handler *PublishHandler) rejectUnpublishAck(message pb.UnpublishService, e
 }
 
 // buildServiceSnapshot 将发布消息转为注册表快照。
-func buildServiceSnapshot(message pb.PublishService, resourceVersion uint64) pb.Service {
+func buildServiceSnapshot(message pb.PublishService, resourceVersion uint64, connectorID string) pb.Service {
 	serviceID := resolveServiceID(message.ServiceID, message.ServiceKey)
 	return pb.Service{
 		ServiceID:       serviceID,
 		ServiceKey:      message.ServiceKey,
 		Namespace:       message.Namespace,
 		Environment:     message.Environment,
+		ConnectorID:     strings.TrimSpace(connectorID),
 		ServiceName:     message.ServiceName,
 		ServiceType:     message.ServiceType,
 		Status:          pb.ServiceStatusActive,
@@ -207,6 +212,24 @@ func buildServiceSnapshot(message pb.PublishService, resourceVersion uint64) pb.
 		Labels:          message.Labels,
 		Metadata:        message.Metadata,
 	}
+}
+
+// resolveConnectorID 提取发布事件归属的 connector_id。
+func (handler *PublishHandler) resolveConnectorID(envelope pb.ControlEnvelope) string {
+	normalizedConnectorID := strings.TrimSpace(envelope.ConnectorID)
+	if normalizedConnectorID != "" {
+		// payload 已携带 connector_id 时直接采用。
+		return normalizedConnectorID
+	}
+	if handler.sessionRegistry == nil {
+		return ""
+	}
+	sessionSnapshot, exists := handler.sessionRegistry.GetBySession(envelope.SessionID)
+	if !exists {
+		return ""
+	}
+	// 回落到 session 视图，兼容旧端未显式透传 connector_id 的场景。
+	return strings.TrimSpace(sessionSnapshot.ConnectorID)
 }
 
 // resolveServiceID 解析服务主键。

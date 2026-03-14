@@ -396,6 +396,22 @@ func (manager *Manager) AcquireIdle(at time.Time) (*Record, bool) {
 	return record, true
 }
 
+// ActivateIdle 按 tunnelID 将 idle tunnel 激活为 active，并触发补池。
+func (manager *Manager) ActivateIdle(tunnelID string) error {
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return ErrTunnelNotFound
+	}
+	if _, err := manager.registry.ActivateIdleByID(manager.nowFn(), normalizedTunnelID); err != nil {
+		return err
+	}
+	// idle 被激活消费后立即触发补池，保持预建水位。
+	manager.RequestRefill(manager.config.MinIdle, "consume")
+	manager.updatePoolMetrics(manager.registry.Snapshot())
+	manager.emitEvent("tunnel_active")
+	return nil
+}
+
 // MarkActive 把 reserved tunnel 标记为 active。
 func (manager *Manager) MarkActive(tunnelID string) error {
 	normalizedTunnelID := strings.TrimSpace(tunnelID)

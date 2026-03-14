@@ -203,3 +203,35 @@ func (registry *ServiceRegistry) List() []pb.Service {
 	}
 	return result
 }
+
+// MarkLifecycleByConnector 按 connector 批量更新服务生命周期状态。
+func (registry *ServiceRegistry) MarkLifecycleByConnector(
+	now time.Time,
+	connectorID string,
+	status pb.ServiceStatus,
+	healthStatus pb.HealthStatus,
+) int {
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" {
+		// connector_id 为空时无法筛选目标服务。
+		return 0
+	}
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+
+	updatedCount := 0
+	for _, record := range registry.byServiceID {
+		if strings.TrimSpace(record.Service.ConnectorID) != normalizedConnectorID {
+			continue
+		}
+		record.Service.Status = status
+		record.Service.HealthStatus = healthStatus
+		record.UpdatedAt = normalizedNow
+		updatedCount++
+	}
+	return updatedCount
+}

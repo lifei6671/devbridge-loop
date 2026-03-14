@@ -11,6 +11,7 @@ import (
 
 type tunnelRegistryTestTunnel struct {
 	tunnelID string
+	closed   bool
 }
 
 func (tunnel *tunnelRegistryTestTunnel) ID() string {
@@ -29,6 +30,7 @@ func (tunnel *tunnelRegistryTestTunnel) WritePayload(ctx context.Context, payloa
 }
 
 func (tunnel *tunnelRegistryTestTunnel) Close() error {
+	tunnel.closed = true
 	return nil
 }
 
@@ -97,5 +99,40 @@ func TestTunnelRegistryAcquireFIFO(testingObject *testing.T) {
 			first.TunnelID,
 			second.TunnelID,
 		)
+	}
+}
+
+// TestTunnelRegistryPurgeBySession 验证按 session 摘除会关闭并移除对应 tunnel。
+func TestTunnelRegistryPurgeBySession(testingObject *testing.T) {
+	testingObject.Parallel()
+	registry := NewTunnelRegistry()
+	now := time.Now().UTC()
+	oldSessionTunnel := &tunnelRegistryTestTunnel{tunnelID: "tunnel-old"}
+	newSessionTunnel := &tunnelRegistryTestTunnel{tunnelID: "tunnel-new"}
+	if _, err := registry.UpsertIdle(now, "connector-1", "session-old", oldSessionTunnel); err != nil {
+		testingObject.Fatalf("upsert old session tunnel failed: %v", err)
+	}
+	if _, err := registry.UpsertIdle(now.Add(time.Millisecond), "connector-1", "session-new", newSessionTunnel); err != nil {
+		testingObject.Fatalf("upsert new session tunnel failed: %v", err)
+	}
+
+	purged := registry.PurgeBySession(now.Add(2*time.Millisecond), "session-old", "session takeover")
+	if len(purged) != 1 {
+		testingObject.Fatalf("unexpected purged tunnel count: got=%d want=1", len(purged))
+	}
+	if purged[0].TunnelID != "tunnel-old" || purged[0].State != TunnelStateBroken {
+		testingObject.Fatalf("unexpected purged tunnel snapshot: %+v", purged[0])
+	}
+	if _, exists := registry.Get("tunnel-old"); exists {
+		testingObject.Fatalf("expected old session tunnel removed from registry")
+	}
+	if _, exists := registry.Get("tunnel-new"); !exists {
+		testingObject.Fatalf("expected new session tunnel remains")
+	}
+	if !oldSessionTunnel.closed {
+		testingObject.Fatalf("expected old session tunnel closed")
+	}
+	if newSessionTunnel.closed {
+		testingObject.Fatalf("expected new session tunnel not closed")
 	}
 }

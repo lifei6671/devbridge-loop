@@ -147,6 +147,14 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 			}
 		})
 	}
+
+	serviceSnapshot, exists := handler.serviceRegistry.GetByServiceID("svc-1")
+	if !exists {
+		t.Fatalf("expected service snapshot exists after publish flow")
+	}
+	if serviceSnapshot.ConnectorID != "connector-1" {
+		t.Fatalf("unexpected connector_id: got=%s want=connector-1", serviceSnapshot.ConnectorID)
+	}
 }
 
 // TestPublishHandlerHandleUnpublish 验证下线处理器的幂等与删除行为。

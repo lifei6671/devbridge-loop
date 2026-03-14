@@ -145,8 +145,8 @@ func (r *SessionRegistry) SweepHeartbeatTimeout(now time.Time, timeout time.Dura
 	defer r.mu.Unlock()
 	var stale []SessionRuntime
 	for _, entry := range r.bySessionID {
-		if entry.State == SessionClosed {
-			// 已关闭的 session 不再处理。
+		if entry.State != SessionActive && entry.State != SessionDraining {
+			// 仅 ACTIVE/DRAINING 会话参与 heartbeat 判死，避免重复触发 STALE 副作用。
 			continue
 		}
 		if entry.LastHeartbeat.IsZero() {
