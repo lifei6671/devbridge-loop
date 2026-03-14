@@ -5,6 +5,7 @@ CARGO ?= cargo
 BIN_DIR := bin
 AGENT_CORE_BIN := $(BIN_DIR)/agent-core
 CLOUD_BRIDGE_BIN := $(BIN_DIR)/cloud-bridge
+CLOUD_BRIDGE_WEB_DIR := cloud-bridge/web
 DEMO_ORDER_BIN := $(BIN_DIR)/order-service
 DEMO_USER_BIN := $(BIN_DIR)/user-service
 DEMO_INVENTORY_BIN := $(BIN_DIR)/inventory-service
@@ -14,14 +15,17 @@ WIN_GOARCH ?= amd64
 WIN_CGO_ENABLED ?= 0
 WIN11_TAURI_TARGET ?= x86_64-pc-windows-gnu
 WIN11_TAURI_ARGS ?= --no-bundle
-TAURI_EXTRA_ARGS ?=
+TAURI_EXTRA_ARGS ?= --no-bundle
+UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
+IS_WINDOWS_HOST := $(if $(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)),1,0)
 
-.PHONY: help test test-go build-agent-core build-cloud-bridge build-go build-dev-agent-ui build-dev-agent-tauri build-dev-agent-tauri-cross build-demo-order build-demo-user build-demo-inventory build-demos run-demo-order run-demo-user run-demo-inventory build-win11 build-win11-go build-win11-dev-agent build-all clean
+.PHONY: help test test-go build-agent-core build-cloud-bridge-ui build-cloud-bridge build-go build-dev-agent-ui build-dev-agent-tauri build-dev-agent-tauri-cross build-demo-order build-demo-user build-demo-inventory build-demos run-demo-order run-demo-user run-demo-inventory build-win11 build-win11-go build-win11-dev-agent build-all clean
 
 help:
 	@echo "可用命令:"
 	@echo "  make test                 # 运行 Go 单元测试"
 	@echo "  make build-agent-core     # 编译 agent-core"
+	@echo "  make build-cloud-bridge-ui# 构建 Bridge 管理页面静态资源"
 	@echo "  make build-cloud-bridge   # 编译 cloud-bridge"
 	@echo "  make build-go             # 编译全部 Go 模块"
 	@echo "  make build-demos          # 编译 demo 服务（order/user/inventory）"
@@ -37,7 +41,8 @@ help:
 
 test: test-go
 
-test-go:
+# 运行 Go 测试前先构建 Bridge UI，避免 go:embed 因缺失 dist 目录编译失败。
+test-go: build-cloud-bridge-ui
 	cd agent-core && $(GO) test ./...
 	cd cloud-bridge && $(GO) test ./...
 
@@ -45,7 +50,16 @@ build-agent-core:
 	@mkdir -p $(BIN_DIR)
 	cd agent-core && $(GO) build -o ../$(AGENT_CORE_BIN) ./cmd/agent-core
 
-build-cloud-bridge:
+# 构建 Bridge Admin 前端静态资源（用于 go:embed 打包）。
+build-cloud-bridge-ui:
+	@if ! command -v $(NPM) >/dev/null 2>&1; then \
+		echo "未检测到 npm，请先安装 Node.js/npm。"; \
+		exit 1; \
+	fi
+	cd $(CLOUD_BRIDGE_WEB_DIR) && $(NPM) install
+	cd $(CLOUD_BRIDGE_WEB_DIR) && $(NPM) run build
+
+build-cloud-bridge: build-cloud-bridge-ui
 	@mkdir -p $(BIN_DIR)
 	cd cloud-bridge && $(GO) build -o ../$(CLOUD_BRIDGE_BIN) ./cmd/cloud-bridge
 
@@ -81,9 +95,6 @@ build-win11-go:
 	@echo ">> build windows binaries: GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) CGO_ENABLED=$(WIN_CGO_ENABLED)"
 	cd agent-core && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/agent-core.exe ./cmd/agent-core
 	cd cloud-bridge && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/cloud-bridge.exe ./cmd/cloud-bridge
-	cd examples && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/order-service.exe ./cmd/order-service
-	cd examples && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/user-service.exe ./cmd/user-service
-	cd examples && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/inventory-service.exe ./cmd/inventory-service
 
 # 在 WSL 下构建 Windows 版 dev-agent（包含前端依赖安装和前端打包）。
 # 默认使用 windows-gnu 目标，避免 WSL 下依赖 msvc 工具链。
@@ -140,11 +151,34 @@ build-dev-agent-tauri-cross:
 		echo "缺少 TAURI_TARGET。示例：make build-dev-agent-tauri-cross TAURI_TARGET=x86_64-pc-windows-msvc"; \
 		exit 1; \
 	fi
-	@if [ "$$(uname -s)" != "MINGW64_NT" ] && [ "$$(uname -s)" != "MSYS_NT" ] && [ "$$(uname -s)" != "CYGWIN_NT" ] && [ "$(findstring windows-msvc,$(TAURI_TARGET))" != "" ]; then \
+	@if ! command -v $(NPM) >/dev/null 2>&1; then \
+		echo "未检测到 npm，请先安装 Node.js/npm。"; \
+		exit 1; \
+	fi
+	@if ! command -v rustup >/dev/null 2>&1; then \
+		echo "未检测到 rustup，请先安装 Rust 工具链。"; \
+		exit 1; \
+	fi
+	@if [ "$(IS_WINDOWS_HOST)" != "1" ] && [ "$(findstring windows-msvc,$(TAURI_TARGET))" != "" ]; then \
 		echo "当前宿主不是 Windows/MSVC 环境，$(TAURI_TARGET) 需要 Visual Studio 工具链（lib.exe/llvm-rc）。"; \
 		echo "建议改用：make build-dev-agent-tauri-cross TAURI_TARGET=x86_64-pc-windows-gnu TAURI_EXTRA_ARGS='--no-bundle'"; \
 		exit 1; \
 	fi
+	@if ! rustup target list --installed | grep -q "^$(TAURI_TARGET)$$"; then \
+		echo ">> install rust target: $(TAURI_TARGET)"; \
+		rustup target add $(TAURI_TARGET); \
+	fi
+	@if [ "$(findstring x86_64-pc-windows-gnu,$(TAURI_TARGET))" != "" ] && ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+		echo "缺少 mingw 工具链：x86_64-w64-mingw32-gcc"; \
+		echo "请执行：sudo apt-get install -y gcc-mingw-w64-x86-64"; \
+		exit 1; \
+	fi
+	@if [ "$(findstring aarch64-pc-windows-gnu,$(TAURI_TARGET))" != "" ] && ! command -v aarch64-w64-mingw32-gcc >/dev/null 2>&1; then \
+		echo "缺少 mingw 工具链：aarch64-w64-mingw32-gcc"; \
+		echo "请执行：sudo apt-get install -y gcc-mingw-w64-aarch64"; \
+		exit 1; \
+	fi
+	cd apps/dev-agent && $(NPM) install
 	cd apps/dev-agent && $(NPM) run tauri:build -- --target $(TAURI_TARGET) $(TAURI_EXTRA_ARGS)
 
 build-all: build-go build-demos build-dev-agent-ui
