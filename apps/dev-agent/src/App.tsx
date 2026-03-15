@@ -5,6 +5,8 @@ import {
   Bell,
   Cable,
   ChartNoAxesCombined,
+  Check,
+  ChevronDown,
   CircleHelp,
   Cloud,
   Cpu,
@@ -23,7 +25,7 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { NetworkRateValue } from "@/components/traffic/network_rate_value";
@@ -438,41 +440,49 @@ function FieldHelpTooltip(props: {
   const [isOpen, setIsOpen] = useState(false);
   const [layout, setLayout] = useState<{ left: number; top: number; width: number } | null>(null);
 
+  const openTooltip = useCallback(() => {
+    setLayout(null);
+    setIsOpen(true);
+  }, []);
+
+  const closeTooltip = useCallback(() => {
+    setIsOpen(false);
+  }, []);
+
   const updateTooltipLayout = useCallback(() => {
     if (!isOpen || !triggerRef.current) {
       return;
     }
     const viewportPadding = 12;
-    const horizontalGap = 8;
-    const verticalGap = 10;
+    const horizontalGap = 4;
+    const verticalGap = 0;
     const triggerRect = triggerRef.current.getBoundingClientRect();
     const preferredWidth = window.innerWidth >= 1024 ? 280 : 260;
     const tooltipWidth = Math.min(preferredWidth, Math.max(180, window.innerWidth - viewportPadding * 2));
 
-    let left = triggerRect.right + horizontalGap;
-    if (left + tooltipWidth > window.innerWidth - viewportPadding) {
-      left = triggerRect.left - tooltipWidth - horizontalGap;
+    const rightPreferredLeft = triggerRect.right + horizontalGap;
+    const leftPreferredLeft = triggerRect.left - tooltipWidth - horizontalGap;
+    const centerPreferredLeft = triggerRect.left + triggerRect.width / 2 - tooltipWidth / 2;
+    let left = rightPreferredLeft;
+    if (rightPreferredLeft + tooltipWidth > window.innerWidth - viewportPadding) {
+      if (leftPreferredLeft >= viewportPadding) {
+        left = leftPreferredLeft;
+      } else {
+        left = centerPreferredLeft;
+      }
     }
-    if (left < viewportPadding) {
-      left = viewportPadding;
-    }
-    if (left + tooltipWidth > window.innerWidth - viewportPadding) {
-      left = Math.max(viewportPadding, window.innerWidth - viewportPadding - tooltipWidth);
-    }
+    const maxLeft = Math.max(viewportPadding, window.innerWidth - viewportPadding - tooltipWidth);
+    left = Math.min(maxLeft, Math.max(viewportPadding, left));
 
     const measuredHeight = tooltipRef.current?.offsetHeight ?? 132;
-    let top = triggerRect.bottom + verticalGap;
-    if (top + measuredHeight > window.innerHeight - viewportPadding) {
-      top = triggerRect.top - measuredHeight - verticalGap;
-    }
-    if (top < viewportPadding) {
-      top = viewportPadding;
-    }
+    const centerAlignedTop = triggerRect.top + triggerRect.height / 2 - measuredHeight / 2 + verticalGap;
+    const maxTop = Math.max(viewportPadding, window.innerHeight - viewportPadding - measuredHeight);
+    const top = Math.min(maxTop, Math.max(viewportPadding, centerAlignedTop));
 
     setLayout({ left, top, width: tooltipWidth });
   }, [isOpen]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isOpen) {
       setLayout(null);
       return;
@@ -505,8 +515,8 @@ function FieldHelpTooltip(props: {
   return (
     <span
       className="relative inline-flex items-center"
-      onMouseEnter={() => setIsOpen(true)}
-      onMouseLeave={() => setIsOpen(false)}
+      onMouseEnter={openTooltip}
+      onMouseLeave={closeTooltip}
     >
       <button
         type="button"
@@ -514,8 +524,15 @@ function FieldHelpTooltip(props: {
         aria-label={`${props.label} 配置说明`}
         aria-describedby={tooltipId}
         aria-expanded={isOpen}
-        onClick={() => setIsOpen((prev) => !prev)}
-        onBlur={() => setIsOpen(false)}
+        onFocus={openTooltip}
+        onClick={() => {
+          if (isOpen) {
+            closeTooltip();
+          } else {
+            openTooltip();
+          }
+        }}
+        onBlur={closeTooltip}
         className="inline-flex h-4 w-4 items-center justify-center rounded-full text-[#8a97b0] transition hover:text-[#4a5f86] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea6f3] focus-visible:ring-offset-1"
       >
         <CircleHelp className="h-3.5 w-3.5" aria-hidden />
@@ -536,7 +553,7 @@ function FieldHelpTooltip(props: {
         className={cn(
           "pointer-events-none fixed z-20 rounded-lg border border-[#314469] bg-[#1f2d49] px-3 py-2.5 text-left shadow-xl transition",
           layout ? "" : "left-0 top-0",
-          isOpen ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0",
+          isOpen && layout ? "visible translate-y-0 opacity-100" : "invisible translate-y-0 opacity-0",
         )}
       >
         <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">用法</span>
@@ -821,6 +838,93 @@ const LOG_LEVEL_RANK: Record<string, number> = {
   fatal: 60,
 };
 
+const KNOWN_DIAGNOSE_ERROR_CODES: string[] = [
+  "AGENT_EXIT_EXPECTED",
+  "AGENT_EXIT_UNEXPECTED",
+  "AGENT_START_FAILED",
+  "AGENT_STARTED",
+  "AGENT_STOPPED",
+  "AGENT_STOPPING",
+  "AGENT_WAIT_FAILED",
+  "APP_BOOTSTRAP_NOOP",
+  "APP_BOOTSTRAP_SCHEDULED",
+  "AUTH_FAILED",
+  "AUTH_FLOW_INVALID",
+  "AUTH_REQUIRED",
+  "AUTO_RESTART_FAILED",
+  "AUTO_RESTART_TRIGGERED",
+  "BRIDGE_CONTROL_ERROR",
+  "BRIDGE_RECONNECT_ESTABLISHED",
+  "BRIDGE_RETRY_SCHEDULED",
+  "BRIDGE_STATE_ACTIVE",
+  "BRIDGE_STATE_CLOSED",
+  "BRIDGE_STATE_CONNECTING",
+  "BRIDGE_STATE_DRAINING",
+  "BRIDGE_STATE_STALE",
+  "BRIDGE_UNAVAILABLE",
+  "CRASH_INJECTED",
+  "DIAGNOSE_LOGS_METHOD_NOT_READY",
+  "DIAGNOSE_LOGS_SNAPSHOT",
+  "DIAGNOSE_SNAPSHOT_METHOD_NOT_READY",
+  "EVENT_EMIT_FAILED",
+  "HOST_CONFIG_DIAGNOSE_FILTER_UPDATED",
+  "HOST_CONFIG_UPDATED",
+  "IPC_CONNECTED",
+  "IPC_CONNECTING",
+  "IPC_CONNECT_FAILED",
+  "IPC_DISCONNECTED",
+  "IPC_DISCONNECTING",
+  "IPC_RECONNECTING",
+  "IPC_RESYNCING",
+  "REFILL_REJECTED",
+  "RPC_BOOTSTRAP_FAILED",
+  "RPC_CONNECTED",
+  "RPC_EVENT_DRAINED",
+  "RPC_PING_DEGRADED",
+  "RPC_PING_FAILED",
+  "RPC_RESYNC_FAILED",
+  "RPC_SNAPSHOT_DEGRADED",
+  "RUNTIME_EVENT",
+  "SERVICE_ADD_METHOD_NOT_READY",
+  "SERVICE_ADD_SUCCEEDED",
+  "SERVICE_LIST_METHOD_NOT_READY",
+  "SERVICE_LIST_SNAPSHOT",
+  "SERVICE_SYNC_FAILED",
+  "SESSION_DRAIN_TRIGGERED",
+  "SESSION_RECONNECT_REQUESTED",
+  "SESSION_RECONNECT_TRIGGERED",
+  "SESSION_SNAPSHOT_FAILED",
+  "SESSION_SNAPSHOT_METHOD_NOT_READY",
+  "TRAFFIC_STATS_FALLBACK_HOST",
+  "TUNNEL_ACTIVE",
+  "TUNNEL_CLEANUP_BROKEN",
+  "TUNNEL_CLEANUP_CLOSED",
+  "TUNNEL_DIAL_ANNOUNCED",
+  "TUNNEL_DIAL_ANNOUNCE_BUILD_FAILED",
+  "TUNNEL_DIAL_ANNOUNCE_SEND_FAILED",
+  "TUNNEL_IDLE_ACQUIRED",
+  "TUNNEL_IDLE_TTL_REAPED",
+  "TUNNEL_LIST_METHOD_NOT_READY",
+  "TUNNEL_LIST_SNAPSHOT",
+  "TUNNEL_POOL_CHANGED",
+  "TUNNEL_POOL_EVENT",
+  "TUNNEL_POOL_REBUILT",
+  "TUNNEL_POOL_REPORT_FAILED",
+  "TUNNEL_POOL_REPORT_TRIGGERED",
+  "TUNNEL_POOL_SESSION_ACTIVE",
+  "TUNNEL_POOL_SESSION_DRAINING",
+  "TUNNEL_POOL_SESSION_STALE",
+  "TUNNEL_POOL_STARTUP_RECONCILE_FAILED",
+  "TUNNEL_REFILL_APPLIED",
+  "TUNNEL_REFILL_EXPANSION_CHECK",
+  "TUNNEL_REFILL_IGNORED",
+  "TUNNEL_REFILL_PAYLOAD_INVALID",
+  "TUNNEL_REFILL_REJECTED",
+  "TUNNEL_REFILL_REQUESTED",
+  "TUNNEL_REFILL_REQUEST_RECEIVED",
+  "UPSTREAM_RESET",
+];
+
 function logLevelRank(level: string): number {
   const normalized = level.trim().toLowerCase();
   return LOG_LEVEL_RANK[normalized] ?? LOG_LEVEL_RANK.info;
@@ -997,11 +1101,18 @@ export default function App(): JSX.Element {
     bridge: true,
     tunnel: true,
   });
+  const [diagnoseCodeFilter, setDiagnoseCodeFilter] = useState<string[]>([]);
+  const [diagnoseCodeSearchText, setDiagnoseCodeSearchText] = useState("");
+  const [diagnoseCodeDropdownOpen, setDiagnoseCodeDropdownOpen] = useState(false);
+  const [diagnoseKnownAndObservedCodes, setDiagnoseKnownAndObservedCodes] = useState<string[]>(() =>
+    Array.from(new Set(KNOWN_DIAGNOSE_ERROR_CODES)).sort((left, right) => left.localeCompare(right)),
+  );
   const [busyCommand, setBusyCommand] = useState<RuntimeCommand | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const [nowTsMs, setNowTsMs] = useState(() => Date.now());
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft | null>(null);
   const diagnoseFilterSaveSeqRef = useRef(0);
+  const diagnoseCodeDropdownRef = useRef<HTMLDivElement | null>(null);
   const shownHostLogToastKeysRef = useRef<Set<string>>(new Set());
   const shownRuntimeErrorRef = useRef<string | null>(null);
   const { trafficSnapshot, trafficHistory, refreshTrafficStats } = useTrafficStats();
@@ -1588,7 +1699,7 @@ export default function App(): JSX.Element {
   const diagnoseCategoryAllEnabled =
     diagnoseCategoryFilter.ipc && diagnoseCategoryFilter.bridge && diagnoseCategoryFilter.tunnel;
 
-  const diagnoseDisplayLogs = useMemo(() => {
+  const diagnoseSourceLogs = useMemo(() => {
     const hostDiagnoseLikeLogs: DiagnoseLogEntry[] = hostLogs.map((log) => ({
       ts_ms: log.ts_ms,
       level: log.level,
@@ -1602,9 +1713,32 @@ export default function App(): JSX.Element {
       trigger: undefined,
       reason: undefined,
     }));
-    const source = [...diagnoseLogs, ...hostDiagnoseLikeLogs]
+    return [...diagnoseLogs, ...hostDiagnoseLikeLogs]
       .sort((left, right) => right.ts_ms - left.ts_ms)
       .slice(0, 160);
+  }, [diagnoseLogs, hostLogs]);
+
+  useEffect(() => {
+    setDiagnoseKnownAndObservedCodes((previousCodes) => {
+      const mergedCodes = new Set(previousCodes.map((item) => item.trim()).filter((item) => item.length > 0));
+      let changed = false;
+      diagnoseSourceLogs.forEach((log) => {
+        const normalizedCode = log.code.trim();
+        if (!normalizedCode || mergedCodes.has(normalizedCode)) {
+          return;
+        }
+        mergedCodes.add(normalizedCode);
+        changed = true;
+      });
+      if (!changed) {
+        return previousCodes;
+      }
+      return Array.from(mergedCodes).sort((left, right) => left.localeCompare(right));
+    });
+  }, [diagnoseSourceLogs]);
+
+  const diagnosePreFilteredLogs = useMemo(() => {
+    const source = diagnoseSourceLogs;
     const threshold = logLevelRank(diagnoseMinLevel);
     return source.filter((log) => {
       if (logLevelRank(log.level) < threshold) {
@@ -1613,7 +1747,137 @@ export default function App(): JSX.Element {
       const category = classifyDiagnoseCategory(log);
       return diagnoseCategoryFilter[category];
     });
-  }, [diagnoseCategoryFilter, diagnoseLogs, diagnoseMinLevel, hostLogs]);
+  }, [diagnoseCategoryFilter, diagnoseMinLevel, diagnoseSourceLogs]);
+
+  const diagnoseCodeOptions = useMemo(() => {
+    const countsByCode = new Map<string, number>();
+    diagnosePreFilteredLogs.forEach((log) => {
+      const normalizedCode = log.code.trim();
+      if (!normalizedCode) {
+        return;
+      }
+      countsByCode.set(normalizedCode, (countsByCode.get(normalizedCode) ?? 0) + 1);
+    });
+
+    const candidateCodeSet = new Set<string>();
+    diagnoseKnownAndObservedCodes.forEach((code) => {
+      const normalizedCode = code.trim();
+      if (!normalizedCode) {
+        return;
+      }
+      candidateCodeSet.add(normalizedCode);
+    });
+    diagnoseCodeFilter.forEach((selectedCode) => {
+      const normalizedCode = selectedCode.trim();
+      if (!normalizedCode) {
+        return;
+      }
+      candidateCodeSet.add(normalizedCode);
+    });
+    countsByCode.forEach((_count, code) => {
+      candidateCodeSet.add(code);
+    });
+
+    const selectedCodeSet = new Set(
+      diagnoseCodeFilter.map((code) => code.trim()).filter((code) => code.length > 0),
+    );
+    return Array.from(candidateCodeSet)
+      .map((code) => ({ code, count: countsByCode.get(code) ?? 0 }))
+      .sort((left, right) => {
+        const leftSelected = selectedCodeSet.has(left.code);
+        const rightSelected = selectedCodeSet.has(right.code);
+        if (leftSelected !== rightSelected) {
+          return leftSelected ? -1 : 1;
+        }
+        if (left.count !== right.count) {
+          return right.count - left.count;
+        }
+        return left.code.localeCompare(right.code);
+      });
+  }, [diagnoseCodeFilter, diagnoseKnownAndObservedCodes, diagnosePreFilteredLogs]);
+
+  const diagnoseCodeFilterSet = useMemo(() => {
+    const filteredCodes = diagnoseCodeFilter
+      .map((code) => code.trim())
+      .filter((code) => code.length > 0);
+    return new Set(filteredCodes);
+  }, [diagnoseCodeFilter]);
+
+  const diagnoseCodeSearchNormalized = diagnoseCodeSearchText.trim().toLowerCase();
+  const diagnoseVisibleCodeOptions = useMemo(() => {
+    if (!diagnoseCodeSearchNormalized) {
+      return diagnoseCodeOptions;
+    }
+    return diagnoseCodeOptions.filter((option) =>
+      option.code.toLowerCase().includes(diagnoseCodeSearchNormalized),
+    );
+  }, [diagnoseCodeOptions, diagnoseCodeSearchNormalized]);
+
+  const diagnoseDisplayLogs = useMemo(() => {
+    if (diagnoseCodeFilterSet.size === 0) {
+      return diagnosePreFilteredLogs;
+    }
+    return diagnosePreFilteredLogs.filter((log) => diagnoseCodeFilterSet.has(log.code.trim()));
+  }, [diagnoseCodeFilterSet, diagnosePreFilteredLogs]);
+
+  const diagnoseCodeFilterAllEnabled = diagnoseCodeFilterSet.size === 0;
+  const diagnoseCodeFilterSummary = useMemo(() => {
+    const selectedCodes = Array.from(diagnoseCodeFilterSet);
+    if (selectedCodes.length === 0) {
+      return "全部错误码";
+    }
+    if (selectedCodes.length <= 2) {
+      return selectedCodes.join(", ");
+    }
+    return `${selectedCodes.slice(0, 2).join(", ")} +${selectedCodes.length - 2}`;
+  }, [diagnoseCodeFilterSet]);
+
+  const toggleDiagnoseCodeFilter = useCallback((code: string) => {
+    const normalizedCode = code.trim();
+    if (!normalizedCode) {
+      return;
+    }
+    setDiagnoseCodeFilter((prev) => {
+      const exists = prev.some((item) => item.trim() === normalizedCode);
+      if (exists) {
+        return prev.filter((item) => item.trim() !== normalizedCode);
+      }
+      return [...prev, normalizedCode];
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!diagnoseCodeDropdownOpen) {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!diagnoseCodeDropdownRef.current) {
+        return;
+      }
+      const target = event.target;
+      if (target instanceof Node && diagnoseCodeDropdownRef.current.contains(target)) {
+        return;
+      }
+      setDiagnoseCodeDropdownOpen(false);
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setDiagnoseCodeDropdownOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", handlePointerDown);
+    window.addEventListener("keydown", handleEscape);
+    return () => {
+      window.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("keydown", handleEscape);
+    };
+  }, [diagnoseCodeDropdownOpen]);
+
+  useEffect(() => {
+    if (activeNav !== "diagnose") {
+      setDiagnoseCodeDropdownOpen(false);
+    }
+  }, [activeNav]);
 
   const agentVersion = useMemo(() => {
     const entry = hostLogs.find((log) => log.message.toLowerCase().includes("version"));
@@ -2297,101 +2561,194 @@ export default function App(): JSX.Element {
           <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} compact />
           <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} compact />
         </div>
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-xs text-[#5d6983]">操作类型</span>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
-                diagnoseCategoryAllEnabled
-                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
-                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
-              )}
-              onClick={() =>
-                applyDiagnoseCategoryFilter(() => ({
-                  ipc: true,
-                  bridge: true,
-                  tunnel: true,
-                }))
-              }
-            >
-              全部
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
-                diagnoseCategoryFilter.ipc
-                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
-                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
-              )}
-              onClick={() =>
-                applyDiagnoseCategoryFilter((prev) => {
-                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
-                  if (prev.ipc && enabledCount === 1) {
-                    return prev;
-                  }
-                  return { ...prev, ipc: !prev.ipc };
-                })
-              }
-            >
-              IPC
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
-                diagnoseCategoryFilter.bridge
-                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
-                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
-              )}
-              onClick={() =>
-                applyDiagnoseCategoryFilter((prev) => {
-                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
-                  if (prev.bridge && enabledCount === 1) {
-                    return prev;
-                  }
-                  return { ...prev, bridge: !prev.bridge };
-                })
-              }
-            >
-              Bridge
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
-                diagnoseCategoryFilter.tunnel
-                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
-                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
-              )}
-              onClick={() =>
-                applyDiagnoseCategoryFilter((prev) => {
-                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
-                  if (prev.tunnel && enabledCount === 1) {
-                    return prev;
-                  }
-                  return { ...prev, tunnel: !prev.tunnel };
-                })
-              }
-            >
-              Tunnel
-            </button>
+        <div className="mb-3 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-[#5d6983]">操作类型</span>
+              <button
+                type="button"
+                className={cn(
+                  "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                  diagnoseCategoryAllEnabled
+                    ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                    : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+                )}
+                onClick={() =>
+                  applyDiagnoseCategoryFilter(() => ({
+                    ipc: true,
+                    bridge: true,
+                    tunnel: true,
+                  }))
+                }
+              >
+                全部
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                  diagnoseCategoryFilter.ipc
+                    ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                    : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+                )}
+                onClick={() =>
+                  applyDiagnoseCategoryFilter((prev) => {
+                    const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                    if (prev.ipc && enabledCount === 1) {
+                      return prev;
+                    }
+                    return { ...prev, ipc: !prev.ipc };
+                  })
+                }
+              >
+                IPC
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                  diagnoseCategoryFilter.bridge
+                    ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                    : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+                )}
+                onClick={() =>
+                  applyDiagnoseCategoryFilter((prev) => {
+                    const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                    if (prev.bridge && enabledCount === 1) {
+                      return prev;
+                    }
+                    return { ...prev, bridge: !prev.bridge };
+                  })
+                }
+              >
+                Bridge
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                  diagnoseCategoryFilter.tunnel
+                    ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                    : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+                )}
+                onClick={() =>
+                  applyDiagnoseCategoryFilter((prev) => {
+                    const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                    if (prev.tunnel && enabledCount === 1) {
+                      return prev;
+                    }
+                    return { ...prev, tunnel: !prev.tunnel };
+                  })
+                }
+              >
+                Tunnel
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-[#5d6983]">最小日志级别</span>
+              <select
+                value={diagnoseMinLevel}
+                className="h-8 rounded-lg border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#43506b]"
+                onChange={(event) => setDiagnoseMinLevel(event.target.value)}
+              >
+                <option value="trace">TRACE 及以上</option>
+                <option value="debug">DEBUG 及以上</option>
+                <option value="info">INFO 及以上</option>
+                <option value="warn">WARN 及以上</option>
+                <option value="error">ERROR 及以上</option>
+              </select>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-[#5d6983]">最小日志级别</span>
-            <select
-              value={diagnoseMinLevel}
-              className="h-8 rounded-lg border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#43506b]"
-              onChange={(event) => setDiagnoseMinLevel(event.target.value)}
-            >
-              <option value="trace">TRACE 及以上</option>
-              <option value="debug">DEBUG 及以上</option>
-              <option value="info">INFO 及以上</option>
-              <option value="warn">WARN 及以上</option>
-              <option value="error">ERROR 及以上</option>
-            </select>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-[#5d6983]">错误码过滤</span>
+            <div ref={diagnoseCodeDropdownRef} className="relative">
+              <button
+                type="button"
+                className={cn(
+                  "flex h-8 w-[360px] max-w-[calc(100vw-72px)] min-w-[220px] items-center justify-between gap-2 rounded-lg border px-2.5 text-xs transition",
+                  diagnoseCodeDropdownOpen
+                    ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                    : "border-[#d8dfeb] bg-white text-[#43506b] hover:border-[#bcc9df]",
+                )}
+                onClick={() => setDiagnoseCodeDropdownOpen((prev) => !prev)}
+              >
+                <span className="truncate text-left">{diagnoseCodeFilterSummary}</span>
+                <ChevronDown
+                  className={cn("h-3.5 w-3.5 shrink-0 transition-transform", diagnoseCodeDropdownOpen && "rotate-180")}
+                  aria-hidden
+                />
+              </button>
+              {diagnoseCodeDropdownOpen ? (
+                <div className="absolute left-0 top-[calc(100%+6px)] z-30 w-[360px] max-w-[calc(100vw-72px)] rounded-xl border border-[#d9e2f2] bg-white p-2 shadow-[0_16px_30px_rgba(25,47,89,0.16)]">
+                  <div className="flex items-center gap-2">
+                    <Input
+                      value={diagnoseCodeSearchText}
+                      onChange={(event) => setDiagnoseCodeSearchText(event.target.value)}
+                      placeholder="搜索错误码，例如 TUNNEL_"
+                      className="h-8 rounded-md border-[#d8dfeb] px-2 text-xs"
+                    />
+                    <button
+                      type="button"
+                      className="h-8 shrink-0 rounded-md border border-[#d8dfeb] px-2.5 text-xs text-[#5a6783] transition hover:border-[#bcc9df] hover:text-[#34405a]"
+                      onClick={() => setDiagnoseCodeFilter([])}
+                    >
+                      全部
+                    </button>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between px-0.5 text-[11px] text-[#73829f]">
+                    <span>已选 {diagnoseCodeFilterSet.size} 项</span>
+                    <span>已知 + 动态新增错误码</span>
+                  </div>
+                  <div className="agent-scroll mt-2 max-h-[220px] overflow-y-auto rounded-lg border border-[#e5eaf4] bg-[#f8fbff] p-1.5">
+                    <div className="space-y-1">
+                      {diagnoseVisibleCodeOptions.length === 0 ? (
+                        <span className="block px-1.5 py-1 text-xs text-[#8190aa]">暂无匹配错误码</span>
+                      ) : null}
+                      {diagnoseVisibleCodeOptions.map((option) => {
+                        const selected = diagnoseCodeFilterSet.has(option.code);
+                        return (
+                          <button
+                            key={option.code}
+                            type="button"
+                            className={cn(
+                              "flex h-8 w-full items-center justify-between rounded-md border px-2 text-xs transition",
+                              selected
+                                ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                                : "border-[#d8dfeb] bg-white text-[#5f6c88] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+                            )}
+                            onClick={() => toggleDiagnoseCodeFilter(option.code)}
+                          >
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span
+                                className={cn(
+                                  "flex h-4 w-4 shrink-0 items-center justify-center rounded border",
+                                  selected
+                                    ? "border-[#5f8ce0] bg-[#5f8ce0] text-white"
+                                    : "border-[#c8d3e7] bg-white text-transparent",
+                                )}
+                              >
+                                <Check className="h-3 w-3" />
+                              </span>
+                              <span className="truncate">{option.code}</span>
+                            </span>
+                            <span className="ml-2 shrink-0 text-[11px] opacity-75">{option.count}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            {!diagnoseCodeFilterAllEnabled ? (
+              <button
+                type="button"
+                className="h-7 rounded-md border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#5f6c88] transition hover:border-[#bcc9df] hover:text-[#3f4b66]"
+                onClick={() => setDiagnoseCodeFilter([])}
+              >
+                清空选择
+              </button>
+            ) : null}
           </div>
         </div>
         <div className="agent-scroll min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#e5eaf4]">

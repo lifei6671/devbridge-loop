@@ -88,11 +88,12 @@ func (r *Runtime) initTrafficRuntime() error {
 }
 
 // NotifyEvent 实现 tunnel.PoolEventNotifier，统一分发池事件到 data-plane 与上报器。
-func (r *Runtime) NotifyEvent(trigger string) {
+func (r *Runtime) NotifyEvent(trigger string, reason string) {
 	if r == nil {
 		return
 	}
-	r.recordTunnelPoolDiagnoseEvent(trigger)
+	r.recordTunnelPoolDiagnoseEvent(trigger, reason)
+	normalizedTrigger := strings.TrimSpace(trigger)
 	if r.trafficWakeupChannel != nil {
 		select {
 		case r.trafficWakeupChannel <- struct{}{}:
@@ -101,16 +102,17 @@ func (r *Runtime) NotifyEvent(trigger string) {
 	}
 	if r.tunnelReporter != nil {
 		// 事件驱动上报用于减少 Bridge 与 Agent 的池状态漂移。
-		r.tunnelReporter.NotifyEvent(trigger)
+		r.tunnelReporter.NotifyEvent(normalizedTrigger)
 	}
 }
 
 // recordTunnelPoolDiagnoseEvent 将 tunnel pool 治理事件写入 runtime 诊断日志，供 UI 统一观测。
-func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string) {
+func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string, reason string) {
 	if r == nil {
 		return
 	}
 	normalizedTrigger := strings.TrimSpace(trigger)
+	normalizedReason := strings.TrimSpace(reason)
 	if normalizedTrigger == "" {
 		return
 	}
@@ -132,6 +134,8 @@ func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string) {
 		code = "TUNNEL_ACTIVE"
 	case "pool_changed":
 		code = "TUNNEL_POOL_CHANGED"
+	case "pool_rebuilt":
+		code = "TUNNEL_POOL_REBUILT"
 	case "session_draining":
 		code = "TUNNEL_POOL_SESSION_DRAINING"
 	case "session_stale":
@@ -151,15 +155,26 @@ func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string) {
 		poolSnapshot = r.tunnelManager.Snapshot()
 	}
 	sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
+	message := fmt.Sprintf(
+		"tunnel pool event trigger=%s idle=%d active=%d total=%d",
+		normalizedTrigger,
+		poolSnapshot.IdleCount,
+		poolSnapshot.ActiveCount,
+		poolSnapshot.TotalCount,
+	)
+	if normalizedReason != "" {
+		message = fmt.Sprintf("%s reason=%s", message, normalizedReason)
+	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
 		Level:        level,
 		Module:       "agent.runtime.tunnel",
 		Code:         code,
-		Message:      fmt.Sprintf("tunnel pool event trigger=%s idle=%d active=%d total=%d", normalizedTrigger, poolSnapshot.IdleCount, poolSnapshot.ActiveCount, poolSnapshot.TotalCount),
+		Message:      message,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
 		BridgeState:  bridgeState,
 		Trigger:      normalizedTrigger,
+		Reason:       normalizedReason,
 	})
 }
 
@@ -307,7 +322,7 @@ func (r *Runtime) cleanupTunnelAfterTraffic(tunnelID string, reason string) {
 	}
 	// tunnel 回收后同步清理关联信息，避免 UI 读取到陈旧关联。
 	r.removeTunnelAssociation(normalizedTunnelID)
-	if err := r.tunnelManager.CloseAndRemove(normalizedTunnelID); err == nil || errors.Is(err, tunnel.ErrTunnelNotFound) {
+	if err := r.tunnelManager.CloseAndRemoveWithReason(normalizedTunnelID, strings.TrimSpace(reason)); err == nil || errors.Is(err, tunnel.ErrTunnelNotFound) {
 		return
 	}
 	// 兜底走 broken 回收，避免状态机停留在中间态。

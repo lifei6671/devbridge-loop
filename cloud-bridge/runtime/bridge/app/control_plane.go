@@ -1396,26 +1396,76 @@ func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
 	return nil
 }
 
-// resolveSingleActiveSessionOwner 在当前会话视图中解析唯一 ACTIVE session 作为 tunnel 归属。
+// resolveSingleActiveSessionOwner 在当前会话视图中解析 tunnel 归属。
+//
+// 规则：
+//  1. 仅允许单 connector 活跃；多 connector 同时 ACTIVE 仍视为歧义。
+//  2. 同 connector 若存在重复 ACTIVE session（如 Agent 快速重启导致 epoch 相同并存），
+//     优先使用 sessionRegistry 的 connector 当前映射，避免误判 owner 缺失导致入站 tunnel 被立即关闭。
 func (server *controlPlaneServer) resolveSingleActiveSessionOwner() (string, string, uint64, bool) {
 	if server == nil || server.dispatcher == nil || server.dispatcher.sessionRegistry == nil {
 		return "", "", 0, false
 	}
 	sessionItems := server.dispatcher.sessionRegistry.List()
 	candidates := make([]registry.SessionRuntime, 0, len(sessionItems))
+	connectorSet := make(map[string]struct{}, len(sessionItems))
 	for _, sessionRuntime := range sessionItems {
 		if sessionRuntime.State != registry.SessionActive {
 			continue
 		}
-		if strings.TrimSpace(sessionRuntime.ConnectorID) == "" || strings.TrimSpace(sessionRuntime.SessionID) == "" {
+		sessionRuntime.ConnectorID = strings.TrimSpace(sessionRuntime.ConnectorID)
+		sessionRuntime.SessionID = strings.TrimSpace(sessionRuntime.SessionID)
+		if sessionRuntime.ConnectorID == "" || sessionRuntime.SessionID == "" {
 			continue
 		}
 		candidates = append(candidates, sessionRuntime)
+		connectorSet[sessionRuntime.ConnectorID] = struct{}{}
 	}
-	if len(candidates) != 1 {
+	if len(candidates) == 0 {
 		return "", "", 0, false
 	}
-	return strings.TrimSpace(candidates[0].ConnectorID), strings.TrimSpace(candidates[0].SessionID), candidates[0].Epoch, true
+	if len(connectorSet) != 1 {
+		// 多 connector 同时 ACTIVE 时 owner 不可判定。
+		return "", "", 0, false
+	}
+
+	// 只有一个 connector 时，优先取 connector 当前映射会话（可收敛同 epoch 重连并发场景）。
+	var connectorID string
+	for key := range connectorSet {
+		connectorID = key
+		break
+	}
+	if connectorID != "" {
+		if currentSession, exists := server.dispatcher.sessionRegistry.GetByConnector(connectorID); exists {
+			normalizedCurrentSessionID := strings.TrimSpace(currentSession.SessionID)
+			normalizedCurrentConnectorID := strings.TrimSpace(currentSession.ConnectorID)
+			if currentSession.State == registry.SessionActive &&
+				normalizedCurrentSessionID != "" &&
+				normalizedCurrentConnectorID == connectorID {
+				return connectorID, normalizedCurrentSessionID, currentSession.Epoch, true
+			}
+		}
+	}
+
+	// 兜底从 ACTIVE 候选中选择“更高 epoch，其次更晚更新时间”的会话。
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.Epoch > best.Epoch {
+			best = candidate
+			continue
+		}
+		if candidate.Epoch < best.Epoch {
+			continue
+		}
+		if candidate.UpdatedAt.After(best.UpdatedAt) {
+			best = candidate
+			continue
+		}
+		if candidate.UpdatedAt.Equal(best.UpdatedAt) && candidate.LastHeartbeat.After(best.LastHeartbeat) {
+			best = candidate
+		}
+	}
+	return strings.TrimSpace(best.ConnectorID), strings.TrimSpace(best.SessionID), best.Epoch, true
 }
 
 // watchAcceptedTunnelLifecycle 监听 tunnel 终止并在 idle/reserved 阶段做兜底回收。

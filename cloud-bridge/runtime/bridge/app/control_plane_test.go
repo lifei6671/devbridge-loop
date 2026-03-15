@@ -970,6 +970,59 @@ func TestRegisterAcceptedTunnelSingleActiveSession(testingObject *testing.T) {
 	testingObject.Fatalf("expected idle tunnel removed after close")
 }
 
+// TestRegisterAcceptedTunnelDuplicateActiveSameConnector
+// 验证同 connector 存在重复 ACTIVE session 时，仍可按当前映射会话接收入站 tunnel。
+func TestRegisterAcceptedTunnelDuplicateActiveSameConnector(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now.Add(-time.Second), registry.SessionRuntime{
+		SessionID:     "session-old",
+		ConnectorID:   "agent-local",
+		Epoch:         1,
+		State:         registry.SessionActive,
+		LastHeartbeat: now.Add(-time.Second),
+		UpdatedAt:     now.Add(-time.Second),
+	})
+	// 快速重启场景：同 connector、新 session，但 epoch 与旧会话相同。
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-new",
+		ConnectorID:   "agent-local",
+		Epoch:         1,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("inbound-tunnel-dup-active")
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed); err != nil {
+		testingObject.Fatalf("register accepted tunnel failed: %v", err)
+	}
+
+	runtimeSnapshot, exists := tunnelRegistry.Get("inbound-tunnel-dup-active")
+	if !exists {
+		testingObject.Fatalf("expected tunnel registered")
+	}
+	if runtimeSnapshot.State != registry.TunnelStateIdle {
+		testingObject.Fatalf("unexpected tunnel state: got=%s want=%s", runtimeSnapshot.State, registry.TunnelStateIdle)
+	}
+	if runtimeSnapshot.ConnectorID != "agent-local" || runtimeSnapshot.SessionID != "session-new" {
+		testingObject.Fatalf(
+			"unexpected tunnel owner under duplicate active session: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+}
+
 // TestRegisterAcceptedTunnelLifecycleProbeRemoteClose 验证 idle tunnel 在 Done 未触发时也会被探活回收。
 func TestRegisterAcceptedTunnelLifecycleProbeRemoteClose(testingObject *testing.T) {
 	testingObject.Parallel()
