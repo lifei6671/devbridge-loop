@@ -19,7 +19,10 @@ const (
 	trafficWireTypeOpenAck      byte = 2
 	trafficWireTypeData         byte = 3
 	trafficWireTypeClose        byte = 4
-	trafficWireTypeReset        byte = 5
+	trafficWireTypeCloseAck     byte = 5
+	trafficWireTypeReset        byte = 6
+	trafficWireTypeRecycle      byte = 7
+	trafficWireTypeRecycleAck   byte = 8
 )
 
 // LengthPrefixedTrafficProtocolConfig 描述长度前缀协议配置。
@@ -189,8 +192,14 @@ func encodeWireType(frameType TrafficFrameType) (byte, error) {
 		return trafficWireTypeData, nil
 	case TrafficFrameClose:
 		return trafficWireTypeClose, nil
+	case TrafficFrameCloseAck:
+		return trafficWireTypeCloseAck, nil
 	case TrafficFrameReset:
 		return trafficWireTypeReset, nil
+	case TrafficFrameRecycle:
+		return trafficWireTypeRecycle, nil
+	case TrafficFrameRecycleAck:
+		return trafficWireTypeRecycleAck, nil
 	default:
 		return 0, fmt.Errorf("%w: unknown frame type=%q", transport.ErrInvalidArgument, frameType)
 	}
@@ -207,8 +216,14 @@ func decodeWireType(wireType byte) (TrafficFrameType, error) {
 		return TrafficFrameData, nil
 	case trafficWireTypeClose:
 		return TrafficFrameClose, nil
+	case trafficWireTypeCloseAck:
+		return TrafficFrameCloseAck, nil
 	case trafficWireTypeReset:
 		return TrafficFrameReset, nil
+	case trafficWireTypeRecycle:
+		return TrafficFrameRecycle, nil
+	case trafficWireTypeRecycleAck:
+		return TrafficFrameRecycleAck, nil
 	default:
 		return "", fmt.Errorf("%w: unknown wire type=%d", transport.ErrInvalidArgument, wireType)
 	}
@@ -226,8 +241,14 @@ func encodePayload(frame TrafficFrame) ([]byte, error) {
 		return append([]byte(nil), frame.Data...), nil
 	case TrafficFrameClose:
 		return json.Marshal(frame.Close)
+	case TrafficFrameCloseAck:
+		return json.Marshal(frame.CloseAck)
 	case TrafficFrameReset:
 		return json.Marshal(frame.Reset)
+	case TrafficFrameRecycle:
+		return json.Marshal(frame.Recycle)
+	case TrafficFrameRecycleAck:
+		return json.Marshal(frame.RecycleAck)
 	default:
 		return nil, fmt.Errorf("%w: unknown frame type=%q", transport.ErrInvalidArgument, frame.Type)
 	}
@@ -256,12 +277,30 @@ func decodePayload(frameType TrafficFrameType, payload []byte) (TrafficFrame, er
 			return TrafficFrame{}, fmt.Errorf("decode close payload: %w", err)
 		}
 		return TrafficFrame{Type: TrafficFrameClose, Close: &closePayload}, nil
+	case TrafficFrameCloseAck:
+		var closeAckPayload TrafficCloseAck
+		if err := json.Unmarshal(payload, &closeAckPayload); err != nil {
+			return TrafficFrame{}, fmt.Errorf("decode close_ack payload: %w", err)
+		}
+		return TrafficFrame{Type: TrafficFrameCloseAck, CloseAck: &closeAckPayload}, nil
 	case TrafficFrameReset:
 		var resetPayload TrafficReset
 		if err := json.Unmarshal(payload, &resetPayload); err != nil {
 			return TrafficFrame{}, fmt.Errorf("decode reset payload: %w", err)
 		}
 		return TrafficFrame{Type: TrafficFrameReset, Reset: &resetPayload}, nil
+	case TrafficFrameRecycle:
+		var recyclePayload TunnelRecycle
+		if err := json.Unmarshal(payload, &recyclePayload); err != nil {
+			return TrafficFrame{}, fmt.Errorf("decode recycle payload: %w", err)
+		}
+		return TrafficFrame{Type: TrafficFrameRecycle, Recycle: &recyclePayload}, nil
+	case TrafficFrameRecycleAck:
+		var recycleAckPayload TunnelRecycleAck
+		if err := json.Unmarshal(payload, &recycleAckPayload); err != nil {
+			return TrafficFrame{}, fmt.Errorf("decode recycle_ack payload: %w", err)
+		}
+		return TrafficFrame{Type: TrafficFrameRecycleAck, RecycleAck: &recycleAckPayload}, nil
 	default:
 		return TrafficFrame{}, fmt.Errorf("%w: unknown frame type=%q", transport.ErrInvalidArgument, frameType)
 	}

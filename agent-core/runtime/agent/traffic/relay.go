@@ -249,6 +249,15 @@ func (relay *StreamRelay) readTunnelToUpstream(
 			return err
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == trafficID {
+			closeAckPayload := pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: strings.TrimSpace(payload.Close.TrafficID),
+					Accepted:  true,
+				},
+			}
+			if writeAckErr := tunnel.WritePayload(ctx, closeAckPayload); writeAckErr != nil {
+				return fmt.Errorf("read tunnel close: write close ack: %w", writeAckErr)
+			}
 			return io.EOF
 		}
 		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == trafficID {

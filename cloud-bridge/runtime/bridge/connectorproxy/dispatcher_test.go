@@ -572,6 +572,13 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 			},
 		},
 	})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:   "tunnel-1",
+			RecycleSeq: 1,
+			Accepted:   true,
+		},
+	})
 	_, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel)
 	if err != nil {
 		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
@@ -642,18 +649,33 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	if result.OpenAck == nil || !result.OpenAck.Success {
 		testingObject.Fatalf("expected successful open ack in result")
 	}
-	if _, exists := tunnelRegistry.Get("tunnel-1"); exists {
-		testingObject.Fatalf("expected tunnel removed after successful close")
+	runtimeAfterDispatch, exists := tunnelRegistry.Get("tunnel-1")
+	if !exists {
+		testingObject.Fatalf("expected tunnel kept in registry after successful recycle")
 	}
-	if tunnel.CloseCount() != 1 {
-		testingObject.Fatalf("expected tunnel closed once, got=%d", tunnel.CloseCount())
+	if runtimeAfterDispatch.State != registry.TunnelStateIdle || runtimeAfterDispatch.RecycleSeq != 1 || runtimeAfterDispatch.ReuseCount != 1 {
+		testingObject.Fatalf(
+			"expected tunnel recycled to idle (reuse=1,seq=1), got state=%s reuse=%d seq=%d",
+			runtimeAfterDispatch.State,
+			runtimeAfterDispatch.ReuseCount,
+			runtimeAfterDispatch.RecycleSeq,
+		)
+	}
+	if tunnel.CloseCount() != 0 {
+		testingObject.Fatalf("expected tunnel not closed on non-final recycle, got=%d", tunnel.CloseCount())
 	}
 	if metrics.BridgeActualEndpointOverrideTotal() != 1 {
 		testingObject.Fatalf("expected actual endpoint override metric increment once, got=%d", metrics.BridgeActualEndpointOverrideTotal())
 	}
 	writes := tunnel.Writes()
-	if len(writes) == 0 || writes[0].OpenReq == nil {
+	if len(writes) != 2 {
+		testingObject.Fatalf("expected open+recycle writes, got=%d", len(writes))
+	}
+	if writes[0].OpenReq == nil {
 		testingObject.Fatalf("expected first write is traffic open request")
+	}
+	if writes[1].Recycle == nil || writes[1].Recycle.TunnelID != "tunnel-1" || writes[1].Recycle.RecycleSeq != 1 || writes[1].Recycle.IsFinal {
+		testingObject.Fatalf("expected second write is non-final recycle request")
 	}
 }
 

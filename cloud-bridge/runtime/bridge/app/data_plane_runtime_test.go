@@ -230,9 +230,15 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 		TrafficID: "traffic-1",
 		Success:   true,
 	}})
-	// 第二帧回 close，驱动 relay 正常结束并回收 tunnel。
+	// 第二帧回 close，驱动 relay 正常结束并返回 close_ack。
 	tunnel.EnqueueReadPayload(pb.StreamPayload{Close: &pb.TrafficClose{
 		TrafficID: "traffic-1",
+	}})
+	// 第三帧回 recycle_ack，允许 tunnel 回收入池。
+	tunnel.EnqueueReadPayload(pb.StreamPayload{RecycleAck: &pb.TunnelRecycleAck{
+		TunnelID:   "tunnel-1",
+		RecycleSeq: 1,
+		Accepted:   true,
 	}})
 	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", tunnel); err != nil {
 		testingObject.Fatalf("register idle tunnel failed: %v", err)
@@ -268,19 +274,37 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 	}
 
 	writes := tunnel.Writes()
-	if len(writes) != 1 {
-		testingObject.Fatalf("expected one write payload, got=%d", len(writes))
+	if len(writes) != 3 {
+		testingObject.Fatalf("expected open+close_ack+recycle writes, got=%d", len(writes))
 	}
 	if writes[0].OpenReq == nil || writes[0].OpenReq.TrafficID != "traffic-1" {
 		testingObject.Fatalf("expected first payload to be open req with traffic-1")
 	}
-	if tunnel.closeCount != 1 {
-		testingObject.Fatalf("expected tunnel close once, got=%d", tunnel.closeCount)
+	if writes[1].CloseAck == nil || writes[1].CloseAck.TrafficID != "traffic-1" || !writes[1].CloseAck.Accepted {
+		testingObject.Fatalf("expected second payload to be close_ack accepted for traffic-1")
+	}
+	if writes[2].Recycle == nil || writes[2].Recycle.TunnelID != "tunnel-1" || writes[2].Recycle.RecycleSeq != 1 || writes[2].Recycle.IsFinal {
+		testingObject.Fatalf("expected third payload to be non-final recycle seq=1 for tunnel-1")
+	}
+	if tunnel.closeCount != 0 {
+		testingObject.Fatalf("expected tunnel kept alive for reuse, close_count=%d", tunnel.closeCount)
 	}
 
 	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
-	if snapshot.TotalCount != 0 {
-		testingObject.Fatalf("expected tunnel registry cleaned after close, total=%d", snapshot.TotalCount)
+	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
+		testingObject.Fatalf("expected tunnel registry keeps one idle tunnel after recycle, total=%d idle=%d", snapshot.TotalCount, snapshot.IdleCount)
+	}
+	tunnelRuntime, exists := runtime.dataPlane.tunnelRegistry.Get("tunnel-1")
+	if !exists {
+		testingObject.Fatalf("expected recycled tunnel still present in registry")
+	}
+	if tunnelRuntime.State != registry.TunnelStateIdle || tunnelRuntime.ReuseCount != 1 || tunnelRuntime.RecycleSeq != 1 {
+		testingObject.Fatalf(
+			"expected recycled tunnel state idle/reuse=1/recycle_seq=1, got state=%s reuse=%d recycle_seq=%d",
+			tunnelRuntime.State,
+			tunnelRuntime.ReuseCount,
+			tunnelRuntime.RecycleSeq,
+		)
 	}
 }
 

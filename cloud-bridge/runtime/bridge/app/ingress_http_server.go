@@ -288,8 +288,17 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 		}
 		_ = upstreamResponse.Body.Close()
 
-		_ = writeTunnelCloseFrame(ctx, acquiredTunnel.Tunnel, trafficOpen.TrafficID, "http_response_complete")
-		if recycleErr := runtime.recycleIngressTunnelClosed(acquiredTunnel); recycleErr != nil {
+		postCommitContext := detachedPostCommitContext(ctx)
+		if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, acquiredTunnel.Tunnel, trafficOpen.TrafficID, "http_response_complete"); closeErr != nil {
+			// close_ack 等待失败时先不立即断 tunnel，继续尝试 recycle 握手，减少可回收 tunnel 的误判损耗。
+			log.Printf(
+				"bridge ingress http close-ack wait failed, continue recycle traffic_id=%s tunnel_id=%s err=%v",
+				strings.TrimSpace(trafficOpen.TrafficID),
+				strings.TrimSpace(acquiredTunnel.TunnelID),
+				closeErr,
+			)
+		}
+		if recycleErr := runtime.recycleIngressTunnelClosed(postCommitContext, acquiredTunnel); recycleErr != nil {
 			return markIngressResponseCommitted(fmt.Errorf("proxy connector ingress: recycle tunnel closed: %w", recycleErr))
 		}
 		return nil
@@ -578,6 +587,24 @@ func writeTunnelCloseFrame(ctx context.Context, tunnel registry.RuntimeTunnel, t
 	return tunnel.WritePayload(ctx, closePayload)
 }
 
+func (runtime *Runtime) writeTunnelCloseAndAwaitAck(
+	ctx context.Context,
+	tunnel registry.RuntimeTunnel,
+	trafficID string,
+	reason string,
+) error {
+	if runtime == nil {
+		return ErrRuntimeDataPlaneDependencyMissing
+	}
+	return connectorproxy.WriteTrafficCloseAndAwaitAck(
+		ctx,
+		tunnel,
+		trafficID,
+		reason,
+		runtime.cfg.TunnelReuse.CloseAckTimeout,
+	)
+}
+
 func shouldRetryConnectorIngressRead(request *http.Request, err error) bool {
 	if request == nil || err == nil {
 		return false
@@ -600,17 +627,39 @@ func isSafeHTTPMethodForRetry(method string) bool {
 	}
 }
 
-func (runtime *Runtime) recycleIngressTunnelClosed(runtimeTunnel registry.TunnelRuntime) error {
+func (runtime *Runtime) recycleIngressTunnelClosed(ctx context.Context, runtimeTunnel registry.TunnelRuntime) error {
 	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil || runtimeTunnel.Tunnel == nil {
 		return ErrRuntimeDataPlaneDependencyMissing
 	}
-	closeErr := runtimeTunnel.Tunnel.Close()
-	markClosedErr := runtime.dataPlane.tunnelRegistry.MarkClosed(time.Now().UTC(), runtimeTunnel.TunnelID)
-	_, removeErr := runtime.dataPlane.tunnelRegistry.RemoveTerminal(runtimeTunnel.TunnelID)
-	if closeErr != nil || markClosedErr != nil || removeErr != nil {
-		return errors.Join(closeErr, markClosedErr, removeErr)
+	nextRecycleSeq := runtimeTunnel.RecycleSeq + 1
+	if nextRecycleSeq == 0 {
+		nextRecycleSeq = 1
 	}
-	return nil
+	isFinal := runtimeTunnel.ReuseCount+1 >= runtime.cfg.TunnelReuse.MaxReuseCount
+	if _, err := connectorproxy.ExecuteTunnelRecycleHandshake(
+		ctx,
+		runtimeTunnel.Tunnel,
+		runtimeTunnel.TunnelID,
+		nextRecycleSeq,
+		isFinal,
+		runtime.cfg.TunnelReuse.RecycleTimeout,
+	); err != nil {
+		recycleErr := runtime.recycleIngressTunnelBroken(runtimeTunnel, err.Error())
+		if recycleErr != nil {
+			return errors.Join(err, recycleErr)
+		}
+		return err
+	}
+	if isFinal {
+		closeErr := runtimeTunnel.Tunnel.Close()
+		markClosedErr := runtime.dataPlane.tunnelRegistry.MarkClosed(time.Now().UTC(), runtimeTunnel.TunnelID)
+		_, removeErr := runtime.dataPlane.tunnelRegistry.RemoveTerminal(runtimeTunnel.TunnelID)
+		if closeErr != nil || markClosedErr != nil || removeErr != nil {
+			return errors.Join(closeErr, markClosedErr, removeErr)
+		}
+		return nil
+	}
+	return runtime.dataPlane.tunnelRegistry.MarkIdleAfterRecycle(time.Now().UTC(), runtimeTunnel.TunnelID, nextRecycleSeq)
 }
 
 func (runtime *Runtime) recycleIngressTunnelBroken(runtimeTunnel registry.TunnelRuntime, reason string) error {
@@ -638,6 +687,13 @@ func copyHTTPHeaders(destination http.Header, source http.Header) {
 	}
 }
 
+func detachedPostCommitContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
 type tunnelTrafficReader struct {
 	ctx          context.Context
 	tunnel       registry.RuntimeTunnel
@@ -658,6 +714,12 @@ func (reader *tunnelTrafficReader) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == reader.trafficID {
+			_ = reader.tunnel.WritePayload(reader.ctx, pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: reader.trafficID,
+					Accepted:  true,
+				},
+			})
 			return 0, io.EOF
 		}
 		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == reader.trafficID {

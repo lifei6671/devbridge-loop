@@ -43,6 +43,8 @@ type Record struct {
 	Tunnel         RuntimeTunnel
 	TunnelID       string
 	State          State
+	ReuseCount     int
+	LastRecycleSeq uint64
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	IdleSince      time.Time
@@ -197,6 +199,40 @@ func (registry *Registry) ActivateIdleByID(now time.Time, tunnelID string) (*Rec
 // MarkActive 将 reserved tunnel 切换为 active。
 func (registry *Registry) MarkActive(now time.Time, tunnelID string) error {
 	return registry.transition(now, strings.TrimSpace(tunnelID), StateActive, "")
+}
+
+// MarkIdleAfterRecycle 将 active tunnel 在回收握手成功后切换为 idle。
+func (registry *Registry) MarkIdleAfterRecycle(now time.Time, tunnelID string, recycleSeq uint64) error {
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" || recycleSeq == 0 {
+		return ErrTunnelNotFound
+	}
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	record, exists := registry.records[normalizedTunnelID]
+	if !exists {
+		return ErrTunnelNotFound
+	}
+	if record.State != StateActive && record.State != StateReserved {
+		return ErrInvalidStateTransition
+	}
+	if recycleSeq <= record.LastRecycleSeq {
+		return ErrInvalidStateTransition
+	}
+	record.State = StateIdle
+	record.ReuseCount++
+	record.LastRecycleSeq = recycleSeq
+	record.UpdatedAt = normalizedNow
+	record.IdleSince = normalizedNow
+	registry.stateChangeSeq++
+	record.StateChangeSeq = registry.stateChangeSeq
+	registry.idleOrder = append(registry.idleOrder, normalizedTunnelID)
+	registry.updatedAt = normalizedNow
+	return nil
 }
 
 // MarkClosing 将 idle/reserved/active tunnel 切换为 closing。
@@ -432,9 +468,9 @@ func isValidTransition(current State, target State) bool {
 	case StateIdle:
 		return target == StateReserved || target == StateClosing || target == StateBroken
 	case StateReserved:
-		return target == StateActive || target == StateClosing || target == StateBroken
+		return target == StateActive || target == StateIdle || target == StateClosing || target == StateBroken
 	case StateActive:
-		return target == StateClosing || target == StateBroken
+		return target == StateIdle || target == StateClosing || target == StateBroken
 	case StateClosing:
 		return target == StateClosed
 	case StateClosed, StateBroken:

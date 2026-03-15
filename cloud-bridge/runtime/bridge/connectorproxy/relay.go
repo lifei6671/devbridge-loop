@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 var (
@@ -83,6 +84,15 @@ func (relay *Relay) Relay(ctx context.Context, tunnel registry.RuntimeTunnel, tr
 			return fmt.Errorf("relay: read payload: %w", err)
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == normalizedTrafficID {
+			closeAckPayload := pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: normalizedTrafficID,
+					Accepted:  true,
+				},
+			}
+			if writeAckErr := tunnel.WritePayload(normalizedContext, closeAckPayload); writeAckErr != nil {
+				return fmt.Errorf("relay: write close ack: %w", writeAckErr)
+			}
 			return nil
 		}
 		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == normalizedTrafficID {

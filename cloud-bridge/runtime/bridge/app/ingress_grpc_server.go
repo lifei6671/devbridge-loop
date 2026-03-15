@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -238,8 +239,17 @@ func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
 		}
 		return proxyErr
 	}
-	_ = writeTunnelCloseFrame(ctx, upstreamTunnel.Tunnel, trafficOpen.TrafficID, "grpc_response_complete")
-	if recycleErr := runtime.recycleIngressTunnelClosed(upstreamTunnel); recycleErr != nil {
+	postCommitContext := detachedPostCommitContext(ctx)
+	if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, upstreamTunnel.Tunnel, trafficOpen.TrafficID, "grpc_response_complete"); closeErr != nil {
+		// close_ack 等待失败时先不立即断 tunnel，继续尝试 recycle 握手，减少可回收 tunnel 的误判损耗。
+		log.Printf(
+			"bridge ingress grpc close-ack wait failed, continue recycle traffic_id=%s tunnel_id=%s err=%v",
+			strings.TrimSpace(trafficOpen.TrafficID),
+			strings.TrimSpace(upstreamTunnel.TunnelID),
+			closeErr,
+		)
+	}
+	if recycleErr := runtime.recycleIngressTunnelClosed(postCommitContext, upstreamTunnel); recycleErr != nil {
 		return markIngressResponseCommitted(recycleErr)
 	}
 	return nil
@@ -492,6 +502,12 @@ func (conn *ingressTunnelDataConn) Read(buffer []byte) (int, error) {
 			return 0, readErr
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == conn.trafficID {
+			_ = conn.tunnel.WritePayload(conn.ctx, pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: conn.trafficID,
+					Accepted:  true,
+				},
+			})
 			return 0, io.EOF
 		}
 		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == conn.trafficID {
@@ -578,4 +594,3 @@ func (address ingressTunnelNetAddr) Network() string {
 func (address ingressTunnelNetAddr) String() string {
 	return string(address)
 }
-

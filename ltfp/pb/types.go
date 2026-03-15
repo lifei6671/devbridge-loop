@@ -39,6 +39,9 @@ type ConnectorWelcome struct {
 	HeartbeatIntervalSec uint32            `json:"heartbeatIntervalSec"`
 	Capabilities         []string          `json:"capabilities,omitempty"`
 	AssignedSessionEpoch uint64            `json:"assignedSessionEpoch"`
+	TunnelMaxReuseCount  int32             `json:"tunnelMaxReuseCount,omitempty"`
+	TunnelRecycleTimeout uint32            `json:"tunnelRecycleTimeoutSec,omitempty"`
+	TunnelIdleTTLSec     uint32            `json:"tunnelIdleTtlSec,omitempty"`
 	Metadata             map[string]string `json:"metadata,omitempty"`
 }
 
@@ -361,6 +364,15 @@ type TrafficClose struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// TrafficCloseAck 描述正常关闭确认消息。
+type TrafficCloseAck struct {
+	TrafficID    string            `json:"trafficId"`
+	Accepted     bool              `json:"accepted"`
+	ErrorCode    string            `json:"errorCode,omitempty"`
+	ErrorMessage string            `json:"errorMessage,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
 // TrafficReset 描述异常中断流量消息。
 type TrafficReset struct {
 	TrafficID    string `json:"trafficId"`
@@ -368,13 +380,35 @@ type TrafficReset struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
+// TunnelRecycle 描述服务端发起的 tunnel 回收请求。
+type TunnelRecycle struct {
+	TunnelID              string            `json:"tunnelId"`
+	RecycleSeq            uint64            `json:"recycleSeq"`
+	IsFinal               bool              `json:"isFinal,omitempty"`
+	CompletedTrafficCount int32             `json:"completedTrafficCount,omitempty"`
+	Metadata              map[string]string `json:"metadata,omitempty"`
+}
+
+// TunnelRecycleAck 描述 Agent 对 tunnel 回收请求的确认。
+type TunnelRecycleAck struct {
+	TunnelID     string            `json:"tunnelId"`
+	RecycleSeq   uint64            `json:"recycleSeq"`
+	Accepted     bool              `json:"accepted"`
+	ErrorCode    string            `json:"errorCode,omitempty"`
+	ErrorMessage string            `json:"errorMessage,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
 // StreamPayload 描述数据通道 oneof 负载。
 type StreamPayload struct {
-	OpenReq *TrafficOpen    `json:"openReq,omitempty"`
-	OpenAck *TrafficOpenAck `json:"openAck,omitempty"`
-	Data    []byte          `json:"data,omitempty"`
-	Close   *TrafficClose   `json:"close,omitempty"`
-	Reset   *TrafficReset   `json:"reset,omitempty"`
+	OpenReq    *TrafficOpen       `json:"openReq,omitempty"`
+	OpenAck    *TrafficOpenAck    `json:"openAck,omitempty"`
+	Data       []byte             `json:"data,omitempty"`
+	Close      *TrafficClose      `json:"close,omitempty"`
+	CloseAck   *TrafficCloseAck   `json:"closeAck,omitempty"`
+	Reset      *TrafficReset      `json:"reset,omitempty"`
+	Recycle    *TunnelRecycle     `json:"recycle,omitempty"`
+	RecycleAck *TunnelRecycleAck  `json:"recycleAck,omitempty"`
 }
 
 // ActivePayloadCount 统计数据面 oneof 实际被设置的字段数量。
@@ -396,8 +430,20 @@ func (payload StreamPayload) ActivePayloadCount() int {
 	if payload.Close != nil {
 		count++
 	}
+	// CloseAck 字段表示对 close 的确认。
+	if payload.CloseAck != nil {
+		count++
+	}
 	// Reset 字段表示异常结束。
 	if payload.Reset != nil {
+		count++
+	}
+	// Recycle 字段表示服务端请求回收 tunnel。
+	if payload.Recycle != nil {
+		count++
+	}
+	// RecycleAck 字段表示 Agent 回收确认。
+	if payload.RecycleAck != nil {
 		count++
 	}
 	return count

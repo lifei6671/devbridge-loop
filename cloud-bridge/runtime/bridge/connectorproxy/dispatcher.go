@@ -48,6 +48,8 @@ type DispatcherOptions struct {
 	FailureMapper  *FailureMapper
 	Metrics        *obs.Metrics
 	Now            func() time.Time
+	MaxReuseCount  int
+	RecycleTimeout time.Duration
 }
 
 // Dispatcher coordinates connector proxy execution.
@@ -59,6 +61,8 @@ type Dispatcher struct {
 	failureMapper  *FailureMapper
 	metrics        *obs.Metrics
 	now            func() time.Time
+	maxReuseCount  int
+	recycleTimeout time.Duration
 }
 
 // NewDispatcher 创建 connector proxy dispatcher。
@@ -78,6 +82,14 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 	if nowFunction == nil {
 		nowFunction = func() time.Time { return time.Now().UTC() }
 	}
+	maxReuseCount := options.MaxReuseCount
+	if maxReuseCount <= 0 {
+		maxReuseCount = 256
+	}
+	recycleTimeout := options.RecycleTimeout
+	if recycleTimeout <= 0 {
+		recycleTimeout = DefaultRecycleHandshakeTimeout
+	}
 	return &Dispatcher{
 		tunnelAcquirer: options.TunnelAcquirer,
 		openHandshake:  options.OpenHandshake,
@@ -86,6 +98,8 @@ func NewDispatcher(options DispatcherOptions) (*Dispatcher, error) {
 		failureMapper:  failureMapper,
 		metrics:        normalizeBridgeMetrics(options.Metrics),
 		now:            nowFunction,
+		maxReuseCount:  maxReuseCount,
+		recycleTimeout: recycleTimeout,
 	}, nil
 }
 
@@ -201,7 +215,7 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
-	if err := dispatcher.recycleTunnelClosed(acquiredTunnel); err != nil {
+	if err := dispatcher.recycleTunnelReusable(normalizedContext, acquiredTunnel); err != nil {
 		log.Printf(
 			"bridge connector dispatch failed event=recycle_tunnel_closed_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
@@ -224,6 +238,35 @@ func (dispatcher *Dispatcher) failResult(result DispatchResult, dispatchError er
 	result.HTTPStatus = mappedFailure.HTTPStatus
 	result.ErrorCode = mappedFailure.Code
 	return result, dispatchError
+}
+
+func (dispatcher *Dispatcher) recycleTunnelReusable(ctx context.Context, runtime registry.TunnelRuntime) error {
+	if runtime.Tunnel == nil {
+		return ErrDispatcherDependencyMissing
+	}
+	nextRecycleSeq := runtime.RecycleSeq + 1
+	if nextRecycleSeq == 0 {
+		nextRecycleSeq = 1
+	}
+	isFinal := runtime.ReuseCount+1 >= dispatcher.maxReuseCount
+	if _, err := ExecuteTunnelRecycleHandshake(
+		ctx,
+		runtime.Tunnel,
+		runtime.TunnelID,
+		nextRecycleSeq,
+		isFinal,
+		dispatcher.recycleTimeout,
+	); err != nil {
+		recycleErr := dispatcher.recycleTunnelBroken(runtime, err.Error())
+		if recycleErr != nil {
+			return errors.Join(err, recycleErr)
+		}
+		return err
+	}
+	if isFinal {
+		return dispatcher.recycleTunnelClosed(runtime)
+	}
+	return dispatcher.tunnelRegistry.MarkIdleAfterRecycle(dispatcher.now(), runtime.TunnelID, nextRecycleSeq)
 }
 
 func (dispatcher *Dispatcher) recycleTunnelClosed(runtime registry.TunnelRuntime) error {

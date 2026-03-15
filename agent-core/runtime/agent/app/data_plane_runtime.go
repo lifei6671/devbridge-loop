@@ -238,49 +238,64 @@ func (r *Runtime) runTrafficAcceptorWorker(ctx context.Context, tunnelID string,
 	if r == nil || r.trafficAcceptor == nil || r.trafficOpener == nil || r.tunnelManager == nil {
 		return
 	}
-	handoff, err := r.trafficAcceptor.WaitTrafficOpen(ctx, tunnelID, tunnelIO)
-	if err != nil {
-		if isTrafficContextCanceled(ctx, err) {
+	for {
+		handoff, err := r.trafficAcceptor.WaitTrafficOpen(ctx, tunnelID, tunnelIO)
+		if err != nil {
+			if isTrafficContextCanceled(ctx, err) {
+				return
+			}
+			r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("wait traffic open failed: %v", err))
 			return
 		}
-		r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("wait traffic open failed: %v", err))
-		return
-	}
 
-	if err := r.tunnelManager.ActivateIdle(tunnelID); err != nil {
-		// 未进入 opener 流程前需要主动释放 lease，避免 reader 所有权泄漏。
-		if handoff.Lease != nil {
-			handoff.Lease.Release()
-		}
-		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+		if err := r.tunnelManager.ActivateIdle(tunnelID); err != nil {
+			// 未进入 opener 流程前需要主动释放 lease，避免 reader 所有权泄漏。
+			if handoff.Lease != nil {
+				handoff.Lease.Release()
+			}
+			if errors.Is(err, tunnel.ErrTunnelNotFound) {
+				return
+			}
+			r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("activate idle failed: %v", err))
 			return
 		}
-		r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("activate idle failed: %v", err))
-		return
+		r.upsertTunnelAssociation(tunnelAssociation{
+			TunnelID:  tunnelID,
+			TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
+			ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
+			// open 阶段先写入 hint 地址，后续以实际选中的 endpoint 地址覆盖。
+			LocalAddr: resolveTrafficHintEndpointAddr(handoff.Open.EndpointSelectionHint),
+			UpdatedAt: time.Now().UTC(),
+		})
+		handleResult, err := r.trafficOpener.Handle(ctx, handoff, tunnelIO)
+		if err != nil {
+			r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("handle traffic open failed: %v", err))
+			return
+		}
+		r.upsertTunnelAssociation(tunnelAssociation{
+			TunnelID:              tunnelID,
+			TrafficID:             strings.TrimSpace(handleResult.TrafficID),
+			ServiceID:             strings.TrimSpace(handoff.Open.ServiceID),
+			LocalAddr:             strings.TrimSpace(handleResult.Endpoint.Addr),
+			OpenAckLatencyMS:      handleResult.OpenAckLatencyMS,
+			UpstreamDialLatencyMS: handleResult.UpstreamDialLatencyMS,
+			UpdatedAt:             time.Now().UTC(),
+		})
+		recycled, finalClose, recycleErr := r.handleTunnelRecyclePhase(ctx, tunnelID, handleResult.TrafficID, tunnelIO)
+		if recycleErr != nil {
+			r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("wait recycle failed: %v", recycleErr))
+			return
+		}
+		if finalClose {
+			r.cleanupTunnelAfterTraffic(tunnelID, "tunnel recycle final close")
+			return
+		}
+		if !recycled {
+			r.cleanupTunnelAfterTraffic(tunnelID, "tunnel recycle rejected")
+			return
+		}
+		// 成功回收入池后继续下一轮 traffic。
 	}
-	r.upsertTunnelAssociation(tunnelAssociation{
-		TunnelID:  tunnelID,
-		TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
-		ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
-		// open 阶段先写入 hint 地址，后续以实际选中的 endpoint 地址覆盖。
-		LocalAddr: resolveTrafficHintEndpointAddr(handoff.Open.EndpointSelectionHint),
-		UpdatedAt: time.Now().UTC(),
-	})
-	handleResult, err := r.trafficOpener.Handle(ctx, handoff, tunnelIO)
-	if err != nil {
-		r.cleanupTunnelAfterTraffic(tunnelID, fmt.Sprintf("handle traffic open failed: %v", err))
-		return
-	}
-	r.upsertTunnelAssociation(tunnelAssociation{
-		TunnelID:              tunnelID,
-		TrafficID:             strings.TrimSpace(handleResult.TrafficID),
-		ServiceID:             strings.TrimSpace(handoff.Open.ServiceID),
-		LocalAddr:             strings.TrimSpace(handleResult.Endpoint.Addr),
-		OpenAckLatencyMS:      handleResult.OpenAckLatencyMS,
-		UpstreamDialLatencyMS: handleResult.UpstreamDialLatencyMS,
-		UpdatedAt:             time.Now().UTC(),
-	})
-	r.cleanupTunnelAfterTraffic(tunnelID, "traffic completed")
 }
 
 // markTrafficWorkerRunning 标记 tunnel 的 acceptor worker 已启动，避免重复并发 reader。
@@ -331,6 +346,133 @@ func (r *Runtime) cleanupTunnelAfterTraffic(tunnelID string, reason string) {
 	}
 	// 兜底走 broken 回收，避免状态机停留在中间态。
 	_ = r.tunnelManager.MarkBrokenAndRemove(normalizedTunnelID, strings.TrimSpace(reason))
+}
+
+// handleTunnelRecyclePhase 等待 close_ack + recycle 并执行回收入池或终态关闭。
+func (r *Runtime) handleTunnelRecyclePhase(
+	ctx context.Context,
+	tunnelID string,
+	trafficID string,
+	tunnelIO traffic.TunnelIO,
+) (bool, bool, error) {
+	if r == nil || r.tunnelManager == nil || tunnelIO == nil {
+		return false, false, ErrRuntimeTrafficDependencyMissing
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	waitContext := ctx
+	if waitContext == nil {
+		waitContext = context.Background()
+	}
+	recycleTimeout := r.cfg.TunnelPool.RecycleAckTO
+	if recycleTimeout <= 0 {
+		recycleTimeout = 3 * time.Second
+	}
+	// 预等待阶段给更宽松的窗口，避免 Bridge 仍在回写客户端响应时提前超时。
+	preRecycleTimeout := recycleTimeout * 5
+	if preRecycleTimeout < 15*time.Second {
+		preRecycleTimeout = 15 * time.Second
+	}
+	closeAckObserved := false
+	for {
+		readContext := waitContext
+		cancelRead := func() {}
+		if _, hasDeadline := waitContext.Deadline(); !hasDeadline {
+			phaseTimeout := recycleTimeout
+			if !closeAckObserved {
+				phaseTimeout = preRecycleTimeout
+			}
+			if phaseTimeout > 0 {
+				readContext, cancelRead = context.WithTimeout(waitContext, phaseTimeout)
+			}
+		}
+		payload, err := tunnelIO.ReadPayload(readContext)
+		cancelRead()
+		if err != nil {
+			return false, false, err
+		}
+		if payload.CloseAck != nil && strings.TrimSpace(payload.CloseAck.TrafficID) == normalizedTrafficID {
+			closeAckObserved = true
+			continue
+		}
+		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == normalizedTrafficID {
+			// Bridge 主动发 close 的场景下，本地回 ack 后即可进入 recycle 等待。
+			closeAckObserved = true
+			// 对端若再次发送 close，按协议回 ACK，避免对端等待。
+			_ = tunnelIO.WritePayload(waitContext, pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: normalizedTrafficID,
+					Accepted:  true,
+				},
+			})
+			continue
+		}
+		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == normalizedTrafficID {
+			return false, false, fmt.Errorf(
+				"traffic reset before recycle: code=%s message=%s",
+				strings.TrimSpace(payload.Reset.ErrorCode),
+				strings.TrimSpace(payload.Reset.ErrorMessage),
+			)
+		}
+		if payload.Recycle == nil {
+			// 忽略与当前回收阶段无关的帧。
+			continue
+		}
+		recycle := payload.Recycle
+		recycleTunnelID := strings.TrimSpace(recycle.TunnelID)
+		if recycleTunnelID != "" && recycleTunnelID != normalizedTunnelID {
+			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "tunnel_mismatch", "recycle tunnel id mismatch")
+			return false, false, fmt.Errorf("recycle tunnel id mismatch: got=%s want=%s", recycleTunnelID, normalizedTunnelID)
+		}
+		record, exists := r.tunnelManager.Get(normalizedTunnelID)
+		lastRecycleSeq := uint64(0)
+		if exists && record != nil {
+			lastRecycleSeq = record.LastRecycleSeq
+		}
+		if recycle.RecycleSeq == 0 || recycle.RecycleSeq <= lastRecycleSeq {
+			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "invalid_seq", "recycle seq not monotonic")
+			return false, false, fmt.Errorf("invalid recycle seq: got=%d last=%d", recycle.RecycleSeq, lastRecycleSeq)
+		}
+		if !closeAckObserved {
+			// 在部分时序下，close 可能已在 relay 阶段被消费，此处允许直接进入 recycle 以提升复用鲁棒性。
+			closeAckObserved = true
+		}
+		if err := r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, true, "", ""); err != nil {
+			return false, false, err
+		}
+		if recycle.IsFinal {
+			return false, true, nil
+		}
+		if err := r.tunnelManager.RecycleToIdle(normalizedTunnelID, recycle.RecycleSeq); err != nil {
+			return false, false, err
+		}
+		// tunnel 回收入池后清理上轮 traffic 关联，等待下一次 open。
+		r.removeTunnelAssociation(normalizedTunnelID)
+		return true, false, nil
+	}
+}
+
+func (r *Runtime) writeTunnelRecycleAck(
+	ctx context.Context,
+	tunnelIO traffic.TunnelIO,
+	tunnelID string,
+	recycleSeq uint64,
+	accepted bool,
+	errorCode string,
+	errorMessage string,
+) error {
+	if tunnelIO == nil {
+		return ErrRuntimeTrafficDependencyMissing
+	}
+	return tunnelIO.WritePayload(ctx, pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:     strings.TrimSpace(tunnelID),
+			RecycleSeq:   recycleSeq,
+			Accepted:     accepted,
+			ErrorCode:    strings.TrimSpace(errorCode),
+			ErrorMessage: strings.TrimSpace(errorMessage),
+		},
+	})
 }
 
 // upsertTunnelAssociation 写入 tunnel 与 traffic/service 的关联运行态。

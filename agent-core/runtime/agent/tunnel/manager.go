@@ -32,6 +32,8 @@ type ManagerConfig struct {
 	MinIdle           int
 	MaxIdle           int
 	IdleTTL           time.Duration
+	MaxReuseCount     int
+	RecycleTimeout    time.Duration
 	MaxInflightOpens  int
 	TunnelOpenRate    float64
 	TunnelOpenBurst   int
@@ -44,6 +46,8 @@ func DefaultManagerConfig() ManagerConfig {
 		MinIdle:           8,
 		MaxIdle:           32,
 		IdleTTL:           10 * time.Minute,
+		MaxReuseCount:     256,
+		RecycleTimeout:    3 * time.Second,
 		MaxInflightOpens:  4,
 		TunnelOpenRate:    10,
 		TunnelOpenBurst:   20,
@@ -80,6 +84,14 @@ func (config ManagerConfig) NormalizeAndValidate() (ManagerConfig, error) {
 			ErrInvalidManagerConfig,
 			normalizedConfig.IdleTTL,
 		)
+	}
+	if normalizedConfig.MaxReuseCount <= 0 {
+		// max_reuse_count 未设置时回落默认值。
+		normalizedConfig.MaxReuseCount = defaultConfig.MaxReuseCount
+	}
+	if normalizedConfig.RecycleTimeout <= 0 {
+		// recycle timeout 未设置时回落默认值。
+		normalizedConfig.RecycleTimeout = defaultConfig.RecycleTimeout
 	}
 	if normalizedConfig.MaxInflightOpens <= 0 {
 		// 未配置 inflight 时回落默认值。
@@ -243,6 +255,14 @@ func (manager *Manager) Snapshot() Snapshot {
 		return Snapshot{}
 	}
 	return manager.registry.Snapshot()
+}
+
+// Get 返回指定 tunnel 的运行态快照。
+func (manager *Manager) Get(tunnelID string) (*Record, bool) {
+	if manager == nil || manager.registry == nil {
+		return nil, false
+	}
+	return manager.registry.Get(strings.TrimSpace(tunnelID))
 }
 
 // Start 启动治理循环：启动预建、周期纠偏、TTL 扫描、refill 触发处理。
@@ -425,6 +445,23 @@ func (manager *Manager) MarkActive(tunnelID string) error {
 	}
 	manager.updatePoolMetrics(manager.registry.Snapshot())
 	manager.emitEvent("tunnel_active")
+	return nil
+}
+
+// RecycleToIdle 在回收握手成功后把 active tunnel 放回 idle 池。
+func (manager *Manager) RecycleToIdle(tunnelID string, recycleSeq uint64) error {
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return ErrTunnelNotFound
+	}
+	if recycleSeq == 0 {
+		return ErrInvalidManagerConfig
+	}
+	if err := manager.registry.MarkIdleAfterRecycle(manager.nowFn(), normalizedTunnelID, recycleSeq); err != nil {
+		return err
+	}
+	manager.updatePoolMetrics(manager.registry.Snapshot())
+	manager.emitEvent("tunnel_recycled")
 	return nil
 }
 

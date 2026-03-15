@@ -17,6 +17,7 @@ type Config struct {
 	Admin         AdminConfig         `yaml:"admin"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	ControlPlane  ControlPlaneConfig  `yaml:"control_plane"`
+	TunnelReuse   TunnelReuseConfig   `yaml:"tunnel_reuse"`
 	// RuntimeConfigFilePath 记录当前配置来源文件路径（仅运行时使用，不参与 YAML 编解码）。
 	RuntimeConfigFilePath string `yaml:"-"`
 }
@@ -72,6 +73,13 @@ type ControlPlaneConfig struct {
 	HeartbeatTimeout time.Duration `yaml:"heartbeat_timeout"`
 }
 
+type TunnelReuseConfig struct {
+	MaxReuseCount     int           `yaml:"max_reuse_count"`
+	RecycleTimeout    time.Duration `yaml:"recycle_timeout"`
+	CloseAckTimeout   time.Duration `yaml:"close_ack_timeout"`
+	EnforceFinalClose bool          `yaml:"enforce_final_close"`
+}
+
 // DefaultConfig returns a runnable baseline configuration.
 func DefaultConfig() Config {
 	return Config{
@@ -122,6 +130,12 @@ func DefaultConfig() Config {
 			ListenAddr:       ":39080",
 			GRPCH2ListenAddr: ":39082",
 			HeartbeatTimeout: 30 * time.Second,
+		},
+		TunnelReuse: TunnelReuseConfig{
+			MaxReuseCount:     256,
+			RecycleTimeout:    3 * time.Second,
+			CloseAckTimeout:   3 * time.Second,
+			EnforceFinalClose: true,
 		},
 	}
 }
@@ -195,6 +209,15 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == strings.TrimSpace(c.ControlPlane.ListenAddr) {
 		return fmt.Errorf("validate config: grpc_h2 listen addr must be different from tcp listen addr")
+	}
+	if c.TunnelReuse.MaxReuseCount <= 0 {
+		return fmt.Errorf("validate config: invalid tunnel_reuse.max_reuse_count=%d", c.TunnelReuse.MaxReuseCount)
+	}
+	if c.TunnelReuse.RecycleTimeout <= 0 {
+		return fmt.Errorf("validate config: invalid tunnel_reuse.recycle_timeout=%v", c.TunnelReuse.RecycleTimeout)
+	}
+	if c.TunnelReuse.CloseAckTimeout <= 0 {
+		return fmt.Errorf("validate config: invalid tunnel_reuse.close_ack_timeout=%v", c.TunnelReuse.CloseAckTimeout)
 	}
 	return nil
 }

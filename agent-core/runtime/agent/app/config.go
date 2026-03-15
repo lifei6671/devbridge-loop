@@ -29,6 +29,8 @@ type TunnelPoolConfig struct {
 	MaxIdle      int
 	MaxInflight  int
 	TTL          time.Duration
+	MaxReuse     int
+	RecycleAckTO time.Duration
 	OpenRate     float64
 	OpenBurst    int
 	ReconcileGap time.Duration
@@ -44,6 +46,8 @@ type TunnelPoolOverride struct {
 	MaxIdle      *int
 	MaxInflight  *int
 	TTL          *time.Duration
+	MaxReuse     *int
+	RecycleAckTO *time.Duration
 	OpenRate     *float64
 	OpenBurst    *int
 	ReconcileGap *time.Duration
@@ -73,6 +77,8 @@ func DefaultConfig() Config {
 			MaxIdle:      32,
 			MaxInflight:  4,
 			TTL:          10 * time.Minute,
+			MaxReuse:     256,
+			RecycleAckTO: 3 * time.Second,
 			OpenRate:     10, // 平滑建连速率（每秒）。
 			OpenBurst:    20, // 冷启动允许的突发窗口。
 			ReconcileGap: time.Second,
@@ -124,6 +130,14 @@ func (c Config) Validate() error {
 		// ttl 不能是负时长。
 		return fmt.Errorf("validate config: invalid tunnel_pool.ttl=%v", c.TunnelPool.TTL)
 	}
+	if c.TunnelPool.MaxReuse <= 0 {
+		// max_reuse 必须大于 0。
+		return fmt.Errorf("validate config: invalid tunnel_pool.max_reuse=%d", c.TunnelPool.MaxReuse)
+	}
+	if c.TunnelPool.RecycleAckTO <= 0 {
+		// recycle ack 超时必须为正数。
+		return fmt.Errorf("validate config: invalid tunnel_pool.recycle_ack_timeout=%v", c.TunnelPool.RecycleAckTO)
+	}
 	if c.TunnelPool.OpenRate <= 0 {
 		// 平滑建连速率必须为正数。
 		return fmt.Errorf("validate config: invalid tunnel_pool.open_rate=%v", c.TunnelPool.OpenRate)
@@ -154,6 +168,12 @@ func (c Config) ApplyTunnelPoolOverride(override TunnelPoolOverride) Config {
 	}
 	if override.TTL != nil {
 		updatedPool.TTL = *override.TTL
+	}
+	if override.MaxReuse != nil {
+		updatedPool.MaxReuse = *override.MaxReuse
+	}
+	if override.RecycleAckTO != nil {
+		updatedPool.RecycleAckTO = *override.RecycleAckTO
 	}
 	if override.OpenRate != nil {
 		updatedPool.OpenRate = *override.OpenRate

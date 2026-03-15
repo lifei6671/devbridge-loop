@@ -122,7 +122,7 @@ func newRuntimeDataPlaneWithDependencies(
 		ServiceRegistry: serviceRegistry,
 		SessionRegistry: sessionRegistry,
 	})
-	pathExecutor, err := newRuntimePathExecutor(tunnelRegistry, dependencies)
+	pathExecutor, err := newRuntimePathExecutor(cfg, tunnelRegistry, dependencies)
 	if err != nil {
 		return nil, fmt.Errorf("new runtime data plane: build path executor: %w", err)
 	}
@@ -143,6 +143,7 @@ func newRuntimeDataPlaneWithDependencies(
 
 // newRuntimePathExecutor 组装 connector/direct/hybrid 三路径执行器。
 func newRuntimePathExecutor(
+	cfg Config,
 	tunnelRegistry *registry.TunnelRegistry,
 	dependencies runtimeDataPlaneDependencies,
 ) (*routing.PathExecutor, error) {
@@ -174,6 +175,8 @@ func newRuntimePathExecutor(
 		OpenHandshake:  openHandshake,
 		TunnelRegistry: tunnelRegistry,
 		Metrics:        dependencies.connectorMetrics,
+		MaxReuseCount:  cfg.TunnelReuse.MaxReuseCount,
+		RecycleTimeout: cfg.TunnelReuse.RecycleTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new runtime path executor: new connector dispatcher: %w", err)

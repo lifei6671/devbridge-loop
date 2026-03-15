@@ -39,6 +39,9 @@ message ConnectorWelcome {
   repeated string capabilities = 5;
   uint64 assigned_session_epoch = 6;
   map<string, string> metadata = 7;
+  int32 tunnel_max_reuse_count = 8;
+  uint32 tunnel_recycle_timeout_sec = 9;
+  uint32 tunnel_idle_ttl_sec = 10;
 }
 
 message ConnectorAuth {
@@ -320,10 +323,35 @@ message TrafficClose {
   string reason = 2;
 }
 
+message TrafficCloseAck {
+  string traffic_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+  string error_message = 4;
+  map<string, string> metadata = 5;
+}
+
 message TrafficReset {
   string traffic_id = 1;
   string error_code = 2;
   string error_message = 3;
+}
+
+message TunnelRecycle {
+  string tunnel_id = 1;
+  uint64 recycle_seq = 2;
+  bool is_final = 3;
+  int32 completed_traffic_count = 4;
+  map<string, string> metadata = 5;
+}
+
+message TunnelRecycleAck {
+  string tunnel_id = 1;
+  uint64 recycle_seq = 2;
+  bool accepted = 3;
+  string error_code = 4;
+  string error_message = 5;
+  map<string, string> metadata = 6;
 }
 
 message StreamPayload {
@@ -332,7 +360,10 @@ message StreamPayload {
     TrafficOpenAck open_ack = 2;
     bytes data = 3;
     TrafficClose close = 4;
-    TrafficReset reset = 5;
+    TrafficCloseAck close_ack = 5;
+    TrafficReset reset = 6;
+    TunnelRecycle recycle = 7;
+    TunnelRecycleAck recycle_ack = 8;
   }
 }
 

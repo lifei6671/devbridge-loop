@@ -1,6 +1,6 @@
 # LTFP 单 Tunnel 多路复用技术方案
 
-**文档状态**：Draft  
+**文档状态**：已完成（Implemented, 2026-03-15）  
 **版本**：v1.0  
 **基于**：LTFP-TransportAbstraction v2.1 / LTFP-v1-Draft v2.1  
 **变更范围**：Transport Abstraction Layer · Runtime Layer · grpc_h2 Binding · Protobuf 协议
@@ -135,13 +135,13 @@ created
 
 ### 3.2 Traffic 结束后的回收流程
 
-**正常结束路径（TrafficClose → Recycle）：**
+**正常结束路径（TrafficClose → TrafficCloseAck → Recycle）：**
 
 ```
 Server                              Agent
   │                                   │
   │──── TrafficClose ────────────────→│
-  │←─── TrafficCloseAck ─────────────│  （现有协议已有）
+  │←─── TrafficCloseAck ─────────────│  （本次新增）
   │                                   │
   │── TunnelRecycle ─────────────────→│  （新增）
   │←── TunnelRecycleAck ─────────────│  （新增）
@@ -176,7 +176,7 @@ Server                              Agent
 
 ### 3.3 回收握手语义约束
 
-- `TunnelRecycle` 必须在 `TrafficClose` + `TrafficCloseAck` 完成后才能发送
+- `TrafficCloseAck` 为本次协议新增帧，`TunnelRecycle` 必须在 `TrafficClose` + `TrafficCloseAck` 完成后才能发送
 - `TunnelRecycle` 只能由 **Server** 发起（因为 Server 拥有 TunnelPool，是决策方）
 - Agent 收到 `TunnelRecycle` 后，必须验证 `recycle_seq` 严格递增，拒绝乱序消息
 - `TunnelRecycleAck.accepted=false` 时，双方均必须关闭 tunnel，不得重试回收
@@ -263,7 +263,7 @@ package transport
 
 type TunnelReuseConfig struct {
     // 单条 tunnel 最大复用次数，超过后强制关闭
-    // 默认建议值：100
+    // 默认建议值：256（业内常见默认：100~1000，取中间稳态值）
     // 设为 0 表示禁用复用（退化为旧行为）
     MaxReuseCount int
 
@@ -273,10 +273,31 @@ type TunnelReuseConfig struct {
 
     // idle 池中 tunnel 的最大闲置存活时间
     // 超过后主动关闭，由 Agent 补充新 tunnel
-    // 默认建议值：5min
+    // 默认建议值：10min
     IdleTTL time.Duration
 }
 ```
+
+### 4.4 默认值与外部传入（支持后续用户配置）
+
+推荐默认值（全量启用场景）：
+
+- `MaxReuseCount = 256`
+- `RecycleHandshakeTimeout = 3s`
+- `IdleTTL = 10min`
+
+外部传入与覆盖顺序（高优先级覆盖低优先级）：
+
+1. 启动参数（CLI flags）
+2. 配置文件（YAML/JSON）
+3. 协议握手下发（`ConnectorWelcome`）
+4. 代码默认值
+
+约束：
+
+- 外部传入必须可选；未传入时自动回落默认值
+- 无效值（负数、0 秒超时等）必须在启动阶段校验并拒绝
+- 后续 UI 配置应落盘到配置文件，遵循同一覆盖顺序
 
 ---
 
@@ -408,7 +429,7 @@ func (s *TunnelStats) IsRecyclable() bool {
 
 gRPC bidi stream 一旦任一方发送 `END_STREAM`（`CloseSend`），stream 进入半关闭状态，无法继续用于下一次 traffic。
 
-因此，**grpc_h2 binding 下的 tunnel 复用必须满足**：在 traffic 结束时，不调用 gRPC stream 的 `CloseSend`，而仅通过 LTFP runtime 层的 `TrafficClose` 帧表达业务关闭意图。
+因此，**grpc_h2 binding 下的 tunnel 复用必须满足**：在 traffic 结束时，不调用 gRPC stream 的 `CloseSend`，而通过 LTFP runtime 层的 `TrafficClose` / `TrafficCloseAck` 完成关闭确认。
 
 这与"禁止并发手工多路复用"的约束**不冲突**：
 
@@ -419,7 +440,7 @@ gRPC bidi stream 一旦任一方发送 `END_STREAM`（`CloseSend`），stream �
 
 ```
 1. TunnelStream（gRPC bidi stream）不在 TrafficClose 后关闭
-2. TrafficClose 帧通过 StreamPayload 发送，与其他帧一样走 LTFP framing
+2. TrafficClose 与 TrafficCloseAck 都通过 StreamPayload 发送
 3. TunnelRecycle / TunnelRecycleAck 同样通过 StreamPayload 发送
 4. 当 TunnelRecycle(is_final=true) 回收后，Server 侧调用 SendMsg 后
    再调用 CloseSend，Agent 侧读到 EOF 后关闭本端
@@ -428,7 +449,7 @@ gRPC bidi stream 一旦任一方发送 `END_STREAM`（`CloseSend`），stream �
 
 ### 6.3 StreamPayload 扩展
 
-在现有 `StreamPayload` 的 `oneof payload` 中新增两个 case：
+在现有 `StreamPayload` 的 `oneof payload` 中新增三个 case（`TrafficCloseAck`、`TunnelRecycle`、`TunnelRecycleAck`）：
 
 ```protobuf
 message StreamPayload {
@@ -437,9 +458,10 @@ message StreamPayload {
     TrafficOpenAck  open_ack       = 2;
     bytes           data           = 3;
     TrafficClose    close          = 4;
-    TrafficReset    reset          = 5;
-    TunnelRecycle     recycle      = 6;  // 新增
-    TunnelRecycleAck  recycle_ack  = 7;  // 新增
+    TrafficCloseAck close_ack      = 5;  // 新增
+    TrafficReset    reset          = 6;
+    TunnelRecycle   recycle        = 7;  // 新增
+    TunnelRecycleAck recycle_ack   = 8;  // 新增
   }
 }
 ```
@@ -485,9 +507,11 @@ message StreamPayload {
 - `TunnelRefillRequest` 的语义不变：依然是 Server 向 Agent 请求补充 idle tunnel
 - 只是触发频率可能降低（因为部分 tunnel 可以回收，不需要每次都新建）
 
-### 7.5 Session 级别的复用开关
+### 7.5 全量启用策略
 
-建议在 `ConnectorWelcome` 中增加 `tunnel_reuse_enabled` 字段，允许 Server 在握手阶段告知 Agent 是否启用 tunnel 复用。这使得复用能力可以按 session 级别动态开关，便于灰度发布和降级。
+本方案采用**直接全量启用**，不引入灰度开关字段。握手阶段仅下发复用参数（如 `max_reuse_count`、`recycle_timeout_sec`、`idle_ttl_sec`）。
+
+若对端版本不支持新增帧（`TrafficCloseAck` / `TunnelRecycle` / `TunnelRecycleAck`），应在握手阶段直接拒绝会话，避免进入不兼容运行态。
 
 ---
 
@@ -496,6 +520,15 @@ message StreamPayload {
 在 `LTFP-v1-Draft` protobuf 草案基础上新增以下 message 定义：
 
 ```protobuf
+// TrafficCloseAck：Agent 对 TrafficClose 的确认
+message TrafficCloseAck {
+  string traffic_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+  string error_message = 4;
+  map<string, string> metadata = 5;
+}
+
 // TunnelRecycle：Server 发起，在 TrafficClose/TrafficCloseAck 完成后发送
 // 表示 Server 认为 tunnel 可以回收，请求 Agent 确认
 message TunnelRecycle {
@@ -506,7 +539,7 @@ message TunnelRecycle {
   uint64 recycle_seq = 2;
 
   // 是否为最终回收（回收后关闭，不再入池）
-  // 当 ruse_count >= max_reuse_count 时为 true
+  // 当 reuse_count >= max_reuse_count 时为 true
   bool is_final = 3;
 
   // 可选：当前该 tunnel 已完成的 traffic 次数（含本次）
@@ -533,7 +566,7 @@ message TunnelRecycleAck {
 }
 ```
 
-`ConnectorWelcome` 扩展字段：
+`ConnectorWelcome` 扩展字段（仅保留参数下发，不引入灰度开关）：
 
 ```protobuf
 message ConnectorWelcome {
@@ -546,15 +579,17 @@ message ConnectorWelcome {
   uint64 assigned_session_epoch = 6;
   map<string, string> metadata = 7;
 
-  // 新增：是否启用 tunnel 复用（Server 侧决策）
-  bool tunnel_reuse_enabled = 8;
-
   // 新增：单条 tunnel 最大复用次数（Server 侧下发配置）
-  // 0 表示使用 Agent 本地默认值
-  int32 tunnel_max_reuse_count = 9;
+  // 0 表示使用实现默认值（建议 256）
+  int32 tunnel_max_reuse_count = 8;
 
   // 新增：回收握手超时（秒）
-  uint32 tunnel_recycle_timeout_sec = 10;
+  // 0 表示使用实现默认值（建议 3）
+  uint32 tunnel_recycle_timeout_sec = 9;
+
+  // 新增：idle tunnel 最大闲置存活时间（秒）
+  // 0 表示使用实现默认值（建议 600）
+  uint32 tunnel_idle_ttl_sec = 10;
 }
 ```
 
@@ -567,9 +602,10 @@ message StreamPayload {
     TrafficOpenAck   open_ack    = 2;
     bytes            data        = 3;
     TrafficClose     close       = 4;
-    TrafficReset     reset       = 5;
-    TunnelRecycle    recycle     = 6;  // 新增
-    TunnelRecycleAck recycle_ack = 7;  // 新增
+    TrafficCloseAck  close_ack   = 5;  // 新增
+    TrafficReset     reset       = 6;
+    TunnelRecycle    recycle     = 7;  // 新增
+    TunnelRecycleAck recycle_ack = 8;  // 新增
   }
 }
 ```
@@ -869,10 +905,10 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 |---|---|---|
 | §1.3 非目标 | 列有"tunnel 多次复用" | 从非目标列表中移除 |
 | §3.2.4 单 Tunnel 单 Traffic | 强约束：tunnel 一次性使用 | 改为"单 Tunnel 串行多 Traffic"，说明串行复用规则 |
-| §3.2.5 Framed All The Way | 列举帧类型 | 补充 `TunnelRecycle` / `TunnelRecycleAck` 为数据面帧类型 |
+| §3.2.5 Framed All The Way | 列举帧类型 | 补充 `TrafficCloseAck` / `TunnelRecycle` / `TunnelRecycleAck` 为数据面帧类型 |
 | §17.4 Tunnel 接口 | 原接口定义 | 增加 `Flush()`、`ReuseCount()`、`Recyclable()` 方法 |
 | §17.5 TunnelPool 接口 | 原接口定义 | 增加 `Recycle()`、`RecycledCount()`、`ClosedCount()` 方法 |
-| §18.2 TrafficProtocol | 帧类型枚举 | 增加 `TrafficFrameRecycle`、`TrafficFrameRecycleAck` |
+| §18.2 TrafficProtocol | 帧类型枚举 | 增加 `TrafficFrameCloseAck`、`TrafficFrameRecycle`、`TrafficFrameRecycleAck` |
 | §19.1 grpc_h2 Binding | 数据面描述 | 补充 grpc stream 复用语义，StreamPayload 扩展说明 |
 | §20 首版强约束 | 第 8 条"可以暂不实现 tunnel 多次复用" | 改为"必须实现 tunnel 串行复用" |
 | §22 推荐目录结构 | 现有结构 | 在 `runtime/connector/` 下增加 `tunnel_reuse.go`、`recycle_handshaker.go` |
@@ -883,7 +919,7 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 | 章节 | 原内容摘要 | 修订方向 |
 |---|---|---|
 | §3.2 数据面禁止应用层二次复用 | 禁止 traffic_id 手工复用 | 保留并发复用禁止约束；新增串行复用例外说明 |
-| §22 protobuf 草案 | 现有 message 定义 | 增加 `TunnelRecycle`、`TunnelRecycleAck`；扩展 `ConnectorWelcome`；扩展 `StreamPayload` |
+| §22 protobuf 草案 | 现有 message 定义 | 增加 `TrafficCloseAck`、`TunnelRecycle`、`TunnelRecycleAck`；扩展 `ConnectorWelcome`；扩展 `StreamPayload` |
 | §24 实施阶段 | 阶段一描述 | 在阶段一中增加"tunnel 串行复用"作为必须实现项 |
 
 ---
@@ -894,9 +930,9 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 
 ### 阶段 0：协议冻结
 
-- 确认 `TunnelRecycle` / `TunnelRecycleAck` 的 protobuf schema
+- 确认 `TrafficCloseAck` / `TunnelRecycle` / `TunnelRecycleAck` 的 protobuf schema
 - 确认 `ConnectorWelcome` 扩展字段
-- 在 `ConnectorWelcome` 中增加 `tunnel_reuse_enabled=false` 作为默认值（特性开关，默认关闭）
+- 确认默认参数：`max_reuse_count=256`、`recycle_timeout_sec=3`、`idle_ttl_sec=600`
 - 更新两份规范文档
 
 ### 阶段 1：Transport 层接口扩展
@@ -910,7 +946,7 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 - 实现 `RecycleHandshaker`（Server 侧）
 - 实现 `AgentTunnelHandler.HandleRecycle`（Agent 侧）
 - 实现 `TunnelDispatcher.RunTunnel` 中的复用循环逻辑
-- 在 `tunnel_reuse_enabled=false` 时确保行为与旧版完全一致
+- 支持外部传入配置并覆盖默认值（CLI / 配置文件 / 握手下发）
 
 ### 阶段 3：集成与测试
 
@@ -918,11 +954,11 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 - 集成测试：端对端验证 tunnel 在多次 traffic 后状态正确
 - 压测：对比开启/关闭复用时的 tunnel 建立速率、连接数、内存占用
 
-### 阶段 4：灰度启用
+### 阶段 4：全量发布
 
-- 在测试环境将 `ConnectorWelcome.tunnel_reuse_enabled` 改为 true
+- 默认全量启用 tunnel 串行复用（无灰度开关）
 - 观察监控指标：`RecycledCount`、`ClosedCount`、`ReuseCount` 分布
-- 确认无异常后在生产环境逐步开启
+- 若出现兼容性问题，通过回退版本处理（非运行期开关降级）
 
 ---
 
@@ -932,17 +968,18 @@ func (h *AgentTunnelHandler) sendRecycleAck(
 
 1. LTFP 传输层采用"长期控制通道 + Agent 预建 Tunnel Pool + **单 Tunnel 串行多 Traffic**"的统一模型，替代原"单 Tunnel 单 Traffic"约束
 2. **并发手工多路复用仍然被禁止**：不允许在单条 tunnel 上通过 `traffic_id` 并发承载多条流量
-3. 串行复用通过**回收握手（TunnelRecycle / TunnelRecycleAck）** 实现，握手在数据面（tunnel 本身）进行，不经控制面
-4. `TunnelRecycle` 只能由 **Server** 发起，`TunnelRecycleAck` 由 **Agent** 响应
+3. 串行复用通过**两段握手**实现：先 `TrafficClose / TrafficCloseAck`，再 `TunnelRecycle / TunnelRecycleAck`；两段握手都在数据面进行，不经控制面
+4. `TunnelRecycle` 只能由 **Server** 发起，`TunnelRecycleAck` 由 **Agent** 响应，且 `TrafficCloseAck` 必须先于 `TunnelRecycle`
 5. 回收握手失败（任何原因）必须**降级为 tunnel 关闭**，不得重试回收
 6. `recycle_seq` 必须单调递增，Agent 必须拒绝乱序消息
 7. 以 `TrafficReset` 结束的 traffic，其 tunnel **不得回收**，必须关闭
 8. 触发过 deadline 的 tunnel **不得回收**，必须关闭
-9. 每条 tunnel 必须有 `max_reuse_count` 上限，由 Server 在 `ConnectorWelcome` 中下发
-10. `tunnel_reuse_enabled` 作为 session 级特性开关，由 Server 在握手阶段控制
+9. 每条 tunnel 必须有 `max_reuse_count` 上限，由 Server 在 `ConnectorWelcome` 中下发；默认值建议为 `256`
+10. `tunnel_recycle_timeout_sec` 与 `tunnel_idle_ttl_sec` 支持在 `ConnectorWelcome` 中下发；默认建议值分别为 `3` 与 `600`
 11. `TunnelRefillRequest` 水位计算可以参考预计回收数量，但安全下界不得依赖回收预测
 12. Transport 层的 `Tunnel` 接口新增 `Flush()`、`ReuseCount()`、`Recyclable()` 方法
 13. Transport 层的 `TunnelPool` 接口新增 `Recycle()` 方法，内部自动处理降级逻辑
-14. `TunnelRecycle` / `TunnelRecycleAck` 属于数据面帧，纳入"Framed All The Way"范畴
+14. `TrafficCloseAck` / `TunnelRecycle` / `TunnelRecycleAck` 属于数据面帧，纳入"Framed All The Way"范畴
 15. grpc_h2 binding 在 tunnel 复用期间不调用 gRPC stream 的 `CloseSend`，仅在 `is_final=true` 回收或错误时才关闭 stream
-16. LTFP 协议层状态机仍然是唯一外部真相源，tunnel 内部的 `recycling` 状态属于 transport 内部态，不对外暴露
+16. 本版本默认全量启用串行复用，不设置灰度开关字段
+17. LTFP 协议层状态机仍然是唯一外部真相源，tunnel 内部的 `recycling` 状态属于 transport 内部态，不对外暴露

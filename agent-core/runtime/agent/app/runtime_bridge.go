@@ -307,15 +307,17 @@ func (r *Runtime) initTunnelManager() error {
 	}
 	registry := tunnel.NewRegistry()
 	manager, err := tunnel.NewManager(tunnel.ManagerOptions{
-		Config: tunnel.ManagerConfig{
-			MinIdle:           r.cfg.TunnelPool.MinIdle,
-			MaxIdle:           r.cfg.TunnelPool.MaxIdle,
-			IdleTTL:           r.cfg.TunnelPool.TTL,
-			MaxInflightOpens:  r.cfg.TunnelPool.MaxInflight,
-			TunnelOpenRate:    r.cfg.TunnelPool.OpenRate,
-			TunnelOpenBurst:   r.cfg.TunnelPool.OpenBurst,
-			ReconcileInterval: r.cfg.TunnelPool.ReconcileGap,
-		},
+			Config: tunnel.ManagerConfig{
+				MinIdle:           r.cfg.TunnelPool.MinIdle,
+				MaxIdle:           r.cfg.TunnelPool.MaxIdle,
+				IdleTTL:           r.cfg.TunnelPool.TTL,
+				MaxReuseCount:     r.cfg.TunnelPool.MaxReuse,
+				RecycleTimeout:    r.cfg.TunnelPool.RecycleAckTO,
+				MaxInflightOpens:  r.cfg.TunnelPool.MaxInflight,
+				TunnelOpenRate:    r.cfg.TunnelPool.OpenRate,
+				TunnelOpenBurst:   r.cfg.TunnelPool.OpenBurst,
+				ReconcileInterval: r.cfg.TunnelPool.ReconcileGap,
+			},
 		Registry: registry,
 		Opener:   &bridgeTunnelOpener{runtime: r},
 		// tunnel manager 事件指标统一写入 runtime 级 metrics 容器。
@@ -2302,6 +2304,8 @@ func (r *Runtime) configSnapshotPayload(ipcTransport string, ipcEndpoint string)
 		"tunnel_pool_max_idle":         r.cfg.TunnelPool.MaxIdle,
 		"tunnel_pool_max_inflight":     r.cfg.TunnelPool.MaxInflight,
 		"tunnel_pool_ttl_ms":           durationToMillis(r.cfg.TunnelPool.TTL),
+		"tunnel_pool_max_reuse":        r.cfg.TunnelPool.MaxReuse,
+		"tunnel_pool_recycle_ack_ms":   durationToMillis(r.cfg.TunnelPool.RecycleAckTO),
 		"tunnel_pool_open_rate":        r.cfg.TunnelPool.OpenRate,
 		"tunnel_pool_open_burst":       r.cfg.TunnelPool.OpenBurst,
 		"tunnel_pool_reconcile_gap_ms": durationToMillis(r.cfg.TunnelPool.ReconcileGap),

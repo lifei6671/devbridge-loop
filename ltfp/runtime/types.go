@@ -67,8 +67,14 @@ const (
 	TrafficFrameData TrafficFrameType = "data"
 	// TrafficFrameClose 表示 Close 帧。
 	TrafficFrameClose TrafficFrameType = "close"
+	// TrafficFrameCloseAck 表示 CloseAck 帧。
+	TrafficFrameCloseAck TrafficFrameType = "close_ack"
 	// TrafficFrameReset 表示 Reset 帧。
 	TrafficFrameReset TrafficFrameType = "reset"
+	// TrafficFrameRecycle 表示 TunnelRecycle 帧。
+	TrafficFrameRecycle TrafficFrameType = "recycle"
+	// TrafficFrameRecycleAck 表示 TunnelRecycleAck 帧。
+	TrafficFrameRecycleAck TrafficFrameType = "recycle_ack"
 )
 
 // TrafficOpenAck 描述 Open 的应答语义。
@@ -84,22 +90,49 @@ type TrafficClose struct {
 	Message string
 }
 
+// TrafficCloseAck 描述协议性关闭确认语义。
+type TrafficCloseAck struct {
+	Accepted bool
+	Code     string
+	Message  string
+}
+
 // TrafficReset 描述异常终止语义。
 type TrafficReset struct {
 	Code    string
 	Message string
 }
 
+// TunnelRecycle 描述服务端发起的 tunnel 回收请求。
+type TunnelRecycle struct {
+	TunnelID              string
+	RecycleSeq            uint64
+	IsFinal               bool
+	CompletedTrafficCount int32
+}
+
+// TunnelRecycleAck 描述 Agent 对 tunnel 回收请求的确认。
+type TunnelRecycleAck struct {
+	TunnelID   string
+	RecycleSeq uint64
+	Accepted   bool
+	ErrorCode  string
+	Message    string
+}
+
 // TrafficFrame 描述 runtime 层统一帧对象。
 //
 // 每一帧必须且只能携带一种语义载荷，对应 Type 字段。
 type TrafficFrame struct {
-	Type    TrafficFrameType
-	Open    *TrafficMeta
-	OpenAck *TrafficOpenAck
-	Data    []byte
-	Close   *TrafficClose
-	Reset   *TrafficReset
+	Type       TrafficFrameType
+	Open       *TrafficMeta
+	OpenAck    *TrafficOpenAck
+	Data       []byte
+	Close      *TrafficClose
+	CloseAck   *TrafficCloseAck
+	Reset      *TrafficReset
+	Recycle    *TunnelRecycle
+	RecycleAck *TunnelRecycleAck
 }
 
 // Validate 校验帧类型与载荷的一致性。
@@ -112,7 +145,7 @@ func (frame TrafficFrame) Validate() error {
 		if err := frame.Open.Validate(); err != nil {
 			return err
 		}
-		if frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.Reset != nil {
+		if frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.CloseAck != nil || frame.Reset != nil || frame.Recycle != nil || frame.RecycleAck != nil {
 			// Open 帧禁止混入其他载荷，避免对端解码歧义。
 			return fmt.Errorf("validate traffic frame: %w: open frame carries unexpected payload", transport.ErrInvalidArgument)
 		}
@@ -120,26 +153,47 @@ func (frame TrafficFrame) Validate() error {
 		if frame.OpenAck == nil {
 			return fmt.Errorf("validate traffic frame: %w: open_ack payload is nil", transport.ErrInvalidArgument)
 		}
-		if frame.Open != nil || len(frame.Data) > 0 || frame.Close != nil || frame.Reset != nil {
+		if frame.Open != nil || len(frame.Data) > 0 || frame.Close != nil || frame.CloseAck != nil || frame.Reset != nil || frame.Recycle != nil || frame.RecycleAck != nil {
 			return fmt.Errorf("validate traffic frame: %w: open_ack frame carries unexpected payload", transport.ErrInvalidArgument)
 		}
 	case TrafficFrameData:
-		if frame.Open != nil || frame.OpenAck != nil || frame.Close != nil || frame.Reset != nil {
+		if frame.Open != nil || frame.OpenAck != nil || frame.Close != nil || frame.CloseAck != nil || frame.Reset != nil || frame.Recycle != nil || frame.RecycleAck != nil {
 			return fmt.Errorf("validate traffic frame: %w: data frame carries unexpected payload", transport.ErrInvalidArgument)
 		}
 	case TrafficFrameClose:
 		if frame.Close == nil {
 			return fmt.Errorf("validate traffic frame: %w: close payload is nil", transport.ErrInvalidArgument)
 		}
-		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Reset != nil {
+		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.CloseAck != nil || frame.Reset != nil || frame.Recycle != nil || frame.RecycleAck != nil {
 			return fmt.Errorf("validate traffic frame: %w: close frame carries unexpected payload", transport.ErrInvalidArgument)
+		}
+	case TrafficFrameCloseAck:
+		if frame.CloseAck == nil {
+			return fmt.Errorf("validate traffic frame: %w: close_ack payload is nil", transport.ErrInvalidArgument)
+		}
+		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.Reset != nil || frame.Recycle != nil || frame.RecycleAck != nil {
+			return fmt.Errorf("validate traffic frame: %w: close_ack frame carries unexpected payload", transport.ErrInvalidArgument)
 		}
 	case TrafficFrameReset:
 		if frame.Reset == nil {
 			return fmt.Errorf("validate traffic frame: %w: reset payload is nil", transport.ErrInvalidArgument)
 		}
-		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil {
+		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.CloseAck != nil || frame.Recycle != nil || frame.RecycleAck != nil {
 			return fmt.Errorf("validate traffic frame: %w: reset frame carries unexpected payload", transport.ErrInvalidArgument)
+		}
+	case TrafficFrameRecycle:
+		if frame.Recycle == nil {
+			return fmt.Errorf("validate traffic frame: %w: recycle payload is nil", transport.ErrInvalidArgument)
+		}
+		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.CloseAck != nil || frame.Reset != nil || frame.RecycleAck != nil {
+			return fmt.Errorf("validate traffic frame: %w: recycle frame carries unexpected payload", transport.ErrInvalidArgument)
+		}
+	case TrafficFrameRecycleAck:
+		if frame.RecycleAck == nil {
+			return fmt.Errorf("validate traffic frame: %w: recycle_ack payload is nil", transport.ErrInvalidArgument)
+		}
+		if frame.Open != nil || frame.OpenAck != nil || len(frame.Data) > 0 || frame.Close != nil || frame.CloseAck != nil || frame.Reset != nil || frame.Recycle != nil {
+			return fmt.Errorf("validate traffic frame: %w: recycle_ack frame carries unexpected payload", transport.ErrInvalidArgument)
 		}
 	default:
 		return fmt.Errorf("validate traffic frame: %w: unknown frame type=%q", transport.ErrInvalidArgument, frame.Type)

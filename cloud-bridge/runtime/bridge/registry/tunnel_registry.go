@@ -53,6 +53,8 @@ type TunnelRuntime struct {
 	ConnectorID string
 	SessionID   string
 	TrafficID   string
+	ReuseCount  int
+	RecycleSeq  uint64
 	State       TunnelState
 	LastError   string
 	CreatedAt   time.Time
@@ -187,6 +189,41 @@ func (registry *TunnelRegistry) MarkActive(now time.Time, tunnelID string, traff
 	runtime.State = TunnelStateActive
 	runtime.TrafficID = strings.TrimSpace(trafficID)
 	runtime.UpdatedAt = normalizedNow
+	registry.updatedAt = normalizedNow
+	return nil
+}
+
+// MarkIdleAfterRecycle 把 active/reserved tunnel 复位为 idle 并更新回收计数。
+func (registry *TunnelRegistry) MarkIdleAfterRecycle(now time.Time, tunnelID string, recycleSeq uint64) error {
+	if registry == nil {
+		return ErrTunnelRegistryDependencyMissing
+	}
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return ErrTunnelNotFound
+	}
+	registry.mutex.Lock()
+	defer registry.mutex.Unlock()
+	runtime, exists := registry.byTunnelID[normalizedTunnelID]
+	if !exists {
+		return ErrTunnelNotFound
+	}
+	if runtime.State != TunnelStateActive && runtime.State != TunnelStateReserved {
+		return ErrInvalidTunnelStateTransition
+	}
+	if recycleSeq == 0 || recycleSeq <= runtime.RecycleSeq {
+		return ErrInvalidTunnelStateTransition
+	}
+	runtime.State = TunnelStateIdle
+	runtime.TrafficID = ""
+	runtime.RecycleSeq = recycleSeq
+	runtime.ReuseCount++
+	runtime.UpdatedAt = normalizedNow
+	registry.idleByConnector[runtime.ConnectorID] = append(registry.idleByConnector[runtime.ConnectorID], runtime.TunnelID)
 	registry.updatedAt = normalizedNow
 	return nil
 }
@@ -460,9 +497,9 @@ func isValidTunnelTransition(current TunnelState, target TunnelState) bool {
 	case TunnelStateIdle:
 		return target == TunnelStateReserved || target == TunnelStateBroken
 	case TunnelStateReserved:
-		return target == TunnelStateActive || target == TunnelStateClosed || target == TunnelStateBroken
+		return target == TunnelStateActive || target == TunnelStateIdle || target == TunnelStateClosed || target == TunnelStateBroken
 	case TunnelStateActive:
-		return target == TunnelStateClosed || target == TunnelStateBroken
+		return target == TunnelStateIdle || target == TunnelStateClosed || target == TunnelStateBroken
 	default:
 		return false
 	}
@@ -478,6 +515,8 @@ func cloneTunnelRuntime(runtime *TunnelRuntime) TunnelRuntime {
 		ConnectorID: runtime.ConnectorID,
 		SessionID:   runtime.SessionID,
 		TrafficID:   runtime.TrafficID,
+		ReuseCount:  runtime.ReuseCount,
+		RecycleSeq:  runtime.RecycleSeq,
 		State:       runtime.State,
 		LastError:   runtime.LastError,
 		CreatedAt:   runtime.CreatedAt,
