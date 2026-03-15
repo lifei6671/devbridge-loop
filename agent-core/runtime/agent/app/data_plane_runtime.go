@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/traffic"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
 	"github.com/lifei6671/devbridge-loop/ltfp/codec"
@@ -58,8 +61,9 @@ func (r *Runtime) initTrafficRuntime() error {
 		return ErrRuntimeTrafficDependencyMissing
 	}
 	opener, err := traffic.NewOpener(traffic.OpenerOptions{
-		// 首版 selector 以 endpoint hint 为入口，后续由 ServiceCatalog 真相源替换。
-		Selector: &runtimeHintEndpointSelector{},
+		Selector: &runtimeHintEndpointSelector{
+			serviceCatalog: r.serviceCatalog,
+		},
 		Dialer: &runtimeNetUpstreamDialer{
 			dialTimeout: defaultTrafficUpstreamDialTimeout,
 		},
@@ -116,36 +120,36 @@ func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string, reason string) {
 	if normalizedTrigger == "" {
 		return
 	}
-	level := "info"
-	code := "TUNNEL_POOL_EVENT"
+	level := events.EventInfo
+	code := events.CodeTunnelPoolEvent
 	switch normalizedTrigger {
 	case "refill_requested":
-		code = "TUNNEL_REFILL_REQUESTED"
+		code = events.CodeTunnelRefillRequested
 	case "ttl_reaped":
-		code = "TUNNEL_IDLE_TTL_REAPED"
+		code = events.CodeTunnelIdleTTLReaped
 	case "tunnel_closed":
-		code = "TUNNEL_CLEANUP_CLOSED"
+		code = events.CodeTunnelCleanupClosed
 	case "tunnel_broken":
-		code = "TUNNEL_CLEANUP_BROKEN"
-		level = "warn"
+		code = events.CodeTunnelCleanupBroken
+		level = events.EventWarn
 	case "idle_acquired":
-		code = "TUNNEL_IDLE_ACQUIRED"
+		code = events.CodeTunnelIdleAcquired
 	case "tunnel_active":
-		code = "TUNNEL_ACTIVE"
+		code = events.CodeTunnelActive
 	case "pool_changed":
-		code = "TUNNEL_POOL_CHANGED"
+		code = events.CodeTunnelPoolChanged
 	case "pool_rebuilt":
-		code = "TUNNEL_POOL_REBUILT"
+		code = events.CodeTunnelPoolRebuilt
 	case "session_draining":
-		code = "TUNNEL_POOL_SESSION_DRAINING"
+		code = events.CodeTunnelPoolSessionDraining
 	case "session_stale":
-		code = "TUNNEL_POOL_SESSION_STALE"
-		level = "warn"
+		code = events.CodeTunnelPoolSessionStale
+		level = events.EventWarn
 	case "session_active":
-		code = "TUNNEL_POOL_SESSION_ACTIVE"
+		code = events.CodeTunnelPoolSessionActive
 	case "startup_reconcile_failed":
-		code = "TUNNEL_POOL_STARTUP_RECONCILE_FAILED"
-		level = "warn"
+		code = events.CodeTunnelPoolStartupReconcileFailed
+		level = events.EventWarn
 	default:
 		// 保留透传 trigger，便于后续扩展治理事件时无损观测。
 	}
@@ -167,7 +171,7 @@ func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string, reason string) {
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
 		Level:        level,
-		Module:       "agent.runtime.tunnel",
+		Module:       events.ModuleAgentRuntimeTunnel,
 		Code:         code,
 		Message:      message,
 		SessionID:    sessionID,
@@ -404,7 +408,9 @@ func isTrafficContextCanceled(ctx context.Context, err error) bool {
 }
 
 // runtimeHintEndpointSelector 使用 endpoint hint 做本地 endpoint 选择。
-type runtimeHintEndpointSelector struct{}
+type runtimeHintEndpointSelector struct {
+	serviceCatalog *service.Catalog
+}
 
 // SelectEndpoint 基于 service_id 与 hint 选择最终 endpoint。
 func (selector *runtimeHintEndpointSelector) SelectEndpoint(
@@ -433,6 +439,10 @@ func (selector *runtimeHintEndpointSelector) SelectEndpoint(
 		break
 	}
 	if resolvedEndpointAddr == "" {
+		catalogEndpoint, hasCatalogEndpoint := selector.selectEndpointFromCatalog(normalizedServiceID, normalizedHint)
+		if hasCatalogEndpoint {
+			return catalogEndpoint, nil
+		}
 		return traffic.Endpoint{}, fmt.Errorf("select endpoint: service=%s missing endpoint hint", normalizedServiceID)
 	}
 	endpointID := strings.TrimSpace(normalizedHint[trafficOpenHintEndpointIDKey])
@@ -444,6 +454,90 @@ func (selector *runtimeHintEndpointSelector) SelectEndpoint(
 		ID:   endpointID,
 		Addr: resolvedEndpointAddr,
 	}, nil
+}
+
+func (selector *runtimeHintEndpointSelector) selectEndpointFromCatalog(
+	serviceID string,
+	hint map[string]string,
+) (traffic.Endpoint, bool) {
+	if selector == nil || selector.serviceCatalog == nil {
+		return traffic.Endpoint{}, false
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return traffic.Endpoint{}, false
+	}
+	endpointIDHint := strings.TrimSpace(hint[trafficOpenHintEndpointIDKey])
+	endpointAddrHint := strings.TrimSpace(hint[trafficOpenHintEndpointAddrKey])
+	if endpointAddrHint == "" {
+		endpointAddrHint = strings.TrimSpace(hint[trafficOpenHintEndpointKey])
+	}
+	if endpointAddrHint == "" {
+		endpointAddrHint = strings.TrimSpace(hint[trafficOpenHintAddressKey])
+	}
+	records := selector.serviceCatalog.List()
+	for _, record := range records {
+		candidateServiceID := strings.TrimSpace(record.Registration.ServiceID)
+		candidateServiceKey := strings.TrimSpace(record.Registration.ServiceKey)
+		if normalizedServiceID != candidateServiceID && normalizedServiceID != candidateServiceKey {
+			continue
+		}
+		if endpointIDHint != "" {
+			for _, endpoint := range record.Registration.Endpoints {
+				if strings.TrimSpace(endpoint.EndpointID) != endpointIDHint {
+					continue
+				}
+				if endpointAddr := resolveEndpointAddress(endpoint); endpointAddr != "" {
+					return traffic.Endpoint{
+						ID:   endpointIDHint,
+						Addr: endpointAddr,
+					}, true
+				}
+			}
+		}
+		if endpointAddrHint != "" {
+			for _, endpoint := range record.Registration.Endpoints {
+				endpointAddr := resolveEndpointAddress(endpoint)
+				if endpointAddr == "" || endpointAddr != endpointAddrHint {
+					continue
+				}
+				endpointID := strings.TrimSpace(endpoint.EndpointID)
+				if endpointID == "" {
+					endpointID = endpointAddr
+				}
+				return traffic.Endpoint{
+					ID:   endpointID,
+					Addr: endpointAddr,
+				}, true
+			}
+		}
+		for _, endpoint := range record.Registration.Endpoints {
+			endpointAddr := resolveEndpointAddress(endpoint)
+			if endpointAddr == "" {
+				continue
+			}
+			endpointID := strings.TrimSpace(endpoint.EndpointID)
+			if endpointID == "" {
+				endpointID = endpointAddr
+			}
+			return traffic.Endpoint{
+				ID:   endpointID,
+				Addr: endpointAddr,
+			}, true
+		}
+	}
+	return traffic.Endpoint{}, false
+}
+
+func resolveEndpointAddress(endpoint pb.ServiceEndpoint) string {
+	normalizedHost := strings.TrimSpace(endpoint.Host)
+	if normalizedHost == "" {
+		return ""
+	}
+	if endpoint.Port > 0 {
+		return net.JoinHostPort(normalizedHost, strconv.Itoa(int(endpoint.Port)))
+	}
+	return normalizedHost
 }
 
 // runtimeNetUpstreamDialer 是 Agent 默认 upstream TCP 拨号器。

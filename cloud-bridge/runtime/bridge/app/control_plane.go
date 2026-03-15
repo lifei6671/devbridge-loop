@@ -1580,11 +1580,17 @@ func classifyTCPInboundConnection(rawConn net.Conn) (net.Conn, bool, error) {
 		return nil, false, fmt.Errorf("classify tcp inbound: read prefix: %w", readErr)
 	}
 	frameType := binary.BigEndian.Uint16(peekBuffer)
+	if !isKnownControlFrameType(frameType) {
+		if isLikelyHTTPPrefix(peekBuffer) {
+			return nil, false, errors.New("classify tcp inbound: non-ltfp protocol on control port (possible http/grpc)")
+		}
+		return nil, false, fmt.Errorf("classify tcp inbound: unknown non-control prefix=0x%02x%02x", peekBuffer[0], peekBuffer[1])
+	}
 	classifiedConn := &prefixedNetConn{
 		Conn:   rawConn,
 		prefix: append([]byte(nil), peekBuffer...),
 	}
-	return classifiedConn, isKnownControlFrameType(frameType), nil
+	return classifiedConn, true, nil
 }
 
 // isKnownControlFrameType 判断帧类型是否属于控制面帧。
@@ -1594,6 +1600,18 @@ func isKnownControlFrameType(frameType uint16) bool {
 	}
 	_, err := transport.ControlMessageTypeForFrameType(frameType)
 	return err == nil
+}
+
+func isLikelyHTTPPrefix(prefix []byte) bool {
+	if len(prefix) < 2 {
+		return false
+	}
+	switch strings.ToUpper(string(prefix)) {
+	case "GE", "HE", "PO", "PU", "DE", "OP", "PA", "TR", "CO", "PR":
+		return true
+	default:
+		return false
+	}
 }
 
 // acceptTCPConnectionWithContext 在支持 deadline 的 listener 上轮询 Accept，以响应 ctx 取消。

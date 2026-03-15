@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -887,7 +888,7 @@ func TestClassifyTCPInboundConnection(testingObject *testing.T) {
 		}
 	})
 
-	testingObject.Run("tunnel_frame_prefix", func(testingObject *testing.T) {
+	testingObject.Run("unknown_prefix_rejected", func(testingObject *testing.T) {
 		serverConn, clientConn := net.Pipe()
 		defer func() {
 			_ = serverConn.Close()
@@ -901,18 +902,63 @@ func TestClassifyTCPInboundConnection(testingObject *testing.T) {
 		}()
 
 		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
-		if err != nil {
-			testingObject.Fatalf("classify tunnel connection failed: %v", err)
+		if err == nil {
+			testingObject.Fatalf("expected unknown prefix classify error")
+		}
+		if !strings.Contains(err.Error(), "unknown non-control prefix") {
+			testingObject.Fatalf("unexpected classify error: %v", err)
 		}
 		if isControl {
-			testingObject.Fatalf("expected tunnel connection")
+			testingObject.Fatalf("expected non-control for unknown prefix")
 		}
-		readBackHeader := make([]byte, 4)
-		if _, err := io.ReadFull(classifiedConn, readBackHeader); err != nil {
-			testingObject.Fatalf("read classified tunnel prefix failed: %v", err)
+		if classifiedConn != nil {
+			testingObject.Fatalf("expected nil classified connection on unknown prefix")
 		}
-		if binary.BigEndian.Uint32(readBackHeader[0:4]) != 16 {
-			testingObject.Fatalf("unexpected tunnel payload length after prefix replay")
+	})
+
+	testingObject.Run("http_prefix_rejected", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		go func() {
+			_, _ = clientConn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+		}()
+
+		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
+		if err == nil {
+			testingObject.Fatalf("expected http prefix classify error")
+		}
+		if !strings.Contains(err.Error(), "non-ltfp protocol") {
+			testingObject.Fatalf("unexpected classify error for http prefix: %v", err)
+		}
+		if isControl {
+			testingObject.Fatalf("expected non-control for http prefix")
+		}
+		if classifiedConn != nil {
+			testingObject.Fatalf("expected nil classified connection for http prefix")
+		}
+	})
+
+	testingObject.Run("no_prefix_timeout_treated_as_tunnel", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		// 不写入任何首包，模拟 Agent 仅建立连接等待 Bridge 下发 traffic_open。
+		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
+		if err != nil {
+			testingObject.Fatalf("classify idle tunnel connection failed: %v", err)
+		}
+		if isControl {
+			testingObject.Fatalf("expected tunnel classification on no-prefix timeout")
+		}
+		if classifiedConn == nil {
+			testingObject.Fatalf("expected passthrough connection for tunnel classification")
 		}
 	})
 }

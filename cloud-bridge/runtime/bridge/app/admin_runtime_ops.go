@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ type adminRuntimeConfigStore struct {
 	mutex sync.RWMutex
 
 	runtimeConfig  Config
+	configFilePath string
+	saveConfigFunc func(config Config, configFilePath string) error
 	configVersion  uint64
 	lastUpdatedAt  time.Time
 	lastOperatorID string
@@ -25,9 +28,11 @@ type adminRuntimeConfigStore struct {
 // newAdminRuntimeConfigStore 构建管理面配置快照存储。
 func newAdminRuntimeConfigStore(config Config) *adminRuntimeConfigStore {
 	return &adminRuntimeConfigStore{
-		runtimeConfig: config,
-		configVersion: 1,
-		lastUpdatedAt: time.Now().UTC(),
+		runtimeConfig:  config,
+		configFilePath: strings.TrimSpace(config.RuntimeConfigFilePath),
+		saveConfigFunc: SaveConfigToYAMLFile,
+		configVersion:  1,
+		lastUpdatedAt:  time.Now().UTC(),
 	}
 }
 
@@ -61,7 +66,8 @@ func buildAdminConfigSnapshot(
 		})
 	}
 	return map[string]any{
-		"config_version": configVersion,
+		"config_version":   configVersion,
+		"config_file_path": strings.TrimSpace(configCopy.RuntimeConfigFilePath),
 		"ingress": map[string]any{
 			"http_addr":      configCopy.Ingress.HTTPAddr,
 			"grpc_addr":      configCopy.Ingress.GRPCAddr,
@@ -154,6 +160,54 @@ func (store *adminRuntimeConfigStore) update(
 	for _, patchKey := range sortedPatchKeys(request.Patch) {
 		patchValue := request.Patch[patchKey]
 		switch patchKey {
+		case "ingress.http_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.HTTPAddr = listenAddr
+		case "ingress.grpc_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.GRPCAddr = listenAddr
+		case "ingress.https_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.HTTPSAddr = listenAddr
+		case "ingress.tls_sni_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.TLSSNIAddr = listenAddr
+		case "ingress.tcp_port_range":
+			portRange, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.TCPPortRange = portRange
+		case "admin.enabled":
+			enabled, err := parsePatchBool(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Admin.Enabled = enabled
+		case "admin.listen_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Admin.ListenAddr = listenAddr
+		case "admin.allow_shared_listener":
+			allowSharedListener, err := parsePatchBool(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Admin.AllowSharedListener = allowSharedListener
 		case "admin.ui_enabled":
 			enabled, err := parsePatchBool(patchValue)
 			if err != nil {
@@ -166,18 +220,58 @@ func (store *adminRuntimeConfigStore) update(
 				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 			}
 			configCandidate.Admin.BasePath = normalizeAdminUIBasePath(basePath)
+		case "control_plane.listen_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.ControlPlane.ListenAddr = listenAddr
+		case "control_plane.grpc_h2_listen_addr":
+			listenAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.ControlPlane.GRPCH2ListenAddr = listenAddr
+		case "control_plane.heartbeat_timeout":
+			heartbeatTimeout, err := parsePatchDuration(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
+		case "control_plane.heartbeat_timeout_ms":
+			heartbeatTimeout, err := parsePatchDurationMillis(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
 		case "observability.log_level":
 			logLevel, err := parsePatchString(patchValue)
 			if err != nil {
 				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 			}
 			configCandidate.Observability.LogLevel = strings.TrimSpace(logLevel)
+		case "observability.metrics_addr":
+			metricsAddr, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Observability.MetricsAddr = metricsAddr
 		default:
 			return adminapi.ConfigUpdateResult{}, fmt.Errorf(
 				"%w: unsupported patch key=%s",
 				adminapi.ErrAdminInvalidArgument,
 				patchKey,
 			)
+		}
+	}
+	if err := configCandidate.Validate(); err != nil {
+		return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+	}
+	configFilePath := strings.TrimSpace(store.configFilePath)
+	if configFilePath != "" && store.saveConfigFunc != nil {
+		configCandidate.RuntimeConfigFilePath = configFilePath
+		if saveErr := store.saveConfigFunc(configCandidate, configFilePath); saveErr != nil {
+			return adminapi.ConfigUpdateResult{}, fmt.Errorf("persist config file failed: %w", saveErr)
 		}
 	}
 	store.runtimeConfig = configCandidate
@@ -322,11 +416,21 @@ func shouldDrainConnectorServices(
 
 // parsePatchBool 解析配置补丁中的布尔值字段。
 func parsePatchBool(rawValue any) (bool, error) {
-	value, ok := rawValue.(bool)
-	if !ok {
+	switch value := rawValue.(type) {
+	case bool:
+		return value, nil
+	case string:
+		normalizedValue := strings.ToLower(strings.TrimSpace(value))
+		if normalizedValue == "true" || normalizedValue == "1" {
+			return true, nil
+		}
+		if normalizedValue == "false" || normalizedValue == "0" {
+			return false, nil
+		}
+		return false, fmt.Errorf("expect bool value, got=%q", value)
+	default:
 		return false, fmt.Errorf("expect bool value, got=%T", rawValue)
 	}
-	return value, nil
 }
 
 // parsePatchString 解析配置补丁中的字符串字段。
@@ -340,6 +444,58 @@ func parsePatchString(rawValue any) (string, error) {
 		return "", fmt.Errorf("string value is empty")
 	}
 	return normalizedValue, nil
+}
+
+// parsePatchDuration 解析配置补丁中的 duration 字符串字段（例如 30s / 1500ms）。
+func parsePatchDuration(rawValue any) (time.Duration, error) {
+	rawText, err := parsePatchString(rawValue)
+	if err != nil {
+		return 0, err
+	}
+	durationValue, parseErr := time.ParseDuration(rawText)
+	if parseErr != nil {
+		return 0, fmt.Errorf("invalid duration value=%q", rawText)
+	}
+	if durationValue <= 0 {
+		return 0, fmt.Errorf("duration value must be > 0")
+	}
+	return durationValue, nil
+}
+
+// parsePatchDurationMillis 解析以毫秒为单位的时长补丁值。
+func parsePatchDurationMillis(rawValue any) (time.Duration, error) {
+	switch value := rawValue.(type) {
+	case float64:
+		if value <= 0 {
+			return 0, fmt.Errorf("duration_ms must be > 0")
+		}
+		return time.Duration(value) * time.Millisecond, nil
+	case int:
+		if value <= 0 {
+			return 0, fmt.Errorf("duration_ms must be > 0")
+		}
+		return time.Duration(value) * time.Millisecond, nil
+	case int64:
+		if value <= 0 {
+			return 0, fmt.Errorf("duration_ms must be > 0")
+		}
+		return time.Duration(value) * time.Millisecond, nil
+	case string:
+		normalizedValue := strings.TrimSpace(value)
+		if normalizedValue == "" {
+			return 0, fmt.Errorf("duration_ms value is empty")
+		}
+		parsedInt, parseErr := strconv.ParseInt(normalizedValue, 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("invalid duration_ms value=%q", normalizedValue)
+		}
+		if parsedInt <= 0 {
+			return 0, fmt.Errorf("duration_ms must be > 0")
+		}
+		return time.Duration(parsedInt) * time.Millisecond, nil
+	default:
+		return 0, fmt.Errorf("expect number/string duration_ms, got=%T", rawValue)
+	}
 }
 
 // sortedPatchKeys 返回排序后的 patch key，保证处理顺序可预测。

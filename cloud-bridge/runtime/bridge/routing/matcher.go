@@ -1,7 +1,9 @@
 package routing
 
 import (
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
@@ -63,8 +65,11 @@ func (matcher *Matcher) Match(request ingress.RouteLookupRequest, routes []pb.Ro
 func normalizeLookupRequest(request ingress.RouteLookupRequest) ingress.RouteLookupRequest {
 	normalized := request
 	normalized.Protocol = strings.ToLower(strings.TrimSpace(request.Protocol))
-	normalized.Host = strings.ToLower(strings.TrimSpace(request.Host))
-	normalized.Authority = strings.ToLower(strings.TrimSpace(request.Authority))
+	normalized.Host = normalizeRouteHostValue(request.Host)
+	normalized.Authority = normalizeRouteAuthorityValue(request.Authority)
+	if normalized.Authority == "" && normalized.Host != "" {
+		normalized.Authority = normalized.Host
+	}
 	normalized.Path = normalizePath(request.Path)
 	normalized.SNI = strings.ToLower(strings.TrimSpace(request.SNI))
 	normalized.Namespace = strings.TrimSpace(request.Namespace)
@@ -80,14 +85,14 @@ func scoreRouteMatch(request ingress.RouteLookupRequest, match pb.RouteMatch) (i
 		}
 		score += 8
 	}
-	if normalizedHost := strings.ToLower(strings.TrimSpace(match.Host)); normalizedHost != "" {
+	if normalizedHost := normalizeRouteHostValue(match.Host); normalizedHost != "" {
 		if normalizedHost != request.Host {
 			return 0, false
 		}
 		score += 10
 	}
-	if normalizedAuthority := strings.ToLower(strings.TrimSpace(match.Authority)); normalizedAuthority != "" {
-		if normalizedAuthority != request.Authority {
+	if normalizedAuthority := normalizeRouteAuthorityValue(match.Authority); normalizedAuthority != "" {
+		if !routeAuthorityMatches(normalizedAuthority, request.Authority, request.Host) {
 			return 0, false
 		}
 		score += 10
@@ -144,4 +149,86 @@ func normalizePath(path string) string {
 		return "/" + normalized
 	}
 	return normalized
+}
+
+func routeAuthorityMatches(routeAuthority string, requestAuthority string, requestHost string) bool {
+	normalizedRouteAuthority := normalizeRouteAuthorityValue(routeAuthority)
+	normalizedRequestAuthority := normalizeRouteAuthorityValue(requestAuthority)
+	if normalizedRouteAuthority == normalizedRequestAuthority {
+		return true
+	}
+	routePort, hasRoutePort := extractAuthorityPort(normalizedRouteAuthority)
+	requestPort, hasRequestPort := extractAuthorityPort(normalizedRequestAuthority)
+	if hasRoutePort && hasRequestPort && routePort != requestPort {
+		return false
+	}
+	routeHost := normalizeRouteHostValue(normalizedRouteAuthority)
+	requestAuthorityHost := normalizeRouteHostValue(normalizedRequestAuthority)
+	if requestAuthorityHost == "" {
+		requestAuthorityHost = normalizeRouteHostValue(requestHost)
+	}
+	return routeHost != "" && routeHost == requestAuthorityHost
+}
+
+func normalizeRouteAuthorityValue(authority string) string {
+	normalized := strings.ToLower(strings.TrimSpace(authority))
+	if normalized == "" {
+		return ""
+	}
+	host, port, splitErr := net.SplitHostPort(normalized)
+	if splitErr != nil {
+		// authority 可能是 host 或 host:port（非标准格式），统一返回 host 去尾点的小写串。
+		if rawHost, rawPort, found := strings.Cut(normalized, ":"); found && !strings.Contains(rawHost, ":") && isNumericPort(rawPort) {
+			return strings.TrimSuffix(strings.TrimSpace(rawHost), ".") + ":" + rawPort
+		}
+		return strings.TrimSuffix(normalized, ".")
+	}
+	normalizedHost := normalizeRouteHostValue(host)
+	if normalizedHost == "" {
+		return ""
+	}
+	return net.JoinHostPort(normalizedHost, port)
+}
+
+func normalizeRouteHostValue(host string) string {
+	normalized := strings.ToLower(strings.TrimSpace(host))
+	if normalized == "" {
+		return ""
+	}
+	parsedHost, _, splitErr := net.SplitHostPort(normalized)
+	if splitErr == nil {
+		normalized = parsedHost
+	} else if rawHost, rawPort, found := strings.Cut(normalized, ":"); found && !strings.Contains(rawHost, ":") && isNumericPort(rawPort) {
+		normalized = rawHost
+	}
+	normalized = strings.TrimPrefix(normalized, "[")
+	normalized = strings.TrimSuffix(normalized, "]")
+	return strings.TrimSuffix(normalized, ".")
+}
+
+func isNumericPort(value string) bool {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return false
+	}
+	port, parseErr := strconv.Atoi(normalized)
+	if parseErr != nil {
+		return false
+	}
+	return port >= 0 && port <= 65535
+}
+
+func extractAuthorityPort(authority string) (string, bool) {
+	normalized := strings.TrimSpace(authority)
+	if normalized == "" {
+		return "", false
+	}
+	if _, port, splitErr := net.SplitHostPort(normalized); splitErr == nil {
+		return port, true
+	}
+	_, port, found := strings.Cut(normalized, ":")
+	if !found || !isNumericPort(port) {
+		return "", false
+	}
+	return strings.TrimSpace(port), true
 }

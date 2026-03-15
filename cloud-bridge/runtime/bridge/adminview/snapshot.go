@@ -1,6 +1,7 @@
 package adminview
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -57,6 +58,31 @@ type SessionItem struct {
 	Epoch           uint64 `json:"epoch"`
 	State           string `json:"state"`
 	LastHeartbeatMS uint64 `json:"last_heartbeat_ms"`
+	UpdatedAtMS     uint64 `json:"updated_at_ms"`
+}
+
+// ServiceItem 定义管理后台 services 列表项。
+type ServiceItem struct {
+	ServiceID       string `json:"service_id"`
+	ServiceKey      string `json:"service_key"`
+	Namespace       string `json:"namespace"`
+	Environment     string `json:"environment"`
+	ConnectorID     string `json:"connector_id"`
+	SessionID       string `json:"session_id"`
+	SessionState    string `json:"session_state"`
+	ServiceName     string `json:"service_name"`
+	ServiceType     string `json:"service_type"`
+	EndpointCount   int    `json:"endpoint_count"`
+	EndpointProto   string `json:"endpoint_protocol"`
+	EndpointHost    string `json:"endpoint_host"`
+	EndpointPort    uint32 `json:"endpoint_port"`
+	EndpointAddress string `json:"endpoint_address"`
+	IngressMode     string `json:"ingress_mode"`
+	SNIName         string `json:"sni_name"`
+	RouteTarget     string `json:"route_target"`
+	AccessHint      string `json:"access_hint"`
+	Status          string `json:"status"`
+	HealthStatus    string `json:"health_status"`
 	UpdatedAtMS     uint64 `json:"updated_at_ms"`
 }
 
@@ -266,6 +292,138 @@ func BuildSessionItems(sessions []registry.SessionRuntime) []SessionItem {
 	sort.Slice(items, func(left, right int) bool {
 		if items[left].UpdatedAtMS == items[right].UpdatedAtMS {
 			return items[left].SessionID < items[right].SessionID
+		}
+		return items[left].UpdatedAtMS > items[right].UpdatedAtMS
+	})
+	return items
+}
+
+// BuildServiceItems 构建 services 只读列表项，包含与 session 的关联信息和访问提示。
+func BuildServiceItems(
+	now time.Time,
+	services []pb.Service,
+	sessions []registry.SessionRuntime,
+) []ServiceItem {
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	nowMS := uint64(normalizedNow.UnixMilli())
+
+	latestSessionByConnector := make(map[string]registry.SessionRuntime)
+	for _, session := range sessions {
+		connectorID := strings.TrimSpace(session.ConnectorID)
+		if connectorID == "" {
+			continue
+		}
+		existingSession, exists := latestSessionByConnector[connectorID]
+		if !exists {
+			latestSessionByConnector[connectorID] = session
+			continue
+		}
+		shouldReplace := session.Epoch > existingSession.Epoch
+		if !shouldReplace {
+			shouldReplace = session.UpdatedAt.After(existingSession.UpdatedAt)
+		}
+		if shouldReplace {
+			latestSessionByConnector[connectorID] = session
+		}
+	}
+
+	items := make([]ServiceItem, 0, len(services))
+	for _, service := range services {
+		connectorID := strings.TrimSpace(service.ConnectorID)
+		sessionItem, hasSession := latestSessionByConnector[connectorID]
+		sessionID := ""
+		sessionState := "UNAVAILABLE"
+		updatedAtMS := nowMS
+		if hasSession {
+			sessionID = strings.TrimSpace(sessionItem.SessionID)
+			sessionState = strings.TrimSpace(string(sessionItem.State))
+			if !sessionItem.UpdatedAt.IsZero() {
+				updatedAtMS = uint64(sessionItem.UpdatedAt.UTC().UnixMilli())
+			}
+			if !sessionItem.LastHeartbeat.IsZero() {
+				lastHeartbeatMS := uint64(sessionItem.LastHeartbeat.UTC().UnixMilli())
+				if lastHeartbeatMS > updatedAtMS {
+					updatedAtMS = lastHeartbeatMS
+				}
+			}
+		}
+
+		endpointProto := ""
+		endpointHost := ""
+		var endpointPort uint32
+		endpointAddress := "--"
+		sniName := strings.TrimSpace(service.Exposure.SNIName)
+		if len(service.Endpoints) > 0 {
+			firstEndpoint := service.Endpoints[0]
+			endpointProto = strings.TrimSpace(firstEndpoint.Protocol)
+			endpointHost = strings.TrimSpace(firstEndpoint.Host)
+			endpointPort = firstEndpoint.Port
+			if endpointHost != "" && endpointPort > 0 {
+				endpointAddress = fmt.Sprintf("%s:%d", endpointHost, endpointPort)
+			} else if endpointHost != "" {
+				endpointAddress = endpointHost
+			} else if endpointPort > 0 {
+				endpointAddress = fmt.Sprintf(":%d", endpointPort)
+			}
+			if sniName == "" {
+				sniName = strings.TrimSpace(firstEndpoint.ServerName)
+			}
+		}
+		serviceType := strings.TrimSpace(service.ServiceType)
+		if serviceType == "" {
+			serviceType = endpointProto
+		}
+		ingressMode := strings.TrimSpace(string(service.Exposure.IngressMode))
+		if ingressMode == "" {
+			ingressMode = "direct"
+		}
+		routeTarget := ""
+		serviceKey := strings.TrimSpace(service.ServiceKey)
+		if serviceKey != "" {
+			routeTarget = fmt.Sprintf("connector_service.service_key=%s", serviceKey)
+		}
+		accessHint := routeTarget
+		if strings.TrimSpace(accessHint) == "" {
+			accessHint = "请先配置 service_key 后再通过 route 指向该服务"
+		}
+		if sniName != "" {
+			accessHint = fmt.Sprintf("%s; route.match.sni=%s", accessHint, sniName)
+		}
+
+		items = append(items, ServiceItem{
+			ServiceID:       strings.TrimSpace(service.ServiceID),
+			ServiceKey:      serviceKey,
+			Namespace:       strings.TrimSpace(service.Namespace),
+			Environment:     strings.TrimSpace(service.Environment),
+			ConnectorID:     connectorID,
+			SessionID:       sessionID,
+			SessionState:    sessionState,
+			ServiceName:     strings.TrimSpace(service.ServiceName),
+			ServiceType:     serviceType,
+			EndpointCount:   len(service.Endpoints),
+			EndpointProto:   endpointProto,
+			EndpointHost:    endpointHost,
+			EndpointPort:    endpointPort,
+			EndpointAddress: endpointAddress,
+			IngressMode:     ingressMode,
+			SNIName:         sniName,
+			RouteTarget:     routeTarget,
+			AccessHint:      accessHint,
+			Status:          strings.TrimSpace(string(service.Status)),
+			HealthStatus:    strings.TrimSpace(string(service.HealthStatus)),
+			UpdatedAtMS:     updatedAtMS,
+		})
+	}
+
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].UpdatedAtMS == items[right].UpdatedAtMS {
+			if items[left].ConnectorID == items[right].ConnectorID {
+				return items[left].ServiceKey < items[right].ServiceKey
+			}
+			return items[left].ConnectorID < items[right].ConnectorID
 		}
 		return items[left].UpdatedAtMS > items[right].UpdatedAtMS
 	})

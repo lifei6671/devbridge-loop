@@ -17,6 +17,8 @@ type Config struct {
 	Admin         AdminConfig         `yaml:"admin"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	ControlPlane  ControlPlaneConfig  `yaml:"control_plane"`
+	// RuntimeConfigFilePath 记录当前配置来源文件路径（仅运行时使用，不参与 YAML 编解码）。
+	RuntimeConfigFilePath string `yaml:"-"`
 }
 
 type IngressConfig struct {

@@ -34,6 +34,83 @@ fn default_diagnose_category_enabled() -> bool {
     true
 }
 
+fn default_service_namespace() -> String {
+    "dev".to_string()
+}
+
+fn default_service_environment() -> String {
+    "demo".to_string()
+}
+
+/// 手动添加服务配置：持久化在宿主配置文件，供 Agent 重启后自动恢复。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualServiceConfig {
+    #[serde(default)]
+    pub service_id: Option<String>,
+    #[serde(default = "default_service_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_service_environment")]
+    pub environment: String,
+    pub service_name: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub sni_name: Option<String>,
+}
+
+impl ManualServiceConfig {
+    /// 归一化手动服务配置；字段不合法时返回 `None`。
+    pub fn normalized(&self) -> Option<Self> {
+        let service_name = self.service_name.trim().to_string();
+        let protocol = self.protocol.trim().to_ascii_lowercase();
+        let host = self.host.trim().to_string();
+        if service_name.is_empty() || protocol.is_empty() || host.is_empty() || self.port == 0 {
+            return None;
+        }
+        let namespace = self.namespace.trim();
+        let environment = self.environment.trim();
+        Some(Self {
+            service_id: self
+                .service_id
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            namespace: if namespace.is_empty() {
+                default_service_namespace()
+            } else {
+                namespace.to_string()
+            },
+            environment: if environment.is_empty() {
+                default_service_environment()
+            } else {
+                environment.to_string()
+            },
+            service_name,
+            protocol,
+            host,
+            port: self.port,
+            sni_name: self
+                .sni_name
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        })
+    }
+}
+
+/// 判断两个手动服务配置是否指向同一条逻辑服务记录。
+fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServiceConfig) -> bool {
+    match (&left.service_id, &right.service_id) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => {
+            left.namespace == right.namespace
+                && left.environment == right.environment
+                && left.service_name == right.service_name
+        }
+    }
+}
+
 /// YAML 文件中的宿主配置格式（用户目录持久化）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedHostRuntimeConfig {
@@ -58,6 +135,8 @@ struct PersistedHostRuntimeConfig {
     pub diagnose_show_bridge: bool,
     #[serde(default = "default_diagnose_category_enabled")]
     pub diagnose_show_tunnel: bool,
+    #[serde(default)]
+    pub manual_services: Vec<ManualServiceConfig>,
 }
 
 /// 宿主期望状态：用于决定是否应保持 Agent 运行。
@@ -219,6 +298,7 @@ pub struct HostRuntimeConfig {
     pub diagnose_show_ipc: bool,
     pub diagnose_show_bridge: bool,
     pub diagnose_show_tunnel: bool,
+    pub manual_services: Vec<ManualServiceConfig>,
 }
 
 /// 解析配置文件目录：优先用户目录，失败时回落当前目录。
@@ -466,6 +546,21 @@ impl HostRuntimeConfig {
     /// 从持久化配置转换为运行时配置。
     fn from_persisted_file(payload: PersistedHostRuntimeConfig) -> Result<Self, String> {
         let ipc_transport = Self::platform_ipc_transport();
+        let mut normalized_manual_services = Vec::new();
+        for service in payload
+            .manual_services
+            .iter()
+            .filter_map(ManualServiceConfig::normalized)
+        {
+            if let Some(existing_index) = normalized_manual_services
+                .iter()
+                .position(|item| same_manual_service_identity(item, &service))
+            {
+                normalized_manual_services[existing_index] = service;
+            } else {
+                normalized_manual_services.push(service);
+            }
+        }
         let runtime_config = Self {
             runtime_program: PathBuf::from(payload.runtime_program.trim()),
             runtime_args: payload.runtime_args,
@@ -492,6 +587,7 @@ impl HostRuntimeConfig {
             diagnose_show_ipc: payload.diagnose_show_ipc,
             diagnose_show_bridge: payload.diagnose_show_bridge,
             diagnose_show_tunnel: payload.diagnose_show_tunnel,
+            manual_services: normalized_manual_services,
         };
         runtime_config.validate_agent_runtime_fields()?;
         Ok(runtime_config)
@@ -516,6 +612,7 @@ impl HostRuntimeConfig {
             diagnose_show_ipc: self.diagnose_show_ipc,
             diagnose_show_bridge: self.diagnose_show_bridge,
             diagnose_show_tunnel: self.diagnose_show_tunnel,
+            manual_services: self.manual_services.clone(),
         }
     }
 
@@ -711,6 +808,7 @@ impl HostRuntimeConfig {
             diagnose_show_ipc: true,
             diagnose_show_bridge: true,
             diagnose_show_tunnel: true,
+            manual_services: Vec::new(),
         };
         // 启动时先做一次宿主侧校验，尽早暴露配置问题。
         config.validate_agent_runtime_fields()?;
@@ -876,6 +974,84 @@ pub fn update_runtime_config(
     // 直接替换真相源，避免增量更新遗漏字段。
     *runtime_config = config;
     Ok(())
+}
+
+/// 持久化手动服务配置：按 `service_id` 或 `namespace/environment/service_name` 执行 upsert。
+pub fn upsert_manual_service_config(
+    state: &Arc<AppRuntimeState>,
+    service: ManualServiceConfig,
+) -> Result<usize, String> {
+    let normalized_service = service
+        .normalized()
+        .ok_or_else(|| "持久化手动服务失败：服务字段不合法".to_string())?;
+    let mut next_runtime_config = current_runtime_config(state)?;
+    if let Some(existing_index) = next_runtime_config
+        .manual_services
+        .iter()
+        .position(|item| same_manual_service_identity(item, &normalized_service))
+    {
+        next_runtime_config.manual_services[existing_index] = normalized_service;
+    } else {
+        next_runtime_config.manual_services.push(normalized_service);
+    }
+    let persisted_size = next_runtime_config.manual_services.len();
+    update_runtime_config(state, next_runtime_config)?;
+    Ok(persisted_size)
+}
+
+/// 删除手动服务配置：优先按 service_id 匹配；service_id 为空时回落 namespace/environment/service_name。
+pub fn remove_manual_service_config(
+    state: &Arc<AppRuntimeState>,
+    service_id: &str,
+    service_key: Option<&str>,
+    namespace: Option<&str>,
+    environment: Option<&str>,
+    service_name: Option<&str>,
+) -> Result<usize, String> {
+    let normalized_service_id = service_id.trim().to_string();
+    let normalized_service_key = service_key.unwrap_or_default().trim().to_string();
+    let normalized_namespace = namespace.unwrap_or_default().trim().to_string();
+    let normalized_environment = environment.unwrap_or_default().trim().to_string();
+    let normalized_service_name = service_name.unwrap_or_default().trim().to_string();
+
+    let mut next_runtime_config = current_runtime_config(state)?;
+    next_runtime_config.manual_services.retain(|item| {
+        if !normalized_service_id.is_empty()
+            && item
+                .service_id
+                .as_ref()
+                .map(|value| value == &normalized_service_id)
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        if normalized_service_id.is_empty()
+            && !normalized_service_key.is_empty()
+            && format!(
+                "{}/{}/{}",
+                item.namespace.trim(),
+                item.environment.trim(),
+                item.service_name.trim()
+            ) == normalized_service_key
+        {
+            return false;
+        }
+        if normalized_service_id.is_empty()
+            && !normalized_namespace.is_empty()
+            && !normalized_environment.is_empty()
+            && !normalized_service_name.is_empty()
+            && item.namespace == normalized_namespace
+            && item.environment == normalized_environment
+            && item.service_name == normalized_service_name
+        {
+            return false;
+        }
+        true
+    });
+
+    let persisted_size = next_runtime_config.manual_services.len();
+    update_runtime_config(state, next_runtime_config)?;
+    Ok(persisted_size)
 }
 
 /// 构建宿主配置快照：仅返回真实可生效的启动参数。
@@ -1063,6 +1239,7 @@ mod tests {
             diagnose_show_ipc: true,
             diagnose_show_bridge: true,
             diagnose_show_tunnel: true,
+            manual_services: Vec::new(),
         }
     }
 

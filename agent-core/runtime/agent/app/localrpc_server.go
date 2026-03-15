@@ -95,6 +95,12 @@ type localRPCServiceAddPayload struct {
 	Protocol    string `json:"protocol"`
 	Host        string `json:"host"`
 	Port        uint32 `json:"port"`
+	SNIName     string `json:"sni_name"`
+}
+
+type localRPCServiceDeletePayload struct {
+	ServiceID  string `json:"service_id"`
+	ServiceKey string `json:"service_key"`
 }
 
 type localRPCAuthPending struct {
@@ -434,6 +440,7 @@ func (server *localRPCServer) dispatchRequest(
 			Protocol:    servicePayload.Protocol,
 			Host:        servicePayload.Host,
 			Port:        servicePayload.Port,
+			SNIName:     servicePayload.SNIName,
 		})
 		if addErr != nil {
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: addErr.Error()}
@@ -441,6 +448,19 @@ func (server *localRPCServer) dispatchRequest(
 		return addedPayload, nil
 	case "service.list":
 		return server.runtime.serviceListPayload(), nil
+	case "service.delete":
+		servicePayload, err := decodePayload[localRPCServiceDeletePayload](requestBody.Payload)
+		if err != nil {
+			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.delete payload"}
+		}
+		deletedPayload, deleteErr := server.runtime.removeService(runtimeServiceDeleteInput{
+			ServiceID:  servicePayload.ServiceID,
+			ServiceKey: servicePayload.ServiceKey,
+		})
+		if deleteErr != nil {
+			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: deleteErr.Error()}
+		}
+		return deletedPayload, nil
 	case "tunnel.list":
 		return server.runtime.tunnelListPayload(), nil
 	case "traffic.stats.snapshot":

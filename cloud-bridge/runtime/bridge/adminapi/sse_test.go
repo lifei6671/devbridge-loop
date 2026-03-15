@@ -51,8 +51,8 @@ func TestSSETopicsQuerySupportsAll(testingObject *testing.T) {
 	if err != nil {
 		testingObject.Fatalf("parse topics failed: %v", err)
 	}
-	if len(topics) != 6 {
-		testingObject.Fatalf("unexpected topics size: got=%d want=6", len(topics))
+	if len(topics) != 7 {
+		testingObject.Fatalf("unexpected topics size: got=%d want=7", len(topics))
 	}
 }
 

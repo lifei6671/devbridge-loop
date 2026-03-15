@@ -151,6 +151,7 @@ pub fn host_config_update(
             diagnose_show_ipc: current_config.diagnose_show_ipc,
             diagnose_show_bridge: current_config.diagnose_show_bridge,
             diagnose_show_tunnel: current_config.diagnose_show_tunnel,
+            manual_services: current_config.manual_services.clone(),
         };
         // 统一复用 HostRuntimeConfig 的校验口径，避免与启动校验漂移。
         next_runtime_config.validate_agent_runtime_fields()?;

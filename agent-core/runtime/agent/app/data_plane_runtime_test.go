@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/traffic"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
+	"github.com/lifei6671/devbridge-loop/ltfp/adapter"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -245,6 +247,77 @@ func TestRunTrafficAcceptorWorkerConsumesOpenAndClosesTunnel(testingObject *test
 	}
 	if _, exists := registry.Get(testTunnel.ID()); exists {
 		testingObject.Fatalf("expected tunnel record removed after traffic completion")
+	}
+}
+
+func TestRuntimeHintEndpointSelectorFallsBackToServiceCatalog(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	catalog := service.NewCatalog()
+	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
+		ServiceID:   "svc-1",
+		ServiceKey:  "dev/demo/jelly",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "jelly",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{
+				EndpointID: "ep-1",
+				Protocol:   "http",
+				Host:       "127.0.0.1",
+				Port:       8080,
+			},
+		},
+	})
+	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
+
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/jelly", map[string]string{})
+	if err != nil {
+		testingObject.Fatalf("select endpoint from catalog failed: %v", err)
+	}
+	if selectedEndpoint.ID != "ep-1" {
+		testingObject.Fatalf("unexpected endpoint id: got=%s want=%s", selectedEndpoint.ID, "ep-1")
+	}
+	if selectedEndpoint.Addr != "127.0.0.1:8080" {
+		testingObject.Fatalf("unexpected endpoint addr: got=%s want=%s", selectedEndpoint.Addr, "127.0.0.1:8080")
+	}
+}
+
+func TestRuntimeHintEndpointSelectorPrefersHintOverCatalog(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	catalog := service.NewCatalog()
+	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
+		ServiceID:   "svc-1",
+		ServiceKey:  "dev/demo/jelly",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "jelly",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{
+				EndpointID: "ep-1",
+				Protocol:   "http",
+				Host:       "127.0.0.1",
+				Port:       8080,
+			},
+		},
+	})
+	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
+
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/jelly", map[string]string{
+		trafficOpenHintEndpointIDKey:   "ep-hint",
+		trafficOpenHintEndpointAddrKey: "127.0.0.1:9090",
+	})
+	if err != nil {
+		testingObject.Fatalf("select endpoint with hint failed: %v", err)
+	}
+	if selectedEndpoint.ID != "ep-hint" {
+		testingObject.Fatalf("unexpected endpoint id: got=%s want=%s", selectedEndpoint.ID, "ep-hint")
+	}
+	if selectedEndpoint.Addr != "127.0.0.1:9090" {
+		testingObject.Fatalf("unexpected endpoint addr: got=%s want=%s", selectedEndpoint.Addr, "127.0.0.1:9090")
 	}
 }
 

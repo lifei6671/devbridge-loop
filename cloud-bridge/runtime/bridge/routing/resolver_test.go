@@ -94,6 +94,62 @@ func TestMatcherMatchIngressIsolation(testingObject *testing.T) {
 	}
 }
 
+// TestMatcherNormalizesHostAndAuthority 验证 Host/Authority 匹配会规整大小写与端口差异。
+func TestMatcherNormalizesHostAndAuthority(testingObject *testing.T) {
+	testingObject.Parallel()
+	matcher := NewMatcher()
+	routes := []pb.Route{
+		{
+			RouteID: "route-host",
+			Metadata: map[string]string{
+				routeMetadataIngressModeKey: string(pb.IngressModeL7Shared),
+			},
+			Match: pb.RouteMatch{
+				Protocol: "http",
+				Host:     "api.dev.local",
+			},
+		},
+		{
+			RouteID: "route-authority",
+			Metadata: map[string]string{
+				routeMetadataIngressModeKey: string(pb.IngressModeL7Shared),
+			},
+			Match: pb.RouteMatch{
+				Protocol:  "http",
+				Authority: "api.dev.local",
+			},
+		},
+		{
+			RouteID: "route-authority-port",
+			Metadata: map[string]string{
+				routeMetadataIngressModeKey: string(pb.IngressModeL7Shared),
+			},
+			Match: pb.RouteMatch{
+				Protocol:  "http",
+				Authority: "api.dev.local:8081",
+			},
+		},
+	}
+
+	request := ingress.RouteLookupRequest{
+		IngressMode: pb.IngressModeL7Shared,
+		Protocol:    "HTTP",
+		Host:        "API.DEV.LOCAL:8080",
+		Authority:   "API.DEV.LOCAL:8080",
+		Path:        "/v1/orders",
+	}
+	matchedRoutes := matcher.Match(request, routes)
+	if len(matchedRoutes) != 2 {
+		testingObject.Fatalf("unexpected normalized match size: got=%d want=2", len(matchedRoutes))
+	}
+	if matchedRoutes[0].RouteID != "route-authority" {
+		testingObject.Fatalf("expected authority route first by score, got=%s", matchedRoutes[0].RouteID)
+	}
+	if matchedRoutes[1].RouteID != "route-host" {
+		testingObject.Fatalf("expected host route second, got=%s", matchedRoutes[1].RouteID)
+	}
+}
+
 // TestResolverResolveTargetKinds 验证 resolver 可输出三类 target 分类结果。
 func TestResolverResolveTargetKinds(testingObject *testing.T) {
 	testingObject.Parallel()

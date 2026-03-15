@@ -3,9 +3,11 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 )
 
@@ -85,9 +87,9 @@ func TestDispatchRequestDiagnoseLogs(testingObject *testing.T) {
 		},
 	}
 	runtimeInstance.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:   "error",
-		Module:  "agent.runtime.bridge",
-		Code:    "BRIDGE_STATE_STALE",
+		Level:   events.EventError,
+		Module:  events.ModuleAgentRuntimeBridge,
+		Code:    events.CodeBridgeStateStale,
 		Message: "heartbeat timeout",
 	})
 	server := &localRPCServer{runtime: runtimeInstance}
@@ -109,7 +111,7 @@ func TestDispatchRequestDiagnoseLogs(testingObject *testing.T) {
 	if len(items) == 0 {
 		testingObject.Fatalf("expected diagnose.logs returns runtime events")
 	}
-	if items[0]["code"] != "BRIDGE_STATE_STALE" {
+	if items[0]["code"] != events.CodeBridgeStateStale {
 		testingObject.Fatalf("unexpected diagnose event code: %+v", items[0]["code"])
 	}
 	if resultPayload["source"] != "agent.runtime.diagnose" {
@@ -134,7 +136,8 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 			"environment":"demo",
 			"protocol":"http",
 			"host":"127.0.0.1",
-			"port":18080
+			"port":18080,
+			"sni_name":"order.dev.example.com"
 		}`),
 	}, &localRPCConnectionAuthState{authenticated: true})
 	if failure != nil {
@@ -161,5 +164,82 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 	}
 	if services[0]["service_name"] != "order-service" {
 		testingObject.Fatalf("unexpected service_name: %+v", services[0]["service_name"])
+	}
+	if services[0]["sni_name"] != "order.dev.example.com" {
+		testingObject.Fatalf("unexpected sni_name: %+v", services[0]["sni_name"])
+	}
+}
+
+// TestDispatchRequestServiceDelete 验证 localrpc service.delete 可删除本地服务目录项。
+func TestDispatchRequestServiceDelete(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtimeInstance, err := BootstrapWithOptions(context.Background(), DefaultConfig(), BootstrapOptions{})
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+	server := &localRPCServer{runtime: runtimeInstance}
+	_, failure := server.dispatchRequest(localRPCRequestBody{
+		Method: "service.add",
+		Payload: json.RawMessage(`{
+			"service_name":"order-service",
+			"namespace":"dev",
+			"environment":"demo",
+			"protocol":"http",
+			"host":"127.0.0.1",
+			"port":18080
+		}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.add failed: code=%s message=%s", failure.code, failure.message)
+	}
+
+	listPayload, failure := server.dispatchRequest(localRPCRequestBody{
+		Method:  "service.list",
+		Payload: json.RawMessage(`{}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.list failed: code=%s message=%s", failure.code, failure.message)
+	}
+	listBody, ok := listPayload.(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected list payload type: %T", listPayload)
+	}
+	services, ok := listBody["services"].([]map[string]any)
+	if !ok || len(services) != 1 {
+		testingObject.Fatalf("unexpected services payload: %+v", listBody["services"])
+	}
+	serviceID, _ := services[0]["service_id"].(string)
+	if serviceID == "" {
+		testingObject.Fatalf("unexpected empty service_id: %+v", services[0]["service_id"])
+	}
+
+	_, failure = server.dispatchRequest(localRPCRequestBody{
+		Method: "service.delete",
+		Payload: json.RawMessage(fmt.Sprintf(`{
+			"service_id":"%s"
+		}`, serviceID)),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.delete failed: code=%s message=%s", failure.code, failure.message)
+	}
+
+	listPayload, failure = server.dispatchRequest(localRPCRequestBody{
+		Method:  "service.list",
+		Payload: json.RawMessage(`{}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.list failed: code=%s message=%s", failure.code, failure.message)
+	}
+	listBody, ok = listPayload.(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected payload type after delete: %T", listPayload)
+	}
+	services, ok = listBody["services"].([]map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected services payload type after delete: %T", listBody["services"])
+	}
+	if len(services) != 0 {
+		testingObject.Fatalf("expected service catalog empty after delete, got=%d", len(services))
 	}
 }

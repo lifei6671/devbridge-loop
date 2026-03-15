@@ -264,3 +264,88 @@ func TestBuildAgentTunnelPoolSummaryUsesLatestReportTimestamp(testingObject *tes
 		)
 	}
 }
+
+// TestServicesListIncludesConnectorAssociation 验证 services 接口可返回服务与 connector/session 关联信息。
+func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_200_000, 0).UTC()
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			Now: func() time.Time { return now },
+			ListServices: func() []pb.Service {
+				return []pb.Service{
+					{
+						ServiceID:    "svc-order",
+						ServiceKey:   "dev/demo/order-service",
+						Namespace:    "dev",
+						Environment:  "demo",
+						ConnectorID:  "agent-a",
+						ServiceName:  "order-service",
+						ServiceType:  "https",
+						Status:       pb.ServiceStatusActive,
+						HealthStatus: pb.HealthStatusHealthy,
+						Endpoints: []pb.ServiceEndpoint{
+							{
+								EndpointID: "ep-order-1",
+								Protocol:   "https",
+								Host:       "127.0.0.1",
+								Port:       18443,
+								ServerName: "order.demo.example.com",
+							},
+						},
+					},
+				}
+			},
+			ListSessions: func() []registry.SessionRuntime {
+				return []registry.SessionRuntime{
+					{
+						SessionID:   "session-a",
+						ConnectorID: "agent-a",
+						State:       registry.SessionActive,
+						Epoch:       8,
+						UpdatedAt:   now,
+					},
+				}
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/services", nil)
+	request.Header.Set("Authorization", "Bearer viewer-token")
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		testingObject.Fatalf("decode services payload failed: %v body=%s", err, recorder.Body.String())
+	}
+	itemsRaw, ok := payload["items"].([]any)
+	if !ok || len(itemsRaw) != 1 {
+		testingObject.Fatalf("unexpected items payload: %+v", payload["items"])
+	}
+	item, ok := itemsRaw[0].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected item type: %+v", itemsRaw[0])
+	}
+	if item["connector_id"] != "agent-a" || item["session_id"] != "session-a" {
+		testingObject.Fatalf("unexpected connector/session mapping: %+v", item)
+	}
+	if item["route_target"] != "connector_service.service_key=dev/demo/order-service" {
+		testingObject.Fatalf("unexpected route_target: %+v", item["route_target"])
+	}
+	if item["sni_name"] != "order.demo.example.com" {
+		testingObject.Fatalf("unexpected sni_name: %+v", item["sni_name"])
+	}
+}

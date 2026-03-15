@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -466,6 +467,55 @@ func TestAdminConfigUpdateEnforcesIfMatchVersion(testingObject *testing.T) {
 	runtime.adminServer.Handler.ServeHTTP(conflictRecorder, conflictRequest)
 	if conflictRecorder.Code != http.StatusConflict {
 		testingObject.Fatalf("unexpected conflict status: got=%d want=%d body=%s", conflictRecorder.Code, http.StatusConflict, conflictRecorder.Body.String())
+	}
+}
+
+// TestAdminConfigUpdatePersistsToRuntimeConfigFile 验证配置更新会落盘到运行配置文件。
+func TestAdminConfigUpdatePersistsToRuntimeConfigFile(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	configFilePath := filepath.Join(tempDir, "bridge.yaml")
+
+	config := DefaultConfig()
+	config.Admin.Enabled = true
+	config.Admin.UIEnabled = false
+	config.RuntimeConfigFilePath = configFilePath
+
+	runtime, err := Bootstrap(context.Background(), config)
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+	if runtime.adminServer == nil {
+		testingObject.Fatalf("expected admin server initialized")
+	}
+
+	updateRecorder := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/config",
+		strings.NewReader(`{"if_match_version":1,"patch":{"ingress.http_addr":":18080","control_plane.heartbeat_timeout_ms":45000}}`),
+	)
+	updateRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
+	updateRequest.Header.Set("Content-Type", "application/json")
+	runtime.adminServer.Handler.ServeHTTP(updateRecorder, updateRequest)
+	if updateRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected update status: got=%d want=%d body=%s", updateRecorder.Code, http.StatusOK, updateRecorder.Body.String())
+	}
+
+	savedConfig, err := LoadConfigFromYAMLFile(configFilePath)
+	if err != nil {
+		testingObject.Fatalf("load saved config failed: %v", err)
+	}
+	if savedConfig.Ingress.HTTPAddr != ":18080" {
+		testingObject.Fatalf("unexpected persisted ingress.http_addr: got=%s want=%s", savedConfig.Ingress.HTTPAddr, ":18080")
+	}
+	if savedConfig.ControlPlane.HeartbeatTimeout != 45*time.Second {
+		testingObject.Fatalf(
+			"unexpected persisted control_plane.heartbeat_timeout: got=%s want=%s",
+			savedConfig.ControlPlane.HeartbeatTimeout,
+			45*time.Second,
+		)
 	}
 }
 

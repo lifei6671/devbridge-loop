@@ -244,6 +244,7 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	}
 	mux.Handle("/api/admin/bridge/overview", server.wrapHandler(RoleViewer, "bridge", "overview", server.handleBridgeOverview))
 	mux.Handle("/api/admin/routes", server.wrapHandler(RoleViewer, "routes", "list", server.handleRoutesList))
+	mux.Handle("/api/admin/services", server.wrapHandler(RoleViewer, "services", "list", server.handleServicesList))
 	mux.Handle("/api/admin/connectors", server.wrapHandler(RoleViewer, "connectors", "list", server.handleConnectorsList))
 	mux.Handle("/api/admin/sessions", server.wrapHandler(RoleViewer, "sessions", "list", server.handleSessionsList))
 	mux.Handle("/api/admin/tunnels/summary", server.wrapHandler(RoleViewer, "tunnels", "summary", server.handleTunnelSummary))
@@ -581,6 +582,99 @@ func (server *Server) handleRoutesList(writer http.ResponseWriter, request *http
 		"limit":       page.limit,
 		"total":       len(items),
 		"source":      "bridge.adminapi.readonly",
+	})
+}
+
+func (server *Server) handleServicesList(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writeError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET is required")
+		return
+	}
+	page, pageErr := parsePageQuery(request, server.maxPageLimit)
+	if pageErr != nil {
+		writeError(writer, http.StatusBadRequest, "INVALID_ARGUMENT", pageErr.Error())
+		return
+	}
+	connectorFilter := strings.TrimSpace(request.URL.Query().Get("connector_id"))
+	sessionStateFilter := strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("session_state")))
+	if sessionStateFilter == "ALL" {
+		sessionStateFilter = ""
+	}
+	statusFilter := strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("status")))
+	if statusFilter == "ALL" {
+		statusFilter = ""
+	}
+	healthFilter := strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("health_status")))
+	if healthFilter == "ALL" {
+		healthFilter = ""
+	}
+	serviceTypeFilter := strings.ToLower(strings.TrimSpace(request.URL.Query().Get("service_type")))
+	if serviceTypeFilter == "all" {
+		serviceTypeFilter = ""
+	}
+	queryText := strings.ToLower(strings.TrimSpace(request.URL.Query().Get("q")))
+
+	items := adminview.BuildServiceItems(
+		server.now(),
+		safeListServices(server.dependencies),
+		safeListSessions(server.dependencies),
+	)
+	if connectorFilter != "" ||
+		sessionStateFilter != "" ||
+		statusFilter != "" ||
+		healthFilter != "" ||
+		serviceTypeFilter != "" ||
+		queryText != "" {
+		filteredItems := make([]adminview.ServiceItem, 0, len(items))
+		for _, item := range items {
+			if connectorFilter != "" && strings.TrimSpace(item.ConnectorID) != connectorFilter {
+				continue
+			}
+			if sessionStateFilter != "" && strings.ToUpper(strings.TrimSpace(item.SessionState)) != sessionStateFilter {
+				continue
+			}
+			if statusFilter != "" && strings.ToUpper(strings.TrimSpace(item.Status)) != statusFilter {
+				continue
+			}
+			if healthFilter != "" && strings.ToUpper(strings.TrimSpace(item.HealthStatus)) != healthFilter {
+				continue
+			}
+			if serviceTypeFilter != "" && strings.ToLower(strings.TrimSpace(item.ServiceType)) != serviceTypeFilter {
+				continue
+			}
+			if queryText != "" {
+				searchText := strings.ToLower(
+					strings.Join([]string{
+						item.ServiceID,
+						item.ServiceKey,
+						item.ServiceName,
+						item.ConnectorID,
+						item.SessionID,
+						item.EndpointAddress,
+						item.SNIName,
+					}, " "),
+				)
+				if !strings.Contains(searchText, queryText) {
+					continue
+				}
+			}
+			filteredItems = append(filteredItems, item)
+		}
+		items = filteredItems
+	}
+	pagedItems, nextCursor := paginate(items, page)
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"items":                 pagedItems,
+		"next_cursor":           nextCursor,
+		"limit":                 page.limit,
+		"total":                 len(items),
+		"connector_id_filter":   normalizeAuditFilterValue(connectorFilter),
+		"session_state_filter":  normalizeAuditFilterValue(sessionStateFilter),
+		"service_status_filter": normalizeAuditFilterValue(statusFilter),
+		"health_status_filter":  normalizeAuditFilterValue(healthFilter),
+		"service_type_filter":   normalizeAuditFilterValue(serviceTypeFilter),
+		"q_filter":              normalizeAuditFilterValue(queryText),
+		"source":                "bridge.adminapi.readonly",
 	})
 }
 

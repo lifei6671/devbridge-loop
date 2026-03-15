@@ -105,6 +105,93 @@ fn set_connection_state(
     Ok(build_runtime_snapshot(&supervisor))
 }
 
+/// 判断远端 method 是否不存在/未开放；用于回放时快速降级。
+fn is_method_unavailable(err: &str) -> bool {
+    err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND")
+}
+
+/// 在 Agent 完成 bootstrap 后回放手动服务配置，确保重启后自动恢复服务目录。
+fn replay_manual_services_after_connect(
+    state: &Arc<AppRuntimeState>,
+    rpc_client: &mut LocalRpcClient,
+) -> (usize, usize) {
+    let runtime_config = match current_runtime_config(state) {
+        Ok(config) => config,
+        Err(err) => {
+            if let Ok(mut supervisor) = state.supervisor.lock() {
+                push_host_log(
+                    &mut supervisor,
+                    "warn",
+                    "ipc_client",
+                    "MANUAL_SERVICE_REPLAY_CONFIG_LOAD_FAILED",
+                    format!("读取手动服务配置失败，已跳过自动回放: {err}"),
+                );
+            }
+            return (0, 1);
+        }
+    };
+    if runtime_config.manual_services.is_empty() {
+        return (0, 0);
+    }
+
+    let mut success_count = 0_usize;
+    let mut failure_count = 0_usize;
+    for service in &runtime_config.manual_services {
+        let request_result = rpc_client.request(
+            "service.add",
+            json!({
+                "service_id": service.service_id,
+                "service_name": service.service_name,
+                "namespace": service.namespace,
+                "environment": service.environment,
+                "protocol": service.protocol,
+                "host": service.host,
+                "port": service.port,
+                "sni_name": service.sni_name,
+            }),
+            LOCAL_RPC_DEFAULT_TIMEOUT_MS,
+        );
+        match request_result {
+            Ok(_) => {
+                success_count = success_count.saturating_add(1);
+            }
+            Err(err) => {
+                failure_count = failure_count.saturating_add(1);
+                if let Ok(mut supervisor) = state.supervisor.lock() {
+                    push_host_log(
+                        &mut supervisor,
+                        "warn",
+                        "ipc_client",
+                        "MANUAL_SERVICE_REPLAY_FAILED",
+                        format!(
+                            "回放手动服务失败 service_name={} namespace={} environment={} host={} port={} err={}",
+                            service.service_name,
+                            service.namespace,
+                            service.environment,
+                            service.host,
+                            service.port,
+                            err
+                        ),
+                    );
+                }
+                if is_method_unavailable(&err) {
+                    if let Ok(mut supervisor) = state.supervisor.lock() {
+                        push_host_log(
+                            &mut supervisor,
+                            "warn",
+                            "ipc_client",
+                            "MANUAL_SERVICE_REPLAY_UNAVAILABLE",
+                            "当前 Agent 未实现 service.add，已跳过剩余手动服务自动加载",
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    (success_count, failure_count)
+}
+
 /// 执行启动与连接阶段切换：reconnecting -> resyncing -> connected。
 fn start_agent_sequence(
     app: &AppHandle,
@@ -349,6 +436,8 @@ fn start_agent_sequence(
         return Err(err);
     }
     let ping_latency_ms = ping_start.elapsed().as_millis() as u64;
+    let (manual_service_replay_success, manual_service_replay_failure) =
+        replay_manual_services_after_connect(state, &mut rpc_client);
 
     let event_total = rpc_client.drain_events().len();
     {
@@ -365,8 +454,11 @@ fn start_agent_sequence(
             "ipc_client",
             "RPC_CONNECTED",
             format!(
-                "本地 RPC 已建立并完成 bootstrap/resync，{}，event_cache={event_total}",
-                rpc_client.describe()
+                "本地 RPC 已建立并完成 bootstrap/resync，{}，event_cache={}，manual_service_replay(success={},failed={})",
+                rpc_client.describe(),
+                event_total,
+                manual_service_replay_success,
+                manual_service_replay_failure
             ),
         );
         if !enforce_strict_peer_pid {
@@ -1709,6 +1801,7 @@ mod tests {
             diagnose_show_ipc: true,
             diagnose_show_bridge: true,
             diagnose_show_tunnel: true,
+            manual_services: Vec::new(),
         }
     }
 

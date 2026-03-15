@@ -485,6 +485,8 @@ tbody tr.table-row-active td:first-child {
   font-size: 0.74rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  width: fit-content;
+  max-width: 100%;
 }
 
 .state-pill.ok {
@@ -523,6 +525,41 @@ tbody tr.table-row-active td:first-child {
 
 .field-inline-wide {
   min-width: 180px;
+}
+
+.service-session-cell,
+.service-endpoint-cell,
+.service-status-cell,
+.service-access-cell {
+  display: grid;
+  gap: 4px;
+}
+
+.service-status-cell {
+  grid-auto-flow: row;
+  justify-items: start;
+}
+
+.service-endpoint-cell small,
+.service-access-cell small {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.3;
+}
+
+.service-access-cell code {
+  display: inline-block;
+  font-family:
+    "IBM Plex Mono",
+    "JetBrains Mono",
+    "Source Code Pro",
+    monospace;
+  font-size: 0.75rem;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #f8faf6;
+  color: #2a3c35;
 }
 
 .ops-grid {

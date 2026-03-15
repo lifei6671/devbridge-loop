@@ -171,8 +171,14 @@ interface SessionSnapshot {
 
 interface ServiceListItem {
   service_id: string;
+  service_key: string;
+  namespace: string;
+  environment: string;
   service_name: string;
   protocol: string;
+  host: string;
+  port: number;
+  sni_name: string;
   status: string;
   endpoint_count: number;
   last_error: string | null;
@@ -200,6 +206,23 @@ interface ServiceAddInput {
   protocol: string;
   host: string;
   port: number;
+  sni_name?: string;
+}
+
+interface ServiceDeleteInput {
+  service_id?: string;
+  service_key?: string;
+  namespace?: string;
+  environment?: string;
+  service_name?: string;
+}
+
+interface ServiceDeleteResult {
+  accepted: boolean;
+  deleted: boolean;
+  service_id: string;
+  service_key: string;
+  updated_at_ms: number;
 }
 
 interface ServiceCreateDraft {
@@ -210,7 +233,19 @@ interface ServiceCreateDraft {
   protocol: string;
   host: string;
   portText: string;
+  sniName: string;
 }
+
+const DEFAULT_SERVICE_CREATE_DRAFT: ServiceCreateDraft = {
+  serviceId: "",
+  serviceName: "",
+  namespace: "dev",
+  environment: "demo",
+  protocol: "tcp",
+  host: "127.0.0.1",
+  portText: "8080",
+  sniName: "",
+};
 
 interface HostConfigUpdateInput {
   runtime_program: string;
@@ -1085,16 +1120,11 @@ export default function App(): JSX.Element {
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const [closeActionLoading, setCloseActionLoading] = useState(false);
   const [serviceCreateExpanded, setServiceCreateExpanded] = useState(false);
+  const [serviceFormMode, setServiceFormMode] = useState<"create" | "edit">("create");
+  const [serviceEditingID, setServiceEditingID] = useState<string | null>(null);
   const [creatingService, setCreatingService] = useState(false);
-  const [serviceCreateDraft, setServiceCreateDraft] = useState<ServiceCreateDraft>({
-    serviceId: "",
-    serviceName: "",
-    namespace: "dev",
-    environment: "demo",
-    protocol: "tcp",
-    host: "127.0.0.1",
-    portText: "8080",
-  });
+  const [deletingServiceID, setDeletingServiceID] = useState<string | null>(null);
+  const [serviceCreateDraft, setServiceCreateDraft] = useState<ServiceCreateDraft>(DEFAULT_SERVICE_CREATE_DRAFT);
   const [diagnoseMinLevel, setDiagnoseMinLevel] = useState("info");
   const [diagnoseCategoryFilter, setDiagnoseCategoryFilter] = useState<DiagnoseCategoryFilterState>({
     ipc: true,
@@ -1958,7 +1988,37 @@ export default function App(): JSX.Element {
     }
   }, [hostConfig, notify, refreshHostLogs, settingsDraft]);
 
-  const createService = useCallback(async () => {
+  const closeServiceForm = useCallback(() => {
+    setServiceCreateExpanded(false);
+    setServiceFormMode("create");
+    setServiceEditingID(null);
+    setServiceCreateDraft(DEFAULT_SERVICE_CREATE_DRAFT);
+  }, []);
+
+  const openCreateServiceForm = useCallback(() => {
+    setServiceFormMode("create");
+    setServiceEditingID(null);
+    setServiceCreateDraft(DEFAULT_SERVICE_CREATE_DRAFT);
+    setServiceCreateExpanded(true);
+  }, []);
+
+  const openEditServiceForm = useCallback((item: ServiceListItem) => {
+    setServiceFormMode("edit");
+    setServiceEditingID(item.service_id);
+    setServiceCreateDraft({
+      serviceId: item.service_id,
+      serviceName: item.service_name,
+      namespace: item.namespace || "dev",
+      environment: item.environment || "demo",
+      protocol: item.protocol || "tcp",
+      host: item.host || "127.0.0.1",
+      portText: String(item.port > 0 ? item.port : 8080),
+      sniName: item.sni_name || "",
+    });
+    setServiceCreateExpanded(true);
+  }, []);
+
+  const submitServiceForm = useCallback(async () => {
     const serviceName = serviceCreateDraft.serviceName.trim();
     if (!serviceName) {
       notify("warning", "参数不完整", "请输入服务名称");
@@ -1975,14 +2035,22 @@ export default function App(): JSX.Element {
       notify("warning", "参数不合法", "port 不能超过 65535");
       return;
     }
+    const normalizedServiceID = serviceFormMode === "edit"
+      ? (serviceEditingID?.trim() || serviceCreateDraft.serviceId.trim())
+      : serviceCreateDraft.serviceId.trim();
+    if (serviceFormMode === "edit" && !normalizedServiceID) {
+      notify("warning", "参数不完整", "编辑模式缺少 service_id");
+      return;
+    }
     const payload: ServiceAddInput = {
-      service_id: serviceCreateDraft.serviceId.trim() || undefined,
+      service_id: normalizedServiceID || undefined,
       service_name: serviceName,
       namespace: serviceCreateDraft.namespace.trim() || undefined,
       environment: serviceCreateDraft.environment.trim() || undefined,
       protocol: serviceCreateDraft.protocol.trim().toLowerCase(),
       host: serviceCreateDraft.host.trim(),
       port,
+      sni_name: serviceCreateDraft.sniName.trim() || undefined,
     };
     setCreatingService(true);
     try {
@@ -1992,23 +2060,52 @@ export default function App(): JSX.Element {
         return next.sort((left, right) => right.updated_at_ms - left.updated_at_ms);
       });
       await refreshServiceList();
-      notify("success", "新增服务成功", `${created.service_name} (${created.protocol})`);
-      setServiceCreateExpanded(false);
-      setServiceCreateDraft({
-        serviceId: "",
-        serviceName: "",
-        namespace: "dev",
-        environment: "demo",
-        protocol: "tcp",
-        host: "127.0.0.1",
-        portText: "8080",
-      });
+      notify(
+        "success",
+        serviceFormMode === "edit" ? "服务更新成功" : "新增服务成功",
+        `${created.service_name} (${created.protocol})`,
+      );
+      closeServiceForm();
     } catch (error) {
-      notify("error", "新增服务失败", normalizeErrorMessage(error));
+      notify("error", serviceFormMode === "edit" ? "更新服务失败" : "新增服务失败", normalizeErrorMessage(error));
     } finally {
       setCreatingService(false);
     }
-  }, [notify, refreshServiceList, serviceCreateDraft]);
+  }, [closeServiceForm, notify, refreshServiceList, serviceCreateDraft, serviceEditingID, serviceFormMode]);
+
+  const deleteService = useCallback(async (item: ServiceListItem) => {
+    const confirmed = globalThis.confirm(
+      `确认删除服务「${item.service_name}」吗？\nservice_id=${item.service_id}`,
+    );
+    if (!confirmed) {
+      return;
+    }
+    setDeletingServiceID(item.service_id);
+    try {
+      const payload: ServiceDeleteInput = {
+        service_id: item.service_id || undefined,
+        service_key: item.service_key || undefined,
+        namespace: item.namespace || undefined,
+        environment: item.environment || undefined,
+        service_name: item.service_name || undefined,
+      };
+      const result = await invoke<ServiceDeleteResult>("service_delete", { input: payload });
+      if (result.deleted) {
+        setServiceItems((prev) => prev.filter((service) => service.service_id !== item.service_id));
+        if (serviceEditingID === item.service_id) {
+          closeServiceForm();
+        }
+        notify("success", "服务删除成功", item.service_name);
+      } else {
+        notify("warning", "服务不存在或已删除", item.service_name);
+      }
+      await refreshServiceList();
+    } catch (error) {
+      notify("error", "删除服务失败", normalizeErrorMessage(error));
+    } finally {
+      setDeletingServiceID(null);
+    }
+  }, [closeServiceForm, notify, refreshServiceList, serviceEditingID]);
 
   const renderServicesTable = (): JSX.Element => (
     <Card className="overflow-hidden">
@@ -2019,95 +2116,136 @@ export default function App(): JSX.Element {
         </div>
         <Button
           className="h-9 rounded-lg bg-[#1f67e5] px-4 text-sm font-semibold hover:bg-[#1a58c7]"
-          onClick={() => setServiceCreateExpanded((prev) => !prev)}
+          onClick={() => {
+            if (serviceCreateExpanded) {
+              closeServiceForm();
+              return;
+            }
+            openCreateServiceForm();
+          }}
         >
-          {serviceCreateExpanded ? "收起新增" : "+ 新增服务"}
+          {serviceCreateExpanded ? "收起表单" : "+ 新增服务"}
         </Button>
       </CardHeader>
       <CardContent className="p-0">
         {serviceCreateExpanded ? (
           <div className="border-y border-[#e5eaf4] bg-[#f8fbff] p-4">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <Input
-                placeholder="服务名称，例如 order-service"
-                value={serviceCreateDraft.serviceName}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
-                }
-                className="h-9 rounded-lg bg-white"
-              />
-              <Input
-                placeholder="服务 ID（可选）"
-                value={serviceCreateDraft.serviceId}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
-                }
-                className="h-9 rounded-lg bg-white"
-              />
-              <Input
-                placeholder="Namespace（默认 dev）"
-                value={serviceCreateDraft.namespace}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
-                }
-                className="h-9 rounded-lg bg-white"
-              />
-              <Input
-                placeholder="Environment（默认 demo）"
-                value={serviceCreateDraft.environment}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
-                }
-                className="h-9 rounded-lg bg-white"
-              />
-              <select
-                value={serviceCreateDraft.protocol}
-                className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
-                }
-              >
-                <option value="tcp">tcp</option>
-                <option value="http">http</option>
-                <option value="https">https</option>
-              </select>
-              <Input
-                placeholder="Host，例如 127.0.0.1"
-                value={serviceCreateDraft.host}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
-                }
-                className="h-9 rounded-lg bg-white"
-              />
-              <Input
-                placeholder="Port，例如 8080"
-                value={serviceCreateDraft.portText}
-                onChange={(event) =>
-                  setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
-                }
-                inputMode="numeric"
-                className="h-9 rounded-lg bg-white"
-              />
-              <div className="flex items-center justify-end gap-2">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <h4 className="text-sm font-semibold text-[#33415e]">
+                {serviceFormMode === "edit" ? "编辑服务" : "新增服务"}
+              </h4>
+              {serviceFormMode === "edit" && serviceEditingID ? (
+                <span className="rounded-md border border-[#d9e2f2] bg-white px-2 py-1 text-[11px] text-[#657391]">
+                  service_id: {serviceEditingID}
+                </span>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <SettingsField label="服务名称" hint="必填">
+                <Input
+                  placeholder="例如 order-service"
+                  value={serviceCreateDraft.serviceName}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <SettingsField label="服务 ID" hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}>
+                <Input
+                  placeholder="例如 svc-order"
+                  value={serviceCreateDraft.serviceId}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                  disabled={serviceFormMode === "edit"}
+                />
+              </SettingsField>
+              <SettingsField label="命名空间" hint="默认 dev">
+                <Input
+                  placeholder="例如 dev"
+                  value={serviceCreateDraft.namespace}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <SettingsField label="环境" hint="默认 demo">
+                <Input
+                  placeholder="例如 demo"
+                  value={serviceCreateDraft.environment}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <SettingsField label="协议" hint="tcp / http / https">
+                <select
+                  value={serviceCreateDraft.protocol}
+                  className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
+                  }
+                >
+                  <option value="tcp">tcp</option>
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </SettingsField>
+              <SettingsField label="主机地址" hint="如 127.0.0.1">
+                <Input
+                  placeholder="例如 127.0.0.1"
+                  value={serviceCreateDraft.host}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <SettingsField label="端口" hint="1 - 65535">
+                <Input
+                  placeholder="例如 8080"
+                  value={serviceCreateDraft.portText}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
+                  }
+                  inputMode="numeric"
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <SettingsField label="SNI (可选)" hint="用于 TLS SNI 转发">
+                <Input
+                  placeholder="例如 order.dev.example.com"
+                  value={serviceCreateDraft.sniName}
+                  onChange={(event) =>
+                    setServiceCreateDraft((prev) => ({ ...prev, sniName: event.target.value }))
+                  }
+                  className="h-9 rounded-lg bg-white"
+                />
+              </SettingsField>
+              <div className="flex items-end justify-end gap-2">
                 <Button
                   variant="outline"
                   className="h-9 rounded-lg text-xs"
                   disabled={creatingService}
-                  onClick={() => setServiceCreateExpanded(false)}
+                  onClick={closeServiceForm}
                 >
                   取消
                 </Button>
                 <Button
                   className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
                   disabled={creatingService}
-                  onClick={() => void createService()}
+                  onClick={() => void submitServiceForm()}
                 >
-                  {creatingService ? "提交中..." : "提交新增"}
+                  {creatingService ? "提交中..." : serviceFormMode === "edit" ? "保存修改" : "提交新增"}
                 </Button>
               </div>
             </div>
             <p className="mt-2 text-[11px] text-[#6b7892]">
-              新增后会立即进入本地服务目录，并在 Bridge 会话可用时自动尝试同步。
+              服务保存后会立即写入本地服务目录，并在 Bridge 会话可用时自动尝试同步。
             </p>
           </div>
         ) : null}
@@ -2118,15 +2256,18 @@ export default function App(): JSX.Element {
                 <th className={TABLE_HEAD_CLASS}>服务 ID</th>
                 <th className={TABLE_HEAD_CLASS}>名称</th>
                 <th className={TABLE_HEAD_CLASS}>协议</th>
+                <th className={TABLE_HEAD_CLASS}>地址</th>
+                <th className={TABLE_HEAD_CLASS}>SNI</th>
                 <th className={TABLE_HEAD_CLASS}>Endpoint 数</th>
                 <th className={TABLE_HEAD_CLASS}>状态</th>
                 <th className={TABLE_HEAD_CLASS}>更新时间</th>
+                <th className={TABLE_HEAD_CLASS}>操作</th>
               </tr>
             </thead>
             <tbody>
               {filteredServices.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={6}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={9}>
                     当前没有可展示的服务
                   </td>
                 </tr>
@@ -2136,6 +2277,10 @@ export default function App(): JSX.Element {
                   <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
                   <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
                   <td className={TABLE_CELL_CLASS}>{item.protocol || "--"}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    {item.host ? `${item.host}${item.port > 0 ? `:${item.port}` : ""}` : "--"}
+                  </td>
+                  <td className={TABLE_CELL_CLASS}>{item.sni_name || "--"}</td>
                   <td className={TABLE_CELL_CLASS}>{item.endpoint_count}</td>
                   <td className={TABLE_CELL_CLASS}>
                     <Badge variant={serviceVariant(item.status)} title={item.status}>
@@ -2143,6 +2288,26 @@ export default function App(): JSX.Element {
                     </Badge>
                   </td>
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-7 rounded-md px-2.5 text-xs"
+                        onClick={() => openEditServiceForm(item)}
+                        disabled={deletingServiceID === item.service_id}
+                      >
+                        编辑
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        className="h-7 rounded-md px-2.5 text-xs"
+                        disabled={deletingServiceID === item.service_id}
+                        onClick={() => void deleteService(item)}
+                      >
+                        {deletingServiceID === item.service_id ? "删除中..." : "删除"}
+                      </Button>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -2924,8 +3089,7 @@ export default function App(): JSX.Element {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 gap-3.5 lg:grid-cols-[1.56fr_0.96fr]">
-        {renderServicesTable()}
+      <div className="grid grid-cols-1 gap-3.5">
         {renderTrafficCard()}
       </div>
 

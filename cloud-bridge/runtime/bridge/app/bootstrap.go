@@ -19,10 +19,12 @@ import (
 
 // Runtime wires the bridge runtime subsystems together.
 type Runtime struct {
-	cfg           Config
-	adminServer   *http.Server
-	controlServer *controlPlaneServer
-	dataPlane     *runtimeDataPlane
+	cfg               Config
+	ingressHTTPServer *http.Server
+	ingressGRPCServer *http.Server
+	adminServer       *http.Server
+	controlServer     *controlPlaneServer
+	dataPlane         *runtimeDataPlane
 }
 
 // Bootstrap prepares the runtime graph. It is intentionally minimal in the skeleton.
@@ -164,12 +166,15 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{
+	runtime := &Runtime{
 		cfg:           cfg,
 		controlServer: controlServer,
 		dataPlane:     dataPlane,
 		adminServer:   adminServer,
-	}, nil
+	}
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, cfg.Ingress.HTTPAddr)
+	runtime.ingressGRPCServer = newIngressGRPCServer(runtime, cfg.Ingress.GRPCAddr)
+	return runtime, nil
 }
 
 // Run 启动 Bridge 运行时，当前阶段负责托管内嵌管理页面。
@@ -180,7 +185,9 @@ func (r *Runtime) Run(ctx context.Context) error {
 		normalizedContext = context.Background()
 	}
 	log.Printf(
-		"bridge runtime starting control_addr=%s control_grpc_addr=%s admin_enabled=%t admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
+		"bridge runtime starting ingress_http_addr=%s ingress_grpc_addr=%s control_addr=%s control_grpc_addr=%s admin_enabled=%t admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
+		r.cfg.Ingress.HTTPAddr,
+		r.cfg.Ingress.GRPCAddr,
 		r.cfg.ControlPlane.ListenAddr,
 		r.cfg.ControlPlane.GRPCH2ListenAddr,
 		r.cfg.Admin.Enabled,
@@ -190,7 +197,23 @@ func (r *Runtime) Run(ctx context.Context) error {
 		web.EmbeddedVersion(),
 	)
 
-	serverErrChannel := make(chan error, 2)
+	serverErrChannel := make(chan error, 4)
+	go func() {
+		if r.ingressHTTPServer == nil {
+			return
+		}
+		if err := r.ingressHTTPServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrChannel <- fmt.Errorf("run bridge runtime: listen ingress http server: %w", err)
+		}
+	}()
+	go func() {
+		if r.ingressGRPCServer == nil {
+			return
+		}
+		if err := r.ingressGRPCServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrChannel <- fmt.Errorf("run bridge runtime: listen ingress grpc server: %w", err)
+		}
+	}()
 	go func() {
 		if r.controlServer == nil {
 			return
@@ -286,6 +309,16 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	if r.adminServer != nil {
 		if err := r.adminServer.Shutdown(normalizedContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("shutdown bridge runtime: %w", err)
+		}
+	}
+	if r.ingressHTTPServer != nil {
+		if err := r.ingressHTTPServer.Shutdown(normalizedContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("shutdown bridge ingress http server: %w", err)
+		}
+	}
+	if r.ingressGRPCServer != nil {
+		if err := r.ingressGRPCServer.Shutdown(normalizedContext); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("shutdown bridge ingress grpc server: %w", err)
 		}
 	}
 	if r.controlServer != nil {

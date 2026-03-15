@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/control"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
@@ -287,13 +288,13 @@ func TestHandleBridgeBusinessControlFrameTunnelRefillRequest(testingObject *test
 		)
 	}
 	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_REQUEST_RECEIVED") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillRequestReceived) {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_REQUEST_RECEIVED")
 	}
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_APPLIED") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillApplied) {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_APPLIED")
 	}
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_EXPANSION_CHECK") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillExpansionCheck) {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_EXPANSION_CHECK")
 	}
 }
@@ -352,13 +353,13 @@ func TestHandleBridgeBusinessControlFrameTunnelRefillRequestIgnoredWhenSatisfied
 		testingObject.Fatalf("expected no refill schedule call, got=%d", scheduler.callCount)
 	}
 	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_IGNORED") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillIgnored) {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_IGNORED")
 	}
-	if testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_APPLIED") {
+	if testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillApplied) {
 		testingObject.Fatalf("expected diagnose logs not contain TUNNEL_REFILL_APPLIED")
 	}
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_EXPANSION_CHECK") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeTunnelRefillExpansionCheck) {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_EXPANSION_CHECK")
 	}
 }
@@ -395,8 +396,76 @@ func TestHandleBridgeBusinessControlFrameControlError(testingObject *testing.T) 
 		testingObject.Fatalf("expected last_error to be updated")
 	}
 	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
-	if !testHasDiagnoseCode(diagnoseLogsPayload, "BRIDGE_CONTROL_ERROR") {
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeBridgeControlError) {
 		testingObject.Fatalf("expected diagnose logs contain BRIDGE_CONTROL_ERROR")
+	}
+}
+
+// TestHandleBridgeBusinessControlFrameRouteAck 验证 route ack 会写入诊断日志，便于排查路由同步问题。
+func TestHandleBridgeBusinessControlFrameRouteAck(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{}
+	routeAssignAckPayload := pb.RouteAssignAck{
+		Accepted:                false,
+		RouteID:                 "agent-auto-route-svc-1",
+		AcceptedResourceVersion: 11,
+		CurrentResourceVersion:  12,
+		ErrorCode:               "STALE_EPOCH_EVENT",
+		ErrorMessage:            "session epoch mismatch for route event",
+	}
+	encodedAssignAckPayload, err := json.Marshal(routeAssignAckPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal route assign ack payload failed: %v", err)
+	}
+	assignAckFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 1,
+		VersionMinor: 0,
+		MessageType:  pb.ControlMessageRouteAssignAck,
+		SessionID:    "session-ack",
+		SessionEpoch: 3,
+		RequestID:    "req-route-assign-ack",
+		Payload:      encodedAssignAckPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode route assign ack frame failed: %v", err)
+	}
+	if err := runtime.handleBridgeBusinessControlFrame(context.Background(), assignAckFrame); err != nil {
+		testingObject.Fatalf("handle route assign ack frame failed: %v", err)
+	}
+
+	routeRevokeAckPayload := pb.RouteRevokeAck{
+		Accepted:                true,
+		RouteID:                 "agent-auto-route-svc-1",
+		AcceptedResourceVersion: 12,
+		CurrentResourceVersion:  12,
+	}
+	encodedRevokeAckPayload, err := json.Marshal(routeRevokeAckPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal route revoke ack payload failed: %v", err)
+	}
+	revokeAckFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 1,
+		VersionMinor: 0,
+		MessageType:  pb.ControlMessageRouteRevokeAck,
+		SessionID:    "session-ack",
+		SessionEpoch: 3,
+		RequestID:    "req-route-revoke-ack",
+		Payload:      encodedRevokeAckPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode route revoke ack frame failed: %v", err)
+	}
+	if err := runtime.handleBridgeBusinessControlFrame(context.Background(), revokeAckFrame); err != nil {
+		testingObject.Fatalf("handle route revoke ack frame failed: %v", err)
+	}
+
+	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeRouteAssignRejected) {
+		testingObject.Fatalf("expected diagnose logs contain ROUTE_ASSIGN_REJECTED")
+	}
+	if !testHasDiagnoseCode(diagnoseLogsPayload, events.CodeRouteRevokeAccepted) {
+		testingObject.Fatalf("expected diagnose logs contain ROUTE_REVOKE_ACCEPTED")
 	}
 }
 
@@ -434,7 +503,7 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 		ServiceName: "order-service",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
-			{EndpointID: "ep-1", Protocol: "http", Host: "127.0.0.1", Port: 18080},
+			{EndpointID: "ep-1", Protocol: "http", Host: "127.0.0.1", Port: 18080, ServerName: "order.demo.example.com"},
 		},
 	})
 	runtime := &Runtime{
@@ -451,8 +520,8 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 		testingObject.Fatalf("sync service control state failed: %v", err)
 	}
 	frames := controlChannel.Frames()
-	if len(frames) != 2 {
-		testingObject.Fatalf("unexpected control frame count: got=%d want=2", len(frames))
+	if len(frames) != 3 {
+		testingObject.Fatalf("unexpected control frame count: got=%d want=3", len(frames))
 	}
 	firstEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
 	if err != nil {
@@ -465,10 +534,37 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	if err != nil {
 		testingObject.Fatalf("decode second business frame failed: %v", err)
 	}
-	if secondEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
+	if secondEnvelope.MessageType != pb.ControlMessageRouteAssign {
 		testingObject.Fatalf(
 			"unexpected second message type: got=%s want=%s",
 			secondEnvelope.MessageType,
+			pb.ControlMessageRouteAssign,
+		)
+	}
+	var routeAssignPayload pb.RouteAssign
+	if err := json.Unmarshal(secondEnvelope.Payload, &routeAssignPayload); err != nil {
+		testingObject.Fatalf("decode route assign payload failed: %v", err)
+	}
+	if routeAssignPayload.RouteID != "agent-auto-route-svc-5001" {
+		testingObject.Fatalf("unexpected route id: got=%s want=%s", routeAssignPayload.RouteID, "agent-auto-route-svc-5001")
+	}
+	if routeAssignPayload.Match.Host != "order.demo.example.com" {
+		testingObject.Fatalf("unexpected route host: got=%s want=%s", routeAssignPayload.Match.Host, "order.demo.example.com")
+	}
+	if routeAssignPayload.Match.PathPrefix != "/" {
+		testingObject.Fatalf("unexpected route path prefix: got=%s want=%s", routeAssignPayload.Match.PathPrefix, "/")
+	}
+	if routeAssignPayload.Target.ConnectorService == nil || routeAssignPayload.Target.ConnectorService.ServiceKey != "dev/demo/order-service" {
+		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
+	}
+	thirdEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[2].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode third business frame failed: %v", err)
+	}
+	if thirdEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
+		testingObject.Fatalf(
+			"unexpected third message type: got=%s want=%s",
+			thirdEnvelope.MessageType,
 			pb.ControlMessageServiceHealthReport,
 		)
 	}
@@ -482,6 +578,80 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	}
 	if services[0]["health_status"] != string(pb.HealthStatusHealthy) {
 		testingObject.Fatalf("unexpected health_status in service.list: %+v", services[0]["health_status"])
+	}
+	if services[0]["sni_name"] != "order.demo.example.com" {
+		testingObject.Fatalf("unexpected sni_name in service.list: %+v", services[0]["sni_name"])
+	}
+}
+
+// TestRemoveServicePublishesUnpublishWhenSessionActive 验证删除服务会下发 UnpublishService。
+func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	controlChannel := newTestPrioritizedControlChannel()
+	serviceCatalog := service.NewCatalog()
+	serviceCatalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
+		ServiceID:   "svc-7001",
+		ServiceKey:  "dev/demo/order-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "order-service",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{EndpointID: "ep-1", Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
+	runtime := &Runtime{
+		controlChannel:   controlChannel,
+		controlPublisher: control.NewPublisher("session-7001", 1, 0),
+		serviceCatalog:   serviceCatalog,
+		bridgeState:      "ACTIVE",
+		bridgeSession:    "session-7001",
+		bridgeEpoch:      1,
+	}
+
+	payload, err := runtime.removeService(runtimeServiceDeleteInput{ServiceID: "svc-7001"})
+	if err != nil {
+		testingObject.Fatalf("remove service failed: %v", err)
+	}
+	if deleted, _ := payload["deleted"].(bool); !deleted {
+		testingObject.Fatalf("expected deleted=true, got=%+v", payload["deleted"])
+	}
+	if len(runtime.serviceCatalog.List()) != 0 {
+		testingObject.Fatalf("expected service catalog empty after delete")
+	}
+	frames := controlChannel.Frames()
+	if len(frames) != 2 {
+		testingObject.Fatalf("unexpected frame count after delete: got=%d want=2", len(frames))
+	}
+	routeRevokeEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode route revoke frame failed: %v", err)
+	}
+	if routeRevokeEnvelope.MessageType != pb.ControlMessageRouteRevoke {
+		testingObject.Fatalf(
+			"unexpected first message type: got=%s want=%s",
+			routeRevokeEnvelope.MessageType,
+			pb.ControlMessageRouteRevoke,
+		)
+	}
+	var routeRevokePayload pb.RouteRevoke
+	if err := json.Unmarshal(routeRevokeEnvelope.Payload, &routeRevokePayload); err != nil {
+		testingObject.Fatalf("decode route revoke payload failed: %v", err)
+	}
+	if routeRevokePayload.RouteID != "agent-auto-route-svc-7001" {
+		testingObject.Fatalf("unexpected route revoke id: got=%s want=%s", routeRevokePayload.RouteID, "agent-auto-route-svc-7001")
+	}
+	unpublishEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[1].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode unpublish frame failed: %v", err)
+	}
+	if unpublishEnvelope.MessageType != pb.ControlMessageUnpublishService {
+		testingObject.Fatalf(
+			"unexpected unpublish message type: got=%s want=%s",
+			unpublishEnvelope.MessageType,
+			pb.ControlMessageUnpublishService,
+		)
 	}
 }
 
@@ -658,27 +828,27 @@ func TestDiagnoseSnapshotPayloadUsesEventSource(testingObject *testing.T) {
 		},
 	}
 	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:   "info",
-		Module:  "agent.runtime.bridge",
-		Code:    "BRIDGE_STATE_ACTIVE",
+		Level:   events.EventInfo,
+		Module:  events.ModuleAgentRuntimeBridge,
+		Code:    events.CodeBridgeStateActive,
 		Message: "bridge active",
 	})
 	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:   "warn",
-		Module:  "agent.runtime.bridge",
-		Code:    "BRIDGE_RETRY_SCHEDULED",
+		Level:   events.EventWarn,
+		Module:  events.ModuleAgentRuntimeBridge,
+		Code:    events.CodeBridgeRetryScheduled,
 		Message: "retry scheduled",
 	})
 	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:   "info",
-		Module:  "agent.runtime.refill",
-		Code:    "TUNNEL_REFILL_APPLIED",
+		Level:   events.EventInfo,
+		Module:  events.ModuleAgentRuntimeRefill,
+		Code:    events.CodeTunnelRefillApplied,
 		Message: "refill applied",
 	})
 	runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:   "error",
-		Module:  "agent.runtime.control",
-		Code:    "BRIDGE_CONTROL_ERROR",
+		Level:   events.EventError,
+		Module:  events.ModuleAgentRuntimeControl,
+		Code:    events.CodeBridgeControlError,
 		Message: "control error",
 	})
 

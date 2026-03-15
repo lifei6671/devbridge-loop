@@ -25,6 +25,7 @@ const (
 
 	// sseDefaultListLimit 对齐前端当前页数据量预设，避免一次推送过大。
 	sseDefaultRouteLimit     = 100
+	sseDefaultServiceLimit   = 120
 	sseDefaultConnectorLimit = 100
 	sseDefaultSessionLimit   = 100
 	sseDefaultTunnelLimit    = 120
@@ -47,6 +48,7 @@ type sseTopic string
 const (
 	sseTopicDashboard     sseTopic = "dashboard"
 	sseTopicRoutes        sseTopic = "routes"
+	sseTopicServices      sseTopic = "services"
 	sseTopicConnectors    sseTopic = "connectors"
 	sseTopicTraffic       sseTopic = "traffic"
 	sseTopicOps           sseTopic = "ops"
@@ -57,6 +59,10 @@ type sseSnapshotQuery struct {
 	sessionStateFilter string
 	tunnelStateFilter  string
 	tunnelConnectorID  string
+	serviceStatus      string
+	serviceHealth      string
+	serviceType        string
+	serviceQueryText   string
 	timeRangeMinutes   int
 }
 
@@ -101,12 +107,16 @@ func (server *Server) handleEventsStream(writer http.ResponseWriter, request *ht
 	setAuditParamSummary(
 		writer,
 		fmt.Sprintf(
-			"topics=%s interval_ms=%d session_state=%s tunnel_state=%s connector_id=%s time_range_minutes=%d",
+			"topics=%s interval_ms=%d session_state=%s tunnel_state=%s connector_id=%s service_status=%s service_health=%s service_type=%s q=%s time_range_minutes=%d",
 			strings.Join(sseTopicsToStrings(topics), ","),
 			interval.Milliseconds(),
 			normalizeAuditFilterValue(snapshotQuery.sessionStateFilter),
 			normalizeAuditFilterValue(snapshotQuery.tunnelStateFilter),
 			normalizeAuditFilterValue(snapshotQuery.tunnelConnectorID),
+			normalizeAuditFilterValue(snapshotQuery.serviceStatus),
+			normalizeAuditFilterValue(snapshotQuery.serviceHealth),
+			normalizeAuditFilterValue(snapshotQuery.serviceType),
+			normalizeAuditFilterValue(snapshotQuery.serviceQueryText),
 			snapshotQuery.timeRangeMinutes,
 		),
 	)
@@ -226,6 +236,67 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 		}
 		return map[string]any{
 			"items": items,
+		}
+	case sseTopicServices:
+		serviceItems := adminview.BuildServiceItems(
+			server.now(),
+			safeListServices(server.dependencies),
+			safeListSessions(server.dependencies),
+		)
+		if query.tunnelConnectorID != "" ||
+			query.sessionStateFilter != "" ||
+			query.serviceStatus != "" ||
+			query.serviceHealth != "" ||
+			query.serviceType != "" ||
+			query.serviceQueryText != "" {
+			filteredItems := make([]adminview.ServiceItem, 0, len(serviceItems))
+			for _, item := range serviceItems {
+				if query.tunnelConnectorID != "" && strings.TrimSpace(item.ConnectorID) != query.tunnelConnectorID {
+					continue
+				}
+				if query.sessionStateFilter != "" && strings.ToUpper(strings.TrimSpace(item.SessionState)) != query.sessionStateFilter {
+					continue
+				}
+				if query.serviceStatus != "" && strings.ToUpper(strings.TrimSpace(item.Status)) != query.serviceStatus {
+					continue
+				}
+				if query.serviceHealth != "" && strings.ToUpper(strings.TrimSpace(item.HealthStatus)) != query.serviceHealth {
+					continue
+				}
+				if query.serviceType != "" && strings.ToLower(strings.TrimSpace(item.ServiceType)) != query.serviceType {
+					continue
+				}
+				if query.serviceQueryText != "" {
+					searchText := strings.ToLower(
+						strings.Join([]string{
+							item.ServiceID,
+							item.ServiceKey,
+							item.ServiceName,
+							item.ConnectorID,
+							item.SessionID,
+							item.EndpointAddress,
+							item.SNIName,
+						}, " "),
+					)
+					if !strings.Contains(searchText, query.serviceQueryText) {
+						continue
+					}
+				}
+				filteredItems = append(filteredItems, item)
+			}
+			serviceItems = filteredItems
+		}
+		if len(serviceItems) > sseDefaultServiceLimit {
+			serviceItems = serviceItems[:sseDefaultServiceLimit]
+		}
+		return map[string]any{
+			"items":                 serviceItems,
+			"connector_id_filter":   normalizeAuditFilterValue(query.tunnelConnectorID),
+			"session_state_filter":  normalizeAuditFilterValue(query.sessionStateFilter),
+			"service_status_filter": normalizeAuditFilterValue(query.serviceStatus),
+			"health_status_filter":  normalizeAuditFilterValue(query.serviceHealth),
+			"service_type_filter":   normalizeAuditFilterValue(query.serviceType),
+			"query_text_filter":     normalizeAuditFilterValue(query.serviceQueryText),
 		}
 	case sseTopicConnectors:
 		connectorItems := adminview.BuildConnectorItems(
@@ -463,6 +534,19 @@ func parseSSESnapshotQuery(request *http.Request) (sseSnapshotQuery, error) {
 	if strings.EqualFold(snapshotQuery.tunnelConnectorID, "all") {
 		snapshotQuery.tunnelConnectorID = ""
 	}
+	snapshotQuery.serviceStatus = strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("status")))
+	if snapshotQuery.serviceStatus == "ALL" {
+		snapshotQuery.serviceStatus = ""
+	}
+	snapshotQuery.serviceHealth = strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("health_status")))
+	if snapshotQuery.serviceHealth == "ALL" {
+		snapshotQuery.serviceHealth = ""
+	}
+	snapshotQuery.serviceType = strings.ToLower(strings.TrimSpace(request.URL.Query().Get("service_type")))
+	if snapshotQuery.serviceType == "all" {
+		snapshotQuery.serviceType = ""
+	}
+	snapshotQuery.serviceQueryText = strings.ToLower(strings.TrimSpace(request.URL.Query().Get("q")))
 	rawTimeRangeMinutes := strings.TrimSpace(request.URL.Query().Get("time_range_minutes"))
 	if rawTimeRangeMinutes == "" {
 		return snapshotQuery, nil
@@ -484,6 +568,8 @@ func normalizeSSETopic(rawTopic string) (sseTopic, bool) {
 		return sseTopicDashboard, true
 	case string(sseTopicRoutes):
 		return sseTopicRoutes, true
+	case string(sseTopicServices):
+		return sseTopicServices, true
 	case string(sseTopicConnectors):
 		return sseTopicConnectors, true
 	case string(sseTopicTraffic):
@@ -501,6 +587,7 @@ func allSSETopics() []sseTopic {
 	return []sseTopic{
 		sseTopicDashboard,
 		sseTopicRoutes,
+		sseTopicServices,
 		sseTopicConnectors,
 		sseTopicTraffic,
 		sseTopicOps,

@@ -3,6 +3,8 @@ package app
 import (
 	"strings"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
 )
 
 const (
@@ -51,15 +53,15 @@ func (r *Runtime) appendDiagnoseEvent(event runtimeDiagnoseEvent) {
 	}
 	normalizedEvent.Level = strings.ToLower(strings.TrimSpace(normalizedEvent.Level))
 	if normalizedEvent.Level == "" {
-		normalizedEvent.Level = "info"
+		normalizedEvent.Level = events.EventInfo
 	}
 	normalizedEvent.Module = strings.TrimSpace(normalizedEvent.Module)
 	if normalizedEvent.Module == "" {
-		normalizedEvent.Module = "agent.runtime"
+		normalizedEvent.Module = events.ModuleAgentRuntime
 	}
 	normalizedEvent.Code = strings.TrimSpace(normalizedEvent.Code)
 	if normalizedEvent.Code == "" {
-		normalizedEvent.Code = "RUNTIME_EVENT"
+		normalizedEvent.Code = events.CodeRuntimeEvent
 	}
 	normalizedEvent.Message = strings.TrimSpace(normalizedEvent.Message)
 	if normalizedEvent.Message == "" {
@@ -108,25 +110,25 @@ func (r *Runtime) snapshotDiagnoseEvents(limit int) []runtimeDiagnoseEvent {
 }
 
 // summarizeDiagnoseEvents 对诊断事件窗口做聚合，供 diagnose.snapshot 输出。
-func summarizeDiagnoseEvents(events []runtimeDiagnoseEvent) runtimeDiagnoseSummary {
+func summarizeDiagnoseEvents(diagnoseEvents []runtimeDiagnoseEvent) runtimeDiagnoseSummary {
 	summary := runtimeDiagnoseSummary{}
-	for _, event := range events {
+	for _, event := range diagnoseEvents {
 		summary.EventTotal++
 		normalizedCode := strings.TrimSpace(event.Code)
 		normalizedLevel := strings.ToLower(strings.TrimSpace(event.Level))
-		if normalizedLevel == "error" {
+		if normalizedLevel == events.EventError {
 			summary.ErrorCount++
 		}
-		if strings.HasPrefix(normalizedCode, "BRIDGE_STATE_") {
+		if strings.HasPrefix(normalizedCode, events.CodePrefixBridgeState) {
 			summary.StateChangeCount++
 		}
-		if strings.HasPrefix(normalizedCode, "SESSION_RECONNECT_") ||
-			strings.HasPrefix(normalizedCode, "BRIDGE_RETRY_") ||
-			normalizedCode == "BRIDGE_RECONNECT_ESTABLISHED" {
+		if strings.HasPrefix(normalizedCode, events.CodePrefixSessionReconnect) ||
+			strings.HasPrefix(normalizedCode, events.CodePrefixBridgeRetry) ||
+			normalizedCode == events.CodeBridgeReconnectEstablished {
 			summary.ReconnectCount++
 		}
-		if strings.HasPrefix(normalizedCode, "TUNNEL_REFILL_") ||
-			strings.HasPrefix(normalizedCode, "TUNNEL_POOL_REPORT_") {
+		if strings.HasPrefix(normalizedCode, events.CodePrefixTunnelRefill) ||
+			strings.HasPrefix(normalizedCode, events.CodePrefixTunnelPoolReport) {
 			summary.RefillEventCount++
 		}
 		if summary.LastEventAtMS == nil || event.TimestampMS >= *summary.LastEventAtMS {

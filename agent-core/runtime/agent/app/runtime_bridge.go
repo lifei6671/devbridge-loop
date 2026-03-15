@@ -13,6 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/control"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
@@ -22,8 +26,6 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -32,6 +34,7 @@ const (
 	bridgeHeartbeatWriteTimeout  = 2 * time.Second
 	bridgeBusinessWriteTimeout   = 3 * time.Second
 	bridgeTunnelDialAnnounceTTL  = 250 * time.Millisecond
+	bridgeAutoRouteIDPrefix      = "agent-auto-route"
 
 	bridgeRetryInitialBackoff = time.Second
 	bridgeRetryMaxBackoff     = 8 * time.Second
@@ -89,6 +92,12 @@ type runtimeServiceAddInput struct {
 	Protocol    string
 	Host        string
 	Port        uint32
+	SNIName     string
+}
+
+type runtimeServiceDeleteInput struct {
+	ServiceID  string
+	ServiceKey string
 }
 
 // bridgeTunnelOpener 实现数据面 tunnel 建连，按配置选择底层 binding。
@@ -122,6 +131,15 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 			tunnelMeta,
 		)
 		if err != nil {
+			opener.runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+				Level:        events.EventWarn,
+				Module:       events.ModuleAgentRuntimeBridge,
+				Code:         events.CodeSessionReconnectRequested,
+				Message:      fmt.Sprintf("tcp framed dial tunnel fail:%v", err),
+				SessionID:    sessionID,
+				SessionEpoch: sessionEpoch,
+				BridgeState:  "RECONNECTING",
+			})
 			return nil, err
 		}
 		dialLocalAddr := ""
@@ -407,9 +425,9 @@ func (r *Runtime) requestBridgeReconnect(resetBackoff bool) {
 	}
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "warn",
-		Module:       "agent.runtime.bridge",
-		Code:         "SESSION_RECONNECT_REQUESTED",
+		Level:        events.EventWarn,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeSessionReconnectRequested,
 		Message:      fmt.Sprintf("bridge reconnect requested reset_backoff=%t", resetBackoff),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -432,9 +450,9 @@ func (r *Runtime) requestBridgeDrain() {
 	sessionEpoch = r.bridgeEpoch
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_STATE_DRAINING",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeStateDraining,
 		Message:      "bridge session drain requested",
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -453,9 +471,9 @@ func (r *Runtime) setBridgeConnecting() {
 	r.updatedAt = time.Now().UTC()
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_STATE_CONNECTING",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeStateConnecting,
 		Message:      "bridge control channel is connecting",
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -493,9 +511,9 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 	r.bridgeMu.Unlock()
 	if wasReconnect {
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:        "info",
-			Module:       "agent.runtime.bridge",
-			Code:         "BRIDGE_RECONNECT_ESTABLISHED",
+			Level:        events.EventInfo,
+			Module:       events.ModuleAgentRuntimeBridge,
+			Code:         events.CodeBridgeReconnectEstablished,
 			Message:      "bridge reconnect completed and session switched",
 			SessionID:    currentSessionID,
 			SessionEpoch: currentSessionEpoch,
@@ -503,9 +521,9 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 		})
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_STATE_ACTIVE",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeStateActive,
 		Message:      "bridge control channel is active",
 		SessionID:    currentSessionID,
 		SessionEpoch: currentSessionEpoch,
@@ -554,9 +572,9 @@ func (r *Runtime) setBridgeRetrying(connectErr error, failStreak uint32, backoff
 		message = fmt.Sprintf("%s error=%s", message, lastError)
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "warn",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_RETRY_SCHEDULED",
+		Level:        events.EventWarn,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeRetryScheduled,
 		Message:      message,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -580,9 +598,9 @@ func (r *Runtime) setBridgeLost(readErr error) {
 		errorText = "bridge control channel became stale"
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "error",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_STATE_STALE",
+		Level:        events.EventError,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeStateStale,
 		Message:      errorText,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -603,9 +621,9 @@ func (r *Runtime) setBridgeDrained() {
 	r.nextRetryAt = time.Time{}
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.bridge",
-		Code:         "BRIDGE_STATE_CLOSED",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeBridge,
+		Code:         events.CodeBridgeStateClosed,
 		Message:      "bridge session drained and closed",
 		SessionID:    closedSessionID,
 		SessionEpoch: closedSessionEpoch,
@@ -863,6 +881,10 @@ func (r *Runtime) handleBridgeControlEnvelope(ctx context.Context, envelope pb.C
 		return r.handleControlErrorEnvelope(envelope)
 	case pb.ControlMessagePublishServiceAck:
 		return r.handlePublishServiceAckEnvelope(envelope)
+	case pb.ControlMessageRouteAssignAck:
+		return r.handleRouteAssignAckEnvelope(envelope)
+	case pb.ControlMessageRouteRevokeAck:
+		return r.handleRouteRevokeAckEnvelope(envelope)
 	default:
 		// 其他消息类型在当前阶段先透传忽略，后续按能力分阶段接入。
 		return nil
@@ -881,9 +903,9 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 	if len(envelope.Payload) == 0 {
 		err := errors.New("tunnel refill payload is empty")
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:        "error",
-			Module:       "agent.runtime.refill",
-			Code:         "TUNNEL_REFILL_PAYLOAD_INVALID",
+			Level:        events.EventError,
+			Module:       events.ModuleAgentRuntimeRefill,
+			Code:         events.CodeTunnelRefillPayloadInvalid,
 			Message:      err.Error(),
 			SessionID:    sessionID,
 			SessionEpoch: sessionEpoch,
@@ -895,9 +917,9 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 	if err := json.Unmarshal(envelope.Payload, &refillPayload); err != nil {
 		wrappedErr := fmt.Errorf("unmarshal tunnel refill payload failed: %w", err)
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:        "error",
-			Module:       "agent.runtime.refill",
-			Code:         "TUNNEL_REFILL_PAYLOAD_INVALID",
+			Level:        events.EventError,
+			Module:       events.ModuleAgentRuntimeRefill,
+			Code:         events.CodeTunnelRefillPayloadInvalid,
 			Message:      wrappedErr.Error(),
 			SessionID:    sessionID,
 			SessionEpoch: sessionEpoch,
@@ -936,9 +958,9 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		Timestamp:           requestTimestamp,
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.refill",
-		Code:         "TUNNEL_REFILL_REQUEST_RECEIVED",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeRefill,
+		Code:         events.CodeTunnelRefillRequestReceived,
 		Message:      fmt.Sprintf("receive tunnel refill request idle_delta=%d target_idle=%d bridge_idle=%d bridge_in_use=%d", refillRequest.RequestedIdleDelta, refillRequest.RequestedTargetIdle, bridgeIdleCount, bridgeInUseCount),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -949,9 +971,9 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 	if err != nil {
 		wrappedErr := fmt.Errorf("handle tunnel refill request failed: %w", err)
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:        "error",
-			Module:       "agent.runtime.refill",
-			Code:         "TUNNEL_REFILL_REJECTED",
+			Level:        events.EventError,
+			Module:       events.ModuleAgentRuntimeRefill,
+			Code:         events.CodeTunnelRefillRejected,
 			Message:      wrappedErr.Error(),
 			SessionID:    sessionID,
 			SessionEpoch: sessionEpoch,
@@ -961,16 +983,16 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		return wrappedErr
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.refill",
-		Code:         "TUNNEL_REFILL_EXPANSION_CHECK",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeRefill,
+		Code:         events.CodeTunnelRefillExpansionCheck,
 		Message:      fmt.Sprintf("tunnel refill expansion check need_expansion=%t before_idle=%d before_in_use=%d effective_target_idle=%d bridge_idle=%d bridge_in_use=%d", handleResult.NeedExpansion, handleResult.BeforeIdleCount, handleResult.BeforeInUseCount, handleResult.EffectiveTargetIdle, bridgeIdleCount, bridgeInUseCount),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
 		RequestID:    requestID,
 		Reason:       string(refillRequest.Reason),
 	})
-	refillEventCode := "TUNNEL_REFILL_APPLIED"
+	refillEventCode := events.CodeTunnelRefillApplied
 	refillEventMessage := fmt.Sprintf(
 		"tunnel refill applied idle_delta=%d before_idle=%d before_in_use=%d effective_target_idle=%d bridge_idle=%d bridge_in_use=%d",
 		refillRequest.RequestedIdleDelta,
@@ -981,7 +1003,7 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		bridgeInUseCount,
 	)
 	if !handleResult.Accepted {
-		refillEventCode = "TUNNEL_REFILL_IGNORED"
+		refillEventCode = events.CodeTunnelRefillIgnored
 		ignoreReason := "not_accepted"
 		if handleResult.Deduplicated {
 			ignoreReason = "deduplicated"
@@ -1000,8 +1022,8 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 		)
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.refill",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeRefill,
 		Code:         refillEventCode,
 		Message:      refillEventMessage,
 		SessionID:    sessionID,
@@ -1071,9 +1093,9 @@ func (r *Runtime) handleControlErrorEnvelope(envelope pb.ControlEnvelope) error 
 	bridgeState = r.bridgeState
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "error",
-		Module:       "agent.runtime.control",
-		Code:         "BRIDGE_CONTROL_ERROR",
+		Level:        events.EventError,
+		Module:       events.ModuleAgentRuntimeControl,
+		Code:         events.CodeBridgeControlError,
 		Message:      errorText,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -1108,12 +1130,93 @@ func (r *Runtime) handlePublishServiceAckEnvelope(envelope pb.ControlEnvelope) e
 	return nil
 }
 
+// handleRouteAssignAckEnvelope 记录 Bridge 回传的 RouteAssignAck，便于排查 ingress route 不一致问题。
+func (r *Runtime) handleRouteAssignAckEnvelope(envelope pb.ControlEnvelope) error {
+	if r == nil {
+		return nil
+	}
+	if len(envelope.Payload) == 0 {
+		return nil
+	}
+	var routeAssignAck pb.RouteAssignAck
+	if err := json.Unmarshal(envelope.Payload, &routeAssignAck); err != nil {
+		return fmt.Errorf("unmarshal route assign ack payload failed: %w", err)
+	}
+	ackCode := events.CodeRouteAssignAccepted
+	ackLevel := events.EventInfo
+	if !routeAssignAck.Accepted {
+		ackCode = events.CodeRouteAssignRejected
+		ackLevel = events.EventWarn
+	}
+	ackMessage := fmt.Sprintf(
+		"route assign ack accepted=%t route_id=%s accepted_version=%d current_version=%d error_code=%s error_message=%s",
+		routeAssignAck.Accepted,
+		strings.TrimSpace(routeAssignAck.RouteID),
+		routeAssignAck.AcceptedResourceVersion,
+		routeAssignAck.CurrentResourceVersion,
+		strings.TrimSpace(routeAssignAck.ErrorCode),
+		strings.TrimSpace(routeAssignAck.ErrorMessage),
+	)
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        ackLevel,
+		Module:       events.ModuleAgentRuntimeRoute,
+		Code:         ackCode,
+		Message:      ackMessage,
+		SessionID:    strings.TrimSpace(envelope.SessionID),
+		SessionEpoch: envelope.SessionEpoch,
+		RequestID:    strings.TrimSpace(envelope.RequestID),
+	})
+	return nil
+}
+
+// handleRouteRevokeAckEnvelope 记录 Bridge 回传的 RouteRevokeAck，便于排查路由撤销收敛。
+func (r *Runtime) handleRouteRevokeAckEnvelope(envelope pb.ControlEnvelope) error {
+	if r == nil {
+		return nil
+	}
+	if len(envelope.Payload) == 0 {
+		return nil
+	}
+	var routeRevokeAck pb.RouteRevokeAck
+	if err := json.Unmarshal(envelope.Payload, &routeRevokeAck); err != nil {
+		return fmt.Errorf("unmarshal route revoke ack payload failed: %w", err)
+	}
+	ackCode := events.CodeRouteRevokeAccepted
+	ackLevel := events.EventInfo
+	if !routeRevokeAck.Accepted {
+		ackCode = events.CodeRouteRevokeRejected
+		ackLevel = events.EventWarn
+	}
+	ackMessage := fmt.Sprintf(
+		"route revoke ack accepted=%t route_id=%s accepted_version=%d current_version=%d error_code=%s error_message=%s",
+		routeRevokeAck.Accepted,
+		strings.TrimSpace(routeRevokeAck.RouteID),
+		routeRevokeAck.AcceptedResourceVersion,
+		routeRevokeAck.CurrentResourceVersion,
+		strings.TrimSpace(routeRevokeAck.ErrorCode),
+		strings.TrimSpace(routeRevokeAck.ErrorMessage),
+	)
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        ackLevel,
+		Module:       events.ModuleAgentRuntimeRoute,
+		Code:         ackCode,
+		Message:      ackMessage,
+		SessionID:    strings.TrimSpace(envelope.SessionID),
+		SessionEpoch: envelope.SessionEpoch,
+		RequestID:    strings.TrimSpace(envelope.RequestID),
+	})
+	return nil
+}
+
 // syncServiceControlState 在会话激活后同步一次服务发布与健康状态。
 func (r *Runtime) syncServiceControlState(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
 	if err := r.publishCatalogServices(ctx); err != nil {
+		return err
+	}
+	if err := r.publishCatalogRoutes(ctx); err != nil {
 		return err
 	}
 	if err := r.reportCatalogHealth(ctx); err != nil {
@@ -1149,6 +1252,37 @@ func (r *Runtime) publishCatalogServices(ctx context.Context) error {
 		}
 		if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
 			return fmt.Errorf("send publish service failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// publishCatalogRoutes 基于本地服务目录下发 RouteAssign，打通 Host/Path 到 connector_service 的映射链路。
+func (r *Runtime) publishCatalogRoutes(ctx context.Context) error {
+	if r == nil || r.serviceCatalog == nil || r.controlPublisher == nil {
+		return nil
+	}
+	records := r.serviceCatalog.List()
+	if len(records) == 0 {
+		return nil
+	}
+	for _, record := range records {
+		routeAssignPayload, shouldPublish := buildAutoRouteAssignPayload(record.Registration)
+		if !shouldPublish {
+			continue
+		}
+		envelope, err := r.controlPublisher.Publish(
+			ctx,
+			pb.ControlMessageRouteAssign,
+			"route",
+			strings.TrimSpace(routeAssignPayload.RouteID),
+			routeAssignPayload,
+		)
+		if err != nil {
+			return fmt.Errorf("build route assign envelope failed: %w", err)
+		}
+		if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
+			return fmt.Errorf("send route assign failed: %w", err)
 		}
 	}
 	return nil
@@ -1267,26 +1401,26 @@ func (r *Runtime) tryAnnounceDialedTunnel(tunnelID string, sessionID string, ses
 	)
 	if buildErr != nil {
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:   "warn",
-			Module:  "agent.runtime.tunnel",
-			Code:    "TUNNEL_DIAL_ANNOUNCE_BUILD_FAILED",
+			Level:   events.EventWarn,
+			Module:  events.ModuleAgentRuntimeTunnel,
+			Code:    events.CodeTunnelDialAnnounceBuildFailed,
 			Message: fmt.Sprintf("build tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, buildErr),
 		})
 		return
 	}
 	if sendErr := r.sendBusinessControlEnvelope(announceContext, envelope); sendErr != nil {
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:   "warn",
-			Module:  "agent.runtime.tunnel",
-			Code:    "TUNNEL_DIAL_ANNOUNCE_SEND_FAILED",
+			Level:   events.EventWarn,
+			Module:  events.ModuleAgentRuntimeTunnel,
+			Code:    events.CodeTunnelDialAnnounceSendFailed,
 			Message: fmt.Sprintf("send tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, sendErr),
 		})
 		return
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:  "info",
-		Module: "agent.runtime.tunnel",
-		Code:   "TUNNEL_DIAL_ANNOUNCED",
+		Level:  events.EventInfo,
+		Module: events.ModuleAgentRuntimeTunnel,
+		Code:   events.CodeTunnelDialAnnounced,
 		Message: fmt.Sprintf(
 			"tunnel dial announce sent tunnel_id=%s session_id=%s session_epoch=%d dial_local_addr=%s",
 			normalizedTunnelID,
@@ -1306,9 +1440,9 @@ func (r *Runtime) reportTunnelPoolNow(ctx context.Context, trigger string) {
 	if err := r.tunnelReporter.ReportNow(ctx, trigger); err != nil {
 		sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:        "warn",
-			Module:       "agent.runtime.refill",
-			Code:         "TUNNEL_POOL_REPORT_FAILED",
+			Level:        events.EventWarn,
+			Module:       events.ModuleAgentRuntimeRefill,
+			Code:         events.CodeTunnelPoolReportFailed,
 			Message:      fmt.Sprintf("tunnel pool report failed trigger=%s error=%v", strings.TrimSpace(trigger), err),
 			SessionID:    sessionID,
 			SessionEpoch: sessionEpoch,
@@ -1319,9 +1453,9 @@ func (r *Runtime) reportTunnelPoolNow(ctx context.Context, trigger string) {
 	}
 	sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:        "info",
-		Module:       "agent.runtime.refill",
-		Code:         "TUNNEL_POOL_REPORT_TRIGGERED",
+		Level:        events.EventInfo,
+		Module:       events.ModuleAgentRuntimeRefill,
+		Code:         events.CodeTunnelPoolReportTriggered,
 		Message:      fmt.Sprintf("tunnel pool report triggered trigger=%s", strings.TrimSpace(trigger)),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
@@ -1676,6 +1810,7 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	if normalizedHost == "" {
 		normalizedHost = "127.0.0.1"
 	}
+	normalizedSNIName := strings.TrimSpace(input.SNIName)
 	if input.Port == 0 {
 		return nil, errors.New("port must be greater than 0")
 	}
@@ -1709,6 +1844,7 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 				Protocol:   normalizedProtocol,
 				Host:       normalizedHost,
 				Port:       input.Port,
+				ServerName: normalizedSNIName,
 			},
 		},
 	})
@@ -1719,9 +1855,9 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		// 会话可用时尽力触发一次全量同步；失败仅记录诊断，不回滚本地目录。
 		if err := r.syncServiceControlState(context.Background()); err != nil {
 			r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-				Level:   "warn",
-				Module:  "agent.runtime.service",
-				Code:    "SERVICE_SYNC_FAILED",
+				Level:   events.EventWarn,
+				Module:  events.ModuleAgentRuntimeService,
+				Code:    events.CodeServiceSyncFailed,
 				Message: fmt.Sprintf("sync service to bridge failed: %v", err),
 			})
 		}
@@ -1739,10 +1875,253 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		"namespace":      record.Registration.Namespace,
 		"environment":    record.Registration.Environment,
 		"protocol":       normalizedProtocol,
+		"host":           normalizedHost,
+		"port":           input.Port,
+		"sni_name":       normalizedSNIName,
 		"endpoint_count": len(record.Registration.Endpoints),
 		"updated_at_ms":  updatedAtMS,
 		"source":         "agent.runtime",
 	}, nil
+}
+
+// 删除本地服务目录项，并在会话 ACTIVE 时尽力同步一次 UnpublishService。
+func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any, error) {
+	if r == nil || r.serviceCatalog == nil {
+		return nil, errors.New("service catalog is not initialized")
+	}
+	normalizedServiceID := strings.TrimSpace(input.ServiceID)
+	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
+	if normalizedServiceID == "" && normalizedServiceKey == "" {
+		return nil, errors.New("service_id or service_key is required")
+	}
+
+	var targetRegistration adapter.LocalRegistration
+	for _, record := range r.serviceCatalog.List() {
+		recordServiceID := strings.TrimSpace(record.Registration.ServiceID)
+		recordServiceKey := strings.TrimSpace(record.Registration.ServiceKey)
+		if normalizedServiceID != "" {
+			if recordServiceID != normalizedServiceID {
+				continue
+			}
+		} else if recordServiceKey != normalizedServiceKey {
+			continue
+		}
+		normalizedServiceID = recordServiceID
+		targetRegistration = record.Registration
+		break
+	}
+	if normalizedServiceID == "" {
+		return map[string]any{
+			"accepted":      true,
+			"deleted":       false,
+			"service_id":    strings.TrimSpace(input.ServiceID),
+			"service_key":   normalizedServiceKey,
+			"updated_at_ms": runtimeNowMillis(),
+			"source":        "agent.runtime",
+		}, nil
+	}
+
+	deleted := r.serviceCatalog.RemoveByServiceID(normalizedServiceID)
+	if deleted {
+		normalizedServiceKey = strings.TrimSpace(targetRegistration.ServiceKey)
+		if normalizedServiceKey == "" {
+			normalizedServiceKey = adapter.BuildServiceKey(
+				targetRegistration.Namespace,
+				targetRegistration.Environment,
+				targetRegistration.ServiceName,
+			)
+		}
+	}
+
+	if deleted {
+		if _, _, active := r.bridgeSessionMeta(); active && r.controlPublisher != nil {
+			if routeID := buildAutoRouteID(targetRegistration); routeID != "" {
+				routeRevokePayload := pb.RouteRevoke{
+					RouteID:     routeID,
+					Namespace:   strings.TrimSpace(targetRegistration.Namespace),
+					Environment: strings.TrimSpace(targetRegistration.Environment),
+					Reason:      "service_removed",
+				}
+				if routeRevokePayload.Namespace == "" {
+					routeRevokePayload.Namespace = "dev"
+				}
+				if routeRevokePayload.Environment == "" {
+					routeRevokePayload.Environment = "demo"
+				}
+				envelope, err := r.controlPublisher.Publish(
+					context.Background(),
+					pb.ControlMessageRouteRevoke,
+					"route",
+					strings.TrimSpace(routeRevokePayload.RouteID),
+					routeRevokePayload,
+				)
+				if err != nil {
+					r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+						Level:   events.EventWarn,
+						Module:  events.ModuleAgentRuntimeService,
+						Code:    events.CodeServiceRouteRevokeBuildFailed,
+						Message: fmt.Sprintf("build route revoke envelope failed: %v", err),
+					})
+				} else if err := r.sendBusinessControlEnvelope(context.Background(), envelope); err != nil {
+					r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+						Level:   events.EventWarn,
+						Module:  events.ModuleAgentRuntimeService,
+						Code:    events.CodeServiceRouteRevokeSendFailed,
+						Message: fmt.Sprintf("send route revoke failed: %v", err),
+					})
+				}
+			}
+
+			unpublishPayload := adapter.ToUnpublishService(
+				targetRegistration,
+				"service removed by agent localrpc",
+			)
+			resourceID := strings.TrimSpace(unpublishPayload.ServiceID)
+			if resourceID == "" {
+				resourceID = strings.TrimSpace(unpublishPayload.ServiceKey)
+			}
+			envelope, err := r.controlPublisher.Publish(
+				context.Background(),
+				pb.ControlMessageUnpublishService,
+				"service",
+				resourceID,
+				unpublishPayload,
+			)
+			if err != nil {
+				r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+					Level:   events.EventWarn,
+					Module:  events.ModuleAgentRuntimeService,
+					Code:    events.CodeServiceUnpublishBuildFailed,
+					Message: fmt.Sprintf("build unpublish service envelope failed: %v", err),
+				})
+			} else if err := r.sendBusinessControlEnvelope(context.Background(), envelope); err != nil {
+				r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+					Level:   events.EventWarn,
+					Module:  events.ModuleAgentRuntimeService,
+					Code:    events.CodeServiceUnpublishSendFailed,
+					Message: fmt.Sprintf("send unpublish service failed: %v", err),
+				})
+			}
+		}
+	}
+
+	return map[string]any{
+		"accepted":      true,
+		"deleted":       deleted,
+		"service_id":    normalizedServiceID,
+		"service_key":   normalizedServiceKey,
+		"updated_at_ms": runtimeNowMillis(),
+		"source":        "agent.runtime",
+	}, nil
+}
+
+func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.RouteAssign, bool) {
+	serviceKey := strings.TrimSpace(registration.ServiceKey)
+	if serviceKey == "" {
+		serviceKey = adapter.BuildServiceKey(
+			registration.Namespace,
+			registration.Environment,
+			registration.ServiceName,
+		)
+	}
+	if strings.TrimSpace(serviceKey) == "" {
+		return pb.RouteAssign{}, false
+	}
+	normalizedProtocol := normalizeAutoRouteProtocol(registration.ServiceType)
+	if normalizedProtocol == "" {
+		return pb.RouteAssign{}, false
+	}
+	routeID := buildAutoRouteID(registration)
+	if routeID == "" {
+		return pb.RouteAssign{}, false
+	}
+	namespace := strings.TrimSpace(registration.Namespace)
+	if namespace == "" {
+		namespace = "dev"
+	}
+	environment := strings.TrimSpace(registration.Environment)
+	if environment == "" {
+		environment = "demo"
+	}
+	pathPrefix := strings.TrimSpace(registration.Exposure.PathPrefix)
+	if pathPrefix == "" {
+		pathPrefix = "/"
+	}
+	return pb.RouteAssign{
+		RouteID:     routeID,
+		Namespace:   namespace,
+		Environment: environment,
+		Match: pb.RouteMatch{
+			Protocol:   normalizedProtocol,
+			Host:       resolveAutoRouteHost(registration),
+			PathPrefix: pathPrefix,
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: serviceKey,
+			},
+		},
+		Priority: 100,
+		Metadata: map[string]string{
+			"source":       "agent.auto_route",
+			"service_key":  serviceKey,
+			"ingress_mode": string(pb.IngressModeL7Shared),
+		},
+	}, true
+}
+
+func normalizeAutoRouteProtocol(serviceType string) string {
+	switch strings.ToLower(strings.TrimSpace(serviceType)) {
+	case "http", "https":
+		return "http"
+	case "grpc", "grpc_h2", "grpc-h2":
+		return "grpc"
+	default:
+		return ""
+	}
+}
+
+func resolveAutoRouteHost(registration adapter.LocalRegistration) string {
+	normalizedHost := strings.TrimSpace(registration.Exposure.Host)
+	if normalizedHost != "" {
+		return normalizedHost
+	}
+	for _, endpoint := range registration.Endpoints {
+		if endpointHost := strings.TrimSpace(endpoint.ServerName); endpointHost != "" {
+			return endpointHost
+		}
+	}
+	if exposureSNI := strings.TrimSpace(registration.Exposure.SNIName); exposureSNI != "" {
+		return exposureSNI
+	}
+	return ""
+}
+
+func buildAutoRouteID(registration adapter.LocalRegistration) string {
+	resourceID := strings.TrimSpace(registration.ServiceID)
+	if resourceID == "" {
+		resourceID = strings.TrimSpace(registration.ServiceKey)
+	}
+	if resourceID == "" {
+		resourceID = adapter.BuildServiceKey(
+			registration.Namespace,
+			registration.Environment,
+			registration.ServiceName,
+		)
+	}
+	normalizedResourceID := strings.TrimSpace(resourceID)
+	if normalizedResourceID == "" {
+		return ""
+	}
+	sanitizedResourceID := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		".", "-",
+		" ", "-",
+	).Replace(normalizedResourceID)
+	return fmt.Sprintf("%s-%s", bridgeAutoRouteIDPrefix, sanitizedResourceID)
 }
 
 // 组装 service.list 返回体。
@@ -1761,6 +2140,22 @@ func (r *Runtime) serviceListPayload() map[string]any {
 		if !record.UpdatedAt.IsZero() {
 			updatedAtMS = uint64(record.UpdatedAt.UTC().UnixMilli())
 		}
+		endpointsPayload := make([]map[string]any, 0, len(record.Registration.Endpoints))
+		primarySNIName := strings.TrimSpace(record.Registration.Exposure.SNIName)
+		for _, endpoint := range record.Registration.Endpoints {
+			endpointSNIName := strings.TrimSpace(endpoint.ServerName)
+			if primarySNIName == "" && endpointSNIName != "" {
+				primarySNIName = endpointSNIName
+			}
+			endpointsPayload = append(endpointsPayload, map[string]any{
+				"endpoint_id": endpoint.EndpointID,
+				"protocol":    endpoint.Protocol,
+				"host":        endpoint.Host,
+				"port":        endpoint.Port,
+				"server_name": endpoint.ServerName,
+				"sni_name":    endpointSNIName,
+			})
+		}
 		items = append(items, map[string]any{
 			"service_id":       record.Registration.ServiceID,
 			"service_key":      record.Registration.ServiceKey,
@@ -1768,8 +2163,11 @@ func (r *Runtime) serviceListPayload() map[string]any {
 			"environment":      record.Registration.Environment,
 			"service_name":     record.Registration.ServiceName,
 			"service_type":     record.Registration.ServiceType,
+			"protocol":         record.Registration.ServiceType,
 			"status":           string(pb.ServiceStatusActive),
 			"health_status":    string(record.HealthStatus),
+			"endpoints":        endpointsPayload,
+			"sni_name":         primarySNIName,
 			"endpoint_count":   len(record.Registration.Endpoints),
 			"resource_version": uint64(0),
 			"updated_at_ms":    updatedAtMS,

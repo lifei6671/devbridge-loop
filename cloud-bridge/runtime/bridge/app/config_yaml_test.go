@@ -102,6 +102,9 @@ control_plane:
 	if config.Admin.Enabled {
 		testingObject.Fatalf("expected admin disabled from yaml")
 	}
+	if config.RuntimeConfigFilePath != configFilePath {
+		testingObject.Fatalf("unexpected runtime config file path: got=%s want=%s", config.RuntimeConfigFilePath, configFilePath)
+	}
 }
 
 // TestLoadConfigFromYAMLFileRejectsEmptyPath 验证空路径会被配置加载入口拒绝。
@@ -111,5 +114,46 @@ func TestLoadConfigFromYAMLFileRejectsEmptyPath(testingObject *testing.T) {
 	_, err := LoadConfigFromYAMLFile("   ")
 	if err == nil {
 		testingObject.Fatalf("expected empty yaml path to fail")
+	}
+}
+
+// TestSaveConfigToYAMLFileRoundTrip 验证配置可写回 YAML 并可再次加载。
+func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	configFilePath := filepath.Join(tempDir, "bridge.yaml")
+	config := DefaultConfig()
+	config.Ingress.HTTPAddr = ":18080"
+	config.Ingress.GRPCAddr = ":18081"
+	config.Ingress.TCPPortRange = "9100-9200"
+	config.ControlPlane.ListenAddr = ":19080"
+	config.ControlPlane.GRPCH2ListenAddr = ":19082"
+	config.ControlPlane.HeartbeatTimeout = 45 * time.Second
+	config.Admin.BasePath = "/console"
+	config.Observability.LogLevel = "debug"
+
+	if err := SaveConfigToYAMLFile(config, configFilePath); err != nil {
+		testingObject.Fatalf("save config yaml failed: %v", err)
+	}
+	loadedConfig, err := LoadConfigFromYAMLFile(configFilePath)
+	if err != nil {
+		testingObject.Fatalf("load saved config yaml failed: %v", err)
+	}
+	if loadedConfig.Ingress.HTTPAddr != config.Ingress.HTTPAddr {
+		testingObject.Fatalf("unexpected ingress.http_addr: got=%s want=%s", loadedConfig.Ingress.HTTPAddr, config.Ingress.HTTPAddr)
+	}
+	if loadedConfig.ControlPlane.HeartbeatTimeout != config.ControlPlane.HeartbeatTimeout {
+		testingObject.Fatalf(
+			"unexpected control_plane.heartbeat_timeout: got=%s want=%s",
+			loadedConfig.ControlPlane.HeartbeatTimeout,
+			config.ControlPlane.HeartbeatTimeout,
+		)
+	}
+	if loadedConfig.Admin.BasePath != config.Admin.BasePath {
+		testingObject.Fatalf("unexpected admin.base_path: got=%s want=%s", loadedConfig.Admin.BasePath, config.Admin.BasePath)
+	}
+	if loadedConfig.Observability.LogLevel != config.Observability.LogLevel {
+		testingObject.Fatalf("unexpected observability.log_level: got=%s want=%s", loadedConfig.Observability.LogLevel, config.Observability.LogLevel)
 	}
 }

@@ -1,3 +1,4 @@
 # 存在的问题
 
-[] 1、发现Agent客户端会不定时的收到 TUNNEL_REFILL_APPLIED 消息，导致Agent新增了连接，但是实际上当前的tunnel并没有比占用。且新增了连接后，Bridge的idle统计数据只会增长不会下降。
+[] 1、Bridge的服务菜单的状态的徽章宽度过宽，没有自适应宽度。
+[] 2、我在控制台执行 curl --location 'http://127.0.0.1:39080' --header 'Host:jelly.disign.me' 发现并请求不通该服务。

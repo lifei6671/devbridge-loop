@@ -12,6 +12,7 @@ import { Toaster, toast } from "sonner";
 type AdminPageKey =
   | "dashboard"
   | "routes"
+  | "services"
   | "connectors"
   | "traffic"
   | "ops"
@@ -72,6 +73,8 @@ type SSEEnvelope = {
 const sseSnapshotEventName = "bridge.snapshot";
 const sseReadyEventName = "bridge.ready";
 const sseHeartbeatEventName = "bridge.heartbeat";
+const adminPageQueryKey = "page";
+const defaultAdminPage: AdminPageKey = "dashboard";
 
 const pageCatalog: Array<{
   key: AdminPageKey;
@@ -80,11 +83,80 @@ const pageCatalog: Array<{
 }> = [
   { key: "dashboard", title: "总览", subtitle: "运行态健康与关键指标" },
   { key: "routes", title: "路由", subtitle: "Route 配置与命中上下文" },
+  { key: "services", title: "服务", subtitle: "服务明细、Agent 归属与访问方式" },
   { key: "connectors", title: "连接", subtitle: "Connector / Session 运行态" },
   { key: "traffic", title: "隧道流量", subtitle: "Tunnel Pool 与 Traffic 观测" },
   { key: "ops", title: "配置运维", subtitle: "受控写接口与审计入口" },
   { key: "observability", title: "日志诊断", subtitle: "Logs / Metrics / Diagnose" },
 ];
+
+const configPatchKeyOptions = [
+  "ingress.http_addr",
+  "ingress.grpc_addr",
+  "ingress.https_addr",
+  "ingress.tls_sni_addr",
+  "ingress.tcp_port_range",
+  "admin.enabled",
+  "admin.listen_addr",
+  "admin.allow_shared_listener",
+  "admin.base_path",
+  "admin.ui_enabled",
+  "control_plane.listen_addr",
+  "control_plane.grpc_h2_listen_addr",
+  "control_plane.heartbeat_timeout_ms",
+  "observability.log_level",
+  "observability.metrics_addr",
+] as const;
+
+const adminPageKeyLookup: Record<AdminPageKey, AdminPageKey> = {
+  dashboard: "dashboard",
+  routes: "routes",
+  services: "services",
+  connectors: "connectors",
+  traffic: "traffic",
+  ops: "ops",
+  observability: "observability",
+};
+
+/**
+ * normalizeAdminPageKey 将 URL 中的字符串归一化为可识别的菜单 key。
+ */
+function normalizeAdminPageKey(rawPage: string): AdminPageKey | null {
+  const normalizedPage = rawPage.trim().toLowerCase();
+  if (normalizedPage === "") {
+    return null;
+  }
+  if (normalizedPage in adminPageKeyLookup) {
+    return adminPageKeyLookup[normalizedPage as AdminPageKey];
+  }
+  return null;
+}
+
+/**
+ * resolveAdminPageFromLocation 从 URL 的 query/hash/path 解析当前菜单。
+ */
+function resolveAdminPageFromLocation(locationValue: Pick<Location, "pathname" | "search" | "hash">): AdminPageKey {
+  const queryPage = normalizeAdminPageKey(
+    new URLSearchParams(locationValue.search).get(adminPageQueryKey) ?? ""
+  );
+  if (queryPage !== null) {
+    return queryPage;
+  }
+
+  const normalizedHash = locationValue.hash.replace(/^#\/?/, "").split(/[/?#]/)[0] ?? "";
+  const hashPage = normalizeAdminPageKey(normalizedHash);
+  if (hashPage !== null) {
+    return hashPage;
+  }
+
+  const pathnameSegments = locationValue.pathname.split("/").filter((segment) => segment.trim() !== "");
+  const tailSegment = pathnameSegments[pathnameSegments.length - 1] ?? "";
+  const pathPage = normalizeAdminPageKey(tailSegment);
+  if (pathPage !== null) {
+    return pathPage;
+  }
+  return defaultAdminPage;
+}
 
 /**
  * isRecord 用于把未知值缩窄成可安全读取的对象。
@@ -248,14 +320,25 @@ function resolveTone(rawState: string): StateTone {
  */
 function parsePatchValue(patchKey: string, patchRawValue: string): unknown {
   const normalizedValue = patchRawValue.trim();
-  if (patchKey === "admin.ui_enabled") {
+  if (
+    patchKey === "admin.ui_enabled" ||
+    patchKey === "admin.enabled" ||
+    patchKey === "admin.allow_shared_listener"
+  ) {
     if (normalizedValue === "true" || normalizedValue === "1") {
       return true;
     }
     if (normalizedValue === "false" || normalizedValue === "0") {
       return false;
     }
-    throw new Error("admin.ui_enabled 仅支持 true/false");
+    throw new Error(`${patchKey} 仅支持 true/false`);
+  }
+  if (patchKey === "control_plane.heartbeat_timeout_ms") {
+    const parsedValue = Number(normalizedValue);
+    if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
+      throw new Error("control_plane.heartbeat_timeout_ms 仅支持正整数");
+    }
+    return Math.trunc(parsedValue);
   }
   if (normalizedValue === "") {
     throw new Error("补丁值不能为空");
@@ -290,6 +373,9 @@ function pickSSETopicByPage(page: AdminPageKey): string {
   }
   if (page === "routes") {
     return "routes";
+  }
+  if (page === "services") {
+    return "services";
   }
   if (page === "connectors") {
     return "connectors";
@@ -529,7 +615,12 @@ function buildMetricTrend(items: ApiRecord[], metricKey: string): TrendDatum[] {
 }
 
 export default function App() {
-  const [activePage, setActivePage] = useState<AdminPageKey>("dashboard");
+  const [activePage, setActivePage] = useState<AdminPageKey>(() => {
+    if (typeof window === "undefined") {
+      return defaultAdminPage;
+    }
+    return resolveAdminPageFromLocation(window.location);
+  });
   const [token, setToken] = useState("");
   const [tokenDraft, setTokenDraft] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -538,6 +629,7 @@ export default function App() {
 
   const [overview, setOverview] = useState<ApiRecord>({});
   const [routeItems, setRouteItems] = useState<ApiRecord[]>([]);
+  const [serviceItems, setServiceItems] = useState<ApiRecord[]>([]);
   const [connectorItems, setConnectorItems] = useState<ApiRecord[]>([]);
   const [sessionItems, setSessionItems] = useState<ApiRecord[]>([]);
   const [tunnelSummary, setTunnelSummary] = useState<ApiRecord>({});
@@ -603,6 +695,38 @@ export default function App() {
     }
     return pickDetailTitle(detailSelection.domain, currentDetailRecord);
   }, [currentDetailRecord, detailSelection]);
+
+  /**
+   * syncAdminPageToURL 把菜单页状态写回 URL，支持 push/replace 两种模式。
+   */
+  const syncAdminPageToURL = useCallback((page: AdminPageKey, mode: "push" | "replace" = "replace") => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set(adminPageQueryKey, page);
+    const nextURL = `${url.pathname}${url.search}${url.hash}`;
+    const currentURL = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextURL === currentURL) {
+      return;
+    }
+    if (mode === "push") {
+      window.history.pushState({ [adminPageQueryKey]: page }, "", nextURL);
+      return;
+    }
+    window.history.replaceState({ [adminPageQueryKey]: page }, "", nextURL);
+  }, []);
+
+  /**
+   * navigateToPage 统一菜单导航入口，确保状态与 URL 同步。
+   */
+  const navigateToPage = useCallback(
+    (page: AdminPageKey, options?: { replace?: boolean }) => {
+      setActivePage((previousPage) => (previousPage === page ? previousPage : page));
+      syncAdminPageToURL(page, options?.replace ? "replace" : "push");
+    },
+    [syncAdminPageToURL]
+  );
 
   /**
    * trafficConnectorOptions 汇总可选的 connector 列表，供 Tunnel 页按 Agent 过滤。
@@ -708,6 +832,26 @@ export default function App() {
   }, [autoRefreshIntervalMS]);
 
   useEffect(() => {
+    syncAdminPageToURL(activePage, "replace");
+  }, [activePage, syncAdminPageToURL]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleLocationChange = () => {
+      const nextPage = resolveAdminPageFromLocation(window.location);
+      setActivePage((previousPage) => (previousPage === nextPage ? previousPage : nextPage));
+    };
+    window.addEventListener("popstate", handleLocationChange);
+    window.addEventListener("hashchange", handleLocationChange);
+    return () => {
+      window.removeEventListener("popstate", handleLocationChange);
+      window.removeEventListener("hashchange", handleLocationChange);
+    };
+  }, []);
+
+  useEffect(() => {
     if (detailSelection === null) {
       return;
     }
@@ -806,6 +950,11 @@ export default function App() {
         if (page === "routes") {
           const response = await requestAdmin(`/api/admin/routes${encodeQuery({ limit: 100 })}`);
           setRouteItems(asRecordArray(response.items));
+        }
+
+        if (page === "services") {
+          const response = await requestAdmin(`/api/admin/services${encodeQuery({ limit: 120 })}`);
+          setServiceItems(asRecordArray(response.items));
         }
 
         if (page === "connectors") {
@@ -908,6 +1057,10 @@ export default function App() {
     }
     if (topic === "routes") {
       setRouteItems(asRecordArray(payload.items));
+      return;
+    }
+    if (topic === "services") {
+      setServiceItems(asRecordArray(payload.items));
       return;
     }
     if (topic === "connectors") {
@@ -1258,10 +1411,10 @@ export default function App() {
       } else {
         setDrainConnectorID(normalizedTargetID);
       }
-      setActivePage("ops");
+      navigateToPage("ops");
       toast.info(`已填充 ${target}=${normalizedTargetID} 到 Ops 页面`);
     },
-    []
+    [navigateToPage]
   );
 
   /**
@@ -1553,6 +1706,83 @@ export default function App() {
               <tr>
                 <td colSpan={7} className="empty-cell">
                   当前没有路由数据。
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+
+  const renderServices = () => (
+    <section className="panel">
+      <header className="panel-head">
+        <h3>服务列表</h3>
+        <div className="inline-actions">
+          <span className="panel-sub">共 {serviceItems.length} 条</span>
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() => void refreshPageData("services")}
+          >
+            刷新
+          </button>
+        </div>
+      </header>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Service ID</th>
+              <th>Service Key</th>
+              <th>服务名</th>
+              <th>Agent</th>
+              <th>Session</th>
+              <th>Endpoint</th>
+              <th>SNI</th>
+              <th>状态</th>
+              <th>访问方式</th>
+            </tr>
+          </thead>
+          <tbody>
+            {serviceItems.map((item, index) => (
+              <tr key={`${readText(item, "service_id", "service")}-${index}`}>
+                <td>{readText(item, "service_id")}</td>
+                <td>{readText(item, "service_key")}</td>
+                <td>{readText(item, "service_name")}</td>
+                <td>{readText(item, "connector_id", "--")}</td>
+                <td>
+                  <div className="service-session-cell">
+                    <span>{readText(item, "session_id", "--")}</span>
+                    <StatePill label={readText(item, "session_state", "UNKNOWN")} />
+                  </div>
+                </td>
+                <td>
+                  <div className="service-endpoint-cell">
+                    <span>{readText(item, "endpoint_address", "--")}</span>
+                    <small>{readText(item, "service_type", "--")}</small>
+                  </div>
+                </td>
+                <td>{readText(item, "sni_name", "--")}</td>
+                <td>
+                  <div className="service-status-cell">
+                    <StatePill label={readText(item, "status", "UNKNOWN")} />
+                    <StatePill label={readText(item, "health_status", "UNKNOWN")} />
+                  </div>
+                </td>
+                <td>
+                  <div className="service-access-cell">
+                    <code>{readText(item, "route_target", "--")}</code>
+                    <small>{readText(item, "access_hint", "--")}</small>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {serviceItems.length === 0 && (
+              <tr>
+                <td colSpan={9} className="empty-cell">
+                  当前没有服务数据。
                 </td>
               </tr>
             )}
@@ -1968,9 +2198,11 @@ export default function App() {
           <label>
             <span>Patch Key</span>
             <select value={patchKey} onChange={(event) => setPatchKey(event.target.value)}>
-              <option value="observability.log_level">observability.log_level</option>
-              <option value="admin.base_path">admin.base_path</option>
-              <option value="admin.ui_enabled">admin.ui_enabled</option>
+              {configPatchKeyOptions.map((optionKey) => (
+                <option key={optionKey} value={optionKey}>
+                  {optionKey}
+                </option>
+              ))}
             </select>
           </label>
           <label>
@@ -2141,6 +2373,8 @@ export default function App() {
         return renderDashboard();
       case "routes":
         return renderRoutes();
+      case "services":
+        return renderServices();
       case "connectors":
         return renderConnectors();
       case "traffic":
@@ -2169,7 +2403,7 @@ export default function App() {
               key={item.key}
               type="button"
               className={`nav-btn ${activePage === item.key ? "active" : ""}`}
-              onClick={() => setActivePage(item.key)}
+              onClick={() => navigateToPage(item.key)}
             >
               <span>{item.title}</span>
               <small>{item.subtitle}</small>
