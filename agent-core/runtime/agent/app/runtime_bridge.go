@@ -31,6 +31,7 @@ const (
 	bridgeHeartbeatMissThreshold = 5
 	bridgeHeartbeatWriteTimeout  = 2 * time.Second
 	bridgeBusinessWriteTimeout   = 3 * time.Second
+	bridgeTunnelDialAnnounceTTL  = 250 * time.Millisecond
 
 	bridgeRetryInitialBackoff = time.Second
 	bridgeRetryMaxBackoff     = 8 * time.Second
@@ -103,8 +104,9 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 	if !active {
 		return nil, errors.New("bridge control channel is not active")
 	}
+	tunnelID := opener.runtime.nextTunnelID()
 	tunnelMeta := transport.TunnelMeta{
-		TunnelID:     opener.runtime.nextTunnelID(),
+		TunnelID:     tunnelID,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
 		CreatedAt:    time.Now().UTC(),
@@ -122,6 +124,11 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		if err != nil {
 			return nil, err
 		}
+		dialLocalAddr := ""
+		if tunnelLocalAddr := rawTunnel.LocalAddr(); tunnelLocalAddr != nil {
+			dialLocalAddr = strings.TrimSpace(tunnelLocalAddr.String())
+		}
+		opener.runtime.tryAnnounceDialedTunnel(tunnelID, sessionID, sessionEpoch, dialLocalAddr)
 		// 所有新建 tunnel 统一包一层 payload 适配器，供 traffic runtime 直接消费。
 		return newRuntimeTrafficTunnelAdapter(rawTunnel), nil
 	case transport.BindingTypeGRPCH2.String():
@@ -144,6 +151,7 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 			_ = tunnelStream.Close(context.Background())
 			return nil, fmt.Errorf("create grpc tunnel failed: %w", err)
 		}
+		opener.runtime.tryAnnounceDialedTunnel(tunnelID, sessionID, sessionEpoch, "")
 		// grpc tunnel 同样走统一 payload 适配层，避免 runtime 侧分 binding 分支。
 		return newRuntimeTrafficTunnelAdapter(grpcTunnel), nil
 	default:
@@ -1228,6 +1236,65 @@ func (r *Runtime) SendTunnelPoolReport(ctx context.Context, report control.Tunne
 		return nil
 	}
 	return nil
+}
+
+// tryAnnounceDialedTunnel 在 tunnel 建连成功后向 Bridge 宣告 Agent 侧 tunnel_id。
+func (r *Runtime) tryAnnounceDialedTunnel(tunnelID string, sessionID string, sessionEpoch uint64, dialLocalAddr string) {
+	if r == nil || r.controlPublisher == nil {
+		return
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	normalizedDialLocalAddr := strings.TrimSpace(dialLocalAddr)
+	if normalizedTunnelID == "" || normalizedSessionID == "" || sessionEpoch == 0 {
+		return
+	}
+	announcePayload := pb.TunnelDialAnnounce{
+		SessionID:     normalizedSessionID,
+		SessionEpoch:  sessionEpoch,
+		TunnelID:      normalizedTunnelID,
+		DialLocalAddr: normalizedDialLocalAddr,
+		TimestampUnix: time.Now().UTC().Unix(),
+	}
+	announceContext, cancelAnnounce := context.WithTimeout(context.Background(), bridgeTunnelDialAnnounceTTL)
+	defer cancelAnnounce()
+	envelope, buildErr := r.controlPublisher.Publish(
+		announceContext,
+		pb.ControlMessageTunnelDialAnnounce,
+		"tunnel",
+		normalizedTunnelID,
+		announcePayload,
+	)
+	if buildErr != nil {
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:   "warn",
+			Module:  "agent.runtime.tunnel",
+			Code:    "TUNNEL_DIAL_ANNOUNCE_BUILD_FAILED",
+			Message: fmt.Sprintf("build tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, buildErr),
+		})
+		return
+	}
+	if sendErr := r.sendBusinessControlEnvelope(announceContext, envelope); sendErr != nil {
+		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+			Level:   "warn",
+			Module:  "agent.runtime.tunnel",
+			Code:    "TUNNEL_DIAL_ANNOUNCE_SEND_FAILED",
+			Message: fmt.Sprintf("send tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, sendErr),
+		})
+		return
+	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:  "info",
+		Module: "agent.runtime.tunnel",
+		Code:   "TUNNEL_DIAL_ANNOUNCED",
+		Message: fmt.Sprintf(
+			"tunnel dial announce sent tunnel_id=%s session_id=%s session_epoch=%d dial_local_addr=%s",
+			normalizedTunnelID,
+			normalizedSessionID,
+			sessionEpoch,
+			normalizedDialLocalAddr,
+		),
+	})
 }
 
 // reportTunnelPoolNow 触发一次立即上报，用于会话激活后的首轮对账。

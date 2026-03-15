@@ -96,6 +96,22 @@ func (tunnel *TCPTunnel) Meta() transport.TunnelMeta {
 	return meta
 }
 
+// LocalAddr 返回底层连接本地地址，供上层做连接关联诊断。
+func (tunnel *TCPTunnel) LocalAddr() net.Addr {
+	if tunnel == nil || tunnel.conn == nil {
+		return nil
+	}
+	return tunnel.conn.LocalAddr()
+}
+
+// RemoteAddr 返回底层连接远端地址，供上层做连接关联诊断。
+func (tunnel *TCPTunnel) RemoteAddr() net.Addr {
+	if tunnel == nil || tunnel.conn == nil {
+		return nil
+	}
+	return tunnel.conn.RemoteAddr()
+}
+
 // State 返回 tunnel 当前状态。
 func (tunnel *TCPTunnel) State() transport.TunnelState {
 	if tunnel == nil {

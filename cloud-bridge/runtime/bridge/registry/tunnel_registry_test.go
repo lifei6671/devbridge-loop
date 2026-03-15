@@ -136,3 +136,69 @@ func TestTunnelRegistryPurgeBySession(testingObject *testing.T) {
 		testingObject.Fatalf("expected new session tunnel not closed")
 	}
 }
+
+// TestTunnelRegistryRecycleIdleBySession 验证可按 session 仅回收 idle tunnel。
+func TestTunnelRegistryRecycleIdleBySession(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	registry := NewTunnelRegistry()
+	now := time.Now().UTC()
+	idleTunnelA1 := &tunnelRegistryTestTunnel{tunnelID: "tunnel-a1"}
+	idleTunnelA2 := &tunnelRegistryTestTunnel{tunnelID: "tunnel-a2"}
+	idleTunnelA3 := &tunnelRegistryTestTunnel{tunnelID: "tunnel-a3"}
+	otherSessionTunnel := &tunnelRegistryTestTunnel{tunnelID: "tunnel-b1"}
+	if _, err := registry.UpsertIdle(now, "connector-1", "session-a", idleTunnelA1); err != nil {
+		testingObject.Fatalf("upsert tunnel-a1 failed: %v", err)
+	}
+	if _, err := registry.UpsertIdle(now.Add(time.Millisecond), "connector-1", "session-a", idleTunnelA2); err != nil {
+		testingObject.Fatalf("upsert tunnel-a2 failed: %v", err)
+	}
+	if _, err := registry.UpsertIdle(now.Add(2*time.Millisecond), "connector-1", "session-a", idleTunnelA3); err != nil {
+		testingObject.Fatalf("upsert tunnel-a3 failed: %v", err)
+	}
+	if _, err := registry.UpsertIdle(now.Add(3*time.Millisecond), "connector-1", "session-b", otherSessionTunnel); err != nil {
+		testingObject.Fatalf("upsert tunnel-b1 failed: %v", err)
+	}
+	reservedRuntime, ok := registry.AcquireIdle(now.Add(4*time.Millisecond), "connector-1")
+	if !ok {
+		testingObject.Fatalf("expected acquire idle success")
+	}
+	if reservedRuntime.TunnelID != "tunnel-a1" || reservedRuntime.State != TunnelStateReserved {
+		testingObject.Fatalf("unexpected reserved runtime: %+v", reservedRuntime)
+	}
+
+	recycled := registry.RecycleIdleBySession(now.Add(5*time.Millisecond), "session-a", 5, "agent_pool_reconcile")
+	if len(recycled) != 2 {
+		testingObject.Fatalf("unexpected recycled tunnel count: got=%d want=2", len(recycled))
+	}
+	for _, runtime := range recycled {
+		if runtime.SessionID != "session-a" || runtime.State != TunnelStateBroken {
+			testingObject.Fatalf("unexpected recycled runtime: %+v", runtime)
+		}
+		if runtime.TunnelID != "tunnel-a2" && runtime.TunnelID != "tunnel-a3" {
+			testingObject.Fatalf("unexpected recycled tunnel id: %s", runtime.TunnelID)
+		}
+	}
+
+	if _, exists := registry.Get("tunnel-a2"); exists {
+		testingObject.Fatalf("expected tunnel-a2 removed")
+	}
+	if _, exists := registry.Get("tunnel-a3"); exists {
+		testingObject.Fatalf("expected tunnel-a3 removed")
+	}
+	if _, exists := registry.Get("tunnel-a1"); !exists {
+		testingObject.Fatalf("expected reserved tunnel-a1 remains")
+	}
+	if _, exists := registry.Get("tunnel-b1"); !exists {
+		testingObject.Fatalf("expected other session tunnel remains")
+	}
+	if !idleTunnelA2.closed || !idleTunnelA3.closed {
+		testingObject.Fatalf("expected recycled idle tunnels closed")
+	}
+	if idleTunnelA1.closed {
+		testingObject.Fatalf("expected reserved tunnel not closed by idle recycle")
+	}
+	if otherSessionTunnel.closed {
+		testingObject.Fatalf("expected other session tunnel not closed by idle recycle")
+	}
+}

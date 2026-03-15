@@ -28,6 +28,8 @@ const (
 	ControlMessageServiceHealthReport ControlMessageType = "ServiceHealthReport"
 	// ControlMessageTunnelPoolReport 表示 Agent 上报 tunnel 池状态。
 	ControlMessageTunnelPoolReport ControlMessageType = "TunnelPoolReport"
+	// ControlMessageTunnelDialAnnounce 表示 Agent 宣告已成功建立的数据面 tunnel_id。
+	ControlMessageTunnelDialAnnounce ControlMessageType = "TunnelDialAnnounce"
 	// ControlMessageTunnelRefillRequest 表示 Bridge 请求 Agent 补池。
 	ControlMessageTunnelRefillRequest ControlMessageType = "TunnelRefillRequest"
 	// ControlMessageRouteAssign 表示下发 route。
@@ -141,7 +143,7 @@ func IsKnownControlMessageType(messageType ControlMessageType) bool {
 		return true
 	case ControlMessageUnpublishService, ControlMessageUnpublishServiceAck, ControlMessageServiceHealthReport:
 		return true
-	case ControlMessageTunnelPoolReport, ControlMessageTunnelRefillRequest:
+	case ControlMessageTunnelPoolReport, ControlMessageTunnelDialAnnounce, ControlMessageTunnelRefillRequest:
 		return true
 	case ControlMessageRouteAssign, ControlMessageRouteAssignAck, ControlMessageRouteRevoke, ControlMessageRouteRevokeAck:
 		return true

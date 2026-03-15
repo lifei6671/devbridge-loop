@@ -35,6 +35,8 @@ const (
 	ControlFrameTypeTunnelPoolReport uint16 = 0x0115
 	// ControlFrameTypeTunnelRefillRequest 表示 TunnelRefillRequest 业务控制帧。
 	ControlFrameTypeTunnelRefillRequest uint16 = 0x0116
+	// ControlFrameTypeTunnelDialAnnounce 表示 TunnelDialAnnounce 业务控制帧。
+	ControlFrameTypeTunnelDialAnnounce uint16 = 0x0117
 
 	// ControlFrameTypeRouteAssign 表示 RouteAssign 业务控制帧。
 	ControlFrameTypeRouteAssign uint16 = 0x0120
@@ -84,6 +86,8 @@ func ControlFrameTypeForMessageType(messageType pb.ControlMessageType) (uint16, 
 		return ControlFrameTypeServiceHealthReport, nil
 	case pb.ControlMessageTunnelPoolReport:
 		return ControlFrameTypeTunnelPoolReport, nil
+	case pb.ControlMessageTunnelDialAnnounce:
+		return ControlFrameTypeTunnelDialAnnounce, nil
 	case pb.ControlMessageTunnelRefillRequest:
 		return ControlFrameTypeTunnelRefillRequest, nil
 	case pb.ControlMessageRouteAssign:
@@ -132,6 +136,8 @@ func ControlMessageTypeForFrameType(frameType uint16) (pb.ControlMessageType, er
 		return pb.ControlMessageServiceHealthReport, nil
 	case ControlFrameTypeTunnelPoolReport:
 		return pb.ControlMessageTunnelPoolReport, nil
+	case ControlFrameTypeTunnelDialAnnounce:
+		return pb.ControlMessageTunnelDialAnnounce, nil
 	case ControlFrameTypeTunnelRefillRequest:
 		return pb.ControlMessageTunnelRefillRequest, nil
 	case ControlFrameTypeRouteAssign:

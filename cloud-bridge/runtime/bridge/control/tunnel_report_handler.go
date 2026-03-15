@@ -68,16 +68,18 @@ func (handler *TunnelReportHandler) HandleReport(
 		}
 		handler.reportStore.Upsert(now, connectorID, sessionID, sessionEpoch, report)
 	}
+	recycledIdleCount := handler.reconcileBridgeIdleWithAgentReport(now, sessionID, report)
 	refillRequest, shouldSend := handler.refillController.BuildRefillRequest(sessionID, sessionEpoch, report)
 	if !shouldSend {
 		return pb.TunnelRefillRequest{}, false
 	}
 	bridgeIdleCount, bridgeInUseCount := handler.snapshotBridgePoolBySession(sessionID)
 	if refillRequest.Metadata == nil {
-		refillRequest.Metadata = make(map[string]string, 6)
+		refillRequest.Metadata = make(map[string]string, 8)
 	}
 	refillRequest.Metadata["bridge_idle_count"] = strconv.Itoa(bridgeIdleCount)
 	refillRequest.Metadata["bridge_in_use_count"] = strconv.Itoa(bridgeInUseCount)
+	refillRequest.Metadata["bridge_idle_recycled_count"] = strconv.Itoa(recycledIdleCount)
 	return refillRequest, true
 }
 
@@ -119,4 +121,34 @@ func (handler *TunnelReportHandler) snapshotBridgePoolBySession(sessionID string
 		}
 	}
 	return idleCount, inUseCount
+}
+
+func (handler *TunnelReportHandler) reconcileBridgeIdleWithAgentReport(
+	now time.Time,
+	sessionID string,
+	report pb.TunnelPoolReport,
+) int {
+	if handler == nil || handler.tunnelRegistry == nil {
+		return 0
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" {
+		return 0
+	}
+	agentIdleCount := report.IdleCount
+	if agentIdleCount < 0 {
+		agentIdleCount = 0
+	}
+	bridgeIdleCount, _ := handler.snapshotBridgePoolBySession(normalizedSessionID)
+	excessIdleCount := bridgeIdleCount - agentIdleCount
+	if excessIdleCount <= 0 {
+		return 0
+	}
+	recycled := handler.tunnelRegistry.RecycleIdleBySession(
+		now,
+		normalizedSessionID,
+		excessIdleCount,
+		"agent_pool_reconcile",
+	)
+	return len(recycled)
 }

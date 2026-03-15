@@ -92,6 +92,7 @@ func (r *Runtime) NotifyEvent(trigger string) {
 	if r == nil {
 		return
 	}
+	r.recordTunnelPoolDiagnoseEvent(trigger)
 	if r.trafficWakeupChannel != nil {
 		select {
 		case r.trafficWakeupChannel <- struct{}{}:
@@ -102,6 +103,64 @@ func (r *Runtime) NotifyEvent(trigger string) {
 		// 事件驱动上报用于减少 Bridge 与 Agent 的池状态漂移。
 		r.tunnelReporter.NotifyEvent(trigger)
 	}
+}
+
+// recordTunnelPoolDiagnoseEvent 将 tunnel pool 治理事件写入 runtime 诊断日志，供 UI 统一观测。
+func (r *Runtime) recordTunnelPoolDiagnoseEvent(trigger string) {
+	if r == nil {
+		return
+	}
+	normalizedTrigger := strings.TrimSpace(trigger)
+	if normalizedTrigger == "" {
+		return
+	}
+	level := "info"
+	code := "TUNNEL_POOL_EVENT"
+	switch normalizedTrigger {
+	case "refill_requested":
+		code = "TUNNEL_REFILL_REQUESTED"
+	case "ttl_reaped":
+		code = "TUNNEL_IDLE_TTL_REAPED"
+	case "tunnel_closed":
+		code = "TUNNEL_CLEANUP_CLOSED"
+	case "tunnel_broken":
+		code = "TUNNEL_CLEANUP_BROKEN"
+		level = "warn"
+	case "idle_acquired":
+		code = "TUNNEL_IDLE_ACQUIRED"
+	case "tunnel_active":
+		code = "TUNNEL_ACTIVE"
+	case "pool_changed":
+		code = "TUNNEL_POOL_CHANGED"
+	case "session_draining":
+		code = "TUNNEL_POOL_SESSION_DRAINING"
+	case "session_stale":
+		code = "TUNNEL_POOL_SESSION_STALE"
+		level = "warn"
+	case "session_active":
+		code = "TUNNEL_POOL_SESSION_ACTIVE"
+	case "startup_reconcile_failed":
+		code = "TUNNEL_POOL_STARTUP_RECONCILE_FAILED"
+		level = "warn"
+	default:
+		// 保留透传 trigger，便于后续扩展治理事件时无损观测。
+	}
+
+	poolSnapshot := tunnel.Snapshot{}
+	if r.tunnelManager != nil {
+		poolSnapshot = r.tunnelManager.Snapshot()
+	}
+	sessionID, sessionEpoch, bridgeState := r.bridgeRuntimeContext()
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        level,
+		Module:       "agent.runtime.tunnel",
+		Code:         code,
+		Message:      fmt.Sprintf("tunnel pool event trigger=%s idle=%d active=%d total=%d", normalizedTrigger, poolSnapshot.IdleCount, poolSnapshot.ActiveCount, poolSnapshot.TotalCount),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		BridgeState:  bridgeState,
+		Trigger:      normalizedTrigger,
+	})
 }
 
 // runTrafficAcceptorLoop 维护 idle tunnel -> trafficAcceptor worker 的生命周期。

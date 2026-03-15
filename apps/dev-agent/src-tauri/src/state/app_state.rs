@@ -22,12 +22,16 @@ pub const SUPERVISOR_POLL_MS: u64 = 320;
 pub const STOP_TIMEOUT_MS: u64 = 1200;
 
 const MAX_RPC_LATENCY_SAMPLES: usize = 32;
-const MAX_HOST_LOG_ENTRIES: usize = 80;
+const MAX_HOST_LOG_ENTRIES: usize = 256;
 const HOST_CONFIG_DIR_NAME: &str = ".dev-agent";
 const HOST_CONFIG_FILE_NAME: &str = "host-runtime-config.yaml";
 
 fn default_bridge_transport() -> String {
     "tcp_framed".to_string()
+}
+
+fn default_diagnose_category_enabled() -> bool {
+    true
 }
 
 /// YAML 文件中的宿主配置格式（用户目录持久化）。
@@ -48,6 +52,12 @@ struct PersistedHostRuntimeConfig {
     pub tunnel_pool_open_burst: u32,
     pub tunnel_pool_reconcile_gap_ms: u64,
     pub ipc_endpoint: String,
+    #[serde(default = "default_diagnose_category_enabled")]
+    pub diagnose_show_ipc: bool,
+    #[serde(default = "default_diagnose_category_enabled")]
+    pub diagnose_show_bridge: bool,
+    #[serde(default = "default_diagnose_category_enabled")]
+    pub diagnose_show_tunnel: bool,
 }
 
 /// 宿主期望状态：用于决定是否应保持 Agent 运行。
@@ -161,6 +171,9 @@ pub struct HostConfigSnapshot {
     pub tunnel_pool_reconcile_gap_ms: u64,
     pub ipc_transport: String,
     pub ipc_endpoint: String,
+    pub diagnose_show_ipc: bool,
+    pub diagnose_show_bridge: bool,
+    pub diagnose_show_tunnel: bool,
     pub allowed_method_domains: Vec<String>,
     pub denied_low_level_methods: Vec<String>,
 }
@@ -203,6 +216,9 @@ pub struct HostRuntimeConfig {
     pub tunnel_pool_reconcile_gap_ms: u64,
     pub ipc_transport: String,
     pub ipc_endpoint: String,
+    pub diagnose_show_ipc: bool,
+    pub diagnose_show_bridge: bool,
+    pub diagnose_show_tunnel: bool,
 }
 
 /// 解析配置文件目录：优先用户目录，失败时回落当前目录。
@@ -473,6 +489,9 @@ impl HostRuntimeConfig {
             } else {
                 payload.ipc_endpoint.trim().to_string()
             },
+            diagnose_show_ipc: payload.diagnose_show_ipc,
+            diagnose_show_bridge: payload.diagnose_show_bridge,
+            diagnose_show_tunnel: payload.diagnose_show_tunnel,
         };
         runtime_config.validate_agent_runtime_fields()?;
         Ok(runtime_config)
@@ -494,6 +513,9 @@ impl HostRuntimeConfig {
             tunnel_pool_open_burst: self.tunnel_pool_open_burst,
             tunnel_pool_reconcile_gap_ms: self.tunnel_pool_reconcile_gap_ms,
             ipc_endpoint: self.ipc_endpoint.clone(),
+            diagnose_show_ipc: self.diagnose_show_ipc,
+            diagnose_show_bridge: self.diagnose_show_bridge,
+            diagnose_show_tunnel: self.diagnose_show_tunnel,
         }
     }
 
@@ -670,7 +692,7 @@ impl HostRuntimeConfig {
             )?,
             tunnel_pool_ttl_ms: Self::u64_env_or_default(
                 "DEV_AGENT_CFG_TUNNEL_POOL_TTL_MS",
-                90_000,
+                600_000,
             )?,
             tunnel_pool_open_rate: Self::f64_env_or_default(
                 "DEV_AGENT_CFG_TUNNEL_POOL_OPEN_RATE",
@@ -686,6 +708,9 @@ impl HostRuntimeConfig {
             )?,
             ipc_transport,
             ipc_endpoint,
+            diagnose_show_ipc: true,
+            diagnose_show_bridge: true,
+            diagnose_show_tunnel: true,
         };
         // 启动时先做一次宿主侧校验，尽早暴露配置问题。
         config.validate_agent_runtime_fields()?;
@@ -726,6 +751,9 @@ impl HostRuntimeConfig {
             tunnel_pool_reconcile_gap_ms: self.tunnel_pool_reconcile_gap_ms,
             ipc_transport: self.ipc_transport.clone(),
             ipc_endpoint: self.ipc_endpoint.clone(),
+            diagnose_show_ipc: self.diagnose_show_ipc,
+            diagnose_show_bridge: self.diagnose_show_bridge,
+            diagnose_show_tunnel: self.diagnose_show_tunnel,
             allowed_method_domains: ALLOWED_METHOD_DOMAINS
                 .iter()
                 .map(|item| item.to_string())
@@ -1026,12 +1054,15 @@ mod tests {
             tunnel_pool_min_idle: 8,
             tunnel_pool_max_idle: 32,
             tunnel_pool_max_inflight: 4,
-            tunnel_pool_ttl_ms: 90_000,
+            tunnel_pool_ttl_ms: 600_000,
             tunnel_pool_open_rate: 10.0,
             tunnel_pool_open_burst: 20,
             tunnel_pool_reconcile_gap_ms: 1_000,
             ipc_transport: "uds".to_string(),
             ipc_endpoint: "/tmp/dev-agent/agent.sock".to_string(),
+            diagnose_show_ipc: true,
+            diagnose_show_bridge: true,
+            diagnose_show_tunnel: true,
         }
     }
 

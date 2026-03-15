@@ -29,6 +29,14 @@ pub struct HostConfigUpdateInput {
     pub ipc_endpoint: String,
 }
 
+/// 日志与诊断类别筛选（持久化到宿主配置文件）。
+#[derive(Debug, Deserialize)]
+pub struct DiagnoseCategoryFilterUpdateInput {
+    pub diagnose_show_ipc: bool,
+    pub diagnose_show_bridge: bool,
+    pub diagnose_show_tunnel: bool,
+}
+
 /// 校验运行程序路径：必须是非空字符串。
 fn validate_runtime_program(value: &str) -> Result<PathBuf, String> {
     let normalized = value.trim();
@@ -120,7 +128,8 @@ pub fn host_config_update(
         let agent_id = validate_required_text("agent_id", &input.agent_id)?;
         let bridge_addr = validate_required_text("bridge_addr", &input.bridge_addr)?;
         let bridge_transport = validate_required_text("bridge_transport", &input.bridge_transport)?;
-        let ipc_transport = current_runtime_config(&shared)?.ipc_transport;
+        let current_config = current_runtime_config(&shared)?;
+        let ipc_transport = current_config.ipc_transport.clone();
         let ipc_endpoint = validate_ipc_endpoint(&ipc_transport, &input.ipc_endpoint)?;
 
         // IPC 传输方式由平台决定，这里仅允许更新端点，不允许切 transport。
@@ -139,6 +148,9 @@ pub fn host_config_update(
             tunnel_pool_reconcile_gap_ms: input.tunnel_pool_reconcile_gap_ms,
             ipc_transport: ipc_transport.clone(),
             ipc_endpoint: ipc_endpoint.clone(),
+            diagnose_show_ipc: current_config.diagnose_show_ipc,
+            diagnose_show_bridge: current_config.diagnose_show_bridge,
+            diagnose_show_tunnel: current_config.diagnose_show_tunnel,
         };
         // 统一复用 HostRuntimeConfig 的校验口径，避免与启动校验漂移。
         next_runtime_config.validate_agent_runtime_fields()?;
@@ -171,6 +183,48 @@ bridge_transport={} ipc_transport={} ipc_endpoint={} ts={}",
                     input.bridge_transport.trim(),
                     ipc_transport,
                     ipc_endpoint,
+                    now_ms()
+                ),
+            );
+        }
+
+        current_host_config_snapshot(&shared)
+    })
+}
+
+/// Tauri command：仅更新诊断类别筛选并立即持久化。
+#[tauri::command]
+pub fn host_config_update_diagnose_filter(
+    input: DiagnoseCategoryFilterUpdateInput,
+    state: State<'_, Arc<AppRuntimeState>>,
+) -> Result<HostConfigSnapshot, String> {
+    let shared = state.inner().clone();
+    with_rpc_metrics(&shared, || {
+        if !input.diagnose_show_ipc && !input.diagnose_show_bridge && !input.diagnose_show_tunnel {
+            return Err("至少需要启用一个日志类别筛选".to_string());
+        }
+
+        let mut next_runtime_config = current_runtime_config(&shared)?;
+        next_runtime_config.diagnose_show_ipc = input.diagnose_show_ipc;
+        next_runtime_config.diagnose_show_bridge = input.diagnose_show_bridge;
+        next_runtime_config.diagnose_show_tunnel = input.diagnose_show_tunnel;
+        update_runtime_config(&shared, next_runtime_config)?;
+
+        {
+            let mut supervisor = shared
+                .supervisor
+                .lock()
+                .map_err(|_| "更新配置失败：supervisor 锁异常".to_string())?;
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "commands.config",
+                "HOST_CONFIG_DIAGNOSE_FILTER_UPDATED",
+                format!(
+                    "诊断筛选已更新 ipc={} bridge={} tunnel={} ts={}",
+                    input.diagnose_show_ipc,
+                    input.diagnose_show_bridge,
+                    input.diagnose_show_tunnel,
                     now_ms()
                 ),
             );

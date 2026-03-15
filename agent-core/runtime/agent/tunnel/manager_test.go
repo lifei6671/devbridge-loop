@@ -459,3 +459,40 @@ func TestManagerHandleSessionStateDrainingSerializesWithReconcile(testingObject 
 		testingObject.Fatalf("expected no idle after draining, got=%d", manager.Snapshot().IdleCount)
 	}
 }
+
+// TestManagerHandleSessionStateActiveAlwaysSignalsRefill 验证 ACTIVE 会立即触发一次纠偏信号。
+func TestManagerHandleSessionStateActiveAlwaysSignalsRefill(testingObject *testing.T) {
+	testingObject.Parallel()
+	manager, err := NewManager(ManagerOptions{
+		Config: ManagerConfig{
+			MinIdle:           1,
+			MaxIdle:           4,
+			IdleTTL:           0,
+			MaxInflightOpens:  1,
+			TunnelOpenRate:    1000,
+			TunnelOpenBurst:   1000,
+			ReconcileInterval: time.Hour,
+		},
+		Opener: &producerTestOpener{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new manager failed: %v", err)
+	}
+
+	// 清空历史信号，确保断言只针对本次 ACTIVE 触发。
+	select {
+	case <-manager.refillSignalChannel:
+	default:
+	}
+
+	if _, err := manager.HandleSessionState(SessionStateActive); err != nil {
+		testingObject.Fatalf("handle active state failed: %v", err)
+	}
+
+	select {
+	case <-manager.refillSignalChannel:
+		// expected
+	default:
+		testingObject.Fatalf("expected active state to enqueue immediate reconcile signal")
+	}
+}

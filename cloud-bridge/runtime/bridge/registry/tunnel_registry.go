@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -331,6 +332,79 @@ func (registry *TunnelRegistry) PurgeBySession(now time.Time, sessionID string, 
 		_ = runtime.Tunnel.Close()
 	}
 	return purged
+}
+
+// RecycleIdleBySession 回收指定 session 下最多 limit 条 idle tunnel（用于与 Agent 池状态收敛）。
+func (registry *TunnelRegistry) RecycleIdleBySession(
+	now time.Time,
+	sessionID string,
+	limit int,
+	reason string,
+) []TunnelRuntime {
+	if registry == nil {
+		return nil
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" || limit <= 0 {
+		return nil
+	}
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	normalizedReason := strings.TrimSpace(reason)
+
+	registry.mutex.Lock()
+	candidates := make([]*TunnelRuntime, 0)
+	for _, runtime := range registry.byTunnelID {
+		if strings.TrimSpace(runtime.SessionID) != normalizedSessionID {
+			continue
+		}
+		if runtime.State != TunnelStateIdle {
+			continue
+		}
+		candidates = append(candidates, runtime)
+	}
+	if len(candidates) == 0 {
+		registry.mutex.Unlock()
+		return nil
+	}
+	sort.Slice(candidates, func(leftIndex int, rightIndex int) bool {
+		leftRuntime := candidates[leftIndex]
+		rightRuntime := candidates[rightIndex]
+		if leftRuntime.UpdatedAt.Equal(rightRuntime.UpdatedAt) {
+			return leftRuntime.TunnelID < rightRuntime.TunnelID
+		}
+		return leftRuntime.UpdatedAt.Before(rightRuntime.UpdatedAt)
+	})
+	if limit > len(candidates) {
+		limit = len(candidates)
+	}
+	recycled := make([]TunnelRuntime, 0, limit)
+	for candidateIndex := 0; candidateIndex < limit; candidateIndex++ {
+		runtime := candidates[candidateIndex]
+		registry.removeIdleLocked(runtime.ConnectorID, runtime.TunnelID)
+		runtime.State = TunnelStateBroken
+		if normalizedReason != "" {
+			runtime.LastError = normalizedReason
+		}
+		runtime.UpdatedAt = normalizedNow
+		recycled = append(recycled, cloneTunnelRuntime(runtime))
+		delete(registry.byTunnelID, runtime.TunnelID)
+	}
+	if len(recycled) > 0 {
+		registry.updatedAt = normalizedNow
+	}
+	registry.mutex.Unlock()
+
+	// 在锁外关闭底层连接，避免阻塞写路径。
+	for _, runtime := range recycled {
+		if runtime.Tunnel == nil {
+			continue
+		}
+		_ = runtime.Tunnel.Close()
+	}
+	return recycled
 }
 
 func (registry *TunnelRegistry) transition(now time.Time, tunnelID string, target TunnelState, message string) error {

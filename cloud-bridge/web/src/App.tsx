@@ -130,6 +130,32 @@ function readText(record: ApiRecord, key: string, fallback = "-"): string {
   return fallback;
 }
 
+const bridgeTunnelIDPrefix = "tcp-bridge-tunnel-";
+
+/**
+ * formatTunnelIDForDisplay 将 Bridge/Agent 不同命名空间的 tunnel_id 统一为可对照展示格式。
+ */
+function formatTunnelIDForDisplay(rawTunnelID: string): string {
+  const normalizedTunnelID = rawTunnelID.trim();
+  if (normalizedTunnelID === "") {
+    return "-";
+  }
+  if (normalizedTunnelID.startsWith(bridgeTunnelIDPrefix)) {
+    const suffix = normalizedTunnelID.slice(bridgeTunnelIDPrefix.length).trim();
+    if (/^\d+$/.test(suffix)) {
+      return `tun-${suffix}`;
+    }
+  }
+  return normalizedTunnelID;
+}
+
+/**
+ * readTunnelID 读取并格式化 tunnel_id，避免 Bridge/Agent 面板对照时出现格式不一致。
+ */
+function readTunnelID(record: ApiRecord, key = "tunnel_id", fallback = "-"): string {
+  return formatTunnelIDForDisplay(readText(record, key, fallback));
+}
+
 /**
  * readNumber 按键读取数值字段，支持字符串数值。
  */
@@ -332,7 +358,7 @@ function buildDetailSummaryRows(domain: DetailDomain, record: ApiRecord): Detail
     ];
   }
   return [
-    { label: "Tunnel ID", hint: "隧道实例唯一标识。", value: readText(record, "tunnel_id") },
+    { label: "Tunnel ID", hint: "隧道实例唯一标识。", value: readTunnelID(record) },
     { label: "Connector", hint: "隧道所属连接器 ID。", value: readText(record, "connector_id") },
     { label: "Session", hint: "隧道所属会话 ID。", value: readText(record, "session_id") },
     { label: "Traffic", hint: "当前关联的流量请求 ID。", value: readText(record, "traffic_id", "--") },
@@ -354,7 +380,7 @@ function pickDetailTitle(domain: DetailDomain, record: ApiRecord): string {
   if (domain === "session") {
     return `Session ${readText(record, "session_id", "unknown")}`;
   }
-  return `Tunnel ${readText(record, "tunnel_id", "unknown")}`;
+  return `Tunnel ${readTunnelID(record, "tunnel_id", "unknown")}`;
 }
 
 /**
@@ -1811,9 +1837,9 @@ export default function App() {
                   onKeyDown={(event) => handleDetailRowKeyDown(event, "tunnel", index)}
                   tabIndex={0}
                   role="button"
-                  aria-label={`查看 Tunnel ${readText(item, "tunnel_id", "unknown")} 详情`}
+                  aria-label={`查看 Tunnel ${readTunnelID(item, "tunnel_id", "unknown")} 详情`}
                 >
-                  <td>{readText(item, "tunnel_id")}</td>
+                  <td>{readTunnelID(item)}</td>
                   <td>{readText(item, "connector_id")}</td>
                   <td>{readText(item, "session_id")}</td>
                   <td>{readText(item, "traffic_id", "--")}</td>

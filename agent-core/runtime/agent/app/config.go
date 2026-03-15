@@ -72,7 +72,7 @@ func DefaultConfig() Config {
 			MinIdle:      8,
 			MaxIdle:      32,
 			MaxInflight:  4,
-			TTL:          90 * time.Second,
+			TTL:          10 * time.Minute,
 			OpenRate:     10, // 平滑建连速率（每秒）。
 			OpenBurst:    20, // 冷启动允许的突发窗口。
 			ReconcileGap: time.Second,

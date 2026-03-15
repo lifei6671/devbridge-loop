@@ -421,7 +421,7 @@ func TestControlMessageDispatcherHandleTunnelPoolReport(testingObject *testing.T
 	reportPayload := pb.TunnelPoolReport{
 		SessionID:       "session-3001",
 		SessionEpoch:    7,
-		IdleCount:       0,
+		IdleCount:       1,
 		InUseCount:      5,
 		TargetIdleCount: 8,
 		Trigger:         "event:idle_low",
@@ -464,6 +464,45 @@ func TestControlMessageDispatcherHandleTunnelPoolReport(testingObject *testing.T
 	}
 	if refillRequest.Metadata["bridge_idle_count"] != "1" || refillRequest.Metadata["bridge_in_use_count"] != "1" {
 		testingObject.Fatalf("unexpected bridge pool metadata: %+v", refillRequest.Metadata)
+	}
+	if refillRequest.Metadata["bridge_idle_recycled_count"] != "0" {
+		testingObject.Fatalf("unexpected bridge recycled metadata: %+v", refillRequest.Metadata)
+	}
+}
+
+// TestControlMessageDispatcherHandleTunnelDialAnnounce 验证 Bridge 可接收并消费 Agent tunnel_id 宣告。
+func TestControlMessageDispatcherHandleTunnelDialAnnounce(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{})
+	announcePayload := pb.TunnelDialAnnounce{
+		SessionID:     "session-a",
+		SessionEpoch:  9,
+		TunnelID:      "tun-77",
+		DialLocalAddr: "127.0.0.1:54321",
+		TimestampUnix: time.Now().UTC().Unix(),
+	}
+	encodedPayload, err := json.Marshal(announcePayload)
+	if err != nil {
+		testingObject.Fatalf("marshal announce payload failed: %v", err)
+	}
+	replyEnvelope, err := dispatcher.dispatchEnvelope(pb.ControlEnvelope{
+		VersionMajor: 1,
+		VersionMinor: 0,
+		MessageType:  pb.ControlMessageTunnelDialAnnounce,
+		SessionID:    "session-a",
+		SessionEpoch: 9,
+		Payload:      encodedPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("dispatch tunnel dial announce failed: %v", err)
+	}
+	if replyEnvelope != nil {
+		testingObject.Fatalf("tunnel dial announce should not produce reply envelope")
+	}
+	consumedTunnelID := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "127.0.0.1:54321", 0)
+	if consumedTunnelID != "tun-77" {
+		testingObject.Fatalf("unexpected consumed tunnel id: got=%s want=tun-77", consumedTunnelID)
 	}
 }
 

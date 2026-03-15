@@ -24,6 +24,7 @@ func TestControlFrameTypeMappingRoundTrip(testingObject *testing.T) {
 		pb.ControlMessageUnpublishServiceAck,
 		pb.ControlMessageServiceHealthReport,
 		pb.ControlMessageTunnelPoolReport,
+		pb.ControlMessageTunnelDialAnnounce,
 		pb.ControlMessageTunnelRefillRequest,
 		pb.ControlMessageRouteAssign,
 		pb.ControlMessageRouteAssignAck,

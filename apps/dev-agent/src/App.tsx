@@ -5,6 +5,7 @@ import {
   Bell,
   Cable,
   ChartNoAxesCombined,
+  CircleHelp,
   Cloud,
   Cpu,
   Gauge,
@@ -22,7 +23,7 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { NetworkRateValue } from "@/components/traffic/network_rate_value";
@@ -44,6 +45,8 @@ type ConnectionState = "disconnected" | "reconnecting" | "resyncing" | "connecte
 type AgentRuntimeCommand = "agent_start" | "agent_stop" | "agent_restart" | "agent_crash_inject" | "app_shutdown";
 type BridgeSessionCommand = "session_reconnect" | "session_drain";
 type RuntimeCommand = AgentRuntimeCommand | BridgeSessionCommand;
+type DiagnoseCategory = "ipc" | "bridge" | "tunnel";
+type DiagnoseCategoryFilterState = Record<DiagnoseCategory, boolean>;
 type NavKey = "overview" | "services" | "tunnels" | "traffic" | "connections" | "diagnose" | "settings";
 const APP_CLOSE_REQUESTED_EVENT = "app-close-requested";
 
@@ -86,6 +89,9 @@ interface HostConfigSnapshot {
   tunnel_pool_reconcile_gap_ms: number;
   ipc_transport: string;
   ipc_endpoint: string;
+  diagnose_show_ipc: boolean;
+  diagnose_show_bridge: boolean;
+  diagnose_show_tunnel: boolean;
   allowed_method_domains: string[];
   denied_low_level_methods: string[];
 }
@@ -220,6 +226,12 @@ interface HostConfigUpdateInput {
   ipc_endpoint: string;
 }
 
+interface DiagnoseCategoryFilterUpdateInput {
+  diagnose_show_ipc: boolean;
+  diagnose_show_bridge: boolean;
+  diagnose_show_tunnel: boolean;
+}
+
 interface SettingsDraft {
   runtimeProgram: string;
   runtimeArgsText: string;
@@ -231,10 +243,15 @@ interface SettingsDraft {
   tunnelPoolMinIdleText: string;
   tunnelPoolMaxIdleText: string;
   tunnelPoolMaxInflightText: string;
-  tunnelPoolTtlMsText: string;
+  tunnelPoolTtlSecText: string;
   tunnelPoolOpenRateText: string;
   tunnelPoolOpenBurstText: string;
   tunnelPoolReconcileGapMsText: string;
+}
+
+interface SettingsFieldHelp {
+  usage: string;
+  impact: string;
 }
 
 interface NavItem {
@@ -255,6 +272,65 @@ const NAV_ITEMS: NavItem[] = [
 
 const TABLE_HEAD_CLASS = "px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.08em] text-[#66748f]";
 const TABLE_CELL_CLASS = "px-4 py-3 text-sm text-[#293145]";
+
+const SETTINGS_FIELD_HELP: Record<string, SettingsFieldHelp> = {
+  agentId: {
+    usage: "用于标识当前 Agent 实例，建议在同一环境内保持唯一且稳定。",
+    impact: "会影响 Bridge 侧会话归属和日志检索；频繁修改会导致排障链路断裂。",
+  },
+  runtimeProgram: {
+    usage: "填写 Agent 内核可执行文件的绝对路径，重启 Agent 后生效。",
+    impact: "路径错误会导致进程无法拉起，IPC 与 Bridge 功能都会不可用。",
+  },
+  runtimeArgs: {
+    usage: "按空格输入启动参数，例如配置文件路径与运行模式参数。",
+    impact: "参数会直接传给内核进程，错误参数可能导致启动失败或行为偏差。",
+  },
+  ipcEndpoint: {
+    usage: "本机 IPC 通道地址。Windows 使用 named pipe，Linux/macOS 使用 uds 路径。",
+    impact: "宿主与内核通信完全依赖该端点，配置错误会导致“已启动但无法连通”。",
+  },
+  bridgeTransport: {
+    usage: "选择与 Bridge 建链的传输层实现，当前支持 tcp_framed 与 grpc_h2。",
+    impact: "两端协议不一致时会出现认证/握手失败，导致无法建立 control channel。",
+  },
+  authMode: {
+    usage: "当前为 LocalRPC 的固定鉴权方案，保持只读用于展示。",
+    impact: "用于防止本地未授权调用；随意改动会破坏宿主与内核的安全握手。",
+  },
+  bridgeAddr: {
+    usage: "填写 Bridge 的 host:port 地址，建议使用稳定可达的入口地址。",
+    impact: "决定控制通道与 tunnel 建链目标，错误时会持续重连并触发退避。",
+  },
+  minIdle: {
+    usage: "期望常驻的最小空闲 tunnel 数，建议按并发峰值前置预热。",
+    impact: "过低会增加首包等待，过高会增加连接数、内存与 FD 占用。",
+  },
+  maxIdle: {
+    usage: "空闲 tunnel 池上限，必须大于等于“最小空闲数”。",
+    impact: "限制预建池规模；过小会频繁补池，过大可能造成资源浪费。",
+  },
+  maxInflight: {
+    usage: "一次补池过程中允许并发打开的 tunnel 数。",
+    impact: "过小会导致补池慢，过大可能在网络抖动时放大瞬时连接压力。",
+  },
+  ttlSeconds: {
+    usage: "空闲 tunnel 的生命周期（秒）。设置 0 表示禁用基于 TTL 的回收。",
+    impact: "值小会更积极回收，值大会更稳定复用连接但占用资源更久。",
+  },
+  openRate: {
+    usage: "平滑建连速率（每秒）。建议与服务端承载能力匹配。",
+    impact: "速率过高可能造成连接突刺，过低会导致补池达标速度变慢。",
+  },
+  openBurst: {
+    usage: "冷启动/补池阶段允许的瞬时建连突发窗口。",
+    impact: "突发过大可能导致瞬时抖动，过小会拉长达到目标池容量的时间。",
+  },
+  reconcileGapMs: {
+    usage: "周期性池状态对账间隔（毫秒），用于慢路径纠偏。",
+    impact: "间隔过大会延迟异常收敛，间隔过小会增加调度与日志开销。",
+  },
+};
 
 function normalizeErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -279,7 +355,7 @@ function toSettingsDraft(snapshot: HostConfigSnapshot): SettingsDraft {
     tunnelPoolMinIdleText: String(snapshot.tunnel_pool_min_idle),
     tunnelPoolMaxIdleText: String(snapshot.tunnel_pool_max_idle),
     tunnelPoolMaxInflightText: String(snapshot.tunnel_pool_max_inflight),
-    tunnelPoolTtlMsText: String(snapshot.tunnel_pool_ttl_ms),
+    tunnelPoolTtlSecText: formatTTLSecondsText(snapshot.tunnel_pool_ttl_ms),
     tunnelPoolOpenRateText: String(snapshot.tunnel_pool_open_rate),
     tunnelPoolOpenBurstText: String(snapshot.tunnel_pool_open_burst),
     tunnelPoolReconcileGapMsText: String(snapshot.tunnel_pool_reconcile_gap_ms),
@@ -317,6 +393,29 @@ function parseNonNegativeInteger(text: string, fieldLabel: string): number {
   return parsedValue;
 }
 
+function parseNonNegativeSecondsToMillis(text: string, fieldLabel: string): number {
+  const normalized = text.trim();
+  if (normalized.length === 0) {
+    throw new Error(`${fieldLabel} 不能为空`);
+  }
+  const parsedValue = Number.parseFloat(normalized);
+  if (!Number.isFinite(parsedValue) || parsedValue < 0) {
+    throw new Error(`${fieldLabel} 必须是非负数`);
+  }
+  return Math.round(parsedValue * 1000);
+}
+
+function formatTTLSecondsText(ttlMs: number): string {
+  if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+    return "0";
+  }
+  const seconds = ttlMs / 1000;
+  if (Number.isInteger(seconds)) {
+    return String(seconds);
+  }
+  return seconds.toFixed(3).replace(/\.?0+$/, "");
+}
+
 function parsePositiveFloat(text: string, fieldLabel: string): number {
   const normalized = text.trim();
   if (normalized.length === 0) {
@@ -329,15 +428,139 @@ function parsePositiveFloat(text: string, fieldLabel: string): number {
   return parsedValue;
 }
 
+function FieldHelpTooltip(props: {
+  label: string;
+  help: SettingsFieldHelp;
+}): JSX.Element {
+  const tooltipId = useId();
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement | null>(null);
+  const [isOpen, setIsOpen] = useState(false);
+  const [layout, setLayout] = useState<{ left: number; top: number; width: number } | null>(null);
+
+  const updateTooltipLayout = useCallback(() => {
+    if (!isOpen || !triggerRef.current) {
+      return;
+    }
+    const viewportPadding = 12;
+    const horizontalGap = 8;
+    const verticalGap = 10;
+    const triggerRect = triggerRef.current.getBoundingClientRect();
+    const preferredWidth = window.innerWidth >= 1024 ? 280 : 260;
+    const tooltipWidth = Math.min(preferredWidth, Math.max(180, window.innerWidth - viewportPadding * 2));
+
+    let left = triggerRect.right + horizontalGap;
+    if (left + tooltipWidth > window.innerWidth - viewportPadding) {
+      left = triggerRect.left - tooltipWidth - horizontalGap;
+    }
+    if (left < viewportPadding) {
+      left = viewportPadding;
+    }
+    if (left + tooltipWidth > window.innerWidth - viewportPadding) {
+      left = Math.max(viewportPadding, window.innerWidth - viewportPadding - tooltipWidth);
+    }
+
+    const measuredHeight = tooltipRef.current?.offsetHeight ?? 132;
+    let top = triggerRect.bottom + verticalGap;
+    if (top + measuredHeight > window.innerHeight - viewportPadding) {
+      top = triggerRect.top - measuredHeight - verticalGap;
+    }
+    if (top < viewportPadding) {
+      top = viewportPadding;
+    }
+
+    setLayout({ left, top, width: tooltipWidth });
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setLayout(null);
+      return;
+    }
+    updateTooltipLayout();
+    const frame = window.requestAnimationFrame(updateTooltipLayout);
+    const handleWindowChange = () => updateTooltipLayout();
+    window.addEventListener("resize", handleWindowChange);
+    window.addEventListener("scroll", handleWindowChange, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", handleWindowChange);
+      window.removeEventListener("scroll", handleWindowChange, true);
+    };
+  }, [isOpen, updateTooltipLayout]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [isOpen]);
+
+  return (
+    <span
+      className="relative inline-flex items-center"
+      onMouseEnter={() => setIsOpen(true)}
+      onMouseLeave={() => setIsOpen(false)}
+    >
+      <button
+        type="button"
+        ref={triggerRef}
+        aria-label={`${props.label} 配置说明`}
+        aria-describedby={tooltipId}
+        aria-expanded={isOpen}
+        onClick={() => setIsOpen((prev) => !prev)}
+        onBlur={() => setIsOpen(false)}
+        className="inline-flex h-4 w-4 items-center justify-center rounded-full text-[#8a97b0] transition hover:text-[#4a5f86] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea6f3] focus-visible:ring-offset-1"
+      >
+        <CircleHelp className="h-3.5 w-3.5" aria-hidden />
+      </button>
+      <span
+        ref={tooltipRef}
+        id={tooltipId}
+        role="tooltip"
+        style={
+          layout
+            ? {
+                left: `${layout.left}px`,
+                top: `${layout.top}px`,
+                width: `${layout.width}px`,
+              }
+            : undefined
+        }
+        className={cn(
+          "pointer-events-none fixed z-20 rounded-lg border border-[#314469] bg-[#1f2d49] px-3 py-2.5 text-left shadow-xl transition",
+          layout ? "" : "left-0 top-0",
+          isOpen ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0",
+        )}
+      >
+        <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">用法</span>
+        <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.usage}</span>
+        <span className="mt-2 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">影响</span>
+        <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.impact}</span>
+      </span>
+    </span>
+  );
+}
+
 function SettingsField(props: {
   label: string;
   hint?: string;
+  help?: SettingsFieldHelp;
   children: ReactNode;
 }): JSX.Element {
   return (
     <label className="block space-y-1.5">
       <div className="flex items-end justify-between gap-3">
-        <span className="text-sm font-medium text-[#44516d]">{props.label}</span>
+        <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[#44516d]">
+          {props.label}
+          {props.help ? <FieldHelpTooltip label={props.label} help={props.help} /> : null}
+        </span>
         {props.hint ? <span className="text-[11px] text-[#8290a8]">{props.hint}</span> : null}
       </div>
       {props.children}
@@ -357,6 +580,21 @@ function formatDateTime(tsMs: number | null): string {
     return "--";
   }
   return new Date(tsMs).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatTunnelIDForDisplay(rawTunnelID: string): string {
+  const normalizedTunnelID = rawTunnelID.trim();
+  if (normalizedTunnelID === "") {
+    return "--";
+  }
+  const bridgePrefix = "tcp-bridge-tunnel-";
+  if (normalizedTunnelID.startsWith(bridgePrefix)) {
+    const suffix = normalizedTunnelID.slice(bridgePrefix.length).trim();
+    if (/^\d+$/.test(suffix)) {
+      return `tun-${suffix}`;
+    }
+  }
+  return normalizedTunnelID;
 }
 
 function formatUptime(startedAtMs: number | null): string {
@@ -588,6 +826,38 @@ function logLevelRank(level: string): number {
   return LOG_LEVEL_RANK[normalized] ?? LOG_LEVEL_RANK.info;
 }
 
+function classifyDiagnoseCategory(log: Pick<DiagnoseLogEntry, "module" | "code">): DiagnoseCategory {
+  const module = log.module.trim().toLowerCase();
+  const code = log.code.trim().toLowerCase();
+  if (module.includes("ipc") || code.startsWith("ipc_")) {
+    return "ipc";
+  }
+  if (
+    module.includes("tunnel")
+    || module.includes("refill")
+    || code.startsWith("tunnel_")
+    || code.includes("_tunnel_")
+  ) {
+    return "tunnel";
+  }
+  if (module.includes("bridge") || code.startsWith("bridge_") || code.startsWith("session_")) {
+    return "bridge";
+  }
+  return "bridge";
+}
+
+function diagnoseCategoryFilterFromHostConfig(config: HostConfigSnapshot): DiagnoseCategoryFilterState {
+  const nextFilter: DiagnoseCategoryFilterState = {
+    ipc: config.diagnose_show_ipc,
+    bridge: config.diagnose_show_bridge,
+    tunnel: config.diagnose_show_tunnel,
+  };
+  if (!nextFilter.ipc && !nextFilter.bridge && !nextFilter.tunnel) {
+    return { ipc: true, bridge: true, tunnel: true };
+  }
+  return nextFilter;
+}
+
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) {
     return 0;
@@ -722,10 +992,16 @@ export default function App(): JSX.Element {
     portText: "8080",
   });
   const [diagnoseMinLevel, setDiagnoseMinLevel] = useState("info");
+  const [diagnoseCategoryFilter, setDiagnoseCategoryFilter] = useState<DiagnoseCategoryFilterState>({
+    ipc: true,
+    bridge: true,
+    tunnel: true,
+  });
   const [busyCommand, setBusyCommand] = useState<RuntimeCommand | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const [nowTsMs, setNowTsMs] = useState(() => Date.now());
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft | null>(null);
+  const diagnoseFilterSaveSeqRef = useRef(0);
   const shownHostLogToastKeysRef = useRef<Set<string>>(new Set());
   const shownRuntimeErrorRef = useRef<string | null>(null);
   const { trafficSnapshot, trafficHistory, refreshTrafficStats } = useTrafficStats();
@@ -764,7 +1040,7 @@ export default function App(): JSX.Element {
 
   const refreshHostLogs = useCallback(async () => {
     const logs = await invoke<HostLogEntry[]>("host_logs_snapshot");
-    setHostLogs(logs.slice(-18).reverse());
+    setHostLogs(logs.slice(-128).reverse());
   }, []);
 
   // 读取 runtime 诊断聚合快照（状态 + 事件计数）。
@@ -776,7 +1052,7 @@ export default function App(): JSX.Element {
   // 读取 runtime 诊断事件流，默认仅保留前端可视窗口大小。
   const refreshDiagnoseLogs = useCallback(async () => {
     const logs = await invoke<DiagnoseLogEntry[]>("diagnose_logs_snapshot");
-    setDiagnoseLogs(logs.slice(0, 64));
+    setDiagnoseLogs(logs.slice(0, 128));
   }, []);
 
   const refreshSnapshot = useCallback(async () => {
@@ -828,6 +1104,50 @@ export default function App(): JSX.Element {
     refreshTrafficStatsSafely,
     refreshTunnelList,
   ]);
+
+  const persistDiagnoseCategoryFilter = useCallback(
+    async (nextFilter: DiagnoseCategoryFilterState) => {
+      const sequence = diagnoseFilterSaveSeqRef.current + 1;
+      diagnoseFilterSaveSeqRef.current = sequence;
+      const payload: DiagnoseCategoryFilterUpdateInput = {
+        diagnose_show_ipc: nextFilter.ipc,
+        diagnose_show_bridge: nextFilter.bridge,
+        diagnose_show_tunnel: nextFilter.tunnel,
+      };
+      try {
+        const snapshot = await invoke<HostConfigSnapshot>("host_config_update_diagnose_filter", { input: payload });
+        if (diagnoseFilterSaveSeqRef.current !== sequence) {
+          return;
+        }
+        setHostConfig(snapshot);
+      } catch (error) {
+        if (diagnoseFilterSaveSeqRef.current !== sequence) {
+          return;
+        }
+        notify("warning", "保存日志筛选失败", normalizeErrorMessage(error));
+        if (hostConfig) {
+          setDiagnoseCategoryFilter(diagnoseCategoryFilterFromHostConfig(hostConfig));
+        } else {
+          setDiagnoseCategoryFilter({ ipc: true, bridge: true, tunnel: true });
+        }
+      }
+    },
+    [hostConfig, notify],
+  );
+
+  const applyDiagnoseCategoryFilter = useCallback(
+    (updater: (prev: DiagnoseCategoryFilterState) => DiagnoseCategoryFilterState) => {
+      setDiagnoseCategoryFilter((prev) => {
+        const next = updater(prev);
+        if (next.ipc === prev.ipc && next.bridge === prev.bridge && next.tunnel === prev.tunnel) {
+          return prev;
+        }
+        void persistDiagnoseCategoryFilter(next);
+        return next;
+      });
+    },
+    [persistDiagnoseCategoryFilter],
+  );
 
   const runCommand = useCallback(
     async (command: RuntimeCommand) => {
@@ -1013,6 +1333,7 @@ export default function App(): JSX.Element {
       return;
     }
     setSettingsDraft(toSettingsDraft(hostConfig));
+    setDiagnoseCategoryFilter(diagnoseCategoryFilterFromHostConfig(hostConfig));
   }, [hostConfig]);
 
   useEffect(() => {
@@ -1264,12 +1585,35 @@ export default function App(): JSX.Element {
   ]);
 
   const recentLogs = useMemo(() => hostLogs.slice(0, 3), [hostLogs]);
+  const diagnoseCategoryAllEnabled =
+    diagnoseCategoryFilter.ipc && diagnoseCategoryFilter.bridge && diagnoseCategoryFilter.tunnel;
 
   const diagnoseDisplayLogs = useMemo(() => {
-    const source = diagnoseLogs.length > 0 ? diagnoseLogs : hostLogs;
+    const hostDiagnoseLikeLogs: DiagnoseLogEntry[] = hostLogs.map((log) => ({
+      ts_ms: log.ts_ms,
+      level: log.level,
+      module: log.module,
+      code: log.code,
+      message: log.message,
+      session_id: undefined,
+      session_epoch: undefined,
+      bridge_state: undefined,
+      request_id: undefined,
+      trigger: undefined,
+      reason: undefined,
+    }));
+    const source = [...diagnoseLogs, ...hostDiagnoseLikeLogs]
+      .sort((left, right) => right.ts_ms - left.ts_ms)
+      .slice(0, 160);
     const threshold = logLevelRank(diagnoseMinLevel);
-    return source.filter((log) => logLevelRank(log.level) >= threshold);
-  }, [diagnoseLogs, diagnoseMinLevel, hostLogs]);
+    return source.filter((log) => {
+      if (logLevelRank(log.level) < threshold) {
+        return false;
+      }
+      const category = classifyDiagnoseCategory(log);
+      return diagnoseCategoryFilter[category];
+    });
+  }, [diagnoseCategoryFilter, diagnoseLogs, diagnoseMinLevel, hostLogs]);
 
   const agentVersion = useMemo(() => {
     const entry = hostLogs.find((log) => log.message.toLowerCase().includes("version"));
@@ -1294,7 +1638,7 @@ export default function App(): JSX.Element {
       settingsDraft.tunnelPoolMinIdleText.trim() !== String(hostConfig.tunnel_pool_min_idle) ||
       settingsDraft.tunnelPoolMaxIdleText.trim() !== String(hostConfig.tunnel_pool_max_idle) ||
       settingsDraft.tunnelPoolMaxInflightText.trim() !== String(hostConfig.tunnel_pool_max_inflight) ||
-      settingsDraft.tunnelPoolTtlMsText.trim() !== String(hostConfig.tunnel_pool_ttl_ms) ||
+      settingsDraft.tunnelPoolTtlSecText.trim() !== formatTTLSecondsText(hostConfig.tunnel_pool_ttl_ms) ||
       settingsDraft.tunnelPoolOpenRateText.trim() !== String(hostConfig.tunnel_pool_open_rate) ||
       settingsDraft.tunnelPoolOpenBurstText.trim() !== String(hostConfig.tunnel_pool_open_burst) ||
       settingsDraft.tunnelPoolReconcileGapMsText.trim() !== String(hostConfig.tunnel_pool_reconcile_gap_ms)
@@ -1329,7 +1673,7 @@ export default function App(): JSX.Element {
           settingsDraft.tunnelPoolMaxInflightText,
           "tunnel_pool_max_inflight",
         ),
-        tunnel_pool_ttl_ms: parseNonNegativeInteger(settingsDraft.tunnelPoolTtlMsText, "tunnel_pool_ttl_ms"),
+        tunnel_pool_ttl_ms: parseNonNegativeSecondsToMillis(settingsDraft.tunnelPoolTtlSecText, "tunnel_pool_ttl_s"),
         tunnel_pool_open_rate: parsePositiveFloat(settingsDraft.tunnelPoolOpenRateText, "tunnel_pool_open_rate"),
         tunnel_pool_open_burst: parsePositiveInteger(settingsDraft.tunnelPoolOpenBurstText, "tunnel_pool_open_burst"),
         tunnel_pool_reconcile_gap_ms: parsePositiveInteger(
@@ -1682,7 +2026,7 @@ export default function App(): JSX.Element {
               ) : null}
               {filteredTunnels.map((item) => (
                 <tr key={item.tunnel_id} className="border-t border-[#edf1f8]">
-                  <td className={TABLE_CELL_CLASS}>{item.tunnel_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{formatTunnelIDForDisplay(item.tunnel_id)}</td>
                   <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
                   <td className={TABLE_CELL_CLASS}>
                     {formatTransportLabel(item.protocol || hostConfig?.bridge_transport || "")}
@@ -1727,7 +2071,7 @@ export default function App(): JSX.Element {
           <section className="space-y-3">
             <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Agent 内核参数</h4>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              <SettingsField label="Agent ID" hint="必填">
+              <SettingsField label="Agent ID" hint="必填" help={SETTINGS_FIELD_HELP.agentId}>
                 <Input
                   value={settingsDraft.agentId}
                   onChange={(event) =>
@@ -1739,7 +2083,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="Runtime 程序路径" hint="Agent 可执行文件路径">
+              <SettingsField label="Runtime 程序路径" hint="Agent 可执行文件路径" help={SETTINGS_FIELD_HELP.runtimeProgram}>
                 <Input
                   value={settingsDraft.runtimeProgram}
                   onChange={(event) =>
@@ -1751,7 +2095,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="Runtime 参数" hint="空格分隔">
+              <SettingsField label="Runtime 参数" hint="空格分隔" help={SETTINGS_FIELD_HELP.runtimeArgs}>
                 <Input
                   value={settingsDraft.runtimeArgsText}
                   onChange={(event) =>
@@ -1763,7 +2107,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="IPC 端点" hint="按平台规则校验">
+              <SettingsField label="IPC 端点" hint="按平台规则校验" help={SETTINGS_FIELD_HELP.ipcEndpoint}>
                 <Input
                   value={settingsDraft.endpoint}
                   onChange={(event) =>
@@ -1775,7 +2119,11 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="Bridge 传输方式" hint="tcp_framed 与 grpc_h2 已打通（grpc_h2 默认监听 :39082）">
+              <SettingsField
+                label="Bridge 传输方式"
+                hint="tcp_framed 与 grpc_h2 已打通（grpc_h2 默认监听 :39082）"
+                help={SETTINGS_FIELD_HELP.bridgeTransport}
+              >
                 <select
                   value={settingsDraft.transport}
                   className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
@@ -1789,7 +2137,7 @@ export default function App(): JSX.Element {
                   <option value="grpc_h2">grpc_h2（已支持）</option>
                 </select>
               </SettingsField>
-              <SettingsField label="认证方式" hint="LocalRPC 握手鉴权">
+              <SettingsField label="认证方式" hint="LocalRPC 握手鉴权" help={SETTINGS_FIELD_HELP.authMode}>
                 <select
                   value={settingsDraft.authMode}
                   disabled
@@ -1804,7 +2152,7 @@ export default function App(): JSX.Element {
           <section className="space-y-3">
             <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Bridge 服务端参数</h4>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              <SettingsField label="Bridge 地址" hint="必填">
+              <SettingsField label="Bridge 地址" hint="必填" help={SETTINGS_FIELD_HELP.bridgeAddr}>
                 <Input
                   value={settingsDraft.bridgeAddr}
                   onChange={(event) =>
@@ -1822,7 +2170,7 @@ export default function App(): JSX.Element {
           <section className="space-y-3">
             <h4 className="text-sm font-semibold uppercase tracking-[0.08em] text-[#5f6d87]">Tunnel 池参数</h4>
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              <SettingsField label="最小空闲数">
+              <SettingsField label="最小空闲数" help={SETTINGS_FIELD_HELP.minIdle}>
                 <Input
                   value={settingsDraft.tunnelPoolMinIdleText}
                   onChange={(event) =>
@@ -1834,7 +2182,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="最大空闲数">
+              <SettingsField label="最大空闲数" help={SETTINGS_FIELD_HELP.maxIdle}>
                 <Input
                   value={settingsDraft.tunnelPoolMaxIdleText}
                   onChange={(event) =>
@@ -1846,7 +2194,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="最大并发打开数">
+              <SettingsField label="最大并发打开数" help={SETTINGS_FIELD_HELP.maxInflight}>
                 <Input
                   value={settingsDraft.tunnelPoolMaxInflightText}
                   onChange={(event) =>
@@ -1858,19 +2206,19 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="TTL（毫秒）">
+              <SettingsField label="TTL（秒）" hint="0 表示禁用 TTL 回收" help={SETTINGS_FIELD_HELP.ttlSeconds}>
                 <Input
-                  value={settingsDraft.tunnelPoolTtlMsText}
+                  value={settingsDraft.tunnelPoolTtlSecText}
                   onChange={(event) =>
                     setSettingsDraft((prev) =>
-                      prev ? { ...prev, tunnelPoolTtlMsText: event.target.value } : prev,
+                      prev ? { ...prev, tunnelPoolTtlSecText: event.target.value } : prev,
                     )
                   }
-                  inputMode="numeric"
+                  inputMode="decimal"
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="打开速率">
+              <SettingsField label="打开速率" help={SETTINGS_FIELD_HELP.openRate}>
                 <Input
                   value={settingsDraft.tunnelPoolOpenRateText}
                   onChange={(event) =>
@@ -1882,7 +2230,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="打开突发值">
+              <SettingsField label="打开突发值" help={SETTINGS_FIELD_HELP.openBurst}>
                 <Input
                   value={settingsDraft.tunnelPoolOpenBurstText}
                   onChange={(event) =>
@@ -1894,7 +2242,7 @@ export default function App(): JSX.Element {
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
-              <SettingsField label="对账间隔（毫秒）">
+              <SettingsField label="对账间隔（毫秒）" help={SETTINGS_FIELD_HELP.reconcileGapMs}>
                 <Input
                   value={settingsDraft.tunnelPoolReconcileGapMsText}
                   onChange={(event) =>
@@ -1949,19 +2297,102 @@ export default function App(): JSX.Element {
           <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} compact />
           <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} compact />
         </div>
-        <div className="mb-3 flex items-center justify-end gap-2">
-          <span className="text-xs text-[#5d6983]">最小日志级别</span>
-          <select
-            value={diagnoseMinLevel}
-            className="h-8 rounded-lg border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#43506b]"
-            onChange={(event) => setDiagnoseMinLevel(event.target.value)}
-          >
-            <option value="trace">TRACE 及以上</option>
-            <option value="debug">DEBUG 及以上</option>
-            <option value="info">INFO 及以上</option>
-            <option value="warn">WARN 及以上</option>
-            <option value="error">ERROR 及以上</option>
-          </select>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-[#5d6983]">操作类型</span>
+            <button
+              type="button"
+              className={cn(
+                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                diagnoseCategoryAllEnabled
+                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+              )}
+              onClick={() =>
+                applyDiagnoseCategoryFilter(() => ({
+                  ipc: true,
+                  bridge: true,
+                  tunnel: true,
+                }))
+              }
+            >
+              全部
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                diagnoseCategoryFilter.ipc
+                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+              )}
+              onClick={() =>
+                applyDiagnoseCategoryFilter((prev) => {
+                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                  if (prev.ipc && enabledCount === 1) {
+                    return prev;
+                  }
+                  return { ...prev, ipc: !prev.ipc };
+                })
+              }
+            >
+              IPC
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                diagnoseCategoryFilter.bridge
+                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+              )}
+              onClick={() =>
+                applyDiagnoseCategoryFilter((prev) => {
+                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                  if (prev.bridge && enabledCount === 1) {
+                    return prev;
+                  }
+                  return { ...prev, bridge: !prev.bridge };
+                })
+              }
+            >
+              Bridge
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "h-7 rounded-md border px-2.5 text-xs font-medium transition",
+                diagnoseCategoryFilter.tunnel
+                  ? "border-[#8fb2f2] bg-[#edf4ff] text-[#244a8f]"
+                  : "border-[#d8dfeb] bg-white text-[#65718c] hover:border-[#bcc9df] hover:text-[#3f4b66]",
+              )}
+              onClick={() =>
+                applyDiagnoseCategoryFilter((prev) => {
+                  const enabledCount = Number(prev.ipc) + Number(prev.bridge) + Number(prev.tunnel);
+                  if (prev.tunnel && enabledCount === 1) {
+                    return prev;
+                  }
+                  return { ...prev, tunnel: !prev.tunnel };
+                })
+              }
+            >
+              Tunnel
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-[#5d6983]">最小日志级别</span>
+            <select
+              value={diagnoseMinLevel}
+              className="h-8 rounded-lg border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#43506b]"
+              onChange={(event) => setDiagnoseMinLevel(event.target.value)}
+            >
+              <option value="trace">TRACE 及以上</option>
+              <option value="debug">DEBUG 及以上</option>
+              <option value="info">INFO 及以上</option>
+              <option value="warn">WARN 及以上</option>
+              <option value="error">ERROR 及以上</option>
+            </select>
+          </div>
         </div>
         <div className="agent-scroll min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#e5eaf4]">
           <table className="min-w-full border-separate border-spacing-0">

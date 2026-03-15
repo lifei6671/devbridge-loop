@@ -43,7 +43,7 @@ func DefaultManagerConfig() ManagerConfig {
 	return ManagerConfig{
 		MinIdle:           8,
 		MaxIdle:           32,
-		IdleTTL:           90 * time.Second,
+		IdleTTL:           10 * time.Minute,
 		MaxInflightOpens:  4,
 		TunnelOpenRate:    10,
 		TunnelOpenBurst:   20,
@@ -369,11 +369,7 @@ func (manager *Manager) RequestRefill(targetIdle int, reason string) bool {
 		return false
 	}
 	// 新目标生效后异步唤醒治理循环。
-	select {
-	case manager.refillSignalChannel <- struct{}{}:
-	default:
-		// 信号通道满时说明已有待处理任务，无需重复写入。
-	}
+	manager.enqueueReconcileSignal()
 	manager.emitEvent("refill_requested")
 	return true
 }
@@ -579,14 +575,16 @@ func (manager *Manager) HandleSessionState(state string) (int, error) {
 		// 与 ReconcileNow 串行，确保恢复补池与上一轮 drain 行为顺序一致。
 		manager.reconcileMutex.Lock()
 		manager.stateMutex.Lock()
-		wasSuspended := manager.suspendRefill
 		manager.suspendRefill = false
+		if manager.pendingTargetIdle < manager.config.MinIdle {
+			// ACTIVE 后至少恢复到 min_idle 目标，避免长期停在 0。
+			manager.pendingTargetIdle = manager.config.MinIdle
+		}
+		manager.pendingReason = "session_active"
 		manager.stateMutex.Unlock()
 		manager.reconcileMutex.Unlock()
-		if wasSuspended {
-			// 恢复 ACTIVE 后按 min_idle 重新补池。
-			manager.RequestRefill(manager.config.MinIdle, "session_active")
-		}
+		// 无论此前是否 suspended，都立刻唤醒一次 reconcile，避免首次 startup 失败后长期等待 periodic。
+		manager.enqueueReconcileSignal()
 		manager.emitEvent("session_active")
 		return 0, nil
 	default:
@@ -652,6 +650,18 @@ func (manager *Manager) emitEvent(trigger string) {
 		normalizedTrigger = "pool_event"
 	}
 	notifier.NotifyEvent(normalizedTrigger)
+}
+
+// enqueueReconcileSignal 异步唤醒治理循环执行一次立即纠偏。
+func (manager *Manager) enqueueReconcileSignal() {
+	if manager == nil {
+		return
+	}
+	select {
+	case manager.refillSignalChannel <- struct{}{}:
+	default:
+		// 信号通道满时说明已有待处理任务，无需重复写入。
+	}
 }
 
 // updatePoolMetrics 把当前 pool 快照同步到观测指标。

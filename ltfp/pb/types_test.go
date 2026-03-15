@@ -30,6 +30,9 @@ func TestIsKnownControlMessageType(t *testing.T) {
 	if !IsKnownControlMessageType(ControlMessageTunnelPoolReport) {
 		t.Fatalf("expected tunnel pool report message type to be known")
 	}
+	if !IsKnownControlMessageType(ControlMessageTunnelDialAnnounce) {
+		t.Fatalf("expected tunnel dial announce message type to be known")
+	}
 	if !IsKnownControlMessageType(ControlMessageTunnelRefillRequest) {
 		t.Fatalf("expected tunnel refill request message type to be known")
 	}

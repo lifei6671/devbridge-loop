@@ -201,6 +201,20 @@ type TunnelPoolReport struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// TunnelDialAnnounce 描述 Agent 成功建立 tunnel 后向 Bridge 宣告 tunnel_id 的控制面消息。
+type TunnelDialAnnounce struct {
+	// SessionID 标识宣告归属的会话。
+	SessionID string `json:"sessionId,omitempty"`
+	// SessionEpoch 用于和 Bridge 当前会话代际做匹配。
+	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
+	// TunnelID 为 Agent 侧 tunnel 唯一标识。
+	TunnelID string `json:"tunnelId,omitempty"`
+	// DialLocalAddr 为 Agent 侧该 tunnel TCP 连接本地地址（ip:port），用于 Bridge 入站精准匹配。
+	DialLocalAddr string `json:"dialLocalAddr,omitempty"`
+	// TimestampUnix 为宣告发送时刻（Unix 秒）。
+	TimestampUnix int64 `json:"timestampUnix"`
+}
+
 // TunnelRefillRequest 描述 Bridge 请求 Agent 扩容 tunnel 池的控制面消息。
 type TunnelRefillRequest struct {
 	// SessionID 标识补池请求归属的会话。

@@ -11,6 +11,7 @@ import (
 
 type tunnelReportHandlerTestTunnel struct {
 	tunnelID string
+	closed   bool
 }
 
 func (tunnel *tunnelReportHandlerTestTunnel) ID() string {
@@ -29,6 +30,7 @@ func (tunnel *tunnelReportHandlerTestTunnel) WritePayload(ctx context.Context, p
 }
 
 func (tunnel *tunnelReportHandlerTestTunnel) Close() error {
+	tunnel.closed = true
 	return nil
 }
 
@@ -71,7 +73,7 @@ func TestTunnelReportHandlerHandleReport(t *testing.T) {
 		SessionID:    "session-1",
 		SessionEpoch: 9,
 	}, pb.TunnelPoolReport{
-		IdleCount:       0,
+		IdleCount:       1,
 		InUseCount:      1,
 		TargetIdleCount: 8,
 		Trigger:         "event:pool_low",
@@ -84,6 +86,9 @@ func TestTunnelReportHandlerHandleReport(t *testing.T) {
 	}
 	if refillRequest.Metadata["bridge_idle_count"] != "1" || refillRequest.Metadata["bridge_in_use_count"] != "1" {
 		t.Fatalf("unexpected bridge pool metadata: %+v", refillRequest.Metadata)
+	}
+	if refillRequest.Metadata["bridge_idle_recycled_count"] != "0" {
+		t.Fatalf("unexpected recycled metadata: %+v", refillRequest.Metadata)
 	}
 }
 
@@ -152,5 +157,67 @@ func TestTunnelReportHandlerWritesReportStore(t *testing.T) {
 	}
 	if items[0].IdleCount != 4 || items[0].InUseCount != 2 {
 		t.Fatalf("unexpected report counts: %+v", items[0])
+	}
+}
+
+// TestTunnelReportHandlerReconcileExcessIdle 验证 Agent 上报会触发 Bridge 端 idle 收敛。
+func TestTunnelReportHandlerReconcileExcessIdle(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-4",
+		ConnectorID: "connector-4",
+		Epoch:       12,
+		State:       registry.SessionActive,
+	})
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnelA := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-a"}
+	tunnelB := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-b"}
+	tunnelC := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-c"}
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-4", "session-4", tunnelA); err != nil {
+		t.Fatalf("upsert tunnel-a failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now.Add(time.Millisecond), "connector-4", "session-4", tunnelB); err != nil {
+		t.Fatalf("upsert tunnel-b failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now.Add(2*time.Millisecond), "connector-4", "session-4", tunnelC); err != nil {
+		t.Fatalf("upsert tunnel-c failed: %v", err)
+	}
+	handler := NewTunnelReportHandler(TunnelReportHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		TunnelRegistry:  tunnelRegistry,
+		RefillController: NewRefillController(RefillControllerOptions{
+			Now: func() time.Time { return time.Unix(1700003000, 0).UTC() },
+		}),
+	})
+
+	_, shouldSend := handler.HandleReport(pb.ControlEnvelope{
+		MessageType:  pb.ControlMessageTunnelPoolReport,
+		SessionID:    "session-4",
+		SessionEpoch: 12,
+	}, pb.TunnelPoolReport{
+		IdleCount:       1,
+		InUseCount:      0,
+		TargetIdleCount: 0,
+		Trigger:         "periodic",
+	})
+	if shouldSend {
+		t.Fatalf("expected no refill request when target_idle_count is zero")
+	}
+
+	snapshot := tunnelRegistry.Snapshot()
+	if snapshot.IdleCount != 1 || snapshot.TotalCount != 1 {
+		t.Fatalf("unexpected registry snapshot after reconcile: %+v", snapshot)
+	}
+	closedCount := 0
+	for _, tunnel := range []*tunnelReportHandlerTestTunnel{tunnelA, tunnelB, tunnelC} {
+		if tunnel.closed {
+			closedCount++
+		}
+	}
+	if closedCount != 2 {
+		t.Fatalf("expected 2 recycled tunnels closed, got=%d", closedCount)
 	}
 }

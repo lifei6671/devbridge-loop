@@ -168,6 +168,21 @@ fn start_agent_sequence(
         if had_started_before {
             // 仅在非首次启动时累计 reconnect_total。
             supervisor.reconnect_total += 1;
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "ipc_client",
+                "IPC_RECONNECTING",
+                "检测到非首次拉起，开始重连本地 IPC 通道",
+            );
+        } else {
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "ipc_client",
+                "IPC_CONNECTING",
+                "开始建立本地 IPC 通道",
+            );
         }
         let started_pid = supervisor.pid;
         push_host_log(
@@ -403,6 +418,15 @@ fn stop_agent_sequence(
         supervisor.last_error = None;
         clear_retry_state(&mut supervisor);
         supervisor.updated_at_ms = now_ms();
+        if supervisor.ipc_client.is_some() {
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "ipc_client",
+                "IPC_DISCONNECTING",
+                "开始断开本地 IPC 通道",
+            );
+        }
         push_host_log(
             &mut supervisor,
             "info",
@@ -420,6 +444,15 @@ fn stop_agent_sequence(
         let _ = ipc_client.request("app.shutdown", json!({}), LOCAL_RPC_DEFAULT_TIMEOUT_MS);
         // 先断开 IPC，再终止进程，避免读写线程悬挂。
         ipc_client.close();
+        if let Ok(mut supervisor) = state.supervisor.lock() {
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "ipc_client",
+                "IPC_DISCONNECTED",
+                "本地 IPC 通道已断开",
+            );
+        }
     }
 
     if let Some(mut child) = child_to_stop {
@@ -774,6 +807,13 @@ pub fn spawn_supervisor_monitor(app: AppHandle, state: Arc<AppRuntimeState>) {
                                             "RPC_EVENT_PUMP_FAILED",
                                             error_message,
                                         );
+                                        push_host_log(
+                                            &mut supervisor,
+                                            "warn",
+                                            "ipc_client",
+                                            "IPC_DISCONNECTED",
+                                            "事件泵探活失败，已断开本地 IPC 通道并等待重连",
+                                        );
                                         child_to_kill = supervisor.child.take();
                                         supervisor.pid = None;
                                         emit_after_pump = Some((
@@ -1057,7 +1097,7 @@ fn run_mock_localrpc_server_loop(
     let tunnel_pool_max_inflight =
         std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_MAX_INFLIGHT").unwrap_or_else(|_| "4".to_string());
     let tunnel_pool_ttl_ms =
-        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_TTL_MS").unwrap_or_else(|_| "90000".to_string());
+        std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_TTL_MS").unwrap_or_else(|_| "600000".to_string());
     let tunnel_pool_open_rate =
         std::env::var("DEV_AGENT_CFG_TUNNEL_POOL_OPEN_RATE").unwrap_or_else(|_| "10".to_string());
     let tunnel_pool_open_burst =
@@ -1660,12 +1700,15 @@ mod tests {
             tunnel_pool_min_idle: 8,
             tunnel_pool_max_idle: 32,
             tunnel_pool_max_inflight: 4,
-            tunnel_pool_ttl_ms: 90_000,
+            tunnel_pool_ttl_ms: 600_000,
             tunnel_pool_open_rate: 10.0,
             tunnel_pool_open_burst: 20,
             tunnel_pool_reconcile_gap_ms: 1_000,
             ipc_transport: "uds".to_string(),
             ipc_endpoint: "/tmp/dev-agent/agent.sock".to_string(),
+            diagnose_show_ipc: true,
+            diagnose_show_bridge: true,
+            diagnose_show_tunnel: true,
         }
     }
 

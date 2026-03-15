@@ -37,7 +37,17 @@ const (
 	incomingTunnelProbeInterval = 250 * time.Millisecond
 	// incomingTunnelProbeTimeout 定义单次探测超时时间，避免阻塞生命周期协程。
 	incomingTunnelProbeTimeout = 120 * time.Millisecond
+	// incomingTunnelDialAnnounceWait 定义入站 tunnel 等待 Agent 宣告 tunnel_id 的窗口。
+	incomingTunnelDialAnnounceWait = 180 * time.Millisecond
+	// incomingTunnelDialAnnounceTTL 定义宣告 tunnel_id 在队列中的最大保留时长。
+	incomingTunnelDialAnnounceTTL = 3 * time.Second
 )
+
+type announcedTunnelDialRuntime struct {
+	tunnelID      string
+	dialLocalAddr string
+	announcedAt   time.Time
+}
 
 // controlMessageDispatcher 负责把控制面业务帧分发给 Bridge 控制处理器。
 type controlMessageDispatcher struct {
@@ -51,6 +61,9 @@ type controlMessageDispatcher struct {
 	tunnelHandler         *bridgecontrol.TunnelReportHandler
 	routeHandler          *bridgecontrol.RouteHandler
 	sessionHandler        *bridgecontrol.SessionHandler
+
+	tunnelDialAnnounceMutex  sync.Mutex
+	tunnelDialAnnounceQueues map[string][]announcedTunnelDialRuntime
 }
 
 // controlChannelSessionState 保存单条控制连接最近确认的 session 上下文。
@@ -135,7 +148,8 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 			SessionRegistry: sessionRegistry,
 			RouteRegistry:   routeRegistry,
 		}),
-		sessionHandler: sessionHandler,
+		sessionHandler:           sessionHandler,
+		tunnelDialAnnounceQueues: make(map[string][]announcedTunnelDialRuntime),
 	}
 }
 
@@ -272,10 +286,32 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 			"reason", strings.TrimSpace(refillRequest.Reason),
 			"bridge_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "bridge_idle_count"),
 			"bridge_in_use_count", parseRefillMetadataInt(refillRequest.Metadata, "bridge_in_use_count"),
+			"bridge_idle_recycled_count", parseRefillMetadataInt(refillRequest.Metadata, "bridge_idle_recycled_count"),
 			"agent_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "idle_count"),
 			"agent_target_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "target_idle_count"),
 		)
 		return buildTunnelRefillEnvelope(envelope, refillRequest)
+	case pb.ControlMessageTunnelDialAnnounce:
+		var message pb.TunnelDialAnnounce
+		if err := decodeControlPayload(envelope.Payload, &message); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(message.SessionID) == "" {
+			message.SessionID = strings.TrimSpace(envelope.SessionID)
+		}
+		if message.SessionEpoch == 0 {
+			message.SessionEpoch = envelope.SessionEpoch
+		}
+		slog.Info(
+			"bridge receive tunnel dial announce",
+			"connector_id", strings.TrimSpace(envelope.ConnectorID),
+			"session_id", strings.TrimSpace(message.SessionID),
+			"session_epoch", message.SessionEpoch,
+			"tunnel_id", strings.TrimSpace(message.TunnelID),
+			"dial_local_addr", strings.TrimSpace(message.DialLocalAddr),
+		)
+		dispatcher.enqueueTunnelDialAnnounce(message)
+		return nil, nil
 	case pb.ControlMessageRouteAssign:
 		var message pb.RouteAssign
 		if err := decodeControlPayload(envelope.Payload, &message); err != nil {
@@ -297,6 +333,101 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 	default:
 		// 未接入的消息类型先忽略，避免骨架阶段影响控制链路稳定性。
 		return nil, nil
+	}
+}
+
+func tunnelDialAnnounceQueueKey(sessionID string, sessionEpoch uint64) string {
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" || sessionEpoch == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s#%d", normalizedSessionID, sessionEpoch)
+}
+
+func (dispatcher *controlMessageDispatcher) enqueueTunnelDialAnnounce(message pb.TunnelDialAnnounce) {
+	if dispatcher == nil {
+		return
+	}
+	queueKey := tunnelDialAnnounceQueueKey(message.SessionID, message.SessionEpoch)
+	normalizedTunnelID := strings.TrimSpace(message.TunnelID)
+	normalizedDialLocalAddr := strings.TrimSpace(message.DialLocalAddr)
+	if queueKey == "" || normalizedTunnelID == "" {
+		return
+	}
+	normalizedNow := time.Now().UTC()
+	dispatcher.tunnelDialAnnounceMutex.Lock()
+	defer dispatcher.tunnelDialAnnounceMutex.Unlock()
+	queue := dispatcher.tunnelDialAnnounceQueues[queueKey]
+	cleanQueue := make([]announcedTunnelDialRuntime, 0, len(queue)+1)
+	for _, item := range queue {
+		if normalizedNow.Sub(item.announcedAt) <= incomingTunnelDialAnnounceTTL {
+			cleanQueue = append(cleanQueue, item)
+		}
+	}
+	cleanQueue = append(cleanQueue, announcedTunnelDialRuntime{
+		tunnelID:      normalizedTunnelID,
+		dialLocalAddr: normalizedDialLocalAddr,
+		announcedAt:   normalizedNow,
+	})
+	dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
+}
+
+func (dispatcher *controlMessageDispatcher) consumeTunnelDialAnnounce(
+	sessionID string,
+	sessionEpoch uint64,
+	peerAddr string,
+	wait time.Duration,
+) string {
+	if dispatcher == nil {
+		return ""
+	}
+	queueKey := tunnelDialAnnounceQueueKey(sessionID, sessionEpoch)
+	if queueKey == "" {
+		return ""
+	}
+	normalizedWait := wait
+	if normalizedWait < 0 {
+		normalizedWait = 0
+	}
+	deadline := time.Now().UTC().Add(normalizedWait)
+	normalizedPeerAddr := strings.TrimSpace(peerAddr)
+	for {
+		now := time.Now().UTC()
+		dispatcher.tunnelDialAnnounceMutex.Lock()
+		queue := dispatcher.tunnelDialAnnounceQueues[queueKey]
+		cleanQueue := make([]announcedTunnelDialRuntime, 0, len(queue))
+		nextTunnelID := ""
+		for _, item := range queue {
+			if now.Sub(item.announcedAt) > incomingTunnelDialAnnounceTTL {
+				continue
+			}
+			if nextTunnelID == "" {
+				if normalizedPeerAddr != "" && strings.TrimSpace(item.dialLocalAddr) != normalizedPeerAddr {
+					cleanQueue = append(cleanQueue, item)
+					continue
+				}
+				nextTunnelID = item.tunnelID
+				continue
+			}
+			cleanQueue = append(cleanQueue, item)
+		}
+		if nextTunnelID == "" {
+			if len(cleanQueue) == 0 {
+				delete(dispatcher.tunnelDialAnnounceQueues, queueKey)
+			} else {
+				dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
+			}
+		} else if len(cleanQueue) == 0 {
+			delete(dispatcher.tunnelDialAnnounceQueues, queueKey)
+		} else {
+			dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
+		}
+		dispatcher.tunnelDialAnnounceMutex.Unlock()
+
+		if nextTunnelID != "" || normalizedWait == 0 || !now.Before(deadline) {
+			return nextTunnelID
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1148,8 +1279,44 @@ func (server *controlPlaneServer) handleAcceptedTCPTunnel(rawConn net.Conn) erro
 	if server == nil || server.tcpTransport == nil {
 		return errors.New("handle accepted tcp tunnel: tcp transport is nil")
 	}
+	connectorID, sessionID, sessionEpoch, ownerResolved := server.resolveSingleActiveSessionOwner()
+	if !ownerResolved {
+		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
+		_ = rawConn.Close()
+		return nil
+	}
 	normalizedNow := time.Now().UTC()
-	tunnelID := fmt.Sprintf("%s-%d", defaultIncomingTunnelIDPrefixTCP, server.tcpTunnelSequence.Add(1))
+	tunnelID := ""
+	peerAddr := ""
+	if rawConn != nil && rawConn.RemoteAddr() != nil {
+		peerAddr = strings.TrimSpace(rawConn.RemoteAddr().String())
+	}
+	if server.dispatcher != nil {
+		tunnelID = server.dispatcher.consumeTunnelDialAnnounce(
+			sessionID,
+			sessionEpoch,
+			peerAddr,
+			incomingTunnelDialAnnounceWait,
+		)
+	}
+	if strings.TrimSpace(tunnelID) == "" {
+		tunnelID = fmt.Sprintf("%s-%d", defaultIncomingTunnelIDPrefixTCP, server.tcpTunnelSequence.Add(1))
+		slog.Info(
+			"bridge accept tunnel id fallback",
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"peer_addr", peerAddr,
+			"tunnel_id", tunnelID,
+		)
+	} else {
+		slog.Info(
+			"bridge accept tunnel id matched",
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"peer_addr", peerAddr,
+			"tunnel_id", tunnelID,
+		)
+	}
 	rawTunnel, err := server.tcpTransport.OpenTunnel(rawConn, transport.TunnelMeta{
 		TunnelID:  tunnelID,
 		CreatedAt: normalizedNow,
@@ -1157,7 +1324,12 @@ func (server *controlPlaneServer) handleAcceptedTCPTunnel(rawConn net.Conn) erro
 	if err != nil {
 		return fmt.Errorf("handle accepted tcp tunnel: open tunnel: %w", err)
 	}
-	return server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed)
+	return server.registerAcceptedTunnelWithOwner(
+		rawTunnel,
+		transport.BindingTypeTCPFramed,
+		connectorID,
+		sessionID,
+	)
 }
 
 // registerAcceptedTunnel 将 transport tunnel 适配并注册到 Bridge tunnel registry。
@@ -1174,13 +1346,36 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	if rawTunnel == nil {
 		return errors.New("register accepted tunnel: nil tunnel")
 	}
-	connectorID, sessionID, ok := server.resolveSingleActiveSessionOwner()
+	connectorID, sessionID, _, ok := server.resolveSingleActiveSessionOwner()
 	if !ok {
 		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
 		_ = rawTunnel.Close()
 		return nil
 	}
+	return server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID)
+}
 
+func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
+	rawTunnel transport.Tunnel,
+	bindingType transport.BindingType,
+	connectorID string,
+	sessionID string,
+) error {
+	if server == nil || server.dispatcher == nil || server.dispatcher.tunnelRegistry == nil {
+		if rawTunnel != nil {
+			_ = rawTunnel.Close()
+		}
+		return errors.New("register accepted tunnel: tunnel registry dependency missing")
+	}
+	if rawTunnel == nil {
+		return errors.New("register accepted tunnel: nil tunnel")
+	}
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedConnectorID == "" || normalizedSessionID == "" {
+		_ = rawTunnel.Close()
+		return nil
+	}
 	normalizedNow := time.Now().UTC()
 	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel)
 	if adapter == nil {
@@ -1189,8 +1384,8 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	}
 	registeredRuntime, err := server.dispatcher.tunnelRegistry.UpsertIdle(
 		normalizedNow,
-		connectorID,
-		sessionID,
+		normalizedConnectorID,
+		normalizedSessionID,
 		adapter,
 	)
 	if err != nil {
@@ -1202,9 +1397,9 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 }
 
 // resolveSingleActiveSessionOwner 在当前会话视图中解析唯一 ACTIVE session 作为 tunnel 归属。
-func (server *controlPlaneServer) resolveSingleActiveSessionOwner() (string, string, bool) {
+func (server *controlPlaneServer) resolveSingleActiveSessionOwner() (string, string, uint64, bool) {
 	if server == nil || server.dispatcher == nil || server.dispatcher.sessionRegistry == nil {
-		return "", "", false
+		return "", "", 0, false
 	}
 	sessionItems := server.dispatcher.sessionRegistry.List()
 	candidates := make([]registry.SessionRuntime, 0, len(sessionItems))
@@ -1218,9 +1413,9 @@ func (server *controlPlaneServer) resolveSingleActiveSessionOwner() (string, str
 		candidates = append(candidates, sessionRuntime)
 	}
 	if len(candidates) != 1 {
-		return "", "", false
+		return "", "", 0, false
 	}
-	return strings.TrimSpace(candidates[0].ConnectorID), strings.TrimSpace(candidates[0].SessionID), true
+	return strings.TrimSpace(candidates[0].ConnectorID), strings.TrimSpace(candidates[0].SessionID), candidates[0].Epoch, true
 }
 
 // watchAcceptedTunnelLifecycle 监听 tunnel 终止并在 idle/reserved 阶段做兜底回收。
