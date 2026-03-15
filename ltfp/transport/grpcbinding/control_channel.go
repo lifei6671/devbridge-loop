@@ -295,6 +295,13 @@ func (channel *GRPCH2ControlChannel) watchCallContext(ctx context.Context) func(
 	go func() {
 		select {
 		case <-ctx.Done():
+			// 调用结束时 stopWatch 会先关闭 done；若 done 已关闭，说明本次调用已正常返回，
+			// 此时 ctx.Done() 多半来自上层 defer cancel，不应再误触发 channel 级取消。
+			select {
+			case <-done:
+				return
+			default:
+			}
 			channel.cancelStream()
 		case <-done:
 		}

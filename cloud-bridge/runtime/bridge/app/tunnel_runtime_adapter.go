@@ -87,12 +87,15 @@ func (adapter *runtimeBridgeTunnelAdapter) ReadPayload(ctx context.Context) (pb.
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	usePollingDeadline := shouldUseBridgeTunnelPollingDeadline(adapter.tunnel)
 	readBuffer := make([]byte, adapter.maxPayloadBytes)
 	for {
 		if err := normalizedContext.Err(); err != nil {
 			return pb.StreamPayload{}, err
 		}
-		if err := adapter.tunnel.SetReadDeadline(nextBridgeTunnelIODeadline(normalizedContext, adapter.ioPollInterval)); err != nil {
+		if err := adapter.tunnel.SetReadDeadline(
+			nextBridgeTunnelReadDeadline(normalizedContext, adapter.ioPollInterval, usePollingDeadline),
+		); err != nil {
 			return pb.StreamPayload{}, fmt.Errorf("bridge tunnel read payload: set read deadline: %w", err)
 		}
 		readSize, readErr := adapter.tunnel.Read(readBuffer)
@@ -107,7 +110,12 @@ func (adapter *runtimeBridgeTunnelAdapter) ReadPayload(ctx context.Context) (pb.
 			continue
 		}
 		if errors.Is(readErr, transport.ErrTimeout) {
-			// deadline 轮询超时仅用于检查 ctx，不视为 tunnel 故障。
+			// grpc_h2 不使用短轮询超时；命中 timeout 仅代表上层 deadline 到达。
+			if !usePollingDeadline {
+				if err := normalizedContext.Err(); err != nil {
+					return pb.StreamPayload{}, err
+				}
+			}
 			continue
 		}
 		return pb.StreamPayload{}, fmt.Errorf("bridge tunnel read payload: read tunnel: %w", readErr)
@@ -134,11 +142,14 @@ func (adapter *runtimeBridgeTunnelAdapter) WritePayload(ctx context.Context, pay
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	usePollingDeadline := shouldUseBridgeTunnelPollingDeadline(adapter.tunnel)
 	for {
 		if err := normalizedContext.Err(); err != nil {
 			return err
 		}
-		if err := adapter.tunnel.SetWriteDeadline(nextBridgeTunnelIODeadline(normalizedContext, adapter.ioPollInterval)); err != nil {
+		if err := adapter.tunnel.SetWriteDeadline(
+			nextBridgeTunnelWriteDeadline(normalizedContext, adapter.ioPollInterval, usePollingDeadline),
+		); err != nil {
 			return fmt.Errorf("bridge tunnel write payload: set write deadline: %w", err)
 		}
 		writtenSize, writeErr := adapter.tunnel.Write(encodedPayload)
@@ -149,11 +160,49 @@ func (adapter *runtimeBridgeTunnelAdapter) WritePayload(ctx context.Context, pay
 			return nil
 		}
 		if errors.Is(writeErr, transport.ErrTimeout) {
-			// deadline 轮询超时仅用于检查 ctx，不视为 tunnel 故障。
+			// grpc_h2 不使用短轮询超时；命中 timeout 仅代表上层 deadline 到达。
+			if !usePollingDeadline {
+				if err := normalizedContext.Err(); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		return fmt.Errorf("bridge tunnel write payload: write tunnel: %w", writeErr)
 	}
+}
+
+func shouldUseBridgeTunnelPollingDeadline(rawTunnel transport.Tunnel) bool {
+	if rawTunnel == nil {
+		return true
+	}
+	return rawTunnel.BindingInfo().Type != transport.BindingTypeGRPCH2
+}
+
+func nextBridgeTunnelReadDeadline(ctx context.Context, pollInterval time.Duration, usePolling bool) time.Time {
+	if !usePolling {
+		if ctx == nil {
+			return time.Time{}
+		}
+		if contextDeadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			return contextDeadline
+		}
+		return time.Time{}
+	}
+	return nextBridgeTunnelIODeadline(ctx, pollInterval)
+}
+
+func nextBridgeTunnelWriteDeadline(ctx context.Context, pollInterval time.Duration, usePolling bool) time.Time {
+	if !usePolling {
+		if ctx == nil {
+			return time.Time{}
+		}
+		if contextDeadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			return contextDeadline
+		}
+		return time.Time{}
+	}
+	return nextBridgeTunnelIODeadline(ctx, pollInterval)
 }
 
 // nextBridgeTunnelIODeadline 计算下一次 tunnel I/O 的短轮询 deadline。

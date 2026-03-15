@@ -368,6 +368,7 @@ func (r *Runtime) handleTunnelRecyclePhase(
 	if recycleTimeout <= 0 {
 		recycleTimeout = 3 * time.Second
 	}
+	usePhaseReadTimeout := shouldUseTrafficRecycleReadTimeout(tunnelIO)
 	// 预等待阶段给更宽松的窗口，避免 Bridge 仍在回写客户端响应时提前超时。
 	preRecycleTimeout := recycleTimeout * 5
 	if preRecycleTimeout < 15*time.Second {
@@ -377,14 +378,21 @@ func (r *Runtime) handleTunnelRecyclePhase(
 	for {
 		readContext := waitContext
 		cancelRead := func() {}
-		if _, hasDeadline := waitContext.Deadline(); !hasDeadline {
-			phaseTimeout := recycleTimeout
-			if !closeAckObserved {
-				phaseTimeout = preRecycleTimeout
+		if usePhaseReadTimeout {
+			if _, hasDeadline := waitContext.Deadline(); !hasDeadline {
+				phaseTimeout := recycleTimeout
+				if !closeAckObserved {
+					phaseTimeout = preRecycleTimeout
+				}
+				if phaseTimeout > 0 {
+					readContext, cancelRead = context.WithTimeout(waitContext, phaseTimeout)
+				}
 			}
-			if phaseTimeout > 0 {
-				readContext, cancelRead = context.WithTimeout(waitContext, phaseTimeout)
-			}
+		}
+		if !usePhaseReadTimeout {
+			// grpc_h2 的 per-read timeout 会触发 stream 级 cancel，导致 tunnel 被误判为终态；
+			// recycle 阶段在 grpc 下改为仅跟随上层 context（runtime 生命周期）等待。
+			readContext = waitContext
 		}
 		payload, err := tunnelIO.ReadPayload(readContext)
 		cancelRead()
@@ -450,6 +458,17 @@ func (r *Runtime) handleTunnelRecyclePhase(
 		r.removeTunnelAssociation(normalizedTunnelID)
 		return true, false, nil
 	}
+}
+
+func shouldUseTrafficRecycleReadTimeout(tunnelIO traffic.TunnelIO) bool {
+	if tunnelIO == nil {
+		return true
+	}
+	adapter, ok := tunnelIO.(*runtimeTrafficTunnel)
+	if !ok || adapter == nil || adapter.tunnel == nil {
+		return true
+	}
+	return shouldUseTrafficTunnelPollingDeadline(adapter.tunnel)
 }
 
 func (r *Runtime) writeTunnelRecycleAck(
@@ -781,12 +800,15 @@ func (adapter *runtimeTrafficTunnel) ReadPayload(ctx context.Context) (pb.Stream
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	usePollingDeadline := shouldUseTrafficTunnelPollingDeadline(adapter.tunnel)
 	readBuffer := make([]byte, adapter.maxPayloadBytes)
 	for {
 		if err := normalizedContext.Err(); err != nil {
 			return pb.StreamPayload{}, err
 		}
-		if err := adapter.tunnel.SetReadDeadline(nextTrafficTunnelIODeadline(normalizedContext, adapter.ioPollInterval)); err != nil {
+		if err := adapter.tunnel.SetReadDeadline(
+			nextTrafficTunnelReadDeadline(normalizedContext, adapter.ioPollInterval, usePollingDeadline),
+		); err != nil {
 			return pb.StreamPayload{}, fmt.Errorf("read payload: set read deadline: %w", err)
 		}
 		readSize, readErr := adapter.tunnel.Read(readBuffer)
@@ -801,6 +823,12 @@ func (adapter *runtimeTrafficTunnel) ReadPayload(ctx context.Context) (pb.Stream
 			continue
 		}
 		if errors.Is(readErr, transport.ErrTimeout) {
+			// grpc_h2 不使用短轮询超时；命中 timeout 仅代表上层 deadline 到达。
+			if !usePollingDeadline {
+				if err := normalizedContext.Err(); err != nil {
+					return pb.StreamPayload{}, err
+				}
+			}
 			continue
 		}
 		return pb.StreamPayload{}, fmt.Errorf("read payload: read tunnel: %w", readErr)
@@ -823,11 +851,14 @@ func (adapter *runtimeTrafficTunnel) WritePayload(ctx context.Context, payload p
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	usePollingDeadline := shouldUseTrafficTunnelPollingDeadline(adapter.tunnel)
 	for {
 		if err := normalizedContext.Err(); err != nil {
 			return err
 		}
-		if err := adapter.tunnel.SetWriteDeadline(nextTrafficTunnelIODeadline(normalizedContext, adapter.ioPollInterval)); err != nil {
+		if err := adapter.tunnel.SetWriteDeadline(
+			nextTrafficTunnelWriteDeadline(normalizedContext, adapter.ioPollInterval, usePollingDeadline),
+		); err != nil {
 			return fmt.Errorf("write payload: set write deadline: %w", err)
 		}
 		writtenSize, writeErr := adapter.tunnel.Write(encodedPayload)
@@ -838,10 +869,49 @@ func (adapter *runtimeTrafficTunnel) WritePayload(ctx context.Context, payload p
 			return nil
 		}
 		if errors.Is(writeErr, transport.ErrTimeout) {
+			// grpc_h2 不使用短轮询超时；命中 timeout 仅代表上层 deadline 到达。
+			if !usePollingDeadline {
+				if err := normalizedContext.Err(); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		return fmt.Errorf("write payload: write tunnel: %w", writeErr)
 	}
+}
+
+func shouldUseTrafficTunnelPollingDeadline(rawTunnel transport.Tunnel) bool {
+	if rawTunnel == nil {
+		return true
+	}
+	return rawTunnel.BindingInfo().Type != transport.BindingTypeGRPCH2
+}
+
+func nextTrafficTunnelReadDeadline(ctx context.Context, pollInterval time.Duration, usePolling bool) time.Time {
+	if !usePolling {
+		if ctx == nil {
+			return time.Time{}
+		}
+		if contextDeadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			return contextDeadline
+		}
+		return time.Time{}
+	}
+	return nextTrafficTunnelIODeadline(ctx, pollInterval)
+}
+
+func nextTrafficTunnelWriteDeadline(ctx context.Context, pollInterval time.Duration, usePolling bool) time.Time {
+	if !usePolling {
+		if ctx == nil {
+			return time.Time{}
+		}
+		if contextDeadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			return contextDeadline
+		}
+		return time.Time{}
+	}
+	return nextTrafficTunnelIODeadline(ctx, pollInterval)
 }
 
 // nextTrafficTunnelIODeadline 计算下一次 tunnel I/O 的短轮询 deadline。
