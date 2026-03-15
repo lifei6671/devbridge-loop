@@ -22,11 +22,19 @@ type relayTestTunnel struct {
 
 	writeMutex sync.Mutex
 	writes     []pb.StreamPayload
+	writeGate  <-chan struct{}
 }
 
 func newRelayTestTunnel() *relayTestTunnel {
 	return &relayTestTunnel{
 		readQueue: make(chan relayTestTunnelReadResult, 32),
+	}
+}
+
+func newRelayTestTunnelWithGate(writeGate <-chan struct{}) *relayTestTunnel {
+	return &relayTestTunnel{
+		readQueue: make(chan relayTestTunnelReadResult, 32),
+		writeGate: writeGate,
 	}
 }
 
@@ -40,6 +48,13 @@ func (tunnel *relayTestTunnel) ReadPayload(ctx context.Context) (pb.StreamPayloa
 }
 
 func (tunnel *relayTestTunnel) WritePayload(ctx context.Context, payload pb.StreamPayload) error {
+	if tunnel.writeGate != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tunnel.writeGate:
+		}
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -143,6 +158,50 @@ func (upstream *relayTestUpstream) WrittenBytes() []byte {
 	upstream.writeMutex.Lock()
 	defer upstream.writeMutex.Unlock()
 	return append([]byte(nil), upstream.writes.Bytes()...)
+}
+
+type relayEOFWithDataUpstream struct {
+	readPayload []byte
+	readOnce    bool
+	closeCh     chan struct{}
+	closeOnce   sync.Once
+}
+
+func newRelayEOFWithDataUpstream(readPayload []byte) *relayEOFWithDataUpstream {
+	return &relayEOFWithDataUpstream{
+		readPayload: append([]byte(nil), readPayload...),
+		closeCh:     make(chan struct{}),
+	}
+}
+
+func (upstream *relayEOFWithDataUpstream) Read(payload []byte) (int, error) {
+	select {
+	case <-upstream.closeCh:
+		return 0, io.EOF
+	default:
+	}
+	if upstream.readOnce {
+		return 0, io.EOF
+	}
+	upstream.readOnce = true
+	readSize := copy(payload, upstream.readPayload)
+	return readSize, io.EOF
+}
+
+func (upstream *relayEOFWithDataUpstream) Write(payload []byte) (int, error) {
+	select {
+	case <-upstream.closeCh:
+		return 0, io.EOF
+	default:
+	}
+	return len(payload), nil
+}
+
+func (upstream *relayEOFWithDataUpstream) Close() error {
+	upstream.closeOnce.Do(func() {
+		close(upstream.closeCh)
+	})
+	return nil
 }
 
 // TestStreamRelayBidirectionalAndClose 验证默认 relay 支持双向转发并在 Close 帧后正常结束。
@@ -334,6 +393,44 @@ func TestStreamRelayUpstreamEOFTerminates(testingObject *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		testingObject.Fatalf("timed out waiting relay completion on EOF")
+	}
+}
+
+// TestStreamRelayFlushesFinalChunkOnUpstreamEOF 验证上游 read(n>0, EOF) 时不会丢最后一批数据。
+func TestStreamRelayFlushesFinalChunkOnUpstreamEOF(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	writeGate := make(chan struct{})
+	tunnel := newRelayTestTunnelWithGate(writeGate)
+	responsePayload := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+	upstream := newRelayEOFWithDataUpstream(responsePayload)
+	relay := NewStreamRelay(StreamRelayOptions{
+		BufferFrames:        4,
+		MaxDataFrameBytes:   4096,
+		BackpressureTimeout: 100 * time.Millisecond,
+	})
+
+	relayResultChannel := make(chan error, 1)
+	go func() {
+		relayResultChannel <- relay.Relay(context.Background(), tunnel, upstream, "traffic-eof-data")
+	}()
+
+	// 确保 read(n>0, EOF) 先发生，再放开 tunnel 写入，覆盖 EOF/cancel 竞态窗口。
+	time.Sleep(40 * time.Millisecond)
+	close(writeGate)
+
+	select {
+	case err := <-relayResultChannel:
+		if err != nil {
+			testingObject.Fatalf("expected relay completes without error on EOF-with-data, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		testingObject.Fatalf("timed out waiting relay completion on EOF-with-data")
+	}
+
+	got := flattenTunnelData(tunnel.Writes())
+	if !bytes.Equal(got, responsePayload) {
+		testingObject.Fatalf("unexpected tunneled payload: got=%q want=%q", string(got), string(responsePayload))
 	}
 }
 

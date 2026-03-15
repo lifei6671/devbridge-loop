@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/control"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/obs"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
@@ -102,7 +103,7 @@ func BootstrapWithOptions(ctx context.Context, cfg Config, options BootstrapOpti
 	return &Runtime{
 		cfg:                resolvedConfig,
 		bridgeDesiredUp:    true,
-		bridgeState:        "CONNECTING",
+		bridgeState:        events.BridgeStateConnecting,
 		updatedAt:          time.Now().UTC(),
 		bridgeCommandChan:  make(chan bridgeCommand, 8),
 		serviceCatalog:     serviceCatalog,

@@ -77,6 +77,20 @@ type StreamRelay struct {
 	metrics             *obs.Metrics
 }
 
+type relayWorkerKind uint8
+
+const (
+	relayWorkerReadTunnel relayWorkerKind = iota
+	relayWorkerWriteUpstream
+	relayWorkerReadUpstream
+	relayWorkerWriteTunnel
+)
+
+type relayWorkerResult struct {
+	worker relayWorkerKind
+	err    error
+}
+
 // NewStreamRelay 创建默认 relay。
 func NewStreamRelay(options StreamRelayOptions) *StreamRelay {
 	bufferFrames := options.BufferFrames
@@ -123,58 +137,101 @@ func (relay *StreamRelay) Relay(ctx context.Context, tunnel TunnelIO, upstream i
 	tunnelToUpstream := make(chan []byte, relay.bufferFrames)
 	upstreamToTunnel := make(chan []byte, relay.bufferFrames)
 
-	errorChannel := make(chan error, 4)
+	resultChannel := make(chan relayWorkerResult, 4)
 	var workerWaitGroup sync.WaitGroup
 	workerWaitGroup.Add(4)
 	go func() {
 		defer workerWaitGroup.Done()
 		defer close(tunnelToUpstream)
-		errorChannel <- relay.readTunnelToUpstream(relayContext, tunnel, normalizedTrafficID, tunnelToUpstream)
+		resultChannel <- relayWorkerResult{
+			worker: relayWorkerReadTunnel,
+			err:    relay.readTunnelToUpstream(relayContext, tunnel, normalizedTrafficID, tunnelToUpstream),
+		}
 	}()
 	go func() {
 		defer workerWaitGroup.Done()
-		errorChannel <- relay.writeTunnelDataToUpstream(relayContext, upstream, tunnelToUpstream)
+		resultChannel <- relayWorkerResult{
+			worker: relayWorkerWriteUpstream,
+			err:    relay.writeTunnelDataToUpstream(relayContext, upstream, tunnelToUpstream),
+		}
 	}()
 	go func() {
 		defer workerWaitGroup.Done()
 		defer close(upstreamToTunnel)
-		errorChannel <- relay.readUpstreamToTunnel(relayContext, upstream, upstreamToTunnel)
+		resultChannel <- relayWorkerResult{
+			worker: relayWorkerReadUpstream,
+			err:    relay.readUpstreamToTunnel(relayContext, upstream, upstreamToTunnel),
+		}
 	}()
 	go func() {
 		defer workerWaitGroup.Done()
-		errorChannel <- relay.writeUpstreamDataToTunnel(relayContext, tunnel, normalizedTrafficID, upstreamToTunnel)
+		resultChannel <- relayWorkerResult{
+			worker: relayWorkerWriteTunnel,
+			err:    relay.writeUpstreamDataToTunnel(relayContext, tunnel, normalizedTrafficID, upstreamToTunnel),
+		}
 	}()
 
 	go func() {
 		workerWaitGroup.Wait()
-		close(errorChannel)
+		close(resultChannel)
 	}()
 
 	var relayError error
-	relayEOF := false
+	readTunnelEOF := false
+	readUpstreamEOF := false
+	writeUpstreamDone := false
+	writeTunnelDone := false
+	stopByEOF := false
 	stopRelay := sync.OnceFunc(func() {
 		cancelRelay()
 		_ = upstream.Close()
 	})
-	for err := range errorChannel {
-		if err == nil {
+	for result := range resultChannel {
+		switch result.worker {
+		case relayWorkerWriteUpstream:
+			writeUpstreamDone = true
+		case relayWorkerWriteTunnel:
+			writeTunnelDone = true
+		}
+		if result.err == nil {
+			if readTunnelEOF && writeUpstreamDone {
+				stopByEOF = true
+				stopRelay()
+			}
+			if readUpstreamEOF && writeTunnelDone {
+				stopByEOF = true
+				stopRelay()
+			}
 			continue
 		}
+		err := result.err
 		if relayError != nil {
 			continue
 		}
 		if errors.Is(err, io.EOF) {
-			relayEOF = true
-			stopRelay()
+			switch result.worker {
+			case relayWorkerReadTunnel:
+				readTunnelEOF = true
+				if writeUpstreamDone {
+					stopByEOF = true
+					stopRelay()
+				}
+			case relayWorkerReadUpstream:
+				readUpstreamEOF = true
+				if writeTunnelDone {
+					stopByEOF = true
+					stopRelay()
+				}
+			}
 			continue
 		}
-		if relayEOF {
+		if stopByEOF && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			continue
 		}
 		relayError = err
 		stopRelay()
 	}
-	if relayEOF && relayError == nil {
+	if (readTunnelEOF || readUpstreamEOF) && relayError == nil {
 		return nil
 	}
 	return relayError

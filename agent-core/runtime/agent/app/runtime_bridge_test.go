@@ -605,7 +605,7 @@ func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing
 		controlChannel:   controlChannel,
 		controlPublisher: control.NewPublisher("session-7001", 1, 0),
 		serviceCatalog:   serviceCatalog,
-		bridgeState:      "ACTIVE",
+		bridgeState:      events.BridgeStateActive,
 		bridgeSession:    "session-7001",
 		bridgeEpoch:      1,
 	}
@@ -664,7 +664,7 @@ func TestSendTunnelPoolReport(testingObject *testing.T) {
 		cfg:              Config{AgentID: "agent-6001"},
 		controlChannel:   controlChannel,
 		controlPublisher: control.NewPublisher("session-6001", 3, 0),
-		bridgeState:      "ACTIVE",
+		bridgeState:      events.BridgeStateActive,
 		bridgeSession:    "session-6001",
 		bridgeEpoch:      3,
 	}

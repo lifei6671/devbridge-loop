@@ -134,11 +134,11 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 			opener.runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
 				Level:        events.EventWarn,
 				Module:       events.ModuleAgentRuntimeBridge,
-				Code:         events.CodeSessionReconnectRequested,
+				Code:         events.CodeTCPFramedDialTunnelErr,
 				Message:      fmt.Sprintf("tcp framed dial tunnel fail:%v", err),
 				SessionID:    sessionID,
 				SessionEpoch: sessionEpoch,
-				BridgeState:  "RECONNECTING",
+				BridgeState:  opener.runtime.bridgeState,
 			})
 			return nil, err
 		}
@@ -162,6 +162,15 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		}
 		tunnelStream, err := grpcTransport.OpenTunnelStream(ctx, grpcClient)
 		if err != nil {
+			opener.runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
+				Level:        events.EventWarn,
+				Module:       events.ModuleAgentRuntimeBridge,
+				Code:         events.CodeGRPCTunnelStreamErr,
+				Message:      fmt.Sprintf("grpc transport fail:%v", err),
+				SessionID:    sessionID,
+				SessionEpoch: sessionEpoch,
+				BridgeState:  opener.runtime.bridgeState,
+			})
 			return nil, fmt.Errorf("open grpc tunnel stream failed: %w", err)
 		}
 		grpcTunnel, err := grpcbinding.NewGRPCH2Tunnel(tunnelStream, tunnelMeta)
@@ -229,8 +238,7 @@ func timeToMillisPtr(at time.Time) *uint64 {
 	if at.IsZero() {
 		return nil
 	}
-	value := uint64(at.UTC().UnixMilli())
-	return &value
+	return new(uint64(at.UTC().UnixMilli()))
 }
 
 func durationToMillis(duration time.Duration) uint64 {
@@ -353,7 +361,7 @@ func (r *Runtime) bridgeDesiredUpState() bool {
 func (r *Runtime) bridgeSessionMeta() (string, uint64, bool) {
 	r.bridgeMu.RLock()
 	defer r.bridgeMu.RUnlock()
-	if r.bridgeState != "ACTIVE" || r.bridgeSession == "" || r.bridgeEpoch == 0 {
+	if r.bridgeState != events.BridgeStateActive || r.bridgeSession == "" || r.bridgeEpoch == 0 {
 		return "", 0, false
 	}
 	return r.bridgeSession, r.bridgeEpoch, true
@@ -414,7 +422,7 @@ func (r *Runtime) requestBridgeReconnect(resetBackoff bool) {
 	var sessionEpoch uint64
 	r.bridgeMu.Lock()
 	r.bridgeDesiredUp = true
-	r.bridgeState = "RECONNECTING"
+	r.bridgeState = events.BridgeStateReconnecting
 	r.updatedAt = time.Now().UTC()
 	sessionID = r.bridgeSession
 	sessionEpoch = r.bridgeEpoch
@@ -431,7 +439,7 @@ func (r *Runtime) requestBridgeReconnect(resetBackoff bool) {
 		Message:      fmt.Sprintf("bridge reconnect requested reset_backoff=%t", resetBackoff),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
-		BridgeState:  "RECONNECTING",
+		BridgeState:  events.BridgeStateReconnecting,
 	})
 	r.enqueueBridgeCommand(bridgeCommand{kind: bridgeCommandReconnect, resetBackoff: resetBackoff})
 }
@@ -444,7 +452,7 @@ func (r *Runtime) requestBridgeDrain() {
 	var sessionEpoch uint64
 	r.bridgeMu.Lock()
 	r.bridgeDesiredUp = false
-	r.bridgeState = "DRAINING"
+	r.bridgeState = events.BridgeStateDraining
 	r.updatedAt = time.Now().UTC()
 	sessionID = r.bridgeSession
 	sessionEpoch = r.bridgeEpoch
@@ -456,7 +464,7 @@ func (r *Runtime) requestBridgeDrain() {
 		Message:      "bridge session drain requested",
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
-		BridgeState:  "DRAINING",
+		BridgeState:  events.BridgeStateDraining,
 	})
 	// drain 请求到达后先立即回收本地 tunnel，避免等待控制循环导致统计延迟。
 	r.notifyTunnelManagerState(tunnel.SessionStateDraining)
@@ -467,7 +475,7 @@ func (r *Runtime) setBridgeConnecting() {
 	r.bridgeMu.Lock()
 	sessionID := r.bridgeSession
 	sessionEpoch := r.bridgeEpoch
-	r.bridgeState = "CONNECTING"
+	r.bridgeState = events.BridgeStateConnecting
 	r.updatedAt = time.Now().UTC()
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
@@ -477,7 +485,7 @@ func (r *Runtime) setBridgeConnecting() {
 		Message:      "bridge control channel is connecting",
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
-		BridgeState:  "CONNECTING",
+		BridgeState:  events.BridgeStateConnecting,
 	})
 }
 
@@ -497,7 +505,7 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 	}
 	now := time.Now().UTC()
 	r.bridgeDesiredUp = true
-	r.bridgeState = "ACTIVE"
+	r.bridgeState = events.BridgeStateActive
 	r.heartbeatAt = now
 	r.heartbeatSentAt = now
 	r.updatedAt = now
@@ -517,7 +525,7 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 			Message:      "bridge reconnect completed and session switched",
 			SessionID:    currentSessionID,
 			SessionEpoch: currentSessionEpoch,
-			BridgeState:  "ACTIVE",
+			BridgeState:  events.BridgeStateActive,
 		})
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
@@ -527,7 +535,7 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 		Message:      "bridge control channel is active",
 		SessionID:    currentSessionID,
 		SessionEpoch: currentSessionEpoch,
-		BridgeState:  "ACTIVE",
+		BridgeState:  events.BridgeStateActive,
 	})
 	if r.refillHandler != nil {
 		// 会话重连后立即刷新补池处理器上下文，避免旧代际请求污染。
@@ -546,7 +554,7 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 func (r *Runtime) setBridgeRetrying(connectErr error, failStreak uint32, backoff time.Duration) {
 	r.bridgeMu.Lock()
 	now := time.Now().UTC()
-	r.bridgeState = "RECONNECTING"
+	r.bridgeState = events.BridgeStateReconnecting
 	r.updatedAt = now
 	r.retryFailStreak = failStreak
 	r.retryBackoff = backoff
@@ -578,7 +586,7 @@ func (r *Runtime) setBridgeRetrying(connectErr error, failStreak uint32, backoff
 		Message:      message,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
-		BridgeState:  "RECONNECTING",
+		BridgeState:  events.BridgeStateReconnecting,
 	})
 }
 
@@ -586,7 +594,7 @@ func (r *Runtime) setBridgeLost(readErr error) {
 	r.bridgeMu.Lock()
 	sessionID := r.bridgeSession
 	sessionEpoch := r.bridgeEpoch
-	r.bridgeState = "STALE"
+	r.bridgeState = events.BridgeStateStale
 	r.updatedAt = time.Now().UTC()
 	errorText := ""
 	if readErr != nil {
@@ -604,7 +612,7 @@ func (r *Runtime) setBridgeLost(readErr error) {
 		Message:      errorText,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
-		BridgeState:  "STALE",
+		BridgeState:  events.BridgeStateStale,
 	})
 }
 
@@ -613,7 +621,7 @@ func (r *Runtime) setBridgeDrained() {
 	closedSessionID := r.bridgeSession
 	closedSessionEpoch := r.bridgeEpoch
 	r.bridgeDesiredUp = false
-	r.bridgeState = "CLOSED"
+	r.bridgeState = events.BridgeStateClosed
 	r.bridgeSession = ""
 	r.updatedAt = time.Now().UTC()
 	r.retryFailStreak = 0
@@ -627,7 +635,7 @@ func (r *Runtime) setBridgeDrained() {
 		Message:      "bridge session drained and closed",
 		SessionID:    closedSessionID,
 		SessionEpoch: closedSessionEpoch,
-		BridgeState:  "CLOSED",
+		BridgeState:  events.BridgeStateClosed,
 	})
 	if r.refillHandler != nil {
 		// 会话关闭后清空补池处理器会话上下文，拒绝陈旧请求。
@@ -684,9 +692,9 @@ func (r *Runtime) sessionSnapshot() runtimeSessionSnapshot {
 	snapshot.lastHeartbeatMS = timeToMillisPtr(r.heartbeatAt)
 	snapshot.lastHeartbeatSent = timeToMillisPtr(r.heartbeatSentAt)
 	if snapshot.state == "" {
-		snapshot.state = "UNAVAILABLE"
+		snapshot.state = events.BridgeStateUnavailable
 	}
-	if snapshot.state == "UNAVAILABLE" || snapshot.state == "STALE" || snapshot.state == "RECONNECTING" {
+	if snapshot.state == events.BridgeStateUnavailable || snapshot.state == events.BridgeStateStale || snapshot.state == events.BridgeStateReconnecting {
 		snapshot.unavailableReason = r.lastErr
 	}
 	if snapshot.updatedAtMS == 0 {
@@ -1510,7 +1518,7 @@ func (r *Runtime) waitUntilReconnectCommand(ctx context.Context, failStreak *uin
 			case bridgeCommandReconnect:
 				r.bridgeMu.Lock()
 				r.bridgeDesiredUp = true
-				r.bridgeState = "RECONNECTING"
+				r.bridgeState = events.BridgeStateReconnecting
 				r.updatedAt = time.Now().UTC()
 				r.bridgeMu.Unlock()
 				if command.resetBackoff && failStreak != nil {
