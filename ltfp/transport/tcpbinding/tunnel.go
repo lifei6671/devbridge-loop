@@ -108,7 +108,7 @@ func (tunnel *TCPTunnel) State() transport.TunnelState {
 
 // BindingInfo 返回 binding 元信息。
 func (tunnel *TCPTunnel) BindingInfo() transport.BindingInfo {
-	return transport.BindingInfo{Type: transport.BindingTypeTCPFramed}
+	return transport.NewBindingInfo(transport.BindingTypeTCPFramed)
 }
 
 // Read 按 io.Reader 语义读取下一段 payload。

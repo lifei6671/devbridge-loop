@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
@@ -292,7 +293,18 @@ func (binding *Transport) prepareConn(conn net.Conn) error {
 		return fmt.Errorf("prepare tcp conn set keepalive: %w", err)
 	}
 	if err := tcpConn.SetKeepAlivePeriod(config.KeepAliveInterval); err != nil {
-		return fmt.Errorf("prepare tcp conn set keepalive period: %w", err)
+		// 某些平台不支持细粒度 keepalive 周期配置时，退化为依赖应用层 Probe 兜底治理。
+		if !isKeepAlivePeriodUnsupported(err) {
+			return fmt.Errorf("prepare tcp conn set keepalive period: %w", err)
+		}
 	}
 	return nil
+}
+
+func isKeepAlivePeriodUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	normalizedMessage := strings.ToLower(err.Error())
+	return strings.Contains(normalizedMessage, "not supported") || strings.Contains(normalizedMessage, "unsupported")
 }

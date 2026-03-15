@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::State;
@@ -16,6 +16,18 @@ pub struct ServiceListItem {
     pub endpoint_count: u64,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
+}
+
+/// 新增服务输入体：由前端“服务菜单”提交。
+#[derive(Debug, Deserialize)]
+pub struct ServiceAddInput {
+    pub service_id: Option<String>,
+    pub service_name: String,
+    pub namespace: Option<String>,
+    pub environment: Option<String>,
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
 }
 
 /// 从 JSON 读取字符串字段，缺失时回落到默认值。
@@ -113,6 +125,89 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
         .collect()
 }
 
+fn normalize_optional_text(value: Option<String>, default_value: &str) -> String {
+    let normalized = value.unwrap_or_default();
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        default_value.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String> {
+    let service_name = input.service_name.trim().to_string();
+    if service_name.is_empty() {
+        return Err("service_name 不能为空".to_string());
+    }
+    let protocol = input.protocol.trim().to_ascii_lowercase();
+    if protocol.is_empty() {
+        return Err("protocol 不能为空".to_string());
+    }
+    let host = input.host.trim().to_string();
+    if host.is_empty() {
+        return Err("host 不能为空".to_string());
+    }
+    if input.port == 0 {
+        return Err("port 必须大于 0".to_string());
+    }
+    Ok(ServiceAddInput {
+        service_id: input
+            .service_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        service_name,
+        namespace: Some(normalize_optional_text(input.namespace, "dev")),
+        environment: Some(normalize_optional_text(input.environment, "demo")),
+        protocol,
+        host,
+        port: input.port,
+    })
+}
+
+fn request_service_add_payload(
+    state: &Arc<AppRuntimeState>,
+    input: &ServiceAddInput,
+) -> Result<Option<Value>, String> {
+    let mut ipc_client = {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "新增服务失败：supervisor 锁异常".to_string())?;
+        let Some(ipc_client) = supervisor.ipc_client.take() else {
+            return Ok(None);
+        };
+        ipc_client
+    };
+
+    let request_result = ipc_client.request(
+        "service.add",
+        json!({
+            "service_id": input.service_id,
+            "service_name": input.service_name,
+            "namespace": input.namespace,
+            "environment": input.environment,
+            "protocol": input.protocol,
+            "host": input.host,
+            "port": input.port,
+        }),
+        LOCAL_RPC_DEFAULT_TIMEOUT_MS,
+    );
+
+    {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "新增服务失败：supervisor 锁异常".to_string())?;
+        supervisor.ipc_client = Some(ipc_client);
+    }
+
+    match request_result {
+        Ok(payload) => Ok(Some(payload)),
+        Err(err) => Err(err),
+    }
+}
+
 /// 通过短锁方式读取 `service.list`，避免在 IPC 阻塞期间长期占用 supervisor 锁。
 fn request_service_list_payload(state: &Arc<AppRuntimeState>) -> Result<Option<Value>, String> {
     let mut ipc_client = {
@@ -191,6 +286,61 @@ pub fn service_list_snapshot(
             );
         }
         Ok(items)
+    })
+}
+
+/// Tauri command：新增服务并返回新增后的服务项。
+#[tauri::command]
+pub fn service_add(
+    input: ServiceAddInput,
+    state: State<'_, Arc<AppRuntimeState>>,
+) -> Result<ServiceListItem, String> {
+    let shared = state.inner().clone();
+    with_rpc_metrics(&shared, || {
+        let normalized_input = validate_add_input(input)?;
+        let payload = match request_service_add_payload(&shared, &normalized_input) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return Err("Agent 尚未连接，无法新增服务".to_string()),
+            Err(err) => {
+                if err.contains("METHOD_NOT_ALLOWED") || err.contains("METHOD_NOT_FOUND") {
+                    if let Ok(mut supervisor) = shared.supervisor.lock() {
+                        push_host_log(
+                            &mut supervisor,
+                            "error",
+                            "commands.service",
+                            "SERVICE_ADD_METHOD_NOT_READY",
+                            format!("service.add 尚未在当前 Agent 实现: {err}"),
+                        );
+                    }
+                    return Err(format!("当前 Agent 未实现 service.add: {err}"));
+                }
+                return Err(format!("新增服务失败: {err}"));
+            }
+        };
+
+        let mut parsed_items = parse_service_list(&json!([payload]));
+        let Some(added_item) = parsed_items.pop() else {
+            return Err("新增服务失败：解析响应为空".to_string());
+        };
+
+        {
+            let mut supervisor = shared
+                .supervisor
+                .lock()
+                .map_err(|_| "新增服务失败：supervisor 锁异常".to_string())?;
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "commands.service",
+                "SERVICE_ADD_SUCCEEDED",
+                format!(
+                    "服务新增成功 service_id={} service_name={} endpoint_count={}",
+                    added_item.service_id, added_item.service_name, added_item.endpoint_count
+                ),
+            );
+        }
+
+        Ok(added_item)
     })
 }
 

@@ -54,7 +54,7 @@ func NewSession(role SessionRole, config SessionConfig) (transport.Session, erro
 
 	return transport.NewInMemorySession(
 		normalizedMeta,
-		transport.BindingInfo{Type: transport.BindingTypeTCPFramed},
+		transport.NewBindingInfo(transport.BindingTypeTCPFramed),
 		transport.SessionCapabilities{
 			ControlChannel: config.ControlChannel,
 			Producer:       config.TunnelProducer,

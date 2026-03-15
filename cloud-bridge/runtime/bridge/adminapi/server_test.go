@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -109,5 +110,157 @@ func TestLogsSearchRequiresTimeWindow(testingObject *testing.T) {
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+// TestTunnelSummarySupportsConnectorFilter 验证 tunnel summary 支持按 connector_id 聚合。
+func TestTunnelSummarySupportsConnectorFilter(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1773491430, 0).UTC()
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			Now: func() time.Time { return now },
+			ListTunnels: func() []registry.TunnelRuntime {
+				return []registry.TunnelRuntime{
+					{
+						TunnelID:    "tunnel-a-idle",
+						ConnectorID: "agent-a",
+						State:       registry.TunnelStateIdle,
+						UpdatedAt:   now,
+					},
+					{
+						TunnelID:    "tunnel-a-active",
+						ConnectorID: "agent-a",
+						State:       registry.TunnelStateActive,
+						UpdatedAt:   now,
+					},
+					{
+						TunnelID:    "tunnel-b-broken",
+						ConnectorID: "agent-b",
+						State:       registry.TunnelStateBroken,
+						UpdatedAt:   now,
+					},
+				}
+			},
+			TunnelSnapshot: func() registry.TunnelSnapshot {
+				return registry.TunnelSnapshot{
+					IdleCount:   10,
+					ActiveCount: 4,
+					BrokenCount: 2,
+					TotalCount:  16,
+				}
+			},
+			ListTunnelPoolReports: func() []TunnelPoolReportSnapshot {
+				return []TunnelPoolReportSnapshot{
+					{
+						ConnectorID:     "agent-a",
+						SessionID:       "session-a",
+						SessionEpoch:    8,
+						IdleCount:       7,
+						InUseCount:      3,
+						TargetIdleCount: 8,
+						UpdatedAtMS:     uint64(now.UnixMilli()),
+					},
+					{
+						ConnectorID:     "agent-b",
+						SessionID:       "session-b",
+						SessionEpoch:    3,
+						IdleCount:       2,
+						InUseCount:      1,
+						TargetIdleCount: 4,
+						UpdatedAtMS:     uint64(now.UnixMilli()),
+					},
+				}
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/tunnels/summary?connector_id=agent-a", nil)
+	request.Header.Set("Authorization", "Bearer viewer-token")
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		testingObject.Fatalf("decode summary payload failed: %v body=%s", err, recorder.Body.String())
+	}
+	summary, ok := payload["summary"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("summary payload is missing: %s", recorder.Body.String())
+	}
+	if int(summary["idle"].(float64)) != 1 {
+		testingObject.Fatalf("unexpected idle count: %+v", summary)
+	}
+	if int(summary["active"].(float64)) != 1 {
+		testingObject.Fatalf("unexpected active count: %+v", summary)
+	}
+	if int(summary["broken"].(float64)) != 0 {
+		testingObject.Fatalf("unexpected broken count: %+v", summary)
+	}
+	if int(summary["total"].(float64)) != 2 {
+		testingObject.Fatalf("unexpected total count: %+v", summary)
+	}
+	if payload["connector_id_filter"] != "agent-a" {
+		testingObject.Fatalf("unexpected connector filter echo: %+v", payload)
+	}
+	agentPoolSummary, ok := payload["agent_pool_summary"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("agent pool summary is missing: %+v", payload)
+	}
+	if int(agentPoolSummary["connected"].(float64)) != 10 {
+		testingObject.Fatalf("unexpected agent connected count: %+v", agentPoolSummary)
+	}
+	if int(agentPoolSummary["idle"].(float64)) != 7 || int(agentPoolSummary["in_use"].(float64)) != 3 {
+		testingObject.Fatalf("unexpected agent pool breakdown: %+v", agentPoolSummary)
+	}
+}
+
+// TestBuildAgentTunnelPoolSummaryUsesLatestReportTimestamp
+// 验证 agent pool 汇总的 updated_at_ms 来源于 report 数据，而不是请求当前时间。
+func TestBuildAgentTunnelPoolSummaryUsesLatestReportTimestamp(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_000_000, 0).UTC()
+	oldReportAt := uint64(now.Add(-30 * time.Minute).UnixMilli())
+	latestReportAt := uint64(now.Add(-5 * time.Minute).UnixMilli())
+
+	summary := buildAgentTunnelPoolSummary(now, []TunnelPoolReportSnapshot{
+		{
+			ConnectorID:     "agent-a",
+			SessionID:       "session-a",
+			SessionEpoch:    3,
+			IdleCount:       2,
+			InUseCount:      1,
+			TargetIdleCount: 4,
+			UpdatedAtMS:     oldReportAt,
+		},
+		{
+			ConnectorID:     "agent-b",
+			SessionID:       "session-b",
+			SessionEpoch:    7,
+			IdleCount:       5,
+			InUseCount:      3,
+			TargetIdleCount: 8,
+			ReportedAtMS:    latestReportAt,
+		},
+	})
+
+	if summary.UpdatedAtMS != latestReportAt {
+		testingObject.Fatalf(
+			"unexpected updated_at_ms: got=%d want=%d",
+			summary.UpdatedAtMS,
+			latestReportAt,
+		)
 	}
 }

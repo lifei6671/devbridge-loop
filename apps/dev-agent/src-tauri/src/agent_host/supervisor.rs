@@ -507,7 +507,46 @@ pub fn app_bootstrap_impl(
     super::launcher::ensure_single_instance_guard(state)?;
     // bootstrap 会恢复监控线程处理能力。
     state.shutdown_requested.store(false, Ordering::SeqCst);
-    let snapshot = start_agent(app, state, "app.bootstrap.connected")?;
+    let snapshot = {
+        let mut supervisor = state
+            .supervisor
+            .lock()
+            .map_err(|_| "准备 bootstrap 状态时锁异常".to_string())?;
+        supervisor.desired_state = DesiredState::Running;
+        supervisor.expecting_exit = false;
+        supervisor.pending_auto_restart = supervisor.child.is_none();
+        if supervisor.child.is_none() {
+            // 冷启动时只做状态标记，由后台线程异步拉起，避免阻塞 UI 初始化线程。
+            supervisor.connection_state = ConnectionState::Reconnecting;
+            supervisor.exit_kind = ExitKind::Unexpected;
+            clear_retry_state(&mut supervisor);
+            supervisor.last_error = None;
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "supervisor",
+                "APP_BOOTSTRAP_SCHEDULED",
+                "已调度 Agent 后台拉起流程（异步）",
+            );
+        } else {
+            push_host_log(
+                &mut supervisor,
+                "info",
+                "supervisor",
+                "APP_BOOTSTRAP_NOOP",
+                "Agent 已在运行，bootstrap 复用现有进程",
+            );
+        }
+        supervisor.updated_at_ms = now_ms();
+        build_runtime_snapshot(&supervisor)
+    };
+    emit_runtime_changed(
+        app,
+        state,
+        "app.bootstrap.scheduled",
+        snapshot.clone(),
+        false,
+    );
     Ok(AppBootstrapPayload {
         snapshot,
         host_config: current_host_config_snapshot(state)?,

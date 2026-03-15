@@ -1,0 +1,85 @@
+# Bridge 运行配置示例（YAML）
+# 启动方式示例：
+#   go run ./cmd/cloud-bridge -config ./config.example.yaml
+#
+# 说明：
+# 1) 本文件是“功能完整 + 安全默认值”示例，便于本地联调与部署参考。
+# 2) 生产环境请替换 token，不要使用示例中的默认值。
+# 3) 所有地址均为 Go 标准监听地址格式（如 ":39081"）。
+
+ingress:
+  # HTTP L7 入口监听地址（用于 host/path 路由流量）。
+  http_addr: ":8080"
+  # gRPC 入口监听地址（用于 gRPC 协议流量）。
+  grpc_addr: ":8081"
+  # HTTPS 入口监听地址。
+  https_addr: ":8443"
+  # TLS-SNI 入口监听地址。
+  # 约束：必须与 https_addr 完全相同（共享同一 listener）。
+  tls_sni_addr: ":8443"
+  # L4 独立端口模式可分配范围，格式为 "start-end"。
+  tcp_port_range: "9000-9100"
+
+admin:
+  # 管理面总开关。false 时不启动管理 API/UI。
+  enabled: true
+  # 管理面监听地址（Admin API + Admin UI）。
+  listen_addr: ":39081"
+  # 是否允许管理面与其他监听地址复用端口。
+  # 建议保持 false（默认隔离），仅在特殊部署场景下设为 true。
+  allow_shared_listener: false
+  # 管理 UI 挂载路径前缀。
+  # 例如 "/admin" 时，页面入口为 http://host:39081/admin/
+  base_path: "/admin"
+  # 是否启用管理 UI（API 仍受 enabled 控制）。
+  ui_enabled: true
+  # 管理面鉴权模式：
+  # - bearer：通过 Authorization: Bearer <token>
+  # - cookie：通过 Cookie 读 token（写接口会强制 CSRF 校验）
+  auth_mode: "bearer"
+  # cookie 模式读取 token 的 cookie 名。
+  # auth_mode=bearer 时该字段可保留默认值，不影响行为。
+  cookie_token_name: "devbridge_admin_token"
+  # cookie 模式 CSRF 双提交中的 cookie 名。
+  csrf_cookie_name: "devbridge_admin_csrf"
+  # cookie 模式 CSRF 双提交中的请求头名。
+  csrf_header_name: "X-CSRF-Token"
+  # cookie 模式允许的来源 Origin 列表（写接口会校验 Origin/Referer）。
+  # 示例：本地管理面地址。
+  allowed_origins:
+    - "http://127.0.0.1:39081"
+    - "http://localhost:39081"
+  # 静态 token 列表（bearer/cookie 两种模式都会使用此映射）。
+  # role 可选：viewer / operator / admin
+  # - viewer：只读
+  # - operator：只读 + 运维写接口（drain/reload 等）
+  # - admin：最高权限（含配置更新与导出）
+  auth_tokens:
+    # 只读角色 token（可用于看板和查询页）。
+    - name: "viewer"
+      token: "devbridge-viewer-token"
+      role: "viewer"
+    # 运维角色 token（可执行受控运维命令）。
+    - name: "operator"
+      token: "devbridge-operator-token"
+      role: "operator"
+    # 管理角色 token（可执行高权限管理操作）。
+    - name: "admin"
+      token: "devbridge-admin-token"
+      role: "admin"
+
+observability:
+  # 指标暴露监听地址（metrics endpoint）。
+  metrics_addr: ":39090"
+  # 日志级别（常用：debug / info / warn / error）。
+  log_level: "info"
+
+control_plane:
+  # 控制面主监听地址（TCP framed 控制通道）。
+  listen_addr: ":39080"
+  # 控制面 gRPC H2 监听地址。
+  # 约束：必须与 listen_addr 不同，避免端口冲突。
+  grpc_h2_listen_addr: ":39082"
+  # Session 心跳超时阈值。
+  # 到达该时长未收到心跳会触发会话收敛（例如转为 STALE/CLOSED）。
+  heartbeat_timeout: "30s"

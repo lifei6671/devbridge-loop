@@ -70,3 +70,43 @@ func TestTunnelReportHandlerRejectStaleEpoch(t *testing.T) {
 		t.Fatalf("stale epoch should not trigger refill request")
 	}
 }
+
+// TestTunnelReportHandlerWritesReportStore 验证有效上报会写入 tunnel 池快照存储。
+func TestTunnelReportHandlerWritesReportStore(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-3",
+		ConnectorID: "connector-3",
+		Epoch:       7,
+		State:       registry.SessionActive,
+	})
+	reportStore := NewTunnelPoolReportStore()
+	handler := NewTunnelReportHandler(TunnelReportHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ReportStore:     reportStore,
+	})
+	handler.HandleReport(pb.ControlEnvelope{
+		MessageType:  pb.ControlMessageTunnelPoolReport,
+		SessionID:    "session-3",
+		SessionEpoch: 7,
+		ConnectorID:  "connector-3",
+	}, pb.TunnelPoolReport{
+		IdleCount:       4,
+		InUseCount:      2,
+		TargetIdleCount: 8,
+		Trigger:         "periodic",
+		TimestampUnix:   time.Now().UTC().Unix(),
+	})
+	items := reportStore.List()
+	if len(items) != 1 {
+		t.Fatalf("unexpected report store size: got=%d want=1", len(items))
+	}
+	if items[0].ConnectorID != "connector-3" || items[0].SessionID != "session-3" {
+		t.Fatalf("unexpected report identity: %+v", items[0])
+	}
+	if items[0].IdleCount != 4 || items[0].InUseCount != 2 {
+		t.Fatalf("unexpected report counts: %+v", items[0])
+	}
+}

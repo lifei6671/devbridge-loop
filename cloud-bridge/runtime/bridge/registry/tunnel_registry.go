@@ -40,6 +40,11 @@ type RuntimeTunnel interface {
 	Close() error
 }
 
+// RuntimeTunnelHealthProber 定义 RuntimeTunnel 可选探活能力。
+type RuntimeTunnelHealthProber interface {
+	Probe(ctx context.Context) error
+}
+
 // TunnelRuntime 描述 tunnel 在 Bridge 侧的运行态记录。
 type TunnelRuntime struct {
 	Tunnel      RuntimeTunnel

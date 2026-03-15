@@ -4,8 +4,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +19,13 @@ const (
 	defaultDiagnoseExportTTL = 10 * time.Minute
 )
 
+var (
+	// errDiagnoseExportNotFound 表示导出条目不存在、已过期或已被消费。
+	errDiagnoseExportNotFound = errors.New("diagnose export is missing or expired")
+	// errDiagnoseExportActorMismatch 表示下载人和导出发起人不一致。
+	errDiagnoseExportActorMismatch = errors.New("diagnose export actor mismatch")
+)
+
 // diagnoseExportEntry 表示一条导出记录。
 type diagnoseExportEntry struct {
 	ExportID     string
@@ -25,6 +34,7 @@ type diagnoseExportEntry struct {
 	Payload      []byte
 	MaskedFields []string
 	CreatedAt    time.Time
+	IssuedTo     string
 }
 
 // diagnoseExportStore 是导出文件的内存短期缓存。
@@ -61,6 +71,7 @@ func (store *diagnoseExportStore) create(
 	now time.Time,
 	payload any,
 	maskedFields []string,
+	issuedTo string,
 ) (diagnoseExportEntry, error) {
 	if store == nil {
 		return diagnoseExportEntry{}, ErrAdminOperationNotSupported
@@ -92,6 +103,7 @@ func (store *diagnoseExportStore) create(
 		ExpireAt:     normalizedNow.Add(store.ttl),
 		Payload:      rawPayload,
 		MaskedFields: normalizedMaskedFields,
+		IssuedTo:     strings.TrimSpace(issuedTo),
 	}
 	store.byID[exportID] = entry
 	store.order = append(store.order, exportID)
@@ -99,10 +111,15 @@ func (store *diagnoseExportStore) create(
 	return entry, nil
 }
 
-// get 读取并校验导出条目（id + token + 过期时间）。
-func (store *diagnoseExportStore) get(exportID string, token string, now time.Time) (diagnoseExportEntry, bool) {
+// get 读取并校验导出条目（id + token + 发起人 + 过期时间），并按一次性链接语义立即消费。
+func (store *diagnoseExportStore) get(
+	exportID string,
+	token string,
+	actor string,
+	now time.Time,
+) (diagnoseExportEntry, error) {
 	if store == nil {
-		return diagnoseExportEntry{}, false
+		return diagnoseExportEntry{}, errDiagnoseExportNotFound
 	}
 	normalizedNow := now
 	if normalizedNow.IsZero() {
@@ -113,12 +130,19 @@ func (store *diagnoseExportStore) get(exportID string, token string, now time.Ti
 	store.purgeExpiredLocked(normalizedNow)
 	entry, exists := store.byID[exportID]
 	if !exists {
-		return diagnoseExportEntry{}, false
+		return diagnoseExportEntry{}, errDiagnoseExportNotFound
 	}
 	if entry.Token != token {
-		return diagnoseExportEntry{}, false
+		return diagnoseExportEntry{}, errDiagnoseExportNotFound
 	}
-	return entry, true
+	normalizedActor := strings.TrimSpace(actor)
+	if strings.TrimSpace(entry.IssuedTo) != "" && normalizedActor != strings.TrimSpace(entry.IssuedTo) {
+		return diagnoseExportEntry{}, errDiagnoseExportActorMismatch
+	}
+	// 一次性消费策略：下载成功后立刻删除，避免链接被重放。
+	delete(store.byID, exportID)
+	store.removeFromOrderLocked(exportID)
+	return entry, nil
 }
 
 // purgeExpiredLocked 清理过期导出条目（调用方需持有互斥锁）。
@@ -148,6 +172,21 @@ func (store *diagnoseExportStore) trimOverflowLocked() {
 		store.order = store.order[1:]
 		delete(store.byID, oldestExportID)
 	}
+}
+
+// removeFromOrderLocked 从 FIFO 顺序队列中删除指定导出条目（调用方需持有互斥锁）。
+func (store *diagnoseExportStore) removeFromOrderLocked(exportID string) {
+	if len(store.order) == 0 {
+		return
+	}
+	filteredOrder := store.order[:0]
+	for _, currentExportID := range store.order {
+		if currentExportID == exportID {
+			continue
+		}
+		filteredOrder = append(filteredOrder, currentExportID)
+	}
+	store.order = filteredOrder
 }
 
 // generateExportToken 生成随机下载令牌，避免可预测 ID 被枚举下载。

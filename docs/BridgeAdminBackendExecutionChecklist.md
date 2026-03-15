@@ -40,27 +40,27 @@
 
 ### M2. 受控写接口与并发语义（阶段二）
 
-- [~] `BMA-6` 运维接口：`POST /api/admin/ops/config/reload`
+- [x] `BMA-6` 运维接口：`POST /api/admin/ops/config/reload`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/`、`cloud-bridge/runtime/bridge/app/`
   - 验收：`operator/admin` 可调用；返回可审计结果。
 
-- [~] `BMA-7` 运维接口：`POST /api/admin/ops/session/:sessionId/drain`
+- [x] `BMA-7` 运维接口：`POST /api/admin/ops/session/:sessionId/drain`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/`、`cloud-bridge/runtime/bridge/app/`、`cloud-bridge/runtime/bridge/registry/`
   - 验收：目标 session 进入 `DRAINING`；service/tunnel 发生对应收敛副作用。
 
-- [~] `BMA-8` 运维接口：`POST /api/admin/ops/connector/:connectorId/drain`
+- [x] `BMA-8` 运维接口：`POST /api/admin/ops/connector/:connectorId/drain`
   - 代码入口：同上
   - 验收：按 connector 当前会话执行 drain，具备幂等行为。
 
-- [~] `BMA-9` 配置并发控制：`PUT /api/admin/config` + `if_match_version`
+- [x] `BMA-9` 配置并发控制：`PUT /api/admin/config` + `if_match_version`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/`、`cloud-bridge/runtime/bridge/app/`
   - 验收：版本一致才更新；冲突返回 `409`。
 
-- [~] `BMA-10` 导出安全：`POST /api/admin/ops/diagnose/export`
+- [x] `BMA-10` 导出安全：`POST /api/admin/ops/diagnose/export`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/`
   - 验收：仅 `admin` 可导出；导出内容默认脱敏；短时下载链接有效期受限。
 
-- [~] `BMA-11` 写操作审计增强
+- [x] `BMA-11` 写操作审计增强
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/server.go`
   - 验收：审计日志包含操作者、作用域、参数摘要、结果、trace_id、时间戳。
 
@@ -68,32 +68,34 @@
 
 ### M3. 安全收口（阶段三）
 
-- [ ] `BMA-12` Cookie 模式 CSRF（如启用 Cookie）
+- [x] `BMA-12` Cookie 模式 CSRF（如启用 Cookie）
   - 验收：写操作强制 `CSRF Token + Origin/Referer` 校验，Cookie 安全属性正确。
 
-- [ ] `BMA-13` 管理面网络隔离校验
+- [x] `BMA-13` 管理面网络隔离校验
   - 验收：默认独立监听，避免仅依赖路径前缀作为安全边界。
 
-- [ ] `BMA-14` 导出下载链路审计与访问控制加固
+- [x] `BMA-14` 导出下载链路审计与访问控制加固
   - 验收：导出与下载都可追溯，过期链接不可访问。
 
 ---
 
 ### M4. 页面能力与联调收口（阶段四）
 
-- [ ] `BMA-15` 六类页面端到端联调
+- [x] `BMA-15` 六类页面端到端联调
   - 范围：Dashboard、Route、Connector/Session、Tunnel/Traffic、配置运维、日志指标诊断
   - 验收：页面均调用真实 API，非占位数据。
+  - 完成记录：六类页面均已接入真实 API；详情抽屉与表格联动支持行高亮、自动定位、行级点击与键盘导航；自动刷新已升级为 SSE 优先 + 轮询兜底，并在轮询模式下定时自动重试恢复 SSE。
 
-- [ ] `BMA-16` 内嵌部署联调
+- [x] `BMA-16` 内嵌部署联调
   - 验收：Bridge 单二进制可访问 Admin UI 并执行完整读写流程。
+  - 完成记录：`bootstrap` 集成测试已覆盖单实例 admin server 下 UI 路由、读接口、SSE、写接口（reload/config update/session drain/diagnose export-download）与 cookie+csrf 写入约束链路。
 
 ---
 
 ## 3. 本轮落地范围（当前执行）
 
-- [~] 优先推进 `BMA-6 ~ BMA-11`（受控写接口 + 并发控制 + 导出安全 + 审计增强）。
+- [x] 已完成 `BMA-6 ~ BMA-11` 与 `BMA-12 ~ BMA-14`（写接口 + 并发控制 + 安全收口）。
+- [x] 已完成 `BMA-15 ~ BMA-16`（页面联调与单二进制端到端收口）。
 - [ ] 完成后回写到：
   - `docs/UI-Agent-Bridge-Unimplemented-Checklist.md` 的 `UAB-A2` 阶段记录
   - `docs/Agent-and-Bridge-ExecutionChecklist.md` 的 `A16` 勾选状态
-

@@ -325,6 +325,67 @@ func TestManagerHandleSessionStateDrainAndResume(testingObject *testing.T) {
 	}
 }
 
+// TestManagerHandleSessionStateStaleRecyclesActive 验证 session STALE 会回收 active/reserved/idle，避免跨会话残留。
+func TestManagerHandleSessionStateStaleRecyclesActive(testingObject *testing.T) {
+	testingObject.Parallel()
+	opener := &producerTestOpener{}
+	manager, err := NewManager(ManagerOptions{
+		Config: ManagerConfig{
+			MinIdle:           2,
+			MaxIdle:           4,
+			IdleTTL:           0,
+			MaxInflightOpens:  2,
+			TunnelOpenRate:    1000,
+			TunnelOpenBurst:   1000,
+			ReconcileInterval: time.Second,
+		},
+		Opener: opener,
+	})
+	if err != nil {
+		testingObject.Fatalf("new manager failed: %v", err)
+	}
+	if _, err := manager.ReconcileNow(context.Background(), "startup"); err != nil {
+		testingObject.Fatalf("startup reconcile failed: %v", err)
+	}
+
+	consumed, ok := manager.AcquireIdle(time.Now())
+	if !ok {
+		testingObject.Fatalf("expected acquire idle success")
+	}
+	if err := manager.MarkActive(consumed.TunnelID); err != nil {
+		testingObject.Fatalf("mark active failed: %v", err)
+	}
+
+	recycledCount, err := manager.HandleSessionState(SessionStateStale)
+	if err != nil {
+		testingObject.Fatalf("handle stale state failed: %v", err)
+	}
+	if recycledCount != 2 {
+		testingObject.Fatalf("unexpected recycled count: got=%d want=2", recycledCount)
+	}
+
+	snapshot := manager.Snapshot()
+	if snapshot.IdleCount != 0 || snapshot.ReservedCount != 0 || snapshot.ActiveCount != 0 || snapshot.TotalCount != 0 {
+		testingObject.Fatalf(
+			"expected empty pool after stale recycle: idle=%d reserved=%d active=%d total=%d",
+			snapshot.IdleCount,
+			snapshot.ReservedCount,
+			snapshot.ActiveCount,
+			snapshot.TotalCount,
+		)
+	}
+
+	createdByID := make(map[string]*producerTestTunnel)
+	for _, created := range opener.CreatedTunnels() {
+		createdByID[created.ID()] = created
+	}
+	for tunnelID, created := range createdByID {
+		if created.closeCount.Load() != 1 {
+			testingObject.Fatalf("expected tunnel=%s close once, got=%d", tunnelID, created.closeCount.Load())
+		}
+	}
+}
+
 // TestManagerHandleSessionStateDrainingSerializesWithReconcile 验证 draining 会等待进行中的 reconcile，并最终回收并发新增 idle。
 func TestManagerHandleSessionStateDrainingSerializesWithReconcile(testingObject *testing.T) {
 	testingObject.Parallel()

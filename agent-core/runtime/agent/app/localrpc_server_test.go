@@ -116,3 +116,50 @@ func TestDispatchRequestDiagnoseLogs(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected diagnose source: %+v", resultPayload["source"])
 	}
 }
+
+// TestDispatchRequestServiceAdd 验证 localrpc service.add 可写入 runtime 服务目录并对外可见。
+func TestDispatchRequestServiceAdd(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtimeInstance, err := BootstrapWithOptions(context.Background(), DefaultConfig(), BootstrapOptions{})
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+	server := &localRPCServer{runtime: runtimeInstance}
+	_, failure := server.dispatchRequest(localRPCRequestBody{
+		Method: "service.add",
+		Payload: json.RawMessage(`{
+			"service_name":"order-service",
+			"namespace":"dev",
+			"environment":"demo",
+			"protocol":"http",
+			"host":"127.0.0.1",
+			"port":18080
+		}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.add failed: code=%s message=%s", failure.code, failure.message)
+	}
+
+	payload, failure := server.dispatchRequest(localRPCRequestBody{
+		Method:  "service.list",
+		Payload: json.RawMessage(`{}`),
+	}, &localRPCConnectionAuthState{authenticated: true})
+	if failure != nil {
+		testingObject.Fatalf("dispatch service.list failed: code=%s message=%s", failure.code, failure.message)
+	}
+	resultPayload, ok := payload.(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected payload type: %T", payload)
+	}
+	services, ok := resultPayload["services"].([]map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected services payload type: %T", resultPayload["services"])
+	}
+	if len(services) != 1 {
+		testingObject.Fatalf("unexpected service size: got=%d want=1", len(services))
+	}
+	if services[0]["service_name"] != "order-service" {
+		testingObject.Fatalf("unexpected service_name: %+v", services[0]["service_name"])
+	}
+}

@@ -2,6 +2,7 @@ package control
 
 import (
 	"strings"
+	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -11,12 +12,14 @@ import (
 type TunnelReportHandlerOptions struct {
 	SessionRegistry  *registry.SessionRegistry
 	RefillController *RefillController
+	ReportStore      *TunnelPoolReportStore
 }
 
 // TunnelReportHandler 负责消费 Agent TunnelPoolReport 并决定是否触发补池请求。
 type TunnelReportHandler struct {
 	sessionRegistry  *registry.SessionRegistry
 	refillController *RefillController
+	reportStore      *TunnelPoolReportStore
 }
 
 // NewTunnelReportHandler 创建 tunnel 池上报处理器。
@@ -28,6 +31,7 @@ func NewTunnelReportHandler(options TunnelReportHandlerOptions) *TunnelReportHan
 	return &TunnelReportHandler{
 		sessionRegistry:  options.SessionRegistry,
 		refillController: refillController,
+		reportStore:      options.ReportStore,
 	}
 }
 
@@ -49,6 +53,16 @@ func (handler *TunnelReportHandler) HandleReport(
 	}
 	if !handler.validateSessionEpoch(sessionID, sessionEpoch) {
 		return pb.TunnelRefillRequest{}, false
+	}
+	now := time.Now().UTC()
+	if handler.reportStore != nil {
+		connectorID := strings.TrimSpace(envelope.ConnectorID)
+		if connectorID == "" && handler.sessionRegistry != nil {
+			if sessionRuntime, exists := handler.sessionRegistry.GetBySession(sessionID); exists {
+				connectorID = strings.TrimSpace(sessionRuntime.ConnectorID)
+			}
+		}
+		handler.reportStore.Upsert(now, connectorID, sessionID, sessionEpoch, report)
 	}
 	return handler.refillController.BuildRefillRequest(sessionID, sessionEpoch, report)
 }

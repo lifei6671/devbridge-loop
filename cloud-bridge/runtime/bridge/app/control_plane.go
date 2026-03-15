@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
@@ -23,19 +25,26 @@ import (
 	"google.golang.org/grpc"
 )
 
-const defaultHeartbeatReplyTimeout = 2 * time.Second
+const (
+	defaultHeartbeatReplyTimeout = 2 * time.Second
+	// tcpConnectionClassifierReadTimeout 定义 TCP 入站连接类型判别的首包读取超时。
+	tcpConnectionClassifierReadTimeout = 2 * time.Second
+	// defaultIncomingTunnelIDPrefixTCP 定义 Bridge 侧 TCP 入站 tunnel_id 前缀。
+	defaultIncomingTunnelIDPrefixTCP = "tcp-bridge-tunnel"
+)
 
 // controlMessageDispatcher 负责把控制面业务帧分发给 Bridge 控制处理器。
 type controlMessageDispatcher struct {
-	sessionRegistry *registry.SessionRegistry
-	serviceRegistry *registry.ServiceRegistry
-	routeRegistry   *registry.RouteRegistry
-	tunnelRegistry  *registry.TunnelRegistry
-	publishHandler  *bridgecontrol.PublishHandler
-	healthHandler   *bridgecontrol.HealthHandler
-	tunnelHandler   *bridgecontrol.TunnelReportHandler
-	routeHandler    *bridgecontrol.RouteHandler
-	sessionHandler  *bridgecontrol.SessionHandler
+	sessionRegistry       *registry.SessionRegistry
+	serviceRegistry       *registry.ServiceRegistry
+	routeRegistry         *registry.RouteRegistry
+	tunnelRegistry        *registry.TunnelRegistry
+	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	publishHandler        *bridgecontrol.PublishHandler
+	healthHandler         *bridgecontrol.HealthHandler
+	tunnelHandler         *bridgecontrol.TunnelReportHandler
+	routeHandler          *bridgecontrol.RouteHandler
+	sessionHandler        *bridgecontrol.SessionHandler
 }
 
 // controlChannelSessionState 保存单条控制连接最近确认的 session 上下文。
@@ -59,10 +68,11 @@ func (state *controlChannelSessionState) setSession(sessionID string, sessionEpo
 
 // controlMessageDispatcherOptions 定义控制面分发器依赖。
 type controlMessageDispatcherOptions struct {
-	sessionRegistry *registry.SessionRegistry
-	serviceRegistry *registry.ServiceRegistry
-	routeRegistry   *registry.RouteRegistry
-	tunnelRegistry  *registry.TunnelRegistry
+	sessionRegistry       *registry.SessionRegistry
+	serviceRegistry       *registry.ServiceRegistry
+	routeRegistry         *registry.RouteRegistry
+	tunnelRegistry        *registry.TunnelRegistry
+	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 }
 
 // newControlMessageDispatcher 创建控制面业务分发器及其共享依赖。
@@ -95,10 +105,11 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		Guard:           eventGuard,
 	})
 	return &controlMessageDispatcher{
-		sessionRegistry: sessionRegistry,
-		serviceRegistry: serviceRegistry,
-		routeRegistry:   routeRegistry,
-		tunnelRegistry:  tunnelRegistry,
+		sessionRegistry:       sessionRegistry,
+		serviceRegistry:       serviceRegistry,
+		routeRegistry:         routeRegistry,
+		tunnelRegistry:        tunnelRegistry,
+		tunnelPoolReportStore: options.tunnelPoolReportStore,
 		publishHandler: bridgecontrol.NewPublishHandler(bridgecontrol.PublishHandlerOptions{
 			Guard:           eventGuard,
 			SessionRegistry: sessionRegistry,
@@ -110,6 +121,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		}),
 		tunnelHandler: bridgecontrol.NewTunnelReportHandler(bridgecontrol.TunnelReportHandlerOptions{
 			SessionRegistry: sessionRegistry,
+			ReportStore:     options.tunnelPoolReportStore,
 		}),
 		routeHandler: bridgecontrol.NewRouteHandler(bridgecontrol.RouteHandlerOptions{
 			Guard:           eventGuard,
@@ -445,6 +457,9 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 	normalizedReason := strings.TrimSpace(reason)
 	switch sessionRuntime.State {
 	case registry.SessionDraining:
+		if dispatcher.tunnelPoolReportStore != nil {
+			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
+		}
 		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
 			// DRAINING 后立即摘流：服务标记 INACTIVE，避免被 resolver 继续命中。
 			dispatcher.serviceRegistry.MarkLifecycleByConnector(
@@ -458,6 +473,9 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 			dispatcher.tunnelRegistry.PurgeBySession(now, sessionRuntime.SessionID, "session_draining:"+normalizedReason)
 		}
 	case registry.SessionStale, registry.SessionClosed:
+		if dispatcher.tunnelPoolReportStore != nil {
+			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
+		}
 		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
 			// STALE/CLOSED 服务仅保留审计价值，不再参与路由解析。
 			dispatcher.serviceRegistry.MarkLifecycleByConnector(
@@ -665,19 +683,23 @@ type controlPlaneServer struct {
 	tcpTransport  *tcpbinding.Transport
 	grpcTransport *grpcbinding.Transport
 	dispatcher    *controlMessageDispatcher
+	grpcAcceptor  *grpcbinding.TunnelAcceptor
 
 	mu           sync.Mutex
 	tcpListener  net.Listener
 	grpcListener net.Listener
 	grpcServer   *grpc.Server
+
+	tcpTunnelSequence atomic.Uint64
 }
 
 // controlPlaneDependencies 定义控制面运行时共享依赖。
 type controlPlaneDependencies struct {
-	sessionRegistry *registry.SessionRegistry
-	serviceRegistry *registry.ServiceRegistry
-	routeRegistry   *registry.RouteRegistry
-	tunnelRegistry  *registry.TunnelRegistry
+	sessionRegistry       *registry.SessionRegistry
+	serviceRegistry       *registry.ServiceRegistry
+	routeRegistry         *registry.RouteRegistry
+	tunnelRegistry        *registry.TunnelRegistry
+	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 }
 
 // newControlPlaneServer 创建控制面服务，并绑定业务分发器依赖。
@@ -699,11 +721,13 @@ func newControlPlaneServer(
 		heartbeatTTL:   config.HeartbeatTimeout,
 		tcpTransport:   tcpTransport,
 		grpcTransport:  grpcTransport,
+		grpcAcceptor:   grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
 		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
-			sessionRegistry: dependencies.sessionRegistry,
-			serviceRegistry: dependencies.serviceRegistry,
-			routeRegistry:   dependencies.routeRegistry,
-			tunnelRegistry:  dependencies.tunnelRegistry,
+			sessionRegistry:       dependencies.sessionRegistry,
+			serviceRegistry:       dependencies.serviceRegistry,
+			routeRegistry:         dependencies.routeRegistry,
+			tunnelRegistry:        dependencies.tunnelRegistry,
+			tunnelPoolReportStore: dependencies.tunnelPoolReportStore,
 		}),
 	}, nil
 }
@@ -725,6 +749,7 @@ func (server *controlPlaneServer) run(ctx context.Context) error {
 	}
 	if server.grpcListenAddr != "" {
 		runners = append(runners, server.runGRPC)
+		runners = append(runners, server.runGRPCTunnelAcceptLoop)
 	}
 	serverErrChan := make(chan error, len(runners))
 	var serverWaitGroup sync.WaitGroup
@@ -798,21 +823,23 @@ func (server *controlPlaneServer) runTCP(ctx context.Context) error {
 	var channelWaitGroup sync.WaitGroup
 	defer channelWaitGroup.Wait()
 
+	acceptPollInterval := tcpbinding.DefaultTransportConfig().AcceptPollInterval
+	if server.tcpTransport != nil {
+		acceptPollInterval = server.tcpTransport.Config().AcceptPollInterval
+	}
 	for {
-		controlChannel, acceptErr := server.tcpTransport.AcceptControlChannel(ctx, listener)
+		connection, acceptErr := acceptTCPConnectionWithContext(ctx, listener, acceptPollInterval)
 		if acceptErr != nil {
 			if isControlPlaneStopError(acceptErr) || ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("accept tcp control channel: %w", acceptErr)
+			return fmt.Errorf("accept tcp inbound connection: %w", acceptErr)
 		}
 		channelWaitGroup.Add(1)
-		go func(channel transport.ControlChannel) {
+		go func(rawConn net.Conn) {
 			defer channelWaitGroup.Done()
-			if err := serveControlChannelWithDispatcher(ctx, channel, server.dispatcher); err != nil && !isControlChannelClosedError(err) {
-				_ = channel.Close(context.Background())
-			}
-		}(controlChannel)
+			_ = server.serveTCPInboundConnection(ctx, rawConn)
+		}(connection)
 	}
 }
 
@@ -823,7 +850,8 @@ func (server *controlPlaneServer) runGRPC(ctx context.Context) error {
 	}
 	grpcServer := grpc.NewServer(server.grpcTransport.ServerOptions()...)
 	transportgen.RegisterGRPCH2TransportServiceServer(grpcServer, &grpcControlPlaneService{
-		dispatcher: server.dispatcher,
+		dispatcher:     server.dispatcher,
+		tunnelAcceptor: server.grpcAcceptor,
 	})
 
 	server.mu.Lock()
@@ -863,6 +891,30 @@ func (server *controlPlaneServer) runGRPC(ctx context.Context) error {
 	}
 }
 
+// runGRPCTunnelAcceptLoop 从 gRPC TunnelAcceptor 消费 tunnel 并登记到共享 registry。
+func (server *controlPlaneServer) runGRPCTunnelAcceptLoop(ctx context.Context) error {
+	if server == nil || server.grpcAcceptor == nil {
+		return nil
+	}
+	for {
+		acceptedTunnel, err := server.grpcAcceptor.AcceptTunnel(ctx)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, transport.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accept grpc tunnel: %w", err)
+		}
+		if acceptedTunnel == nil {
+			continue
+		}
+		if registerErr := server.registerAcceptedTunnel(acceptedTunnel, transport.BindingTypeGRPCH2); registerErr != nil {
+			// 单条 tunnel 入库失败不应影响整个接入循环。
+			_ = acceptedTunnel.Close()
+			continue
+		}
+	}
+}
+
 func (server *controlPlaneServer) shutdown() error {
 	if server == nil {
 		return nil
@@ -881,6 +933,9 @@ func (server *controlPlaneServer) shutdown() error {
 		server.grpcServer.Stop()
 		server.grpcServer = nil
 	}
+	if server.grpcAcceptor != nil {
+		server.grpcAcceptor.Close(transport.ErrClosed)
+	}
 	if server.grpcListener != nil {
 		if err := server.grpcListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
 			firstErr = err
@@ -892,7 +947,8 @@ func (server *controlPlaneServer) shutdown() error {
 
 type grpcControlPlaneService struct {
 	transportgen.UnimplementedGRPCH2TransportServiceServer
-	dispatcher *controlMessageDispatcher
+	dispatcher     *controlMessageDispatcher
+	tunnelAcceptor *grpcbinding.TunnelAcceptor
 }
 
 func (service *grpcControlPlaneService) ControlChannel(
@@ -904,7 +960,7 @@ func (service *grpcControlPlaneService) ControlChannel(
 func (service *grpcControlPlaneService) TunnelStream(
 	stream grpc.BidiStreamingServer[transportgen.TunnelEnvelope, transportgen.TunnelEnvelope],
 ) error {
-	return serveGRPCTunnelStream(stream)
+	return serveGRPCTunnelStreamWithAcceptor(stream, service.tunnelAcceptor)
 }
 
 func serveGRPCControlChannel(
@@ -963,6 +1019,17 @@ func serveGRPCControlChannelWithDispatcher(
 func serveGRPCTunnelStream(
 	stream grpc.BidiStreamingServer[transportgen.TunnelEnvelope, transportgen.TunnelEnvelope],
 ) error {
+	return serveGRPCTunnelStreamWithAcceptor(stream, nil)
+}
+
+// serveGRPCTunnelStreamWithAcceptor 处理 gRPC TunnelStream 并在可用时交由 acceptor 入队。
+func serveGRPCTunnelStreamWithAcceptor(
+	stream grpc.BidiStreamingServer[transportgen.TunnelEnvelope, transportgen.TunnelEnvelope],
+	tunnelAcceptor *grpcbinding.TunnelAcceptor,
+) error {
+	if tunnelAcceptor != nil {
+		return tunnelAcceptor.HandleTunnelStream(stream)
+	}
 	for {
 		_, err := stream.Recv()
 		if err != nil {
@@ -972,6 +1039,252 @@ func serveGRPCTunnelStream(
 			return err
 		}
 	}
+}
+
+// serveTCPInboundConnection 对单条 TCP 入站连接做类型判别并分派到 control/tunnel 处理链路。
+func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context, rawConn net.Conn) error {
+	if server == nil || rawConn == nil {
+		return errors.New("serve tcp inbound: invalid argument")
+	}
+	classifiedConn, isControlChannel, err := classifyTCPInboundConnection(rawConn)
+	if err != nil {
+		_ = rawConn.Close()
+		return fmt.Errorf("serve tcp inbound: classify connection: %w", err)
+	}
+	if isControlChannel {
+		controlChannel, openErr := server.tcpTransport.OpenControlChannel(classifiedConn)
+		if openErr != nil {
+			_ = classifiedConn.Close()
+			return fmt.Errorf("serve tcp inbound: open control channel: %w", openErr)
+		}
+		if serveErr := serveControlChannelWithDispatcher(ctx, controlChannel, server.dispatcher); serveErr != nil && !isControlChannelClosedError(serveErr) {
+			_ = controlChannel.Close(context.Background())
+			return fmt.Errorf("serve tcp inbound: serve control channel: %w", serveErr)
+		}
+		return nil
+	}
+	if registerErr := server.handleAcceptedTCPTunnel(classifiedConn); registerErr != nil {
+		_ = classifiedConn.Close()
+		return registerErr
+	}
+	return nil
+}
+
+// handleAcceptedTCPTunnel 将一条已判别为数据面 tunnel 的 TCP 连接登记到共享 tunnel registry。
+func (server *controlPlaneServer) handleAcceptedTCPTunnel(rawConn net.Conn) error {
+	if server == nil || server.tcpTransport == nil {
+		return errors.New("handle accepted tcp tunnel: tcp transport is nil")
+	}
+	normalizedNow := time.Now().UTC()
+	tunnelID := fmt.Sprintf("%s-%d", defaultIncomingTunnelIDPrefixTCP, server.tcpTunnelSequence.Add(1))
+	rawTunnel, err := server.tcpTransport.OpenTunnel(rawConn, transport.TunnelMeta{
+		TunnelID:  tunnelID,
+		CreatedAt: normalizedNow,
+	})
+	if err != nil {
+		return fmt.Errorf("handle accepted tcp tunnel: open tunnel: %w", err)
+	}
+	return server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed)
+}
+
+// registerAcceptedTunnel 将 transport tunnel 适配并注册到 Bridge tunnel registry。
+func (server *controlPlaneServer) registerAcceptedTunnel(
+	rawTunnel transport.Tunnel,
+	bindingType transport.BindingType,
+) error {
+	if server == nil || server.dispatcher == nil || server.dispatcher.tunnelRegistry == nil {
+		if rawTunnel != nil {
+			_ = rawTunnel.Close()
+		}
+		return errors.New("register accepted tunnel: tunnel registry dependency missing")
+	}
+	if rawTunnel == nil {
+		return errors.New("register accepted tunnel: nil tunnel")
+	}
+	connectorID, sessionID, ok := server.resolveSingleActiveSessionOwner()
+	if !ok {
+		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
+		_ = rawTunnel.Close()
+		return nil
+	}
+
+	normalizedNow := time.Now().UTC()
+	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel)
+	if adapter == nil {
+		_ = rawTunnel.Close()
+		return errors.New("register accepted tunnel: build runtime adapter failed")
+	}
+	registeredRuntime, err := server.dispatcher.tunnelRegistry.UpsertIdle(
+		normalizedNow,
+		connectorID,
+		sessionID,
+		adapter,
+	)
+	if err != nil {
+		_ = rawTunnel.Close()
+		return fmt.Errorf("register accepted tunnel: upsert idle: %w", err)
+	}
+	go server.watchAcceptedTunnelLifecycle(registeredRuntime.TunnelID, rawTunnel, bindingType)
+	return nil
+}
+
+// resolveSingleActiveSessionOwner 在当前会话视图中解析唯一 ACTIVE session 作为 tunnel 归属。
+func (server *controlPlaneServer) resolveSingleActiveSessionOwner() (string, string, bool) {
+	if server == nil || server.dispatcher == nil || server.dispatcher.sessionRegistry == nil {
+		return "", "", false
+	}
+	sessionItems := server.dispatcher.sessionRegistry.List()
+	candidates := make([]registry.SessionRuntime, 0, len(sessionItems))
+	for _, sessionRuntime := range sessionItems {
+		if sessionRuntime.State != registry.SessionActive {
+			continue
+		}
+		if strings.TrimSpace(sessionRuntime.ConnectorID) == "" || strings.TrimSpace(sessionRuntime.SessionID) == "" {
+			continue
+		}
+		candidates = append(candidates, sessionRuntime)
+	}
+	if len(candidates) != 1 {
+		return "", "", false
+	}
+	return strings.TrimSpace(candidates[0].ConnectorID), strings.TrimSpace(candidates[0].SessionID), true
+}
+
+// watchAcceptedTunnelLifecycle 监听 tunnel 终止并在 idle/reserved 阶段做兜底回收。
+func (server *controlPlaneServer) watchAcceptedTunnelLifecycle(
+	tunnelID string,
+	rawTunnel transport.Tunnel,
+	bindingType transport.BindingType,
+) {
+	if server == nil || rawTunnel == nil || server.dispatcher == nil || server.dispatcher.tunnelRegistry == nil {
+		return
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return
+	}
+	<-rawTunnel.Done()
+
+	// active tunnel 的生命周期由 connector dispatcher 收敛，避免与 dispatch 回收路径竞争。
+	runtimeSnapshot, exists := server.dispatcher.tunnelRegistry.Get(normalizedTunnelID)
+	if !exists {
+		return
+	}
+	if runtimeSnapshot.State != registry.TunnelStateIdle && runtimeSnapshot.State != registry.TunnelStateReserved {
+		return
+	}
+	lastError := "incoming_tunnel_closed"
+	if rawTunnelErr := rawTunnel.Err(); rawTunnelErr != nil && !errors.Is(rawTunnelErr, transport.ErrClosed) {
+		lastError = strings.TrimSpace(rawTunnelErr.Error())
+		if lastError == "" {
+			lastError = "incoming_tunnel_closed"
+		}
+	}
+	if bindingType != "" {
+		lastError = fmt.Sprintf("%s binding=%s", lastError, bindingType)
+	}
+	normalizedNow := time.Now().UTC()
+	markErr := server.dispatcher.tunnelRegistry.MarkBroken(normalizedNow, normalizedTunnelID, lastError)
+	if markErr != nil && !errors.Is(markErr, registry.ErrTunnelNotFound) && !errors.Is(markErr, registry.ErrInvalidTunnelStateTransition) {
+		return
+	}
+	_, _ = server.dispatcher.tunnelRegistry.RemoveTerminal(normalizedTunnelID)
+}
+
+// classifyTCPInboundConnection 基于首 2 字节识别 TCP 连接是 control channel 还是 data tunnel。
+func classifyTCPInboundConnection(rawConn net.Conn) (net.Conn, bool, error) {
+	if rawConn == nil {
+		return nil, false, errors.New("classify tcp inbound: nil connection")
+	}
+	peekBuffer := make([]byte, 2)
+	if err := rawConn.SetReadDeadline(time.Now().UTC().Add(tcpConnectionClassifierReadTimeout)); err != nil {
+		return nil, false, fmt.Errorf("classify tcp inbound: set read deadline: %w", err)
+	}
+	readSize, readErr := io.ReadFull(rawConn, peekBuffer)
+	_ = rawConn.SetReadDeadline(time.Time{})
+	if readErr != nil {
+		if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() && readSize == 0 {
+			// tunnel 首帧通常由 Bridge 在分配后主动发送；若无首包可先按 tunnel 接入处理。
+			return rawConn, false, nil
+		}
+		return nil, false, fmt.Errorf("classify tcp inbound: read prefix: %w", readErr)
+	}
+	frameType := binary.BigEndian.Uint16(peekBuffer)
+	classifiedConn := &prefixedNetConn{
+		Conn:   rawConn,
+		prefix: append([]byte(nil), peekBuffer...),
+	}
+	return classifiedConn, isKnownControlFrameType(frameType), nil
+}
+
+// isKnownControlFrameType 判断帧类型是否属于控制面帧。
+func isKnownControlFrameType(frameType uint16) bool {
+	if frameType == transport.ControlFrameTypeHeartbeatPing || frameType == transport.ControlFrameTypeHeartbeatPong {
+		return true
+	}
+	_, err := transport.ControlMessageTypeForFrameType(frameType)
+	return err == nil
+}
+
+// acceptTCPConnectionWithContext 在支持 deadline 的 listener 上轮询 Accept，以响应 ctx 取消。
+func acceptTCPConnectionWithContext(ctx context.Context, listener net.Listener, pollInterval time.Duration) (net.Conn, error) {
+	normalizedContext := ctx
+	if normalizedContext == nil {
+		normalizedContext = context.Background()
+	}
+	if listener == nil {
+		return nil, errors.New("accept tcp connection: nil listener")
+	}
+	effectivePollInterval := pollInterval
+	if effectivePollInterval <= 0 {
+		effectivePollInterval = 200 * time.Millisecond
+	}
+	deadlineCapableListener, supportsDeadline := listener.(interface{ SetDeadline(time.Time) error })
+	if !supportsDeadline {
+		return listener.Accept()
+	}
+	for {
+		acceptDeadline := time.Now().UTC().Add(effectivePollInterval)
+		if contextDeadline, hasDeadline := normalizedContext.Deadline(); hasDeadline && contextDeadline.Before(acceptDeadline) {
+			acceptDeadline = contextDeadline
+		}
+		if err := deadlineCapableListener.SetDeadline(acceptDeadline); err != nil {
+			return nil, fmt.Errorf("accept tcp connection: set deadline: %w", err)
+		}
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = deadlineCapableListener.SetDeadline(time.Time{})
+			return connection, nil
+		}
+		if normalizedContext.Err() != nil {
+			_ = deadlineCapableListener.SetDeadline(time.Time{})
+			return nil, normalizedContext.Err()
+		}
+		if netErr, ok := acceptErr.(net.Error); ok && netErr.Timeout() {
+			// 超时只用于轮询 ctx 和 listener 关闭信号，不视为真正错误。
+			continue
+		}
+		return nil, acceptErr
+	}
+}
+
+// prefixedNetConn 在底层连接前拼接一段已读前缀，便于连接类型判别后回放首包。
+type prefixedNetConn struct {
+	net.Conn
+	prefix []byte
+}
+
+// Read 优先消费前缀缓存，再回退到底层连接读取。
+func (conn *prefixedNetConn) Read(payload []byte) (int, error) {
+	if conn == nil {
+		return 0, net.ErrClosed
+	}
+	if len(conn.prefix) == 0 {
+		return conn.Conn.Read(payload)
+	}
+	writtenSize := copy(payload, conn.prefix)
+	conn.prefix = conn.prefix[writtenSize:]
+	return writtenSize, nil
 }
 
 func serveControlChannel(ctx context.Context, controlChannel transport.ControlChannel) error {

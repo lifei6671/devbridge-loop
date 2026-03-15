@@ -78,6 +78,17 @@ type runtimeSessionSnapshot struct {
 	unavailableReason string
 }
 
+type runtimeServiceAddInput struct {
+	ServiceID   string
+	ServiceKey  string
+	Namespace   string
+	Environment string
+	ServiceName string
+	Protocol    string
+	Host        string
+	Port        uint32
+}
+
 // bridgeTunnelOpener 实现数据面 tunnel 建连，按配置选择底层 binding。
 type bridgeTunnelOpener struct {
 	runtime *Runtime
@@ -420,6 +431,8 @@ func (r *Runtime) requestBridgeDrain() {
 		SessionEpoch: sessionEpoch,
 		BridgeState:  "DRAINING",
 	})
+	// drain 请求到达后先立即回收本地 tunnel，避免等待控制循环导致统计延迟。
+	r.notifyTunnelManagerState(tunnel.SessionStateDraining)
 	r.enqueueBridgeCommand(bridgeCommand{kind: bridgeCommandDrain})
 }
 
@@ -1515,6 +1528,92 @@ func (r *Runtime) sessionSnapshotPayload() map[string]any {
 	}
 }
 
+// 新增或更新本地服务目录项，并在会话 ACTIVE 时尽力同步控制面。
+func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]any, error) {
+	if r == nil || r.serviceCatalog == nil {
+		return nil, errors.New("service catalog is not initialized")
+	}
+	normalizedServiceName := strings.TrimSpace(input.ServiceName)
+	if normalizedServiceName == "" {
+		return nil, errors.New("service_name is required")
+	}
+	normalizedProtocol := strings.ToLower(strings.TrimSpace(input.Protocol))
+	if normalizedProtocol == "" {
+		normalizedProtocol = "tcp"
+	}
+	normalizedHost := strings.TrimSpace(input.Host)
+	if normalizedHost == "" {
+		normalizedHost = "127.0.0.1"
+	}
+	if input.Port == 0 {
+		return nil, errors.New("port must be greater than 0")
+	}
+	normalizedNamespace := strings.TrimSpace(input.Namespace)
+	if normalizedNamespace == "" {
+		normalizedNamespace = "dev"
+	}
+	normalizedEnvironment := strings.TrimSpace(input.Environment)
+	if normalizedEnvironment == "" {
+		normalizedEnvironment = "demo"
+	}
+	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
+	if normalizedServiceKey == "" {
+		normalizedServiceKey = adapter.BuildServiceKey(
+			normalizedNamespace,
+			normalizedEnvironment,
+			normalizedServiceName,
+		)
+	}
+
+	record := r.serviceCatalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
+		ServiceID:   strings.TrimSpace(input.ServiceID),
+		ServiceKey:  normalizedServiceKey,
+		Namespace:   normalizedNamespace,
+		Environment: normalizedEnvironment,
+		ServiceName: normalizedServiceName,
+		ServiceType: normalizedProtocol,
+		Endpoints: []pb.ServiceEndpoint{
+			{
+				EndpointID: fmt.Sprintf("%s-%s-%d", normalizedServiceName, normalizedHost, input.Port),
+				Protocol:   normalizedProtocol,
+				Host:       normalizedHost,
+				Port:       input.Port,
+			},
+		},
+	})
+	if strings.TrimSpace(record.Registration.ServiceID) == "" {
+		return nil, errors.New("add service failed: empty service identity")
+	}
+	if _, _, active := r.bridgeSessionMeta(); active {
+		// 会话可用时尽力触发一次全量同步；失败仅记录诊断，不回滚本地目录。
+		if err := r.syncServiceControlState(context.Background()); err != nil {
+			r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+				Level:   "warn",
+				Module:  "agent.runtime.service",
+				Code:    "SERVICE_SYNC_FAILED",
+				Message: fmt.Sprintf("sync service to bridge failed: %v", err),
+			})
+		}
+	}
+
+	updatedAtMS := runtimeNowMillis()
+	if !record.UpdatedAt.IsZero() {
+		updatedAtMS = uint64(record.UpdatedAt.UTC().UnixMilli())
+	}
+	return map[string]any{
+		"accepted":       true,
+		"service_id":     record.Registration.ServiceID,
+		"service_name":   record.Registration.ServiceName,
+		"service_key":    record.Registration.ServiceKey,
+		"namespace":      record.Registration.Namespace,
+		"environment":    record.Registration.Environment,
+		"protocol":       normalizedProtocol,
+		"endpoint_count": len(record.Registration.Endpoints),
+		"updated_at_ms":  updatedAtMS,
+		"source":         "agent.runtime",
+	}, nil
+}
+
 // 组装 service.list 返回体。
 func (r *Runtime) serviceListPayload() map[string]any {
 	if r == nil || r.serviceCatalog == nil {
@@ -1558,6 +1657,11 @@ func (r *Runtime) tunnelListPayload() map[string]any {
 	if r.tunnelRegistry != nil {
 		tunnelRecords = r.tunnelRegistry.List(256)
 	}
+	sessionSnapshot := r.sessionSnapshot()
+	connectionProtocol := strings.TrimSpace(r.cfg.BridgeTransport)
+	if connectionProtocol == "" {
+		connectionProtocol = "unknown"
+	}
 	items := make([]map[string]any, 0, len(tunnelRecords))
 	for _, record := range tunnelRecords {
 		association, _ := r.tunnelAssociationByID(record.TunnelID)
@@ -1574,16 +1678,19 @@ func (r *Runtime) tunnelListPayload() map[string]any {
 		}
 		remoteAddr := strings.TrimSpace(r.cfg.BridgeAddr)
 		items = append(items, map[string]any{
-			"tunnel_id":                record.TunnelID,
-			"traffic_id":               association.TrafficID,
-			"service_id":               association.ServiceID,
-			"state":                    string(record.State),
-			"local_addr":               association.LocalAddr,
-			"remote_addr":              remoteAddr,
-			"latency_ms":               association.OpenAckLatencyMS,
-			"upstream_dial_latency_ms": association.UpstreamDialLatencyMS,
-			"last_error":               record.LastError,
-			"updated_at_ms":            updatedAtMS,
+			"tunnel_id":                 record.TunnelID,
+			"traffic_id":                association.TrafficID,
+			"service_id":                association.ServiceID,
+			"state":                     string(record.State),
+			"protocol":                  connectionProtocol,
+			"local_addr":                association.LocalAddr,
+			"remote_addr":               remoteAddr,
+			"latency_ms":                association.OpenAckLatencyMS,
+			"upstream_dial_latency_ms":  association.UpstreamDialLatencyMS,
+			"last_heartbeat_at_ms":      sessionSnapshot.lastHeartbeatMS,
+			"last_heartbeat_sent_at_ms": sessionSnapshot.lastHeartbeatSent,
+			"last_error":                record.LastError,
+			"updated_at_ms":             updatedAtMS,
 		})
 	}
 	return map[string]any{

@@ -17,6 +17,10 @@ var (
 	ErrTunnelClosed = errors.New("tunnel closed")
 	// ErrTunnelBroken 表示 tunnel 已损坏。
 	ErrTunnelBroken = errors.New("tunnel broken")
+	// ErrTunnelStale 表示 tunnel 探活失败，不应继续分配。
+	ErrTunnelStale = errors.New("tunnel stale: probe failed")
+	// ErrNoTunnel 表示当前没有可分配 tunnel。
+	ErrNoTunnel = errors.New("no available tunnel")
 	// ErrTimeout 表示操作超时。
 	ErrTimeout = errors.New("timeout")
 	// ErrUnsupported 表示能力不支持。

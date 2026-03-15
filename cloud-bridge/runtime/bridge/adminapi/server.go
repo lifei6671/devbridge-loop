@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,18 @@ const (
 	defaultAuditLogLimit = 512
 	// maxTimeWindow 定义 logs/metrics 查询窗口上限（24 小时）。
 	maxTimeWindow = 24 * time.Hour
+	// defaultAdminAuthMode 定义默认鉴权模式（Bearer）。
+	defaultAdminAuthMode = "bearer"
+	// defaultCookieTokenName 定义 cookie 鉴权模式 token cookie 默认名称。
+	defaultCookieTokenName = "devbridge_admin_token"
+	// defaultCSRFCookieName 定义 cookie 鉴权模式 csrf cookie 默认名称。
+	defaultCSRFCookieName = "devbridge_admin_csrf"
+	// defaultCSRFHeaderName 定义 cookie 鉴权模式 csrf header 默认名称。
+	defaultCSRFHeaderName = "X-CSRF-Token"
+	// adminAuthModeBearer 表示 Header Bearer 鉴权模式。
+	adminAuthModeBearer = "bearer"
+	// adminAuthModeCookie 表示 Cookie 鉴权模式。
+	adminAuthModeCookie = "cookie"
 )
 
 // Role 定义管理后台权限角色。
@@ -46,6 +59,29 @@ type BearerToken struct {
 	Role  Role
 }
 
+// TunnelPoolReportSnapshot 定义 Agent tunnel 池上报的只读快照模型。
+type TunnelPoolReportSnapshot struct {
+	ConnectorID     string `json:"connector_id"`
+	SessionID       string `json:"session_id"`
+	SessionEpoch    uint64 `json:"session_epoch"`
+	IdleCount       int    `json:"idle_count"`
+	InUseCount      int    `json:"in_use_count"`
+	TargetIdleCount int    `json:"target_idle_count"`
+	Trigger         string `json:"trigger,omitempty"`
+	ReportedAtMS    uint64 `json:"reported_at_ms"`
+	UpdatedAtMS     uint64 `json:"updated_at_ms"`
+}
+
+// AgentTunnelPoolSummary 定义 Agent 侧 tunnel 池聚合视图。
+type AgentTunnelPoolSummary struct {
+	Idle        int    `json:"idle"`
+	InUse       int    `json:"in_use"`
+	Connected   int    `json:"connected"`
+	TargetIdle  int    `json:"target_idle"`
+	ReportCount int    `json:"report_count"`
+	UpdatedAtMS uint64 `json:"updated_at_ms"`
+}
+
 // Dependencies 定义管理后台只读 API 所需依赖。
 type Dependencies struct {
 	// Now 允许测试注入当前时间。
@@ -60,6 +96,8 @@ type Dependencies struct {
 	ListTunnels func() []registry.TunnelRuntime
 	// TunnelSnapshot 返回 tunnel 汇总快照。
 	TunnelSnapshot func() registry.TunnelSnapshot
+	// ListTunnelPoolReports 返回 Agent tunnel 池上报快照。
+	ListTunnelPoolReports func() []TunnelPoolReportSnapshot
 	// BuildConfigSnapshot 返回脱敏后的配置快照。
 	BuildConfigSnapshot func() map[string]any
 	// Metrics 指向 Bridge 指标容器。
@@ -80,6 +118,16 @@ type ServerOptions struct {
 	BearerTokens  []BearerToken
 	MaxPageLimit  int
 	AuditLogLimit int
+	// AuthMode 定义管理 API 鉴权模式，支持 bearer/cookie。
+	AuthMode string
+	// CookieTokenName 定义 cookie 鉴权模式 token cookie 名。
+	CookieTokenName string
+	// CSRFCookieName 定义 cookie 鉴权模式 CSRF cookie 名。
+	CSRFCookieName string
+	// CSRFHeaderName 定义 cookie 鉴权模式 CSRF 请求头名。
+	CSRFHeaderName string
+	// AllowedOrigins 定义 cookie 鉴权模式允许的 Origin 列表。
+	AllowedOrigins []string
 }
 
 // AuditRecord 描述后台请求审计条目。
@@ -108,13 +156,22 @@ type contextKey string
 
 const principalContextKey contextKey = "adminapi.principal"
 
+type authOptions struct {
+	allowAccessTokenQuery bool
+}
+
 // Server 定义 Bridge 管理后台只读 API 服务。
 type Server struct {
-	dependencies Dependencies
-	tokenLookup  map[string]principal
-	maxPageLimit int
-	auditLogs    *auditLogStore
-	exportStore  *diagnoseExportStore
+	dependencies    Dependencies
+	tokenLookup     map[string]principal
+	maxPageLimit    int
+	auditLogs       *auditLogStore
+	exportStore     *diagnoseExportStore
+	authMode        string
+	cookieTokenName string
+	csrfCookieName  string
+	csrfHeaderName  string
+	allowedOrigins  map[string]struct{}
 }
 
 // NewServer 创建管理后台 API 服务实例。
@@ -142,12 +199,40 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if auditLogLimit <= 0 {
 		auditLogLimit = defaultAuditLogLimit
 	}
+	authMode := strings.ToLower(strings.TrimSpace(options.AuthMode))
+	if authMode == "" {
+		authMode = defaultAdminAuthMode
+	}
+	if authMode != adminAuthModeBearer && authMode != adminAuthModeCookie {
+		return nil, fmt.Errorf("new admin api server: unsupported auth mode=%s", options.AuthMode)
+	}
+	cookieTokenName := strings.TrimSpace(options.CookieTokenName)
+	if cookieTokenName == "" {
+		cookieTokenName = defaultCookieTokenName
+	}
+	csrfCookieName := strings.TrimSpace(options.CSRFCookieName)
+	if csrfCookieName == "" {
+		csrfCookieName = defaultCSRFCookieName
+	}
+	csrfHeaderName := strings.TrimSpace(options.CSRFHeaderName)
+	if csrfHeaderName == "" {
+		csrfHeaderName = defaultCSRFHeaderName
+	}
+	allowedOrigins := normalizeAllowedOrigins(options.AllowedOrigins)
+	if authMode == adminAuthModeCookie && len(allowedOrigins) == 0 {
+		return nil, fmt.Errorf("new admin api server: empty allowed origins in cookie auth mode")
+	}
 	server := &Server{
-		dependencies: options.Dependencies,
-		tokenLookup:  tokenLookup,
-		maxPageLimit: maxPageLimit,
-		auditLogs:    newAuditLogStore(auditLogLimit),
-		exportStore:  newDiagnoseExportStore(defaultDiagnoseExportLimit, defaultDiagnoseExportTTL),
+		dependencies:    options.Dependencies,
+		tokenLookup:     tokenLookup,
+		maxPageLimit:    maxPageLimit,
+		auditLogs:       newAuditLogStore(auditLogLimit),
+		exportStore:     newDiagnoseExportStore(defaultDiagnoseExportLimit, defaultDiagnoseExportTTL),
+		authMode:        authMode,
+		cookieTokenName: cookieTokenName,
+		csrfCookieName:  csrfCookieName,
+		csrfHeaderName:  csrfHeaderName,
+		allowedOrigins:  allowedOrigins,
 	}
 	return server, nil
 }
@@ -169,6 +254,16 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/admin/logs/search", server.wrapHandler(RoleViewer, "logs", "search", server.handleLogsSearch))
 	mux.Handle("/api/admin/metrics/query", server.wrapHandler(RoleViewer, "metrics", "query", server.handleMetricsQuery))
 	mux.Handle("/api/admin/diagnose/summary", server.wrapHandler(RoleViewer, "diagnose", "summary", server.handleDiagnoseSummary))
+	mux.Handle(
+		"/api/admin/events/stream",
+		server.wrapHandlerWithOptions(
+			RoleViewer,
+			"events",
+			"stream",
+			server.handleEventsStream,
+			authOptions{allowAccessTokenQuery: true},
+		),
+	)
 	mux.Handle("/api/admin/ops/config/reload", server.wrapHandler(RoleOperator, "ops", "config_reload", server.handleOpsConfigReload))
 	mux.Handle("/api/admin/ops/session/", server.wrapHandler(RoleOperator, "ops", "session_drain", server.handleOpsSessionDrain))
 	mux.Handle("/api/admin/ops/connector/", server.wrapHandler(RoleOperator, "ops", "connector_drain", server.handleOpsConnectorDrain))
@@ -189,9 +284,19 @@ func (server *Server) wrapHandler(
 	action string,
 	handlerFunc http.HandlerFunc,
 ) http.Handler {
+	return server.wrapHandlerWithOptions(requiredRole, scope, action, handlerFunc, authOptions{})
+}
+
+func (server *Server) wrapHandlerWithOptions(
+	requiredRole Role,
+	scope string,
+	action string,
+	handlerFunc http.HandlerFunc,
+	options authOptions,
+) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		startAt := server.now()
-		actor, authErr := server.authenticateRequest(request)
+		actor, authErr := server.authenticateRequestWithOptions(request, options)
 		if authErr != nil {
 			writeError(writer, http.StatusUnauthorized, "UNAUTHORIZED", authErr.Error())
 			server.auditLogs.append(AuditRecord{
@@ -211,6 +316,23 @@ func (server *Server) wrapHandler(
 		}
 		if !roleCanAccess(actor.role, requiredRole) {
 			writeError(writer, http.StatusForbidden, "FORBIDDEN", "permission denied for role")
+			server.auditLogs.append(AuditRecord{
+				TSMS:      uint64(startAt.UnixMilli()),
+				Actor:     actor.name,
+				Role:      string(actor.role),
+				Method:    request.Method,
+				Path:      request.URL.Path,
+				Scope:     scope,
+				Action:    action,
+				Status:    http.StatusForbidden,
+				Result:    "rejected",
+				TraceID:   strings.TrimSpace(request.Header.Get("X-Request-Id")),
+				ErrorCode: "FORBIDDEN",
+			})
+			return
+		}
+		if securityErr := server.enforceWriteRequestSecurity(request); securityErr != nil {
+			writeError(writer, http.StatusForbidden, "FORBIDDEN", securityErr.Error())
 			server.auditLogs.append(AuditRecord{
 				TSMS:      uint64(startAt.UnixMilli()),
 				Actor:     actor.name,
@@ -256,28 +378,151 @@ func (server *Server) wrapHandler(
 }
 
 func (server *Server) authenticateRequest(request *http.Request) (principal, error) {
+	return server.authenticateRequestWithOptions(request, authOptions{})
+}
+
+func (server *Server) authenticateRequestWithOptions(
+	request *http.Request,
+	options authOptions,
+) (principal, error) {
 	if server == nil {
 		return principal{}, fmt.Errorf("admin api server unavailable")
 	}
-	authorization := strings.TrimSpace(request.Header.Get("Authorization"))
-	if !strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
-		return principal{}, fmt.Errorf("missing bearer token")
+	if request == nil {
+		return principal{}, fmt.Errorf("missing request")
 	}
-	rawToken := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(authorization, "Bearer "), "bearer "))
+	rawToken := extractBearerTokenFromHeader(request.Header.Get("Authorization"))
+	if rawToken == "" && server.authMode == adminAuthModeCookie {
+		rawToken = extractTokenFromCookie(request, server.cookieTokenName)
+	}
+	if rawToken == "" && options.allowAccessTokenQuery && request != nil && request.URL != nil {
+		rawToken = strings.TrimSpace(request.URL.Query().Get("access_token"))
+	}
 	if rawToken == "" {
-		return principal{}, fmt.Errorf("missing bearer token")
+		return principal{}, fmt.Errorf("missing auth token")
 	}
 	if len(server.tokenLookup) == 0 {
-		return principal{}, fmt.Errorf("admin api bearer token is not configured")
+		return principal{}, fmt.Errorf("admin api auth token is not configured")
 	}
 	authPrincipal, exists := server.tokenLookup[rawToken]
 	if !exists {
-		return principal{}, fmt.Errorf("invalid bearer token")
+		return principal{}, fmt.Errorf("invalid auth token")
 	}
 	if strings.TrimSpace(authPrincipal.name) == "" {
 		authPrincipal.name = "token_user"
 	}
 	return authPrincipal, nil
+}
+
+func extractBearerTokenFromHeader(rawAuthorization string) string {
+	authorization := strings.TrimSpace(rawAuthorization)
+	if !strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(authorization, "Bearer "), "bearer "))
+}
+
+// extractTokenFromCookie 从指定 cookie 读取鉴权 token（仅 cookie 鉴权模式使用）。
+func extractTokenFromCookie(request *http.Request, cookieName string) string {
+	if request == nil {
+		return ""
+	}
+	tokenCookie, err := request.Cookie(strings.TrimSpace(cookieName))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(tokenCookie.Value)
+}
+
+// normalizeAllowedOrigins 归一化允许来源列表为集合结构，便于 O(1) 校验。
+func normalizeAllowedOrigins(rawOrigins []string) map[string]struct{} {
+	originSet := make(map[string]struct{}, len(rawOrigins))
+	for _, rawOrigin := range rawOrigins {
+		normalizedOrigin, ok := normalizeOrigin(rawOrigin)
+		if !ok {
+			continue
+		}
+		originSet[normalizedOrigin] = struct{}{}
+	}
+	return originSet
+}
+
+// normalizeOrigin 把 Origin 统一归一化为 scheme://host 形式。
+func normalizeOrigin(rawOrigin string) (string, bool) {
+	trimmedOrigin := strings.TrimSpace(rawOrigin)
+	if trimmedOrigin == "" {
+		return "", false
+	}
+	parsedOrigin, err := url.Parse(trimmedOrigin)
+	if err != nil {
+		return "", false
+	}
+	if strings.TrimSpace(parsedOrigin.Scheme) == "" || strings.TrimSpace(parsedOrigin.Host) == "" {
+		return "", false
+	}
+	// Origin 语义仅接受 scheme://host，不允许拼接 path/query/fragment。
+	if strings.TrimSpace(parsedOrigin.Path) != "" && strings.TrimSpace(parsedOrigin.Path) != "/" {
+		return "", false
+	}
+	if strings.TrimSpace(parsedOrigin.RawQuery) != "" || strings.TrimSpace(parsedOrigin.Fragment) != "" {
+		return "", false
+	}
+	return strings.ToLower(parsedOrigin.Scheme) + "://" + strings.ToLower(parsedOrigin.Host), true
+}
+
+// originFromReferer 从 Referer 派生 Origin，用于兼容某些浏览器不发送 Origin 的场景。
+func originFromReferer(rawReferer string) string {
+	parsedReferer, err := url.Parse(strings.TrimSpace(rawReferer))
+	if err != nil {
+		return ""
+	}
+	if strings.TrimSpace(parsedReferer.Scheme) == "" || strings.TrimSpace(parsedReferer.Host) == "" {
+		return ""
+	}
+	return parsedReferer.Scheme + "://" + parsedReferer.Host
+}
+
+// isMutationMethod 判断是否为会修改状态的请求方法。
+func isMutationMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// enforceWriteRequestSecurity 在 cookie 鉴权模式下对写请求启用 CSRF + 来源校验。
+func (server *Server) enforceWriteRequestSecurity(request *http.Request) error {
+	if server == nil || !isMutationMethod(request.Method) || server.authMode != adminAuthModeCookie {
+		return nil
+	}
+	if request == nil {
+		return fmt.Errorf("invalid request")
+	}
+	rawOrigin := strings.TrimSpace(request.Header.Get("Origin"))
+	if rawOrigin == "" {
+		rawOrigin = originFromReferer(request.Header.Get("Referer"))
+	}
+	normalizedOrigin, ok := normalizeOrigin(rawOrigin)
+	if !ok {
+		return fmt.Errorf("csrf check failed: missing or invalid origin")
+	}
+	if _, allowed := server.allowedOrigins[normalizedOrigin]; !allowed {
+		return fmt.Errorf("csrf check failed: origin is not allowed")
+	}
+	csrfHeaderValue := strings.TrimSpace(request.Header.Get(server.csrfHeaderName))
+	if csrfHeaderValue == "" {
+		return fmt.Errorf("csrf check failed: missing csrf header")
+	}
+	csrfCookie, err := request.Cookie(server.csrfCookieName)
+	if err != nil {
+		return fmt.Errorf("csrf check failed: missing csrf cookie")
+	}
+	if strings.TrimSpace(csrfCookie.Value) == "" || strings.TrimSpace(csrfCookie.Value) != csrfHeaderValue {
+		return fmt.Errorf("csrf check failed: csrf token mismatch")
+	}
+	return nil
 }
 
 func normalizeRole(role string) (Role, bool) {
@@ -400,10 +645,23 @@ func (server *Server) handleTunnelSummary(writer http.ResponseWriter, request *h
 		writeError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET is required")
 		return
 	}
+	connectorFilter := strings.TrimSpace(request.URL.Query().Get("connector_id"))
 	summary := adminview.BuildTunnelSummary(server.now(), safeTunnelSnapshot(server.dependencies))
+	if connectorFilter != "" {
+		// connector 过滤场景下改为按 tunnel 列表聚合，避免误用全局快照统计。
+		filteredTunnels := filterTunnelsByConnector(safeListTunnels(server.dependencies), connectorFilter)
+		summary = adminview.BuildTunnelSummaryFromRuntimes(server.now(), filteredTunnels)
+	}
+	agentPoolReports := filterTunnelPoolReportsByConnector(
+		safeListTunnelPoolReports(server.dependencies),
+		connectorFilter,
+	)
+	agentPoolSummary := buildAgentTunnelPoolSummary(server.now(), agentPoolReports)
 	writeJSON(writer, http.StatusOK, map[string]any{
-		"summary": summary,
-		"source":  "bridge.adminapi.readonly",
+		"summary":             summary,
+		"agent_pool_summary":  agentPoolSummary,
+		"connector_id_filter": normalizeAuditFilterValue(connectorFilter),
+		"source":              "bridge.adminapi.readonly",
 	})
 }
 
@@ -603,6 +861,18 @@ func (recorder *statusCodeRecorder) WriteHeader(statusCode int) {
 	recorder.ResponseWriter.WriteHeader(statusCode)
 }
 
+// Flush 透传底层 flusher 能力，确保 SSE 等流式接口可用。
+func (recorder *statusCodeRecorder) Flush() {
+	if recorder == nil {
+		return
+	}
+	flusher, ok := recorder.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+	flusher.Flush()
+}
+
 // setParamSummary 保存写操作参数摘要供审计日志读取。
 func (recorder *statusCodeRecorder) setParamSummary(summary string) {
 	if recorder == nil {
@@ -779,4 +1049,94 @@ func safeTunnelSnapshot(dependencies Dependencies) registry.TunnelSnapshot {
 		return registry.TunnelSnapshot{}
 	}
 	return dependencies.TunnelSnapshot()
+}
+
+func safeListTunnelPoolReports(dependencies Dependencies) []TunnelPoolReportSnapshot {
+	if dependencies.ListTunnelPoolReports == nil {
+		return []TunnelPoolReportSnapshot{}
+	}
+	return dependencies.ListTunnelPoolReports()
+}
+
+// filterTunnelsByConnector 仅保留指定 connector 的 tunnel 运行态。
+func filterTunnelsByConnector(
+	tunnels []registry.TunnelRuntime,
+	connectorID string,
+) []registry.TunnelRuntime {
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" {
+		return tunnels
+	}
+	filteredTunnels := make([]registry.TunnelRuntime, 0, len(tunnels))
+	for _, tunnelRuntime := range tunnels {
+		if strings.TrimSpace(tunnelRuntime.ConnectorID) != normalizedConnectorID {
+			continue
+		}
+		filteredTunnels = append(filteredTunnels, tunnelRuntime)
+	}
+	return filteredTunnels
+}
+
+// filterTunnelPoolReportsByConnector 仅保留指定 connector 的 tunnel 池上报快照。
+func filterTunnelPoolReportsByConnector(
+	reports []TunnelPoolReportSnapshot,
+	connectorID string,
+) []TunnelPoolReportSnapshot {
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" {
+		return reports
+	}
+	filteredReports := make([]TunnelPoolReportSnapshot, 0, len(reports))
+	for _, report := range reports {
+		if strings.TrimSpace(report.ConnectorID) != normalizedConnectorID {
+			continue
+		}
+		filteredReports = append(filteredReports, report)
+	}
+	return filteredReports
+}
+
+// buildAgentTunnelPoolSummary 基于 Agent 上报快照聚合 tunnel 池视图。
+func buildAgentTunnelPoolSummary(
+	now time.Time,
+	reports []TunnelPoolReportSnapshot,
+) AgentTunnelPoolSummary {
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	summary := AgentTunnelPoolSummary{
+		UpdatedAtMS: uint64(normalizedNow.UnixMilli()),
+	}
+	latestUpdatedAtMS := uint64(0)
+	for _, report := range reports {
+		summary.Idle += maxInt(report.IdleCount, 0)
+		summary.InUse += maxInt(report.InUseCount, 0)
+		summary.TargetIdle += maxInt(report.TargetIdleCount, 0)
+		summary.ReportCount++
+		reportUpdatedAtMS := maxUint64(report.UpdatedAtMS, report.ReportedAtMS)
+		if reportUpdatedAtMS > latestUpdatedAtMS {
+			latestUpdatedAtMS = reportUpdatedAtMS
+		}
+	}
+	if latestUpdatedAtMS == 0 {
+		latestUpdatedAtMS = summary.UpdatedAtMS
+	}
+	summary.Connected = summary.Idle + summary.InUse
+	summary.UpdatedAtMS = latestUpdatedAtMS
+	return summary
+}
+
+func maxInt(value int, fallback int) int {
+	if value < fallback {
+		return fallback
+	}
+	return value
+}
+
+func maxUint64(left uint64, right uint64) uint64 {
+	if left >= right {
+		return left
+	}
+	return right
 }

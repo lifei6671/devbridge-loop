@@ -2,9 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -790,4 +793,300 @@ func TestControlMessageDispatcherHandleFrameRefreshesHeartbeat(testingObject *te
 			sessionSnapshot.LastHeartbeat,
 		)
 	}
+}
+
+// TestClassifyTCPInboundConnection 验证 TCP 首包判别可区分 control 与 tunnel 连接。
+func TestClassifyTCPInboundConnection(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testingObject.Run("control_frame_prefix", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		go func() {
+			header := make([]byte, 6)
+			binary.BigEndian.PutUint16(header[0:2], transport.ControlFrameTypeHeartbeatPing)
+			binary.BigEndian.PutUint32(header[2:6], 0)
+			_, _ = clientConn.Write(header)
+		}()
+
+		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
+		if err != nil {
+			testingObject.Fatalf("classify control connection failed: %v", err)
+		}
+		if !isControl {
+			testingObject.Fatalf("expected control connection")
+		}
+		readBackHeader := make([]byte, 6)
+		if _, err := io.ReadFull(classifiedConn, readBackHeader); err != nil {
+			testingObject.Fatalf("read classified control prefix failed: %v", err)
+		}
+		if binary.BigEndian.Uint16(readBackHeader[0:2]) != transport.ControlFrameTypeHeartbeatPing {
+			testingObject.Fatalf("unexpected control frame type after prefix replay")
+		}
+	})
+
+	testingObject.Run("tunnel_frame_prefix", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		go func() {
+			header := make([]byte, 4)
+			binary.BigEndian.PutUint32(header[0:4], 16)
+			_, _ = clientConn.Write(header)
+		}()
+
+		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
+		if err != nil {
+			testingObject.Fatalf("classify tunnel connection failed: %v", err)
+		}
+		if isControl {
+			testingObject.Fatalf("expected tunnel connection")
+		}
+		readBackHeader := make([]byte, 4)
+		if _, err := io.ReadFull(classifiedConn, readBackHeader); err != nil {
+			testingObject.Fatalf("read classified tunnel prefix failed: %v", err)
+		}
+		if binary.BigEndian.Uint32(readBackHeader[0:4]) != 16 {
+			testingObject.Fatalf("unexpected tunnel payload length after prefix replay")
+		}
+	})
+}
+
+// TestRegisterAcceptedTunnelSingleActiveSession 验证入站 tunnel 可登记到唯一 ACTIVE session。
+func TestRegisterAcceptedTunnelSingleActiveSession(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-local-1",
+		ConnectorID:   "agent-local",
+		Epoch:         8,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("inbound-tunnel-1")
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed); err != nil {
+		testingObject.Fatalf("register accepted tunnel failed: %v", err)
+	}
+
+	runtimeSnapshot, exists := tunnelRegistry.Get("inbound-tunnel-1")
+	if !exists {
+		testingObject.Fatalf("expected tunnel registered")
+	}
+	if runtimeSnapshot.State != registry.TunnelStateIdle {
+		testingObject.Fatalf("unexpected tunnel state: got=%s want=%s", runtimeSnapshot.State, registry.TunnelStateIdle)
+	}
+	if runtimeSnapshot.ConnectorID != "agent-local" || runtimeSnapshot.SessionID != "session-local-1" {
+		testingObject.Fatalf(
+			"unexpected tunnel owner: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+
+	_ = rawTunnel.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, exists := tunnelRegistry.Get("inbound-tunnel-1"); !exists {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	testingObject.Fatalf("expected idle tunnel removed after close")
+}
+
+// TestRegisterAcceptedTunnelAmbiguousOwner 验证 owner 不唯一时入站 tunnel 不会被登记。
+func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-a",
+		ConnectorID:   "agent-a",
+		Epoch:         3,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-b",
+		ConnectorID:   "agent-b",
+		Epoch:         6,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("inbound-tunnel-2")
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed); err != nil {
+		testingObject.Fatalf("register accepted tunnel should not hard fail on ambiguous owner: %v", err)
+	}
+	if tunnelRegistry.Snapshot().TotalCount != 0 {
+		testingObject.Fatalf("expected no tunnel registered when owner is ambiguous")
+	}
+	if !rawTunnel.closed() {
+		testingObject.Fatalf("expected ambiguous tunnel closed immediately")
+	}
+}
+
+// controlPlaneInboundTestTunnel 是 registerAcceptedTunnel 用的最小 transport.Tunnel 假实现。
+type controlPlaneInboundTestTunnel struct {
+	tunnelID string
+
+	doneOnce sync.Once
+	doneChan chan struct{}
+
+	mu      sync.Mutex
+	lastErr error
+	closedV bool
+}
+
+// newControlPlaneInboundTestTunnel 创建可手动关闭的测试 tunnel。
+func newControlPlaneInboundTestTunnel(tunnelID string) *controlPlaneInboundTestTunnel {
+	return &controlPlaneInboundTestTunnel{
+		tunnelID: tunnelID,
+		doneChan: make(chan struct{}),
+	}
+}
+
+// ID 返回稳定 tunnel_id。
+func (tunnel *controlPlaneInboundTestTunnel) ID() string {
+	if tunnel == nil {
+		return ""
+	}
+	return tunnel.tunnelID
+}
+
+// Meta 返回最小 tunnel 元数据。
+func (tunnel *controlPlaneInboundTestTunnel) Meta() transport.TunnelMeta {
+	return transport.TunnelMeta{TunnelID: tunnel.ID(), CreatedAt: time.Now().UTC()}
+}
+
+// State 返回 idle，占位满足接口约束。
+func (tunnel *controlPlaneInboundTestTunnel) State() transport.TunnelState {
+	return transport.TunnelStateIdle
+}
+
+// BindingInfo 返回 tcp_framed 占位绑定信息。
+func (tunnel *controlPlaneInboundTestTunnel) BindingInfo() transport.BindingInfo {
+	return transport.BindingInfo{Type: transport.BindingTypeTCPFramed}
+}
+
+// Read 在该测试替身中不应被调用。
+func (tunnel *controlPlaneInboundTestTunnel) Read(payload []byte) (int, error) {
+	_ = payload
+	return 0, transport.ErrClosed
+}
+
+// Write 在该测试替身中不应被调用。
+func (tunnel *controlPlaneInboundTestTunnel) Write(payload []byte) (int, error) {
+	_ = payload
+	return 0, transport.ErrClosed
+}
+
+// Close 关闭 tunnel 并触发 Done。
+func (tunnel *controlPlaneInboundTestTunnel) Close() error {
+	if tunnel == nil {
+		return nil
+	}
+	tunnel.mu.Lock()
+	tunnel.closedV = true
+	tunnel.lastErr = transport.ErrClosed
+	tunnel.mu.Unlock()
+	tunnel.doneOnce.Do(func() { close(tunnel.doneChan) })
+	return nil
+}
+
+// CloseWrite 测试替身不提供半关闭能力。
+func (tunnel *controlPlaneInboundTestTunnel) CloseWrite() error {
+	return transport.ErrUnsupported
+}
+
+// Reset 以 broken 原因关闭 tunnel。
+func (tunnel *controlPlaneInboundTestTunnel) Reset(cause error) error {
+	if tunnel == nil {
+		return nil
+	}
+	tunnel.mu.Lock()
+	if cause == nil {
+		cause = transport.ErrTunnelBroken
+	}
+	tunnel.closedV = true
+	tunnel.lastErr = cause
+	tunnel.mu.Unlock()
+	tunnel.doneOnce.Do(func() { close(tunnel.doneChan) })
+	return nil
+}
+
+// SetDeadline 测试替身不需要实际 deadline 行为。
+func (tunnel *controlPlaneInboundTestTunnel) SetDeadline(deadline time.Time) error {
+	_ = deadline
+	return nil
+}
+
+// SetReadDeadline 测试替身不需要实际 deadline 行为。
+func (tunnel *controlPlaneInboundTestTunnel) SetReadDeadline(deadline time.Time) error {
+	_ = deadline
+	return nil
+}
+
+// SetWriteDeadline 测试替身不需要实际 deadline 行为。
+func (tunnel *controlPlaneInboundTestTunnel) SetWriteDeadline(deadline time.Time) error {
+	_ = deadline
+	return nil
+}
+
+// Done 返回 tunnel 关闭信号。
+func (tunnel *controlPlaneInboundTestTunnel) Done() <-chan struct{} {
+	if tunnel == nil {
+		closedChan := make(chan struct{})
+		close(closedChan)
+		return closedChan
+	}
+	return tunnel.doneChan
+}
+
+// Err 返回最近错误。
+func (tunnel *controlPlaneInboundTestTunnel) Err() error {
+	if tunnel == nil {
+		return transport.ErrInvalidArgument
+	}
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	return tunnel.lastErr
+}
+
+// closed 返回 tunnel 是否已关闭，供测试断言。
+func (tunnel *controlPlaneInboundTestTunnel) closed() bool {
+	if tunnel == nil {
+		return true
+	}
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	return tunnel.closedV
 }

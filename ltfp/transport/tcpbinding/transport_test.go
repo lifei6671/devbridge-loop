@@ -2,6 +2,7 @@ package tcpbinding
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -96,5 +97,15 @@ func TestTransportDialAndAcceptControlChannel(testingObject *testing.T) {
 
 	if serverErr := <-serverResultChannel; serverErr != nil {
 		testingObject.Fatalf("server side failed: %v", serverErr)
+	}
+}
+
+// TestIsKeepAlivePeriodUnsupported 验证 keepalive 周期不支持错误可被识别。
+func TestIsKeepAlivePeriodUnsupported(testingObject *testing.T) {
+	if !isKeepAlivePeriodUnsupported(errors.New("operation not supported")) {
+		testingObject.Fatalf("expected not supported error detected")
+	}
+	if isKeepAlivePeriodUnsupported(errors.New("permission denied")) {
+		testingObject.Fatalf("unexpected unsupported detection for non-related error")
 	}
 }

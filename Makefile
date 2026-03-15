@@ -90,7 +90,8 @@ run-demo-inventory:
 
 # 在 WSL 下交叉编译 Win11 可执行文件（Go 模块 + demo 模块）。
 # 默认生成 x86_64 Windows 可执行（.exe），可通过 WIN_GOARCH 覆盖为 arm64。
-build-win11-go:
+# 依赖 build-cloud-bridge-ui，确保 cloud-bridge.exe 打包最新内嵌前端静态资源。
+build-win11-go: build-cloud-bridge-ui
 	@mkdir -p $(WIN11_BIN_DIR)
 	@echo ">> build windows binaries: GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) CGO_ENABLED=$(WIN_CGO_ENABLED)"
 	cd agent-core && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/agent-core.exe ./cmd/agent-core

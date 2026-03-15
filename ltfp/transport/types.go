@@ -22,11 +22,70 @@ func (bindingType BindingType) String() string {
 	return string(bindingType)
 }
 
+// KeepalivePolicy 描述 binding 对 idle tunnel 的保活治理参数。
+type KeepalivePolicy struct {
+	// IdleTTL 表示 idle tunnel 在池中的最大存活时间；0 表示不启用 TTL 轮换。
+	IdleTTL time.Duration
+	// ProbeInterval 表示应用层探活间隔；0 表示依赖传输层 keepalive。
+	ProbeInterval time.Duration
+	// ProbeTimeout 表示单次探活超时。
+	ProbeTimeout time.Duration
+	// ProbeMaxFailures 表示连续探活失败阈值。
+	ProbeMaxFailures int
+}
+
 // BindingInfo 描述当前 session 的 binding 元信息。
 type BindingInfo struct {
 	Type                 BindingType
 	Version              string
 	MaxConcurrentStreams int64
+	KeepalivePolicy      KeepalivePolicy
+}
+
+// DefaultKeepalivePolicyForBinding 返回 binding 的默认保活治理参数。
+func DefaultKeepalivePolicyForBinding(bindingType BindingType) KeepalivePolicy {
+	switch bindingType {
+	case BindingTypeGRPCH2:
+		// grpc_h2 依赖连接级 keepalive，应用层 tunnel probe 默认为关闭。
+		return KeepalivePolicy{
+			IdleTTL:          300 * time.Second,
+			ProbeInterval:    0,
+			ProbeTimeout:     0,
+			ProbeMaxFailures: 0,
+		}
+	case BindingTypeTCPFramed:
+		// tcp_framed 需要结合 TCP keepalive 与应用层探活共同治理僵尸 tunnel。
+		return KeepalivePolicy{
+			IdleTTL:          120 * time.Second,
+			ProbeInterval:    30 * time.Second,
+			ProbeTimeout:     5 * time.Second,
+			ProbeMaxFailures: 2,
+		}
+	case BindingTypeQUICNative, BindingTypeH3Stream:
+		// QUIC/H3 首版默认依赖连接级 idle timeout，应用层探活默认为关闭。
+		return KeepalivePolicy{
+			IdleTTL:          300 * time.Second,
+			ProbeInterval:    0,
+			ProbeTimeout:     0,
+			ProbeMaxFailures: 0,
+		}
+	default:
+		// 未知 binding 回落到保守值，避免策略完全缺失。
+		return KeepalivePolicy{
+			IdleTTL:          120 * time.Second,
+			ProbeInterval:    30 * time.Second,
+			ProbeTimeout:     5 * time.Second,
+			ProbeMaxFailures: 2,
+		}
+	}
+}
+
+// NewBindingInfo 创建带默认 keepalive 策略的 BindingInfo。
+func NewBindingInfo(bindingType BindingType) BindingInfo {
+	return BindingInfo{
+		Type:            bindingType,
+		KeepalivePolicy: DefaultKeepalivePolicyForBinding(bindingType),
+	}
 }
 
 // SessionMeta 描述 session 级元数据。

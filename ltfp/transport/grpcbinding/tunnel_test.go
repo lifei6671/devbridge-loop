@@ -274,6 +274,21 @@ func TestGRPCH2TunnelCloseWriteUnsupported(testingObject *testing.T) {
 	}
 }
 
+// TestGRPCH2TunnelProbeUnsupported 验证 grpc_h2 tunnel 显式返回探活不支持。
+func TestGRPCH2TunnelProbeUnsupported(testingObject *testing.T) {
+	tunnelStream, err := newGRPCH2TunnelStream(&fakeTunnelEnvelopeStream{})
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel stream failed: %v", err)
+	}
+	tunnel, err := NewGRPCH2Tunnel(tunnelStream, transport.TunnelMeta{TunnelID: "tunnel-probe-unsupported"})
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel failed: %v", err)
+	}
+	if probeErr := tunnel.Probe(context.Background()); !errors.Is(probeErr, transport.ErrUnsupported) {
+		testingObject.Fatalf("expected ErrUnsupported from grpc probe, got %v", probeErr)
+	}
+}
+
 // TestGRPCH2TunnelResetMarksBroken 验证 Reset 会将 tunnel 标记为 broken。
 func TestGRPCH2TunnelResetMarksBroken(testingObject *testing.T) {
 	tunnelStream, err := newGRPCH2TunnelStream(&fakeTunnelEnvelopeStream{})

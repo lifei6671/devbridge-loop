@@ -4,7 +4,7 @@
 将 `docs/BridgeAdminBackendTechnicalProposal.md` 拆解成可执行、可验收、可持续跟踪的任务清单，并完成一批可运行的后端落地实现与测试。
 
 ## Current Phase
-Phase 5
+Phase 9
 
 ## Phases
 
@@ -36,6 +36,30 @@ Phase 5
 ### Phase 5: 文档回写与交付
 - [x] 更新 `UI-Agent-Bridge-Unimplemented-Checklist.md` 的 A2 阶段记录
 - [x] 输出本轮“已落地 + 剩余任务”说明
+- **Status:** complete
+
+### Phase 6: 页面联调收口（BMA-15/BMA-16）
+- [x] 六类页面端到端联调（真实 API 驱动 + 可操作交互增强）
+- [x] 内嵌部署联调（单实例 server 覆盖 UI/API/SSE/写接口）
+- **Status:** complete
+
+### Phase 7: 配置文件启动能力（YAML）
+- [x] 新增 YAML 配置加载入口（严格字段校验 + 默认值回填 + Validate）
+- [x] 启动命令支持 `-config <yaml_path>`
+- [x] 补充配置加载测试与示例配置文件
+- **Status:** complete
+
+### Phase 8: 安全收口（M3）
+- [x] 新增 cookie 鉴权模式的 CSRF 防护（Origin/Referer + CSRF 双提交）
+- [x] 增加管理面监听地址隔离校验（默认不共享监听地址）
+- [x] 增强导出下载访问控制（发起人绑定 + 一次性下载令牌）
+- [x] 完成 `adminapi/app` 回归测试与 `go test ./...`
+- **Status:** complete
+
+### Phase 9: BMA-15/BMA-16 最终收口
+- [x] 前端自动刷新稳定性增强：轮询兜底模式下自动重试恢复 SSE
+- [x] 单实例联调补全：导出下载一次性令牌链路 + cookie/csrf 写入约束集成测试
+- [x] 回写执行清单：`BridgeAdminBackendExecutionChecklist`、`Agent-and-Bridge-ExecutionChecklist`、`UI-Agent-Bridge-Unimplemented-Checklist`
 - **Status:** complete
 
 ## Key Questions

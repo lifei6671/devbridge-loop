@@ -199,15 +199,16 @@ func (server *Server) handleOpsDiagnoseExport(writer http.ResponseWriter, reques
 		writeOperationError(writer, ErrAdminOperationNotSupported)
 		return
 	}
+	actor := principalFromRequest(request)
 	exportPayload := server.buildDiagnoseExportPayload()
 	sanitizedPayload, maskedFields := sanitizeExportPayload(exportPayload)
-	entry, err := server.exportStore.create(server.now(), sanitizedPayload, maskedFields)
+	entry, err := server.exportStore.create(server.now(), sanitizedPayload, maskedFields, actor.name)
 	if err != nil {
 		writeOperationError(writer, err)
 		return
 	}
 	downloadURL := fmt.Sprintf("/api/admin/ops/diagnose/export/%s/download?token=%s", entry.ExportID, entry.Token)
-	setAuditParamSummary(writer, fmt.Sprintf("export_id=%s", entry.ExportID))
+	setAuditParamSummary(writer, fmt.Sprintf("export_id=%s issued_to=%s", entry.ExportID, strings.TrimSpace(actor.name)))
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"export_id":     entry.ExportID,
 		"download_url":  downloadURL,
@@ -237,13 +238,23 @@ func (server *Server) handleOpsDiagnoseExportDownload(writer http.ResponseWriter
 		writeOperationError(writer, ErrAdminOperationNotSupported)
 		return
 	}
-	entry, exists := server.exportStore.get(exportID, downloadToken, server.now())
-	if !exists {
+	actor := principalFromRequest(request)
+	entry, getErr := server.exportStore.get(exportID, downloadToken, actor.name, server.now())
+	if getErr != nil {
+		if errors.Is(getErr, errDiagnoseExportActorMismatch) {
+			writeError(writer, http.StatusForbidden, "FORBIDDEN", "diagnose export is not issued to current actor")
+			return
+		}
 		writeError(writer, http.StatusNotFound, "NOT_FOUND", "diagnose export is missing or expired")
 		return
 	}
-	setAuditParamSummary(writer, fmt.Sprintf("export_id=%s", exportID))
+	setAuditParamSummary(
+		writer,
+		fmt.Sprintf("export_id=%s issued_to=%s downloaded_by=%s", exportID, strings.TrimSpace(entry.IssuedTo), strings.TrimSpace(actor.name)),
+	)
 	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.Header().Set("Pragma", "no-cache")
 	writer.Header().Set(
 		"Content-Disposition",
 		fmt.Sprintf("attachment; filename=\"bridge-diagnose-%s.json\"", exportID),

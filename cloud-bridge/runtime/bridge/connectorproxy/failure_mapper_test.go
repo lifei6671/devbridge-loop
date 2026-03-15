@@ -25,6 +25,12 @@ func TestFailureMapperMap(testingObject *testing.T) {
 			wantCode:       FailureCodeNoIdleTunnel,
 		},
 		{
+			name:           "no_available_tunnel",
+			err:            ErrNoTunnel,
+			wantHTTPStatus: 503,
+			wantCode:       FailureCodeNoIdleTunnel,
+		},
+		{
 			name: "connector_dial_failed",
 			err: &OpenRejectedError{
 				Ack: pb.TrafficOpenAck{

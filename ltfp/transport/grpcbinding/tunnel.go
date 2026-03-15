@@ -32,6 +32,7 @@ type GRPCH2Tunnel struct {
 }
 
 var _ transport.Tunnel = (*GRPCH2Tunnel)(nil)
+var _ transport.TunnelHealthProber = (*GRPCH2Tunnel)(nil)
 
 // NewGRPCH2Tunnel 使用指定元数据创建 tunnel 适配器。
 func NewGRPCH2Tunnel(stream *GRPCH2TunnelStream, meta transport.TunnelMeta) (*GRPCH2Tunnel, error) {
@@ -97,7 +98,16 @@ func (tunnel *GRPCH2Tunnel) State() transport.TunnelState {
 
 // BindingInfo 返回绑定类型信息。
 func (tunnel *GRPCH2Tunnel) BindingInfo() transport.BindingInfo {
-	return transport.BindingInfo{Type: transport.BindingTypeGRPCH2}
+	return transport.NewBindingInfo(transport.BindingTypeGRPCH2)
+}
+
+// Probe 在 grpc_h2 binding 下由连接级 keepalive 覆盖，因此不额外实现 tunnel 探活。
+func (tunnel *GRPCH2Tunnel) Probe(ctx context.Context) error {
+	_ = ctx
+	if tunnel == nil {
+		return fmt.Errorf("grpc tunnel probe: %w", transport.ErrInvalidArgument)
+	}
+	return fmt.Errorf("grpc tunnel probe: %w", transport.ErrUnsupported)
 }
 
 // Read 按 io.Reader 语义读取 payload。

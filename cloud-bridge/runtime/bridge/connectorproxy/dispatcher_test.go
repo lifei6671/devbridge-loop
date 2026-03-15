@@ -53,6 +53,8 @@ type connectorProxyTestTunnel struct {
 	writeMutex sync.Mutex
 	writes     []pb.StreamPayload
 	failReset  bool
+	probeError error
+	probeCount atomic.Int32
 	closeCount atomic.Int32
 }
 
@@ -96,6 +98,18 @@ func (tunnel *connectorProxyTestTunnel) Close() error {
 	return nil
 }
 
+func (tunnel *connectorProxyTestTunnel) Probe(ctx context.Context) error {
+	tunnel.probeCount.Add(1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	return tunnel.probeError
+}
+
 func (tunnel *connectorProxyTestTunnel) EnqueueReadPayload(payload pb.StreamPayload) {
 	tunnel.readQueue <- connectorProxyReadResult{payload: payload}
 }
@@ -116,6 +130,16 @@ func (tunnel *connectorProxyTestTunnel) SetFailResetWrite(enabled bool) {
 	tunnel.writeMutex.Lock()
 	defer tunnel.writeMutex.Unlock()
 	tunnel.failReset = enabled
+}
+
+func (tunnel *connectorProxyTestTunnel) SetProbeError(err error) {
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	tunnel.probeError = err
+}
+
+func (tunnel *connectorProxyTestTunnel) ProbeCount() int32 {
+	return tunnel.probeCount.Load()
 }
 
 // TestTunnelAcquirerNoIdleTimeoutAndRefill 验证 no-idle 会触发补池并在等待窗口超时失败。
@@ -268,6 +292,81 @@ func TestTunnelAcquirerWaitsForIncomingIdle(testingObject *testing.T) {
 	}
 	if acquired.State != registry.TunnelStateReserved {
 		testingObject.Fatalf("unexpected tunnel state: %s", acquired.State)
+	}
+}
+
+// TestTunnelAcquirerSkipsStaleTunnelViaProbe 验证分配后探活失败的 tunnel 会被剔除并继续重试。
+func TestTunnelAcquirerSkipsStaleTunnelViaProbe(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	staleTunnel := newConnectorProxyTestTunnel("tunnel-stale")
+	staleTunnel.SetProbeError(errors.New("peer already closed"))
+	healthyTunnel := newConnectorProxyTestTunnel("tunnel-healthy")
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", staleTunnel); err != nil {
+		testingObject.Fatalf("upsert stale tunnel failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", healthyTunnel); err != nil {
+		testingObject.Fatalf("upsert healthy tunnel failed: %v", err)
+	}
+	refillRequester := &connectorProxyTestRefillRequester{}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry:        tunnelRegistry,
+		Refill:          refillRequester,
+		EnableNoIdleWT:  false,
+		MaxAcquireRetry: 3,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+
+	acquired, err := acquirer.AcquireIdleTunnel(context.Background(), "connector-1")
+	if err != nil {
+		testingObject.Fatalf("expected acquire success after stale skip, got: %v", err)
+	}
+	if acquired.TunnelID != "tunnel-healthy" {
+		testingObject.Fatalf("unexpected acquired tunnel id: %s", acquired.TunnelID)
+	}
+	if staleTunnel.ProbeCount() != 1 {
+		testingObject.Fatalf("expected stale tunnel probe once, got=%d", staleTunnel.ProbeCount())
+	}
+	if staleTunnel.CloseCount() != 1 {
+		testingObject.Fatalf("expected stale tunnel close once during recycle, got=%d", staleTunnel.CloseCount())
+	}
+	if _, exists := tunnelRegistry.Get("tunnel-stale"); exists {
+		testingObject.Fatalf("expected stale tunnel removed from registry")
+	}
+	if len(refillRequester.Calls()) != 1 {
+		testingObject.Fatalf("expected one refill request triggered by stale tunnel, got=%d", len(refillRequester.Calls()))
+	}
+}
+
+// TestTunnelAcquirerMaxRetryExceededByStale 验证 stale tunnel 连续命中超过重试后返回显式错误语义。
+func TestTunnelAcquirerMaxRetryExceededByStale(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	staleTunnel := newConnectorProxyTestTunnel("tunnel-only-stale")
+	staleTunnel.SetProbeError(errors.New("probe failed"))
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", staleTunnel); err != nil {
+		testingObject.Fatalf("upsert stale tunnel failed: %v", err)
+	}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry:        tunnelRegistry,
+		EnableNoIdleWT:  false,
+		MaxAcquireRetry: 1,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+
+	_, err = acquirer.AcquireIdleTunnel(context.Background(), "connector-1")
+	if !errors.Is(err, ErrNoTunnel) {
+		testingObject.Fatalf("expected ErrNoTunnel after stale retries exhausted, got: %v", err)
+	}
+	if !errors.Is(err, ErrTunnelStale) {
+		testingObject.Fatalf("expected ErrTunnelStale after stale retries exhausted, got: %v", err)
+	}
+	if !errors.Is(err, ErrNoIdleTunnel) {
+		testingObject.Fatalf("expected ErrNoIdleTunnel compatibility signal, got: %v", err)
 	}
 }
 

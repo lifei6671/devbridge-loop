@@ -325,6 +325,44 @@ func BuildTunnelSummary(now time.Time, snapshot registry.TunnelSnapshot) TunnelS
 	}
 }
 
+// BuildTunnelSummaryFromRuntimes 基于 tunnel 列表构建汇总，适用于 connector 过滤后的聚合。
+func BuildTunnelSummaryFromRuntimes(now time.Time, tunnels []registry.TunnelRuntime) TunnelSummarySnapshot {
+	normalizedNow := now
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+	summary := TunnelSummarySnapshot{
+		UpdatedAtMS: uint64(normalizedNow.UnixMilli()),
+	}
+	latestUpdatedAtMS := uint64(0)
+	for _, tunnelRuntime := range tunnels {
+		switch tunnelRuntime.State {
+		case registry.TunnelStateIdle:
+			summary.Idle++
+		case registry.TunnelStateReserved:
+			summary.Reserved++
+		case registry.TunnelStateActive:
+			summary.Active++
+		case registry.TunnelStateClosed:
+			summary.Closed++
+		case registry.TunnelStateBroken:
+			summary.Broken++
+		}
+		summary.Total++
+		if !tunnelRuntime.UpdatedAt.IsZero() {
+			updatedAtMS := uint64(tunnelRuntime.UpdatedAt.UTC().UnixMilli())
+			if updatedAtMS > latestUpdatedAtMS {
+				latestUpdatedAtMS = updatedAtMS
+			}
+		}
+	}
+	if latestUpdatedAtMS == 0 {
+		latestUpdatedAtMS = summary.UpdatedAtMS
+	}
+	summary.UpdatedAtMS = latestUpdatedAtMS
+	return summary
+}
+
 // BuildTrafficSummary 构建 traffic 指标汇总。
 func BuildTrafficSummary(now time.Time, metrics *obs.Metrics) TrafficSummarySnapshot {
 	normalizedNow := now

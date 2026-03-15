@@ -481,7 +481,8 @@ func TestTunnelListPayloadUsesRuntimeAssociation(testingObject *testing.T) {
 	}
 	runtime := &Runtime{
 		cfg: Config{
-			BridgeAddr: "127.0.0.1:39080",
+			BridgeAddr:      "127.0.0.1:39080",
+			BridgeTransport: "tcp_framed",
 		},
 		tunnelRegistry:     registry,
 		tunnelAssociations: make(map[string]tunnelAssociation),
@@ -513,6 +514,9 @@ func TestTunnelListPayloadUsesRuntimeAssociation(testingObject *testing.T) {
 	}
 	if item["remote_addr"] != "127.0.0.1:39080" {
 		testingObject.Fatalf("unexpected remote_addr: %+v", item["remote_addr"])
+	}
+	if item["protocol"] != "tcp_framed" {
+		testingObject.Fatalf("unexpected protocol: %+v", item["protocol"])
 	}
 	if item["latency_ms"] != uint64(23) {
 		testingObject.Fatalf("unexpected latency_ms: %+v", item["latency_ms"])

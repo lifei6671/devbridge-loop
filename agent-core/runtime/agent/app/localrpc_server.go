@@ -86,6 +86,17 @@ type localRPCAuthCompletePayload struct {
 	ClientProof     string `json:"client_proof"`
 }
 
+type localRPCServiceAddPayload struct {
+	ServiceID   string `json:"service_id"`
+	ServiceKey  string `json:"service_key"`
+	Namespace   string `json:"namespace"`
+	Environment string `json:"environment"`
+	ServiceName string `json:"service_name"`
+	Protocol    string `json:"protocol"`
+	Host        string `json:"host"`
+	Port        uint32 `json:"port"`
+}
+
 type localRPCAuthPending struct {
 	protocolVersion string
 	clientNonce     string
@@ -409,6 +420,25 @@ func (server *localRPCServer) dispatchRequest(
 	case "session.drain":
 		server.runtime.requestBridgeDrain()
 		return server.runtime.sessionSnapshotPayload(), nil
+	case "service.add":
+		servicePayload, err := decodePayload[localRPCServiceAddPayload](requestBody.Payload)
+		if err != nil {
+			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.add payload"}
+		}
+		addedPayload, addErr := server.runtime.addOrUpdateService(runtimeServiceAddInput{
+			ServiceID:   servicePayload.ServiceID,
+			ServiceKey:  servicePayload.ServiceKey,
+			Namespace:   servicePayload.Namespace,
+			Environment: servicePayload.Environment,
+			ServiceName: servicePayload.ServiceName,
+			Protocol:    servicePayload.Protocol,
+			Host:        servicePayload.Host,
+			Port:        servicePayload.Port,
+		})
+		if addErr != nil {
+			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: addErr.Error()}
+		}
+		return addedPayload, nil
 	case "service.list":
 		return server.runtime.serviceListPayload(), nil
 	case "tunnel.list":

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/adminapi"
+	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/web"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -34,6 +35,8 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 保存 Agent tunnel 池上报快照，供 Admin 观测页展示“Agent 视角池状态”。
+	tunnelPoolReportStore := bridgecontrol.NewTunnelPoolReportStore()
 	var adminServer *http.Server
 	if cfg.Admin.Enabled {
 		// 管理面启用时才初始化 mux 与 server，关闭时保持零开销。
@@ -76,6 +79,32 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 					}
 					return dataPlane.tunnelRegistry.Snapshot()
 				},
+				ListTunnelPoolReports: func() []adminapi.TunnelPoolReportSnapshot {
+					reportItems := tunnelPoolReportStore.List()
+					result := make([]adminapi.TunnelPoolReportSnapshot, 0, len(reportItems))
+					for _, item := range reportItems {
+						reportedAtMS := uint64(0)
+						if !item.ReportedAt.IsZero() {
+							reportedAtMS = uint64(item.ReportedAt.UTC().UnixMilli())
+						}
+						updatedAtMS := uint64(0)
+						if !item.UpdatedAt.IsZero() {
+							updatedAtMS = uint64(item.UpdatedAt.UTC().UnixMilli())
+						}
+						result = append(result, adminapi.TunnelPoolReportSnapshot{
+							ConnectorID:     strings.TrimSpace(item.ConnectorID),
+							SessionID:       strings.TrimSpace(item.SessionID),
+							SessionEpoch:    item.SessionEpoch,
+							IdleCount:       item.IdleCount,
+							InUseCount:      item.InUseCount,
+							TargetIdleCount: item.TargetIdleCount,
+							Trigger:         strings.TrimSpace(item.Trigger),
+							ReportedAtMS:    reportedAtMS,
+							UpdatedAtMS:     updatedAtMS,
+						})
+					}
+					return result
+				},
 				BuildConfigSnapshot: func() map[string]any {
 					return adminConfigStore.snapshot()
 				},
@@ -108,7 +137,12 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 					return adminConfigStore.update(now, request, actor)
 				},
 			},
-			BearerTokens: buildAdminBearerTokens(cfg.Admin.AuthTokens),
+			BearerTokens:    buildAdminBearerTokens(cfg.Admin.AuthTokens),
+			AuthMode:        cfg.Admin.AuthMode,
+			CookieTokenName: cfg.Admin.CookieTokenName,
+			CSRFCookieName:  cfg.Admin.CSRFCookieName,
+			CSRFHeaderName:  cfg.Admin.CSRFHeaderName,
+			AllowedOrigins:  append([]string(nil), cfg.Admin.AllowedOrigins...),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("initialize admin api server: %w", err)
@@ -121,10 +155,11 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 	}
 	// 控制面与数据面共享注册表，避免“控制面更新了、数据面看不到”的分裂状态。
 	controlServer, err := newControlPlaneServer(cfg.ControlPlane, controlPlaneDependencies{
-		sessionRegistry: dataPlane.sessionRegistry,
-		serviceRegistry: dataPlane.serviceRegistry,
-		routeRegistry:   dataPlane.routeRegistry,
-		tunnelRegistry:  dataPlane.tunnelRegistry,
+		sessionRegistry:       dataPlane.sessionRegistry,
+		serviceRegistry:       dataPlane.serviceRegistry,
+		routeRegistry:         dataPlane.routeRegistry,
+		tunnelRegistry:        dataPlane.tunnelRegistry,
+		tunnelPoolReportStore: tunnelPoolReportStore,
 	})
 	if err != nil {
 		return nil, err

@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::State;
 
@@ -12,9 +13,11 @@ pub struct TunnelListItem {
     pub tunnel_id: String,
     pub service_id: String,
     pub state: String,
+    pub protocol: String,
     pub local_addr: String,
     pub remote_addr: String,
     pub latency_ms: u64,
+    pub last_heartbeat_at_ms: Option<u64>,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
 }
@@ -41,6 +44,24 @@ fn value_u64_or(payload: &Value, key: &str, default_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+fn value_u64_keys(payload: &Value, keys: &[&str], default_value: u64) -> u64 {
+    for key in keys {
+        if let Some(value) = payload.get(*key).and_then(Value::as_u64) {
+            return value;
+        }
+    }
+    default_value
+}
+
+fn value_u64_opt_keys(payload: &Value, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(value) = payload.get(*key).and_then(Value::as_u64) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// 将 localrpc 返回体解析为通道列表，兼容 array/object 两种外层结构。
 fn parse_tunnel_list(payload: &Value) -> Vec<TunnelListItem> {
     let raw_items = if let Some(items) = payload.get("tunnels").and_then(Value::as_array) {
@@ -51,32 +72,57 @@ fn parse_tunnel_list(payload: &Value) -> Vec<TunnelListItem> {
         Vec::new()
     };
 
-    raw_items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let tunnel_id = value_str_or(item, &["tunnel_id", "id"], "");
-            let normalized_tunnel_id = if tunnel_id.is_empty() {
-                // 兜底构造可追踪 id，避免列表渲染时丢失 key。
-                format!("tunnel-{}", index + 1)
-            } else {
-                tunnel_id
-            };
-            TunnelListItem {
-                tunnel_id: normalized_tunnel_id,
-                service_id: value_str_or(item, &["service_id", "service"], "--"),
-                state: value_str_or(item, &["state", "status"], "unknown"),
-                local_addr: value_str_or(item, &["local_addr", "local_target"], "--"),
-                remote_addr: value_str_or(item, &["remote_addr", "public_url"], "--"),
-                latency_ms: value_u64_or(item, "latency_ms", 0),
-                last_error: item
-                    .get("last_error")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string()),
-                updated_at_ms: value_u64_or(item, "updated_at_ms", now_ms()),
+    let mut dedup: HashMap<String, TunnelListItem> = HashMap::new();
+    raw_items.iter().enumerate().for_each(|(index, item)| {
+        let tunnel_id = value_str_or(item, &["tunnel_id", "id"], "");
+        let normalized_tunnel_id = if tunnel_id.is_empty() {
+            // 兜底构造可追踪 id，避免列表渲染时丢失 key。
+            format!("tunnel-{}", index + 1)
+        } else {
+            tunnel_id
+        };
+        let candidate = TunnelListItem {
+            tunnel_id: normalized_tunnel_id.clone(),
+            service_id: value_str_or(item, &["service_id", "service"], "--"),
+            state: value_str_or(item, &["state", "status"], "unknown"),
+            protocol: value_str_or(item, &["protocol", "transport"], "unknown"),
+            local_addr: value_str_or(item, &["local_addr", "local_target"], "--"),
+            remote_addr: value_str_or(item, &["remote_addr", "public_url"], "--"),
+            latency_ms: value_u64_keys(
+                item,
+                &[
+                    "latency_ms",
+                    "open_ack_latency_ms",
+                    "upstream_dial_latency_ms",
+                ],
+                0,
+            ),
+            last_heartbeat_at_ms: value_u64_opt_keys(
+                item,
+                &["last_heartbeat_at_ms", "heartbeat_at_ms"],
+            ),
+            last_error: item
+                .get("last_error")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string()),
+            updated_at_ms: value_u64_or(item, "updated_at_ms", now_ms()),
+        };
+        if let Some(existing) = dedup.get(&normalized_tunnel_id) {
+            if existing.updated_at_ms > candidate.updated_at_ms {
+                return;
             }
-        })
-        .collect()
+        }
+        dedup.insert(normalized_tunnel_id, candidate);
+    });
+
+    let mut items = dedup.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.tunnel_id.cmp(&right.tunnel_id))
+    });
+    items
 }
 
 /// 通过短锁方式读取 `tunnel.list`，避免在 IPC 阻塞期间长期占用 supervisor 锁。

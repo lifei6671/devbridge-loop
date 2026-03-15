@@ -81,3 +81,35 @@ func TestCanTransitionTunnelState(testingObject *testing.T) {
 		testingObject.Fatalf("expected active -> idle transition disallowed")
 	}
 }
+
+// TestDefaultKeepalivePolicyForBinding 验证不同 binding 的默认 keepalive 策略输出。
+func TestDefaultKeepalivePolicyForBinding(testingObject *testing.T) {
+	grpcPolicy := DefaultKeepalivePolicyForBinding(BindingTypeGRPCH2)
+	if grpcPolicy.IdleTTL <= 0 {
+		testingObject.Fatalf("expected grpc idle ttl > 0, got %s", grpcPolicy.IdleTTL)
+	}
+	if grpcPolicy.ProbeInterval != 0 || grpcPolicy.ProbeTimeout != 0 || grpcPolicy.ProbeMaxFailures != 0 {
+		testingObject.Fatalf("unexpected grpc probe policy: %+v", grpcPolicy)
+	}
+
+	tcpPolicy := DefaultKeepalivePolicyForBinding(BindingTypeTCPFramed)
+	if tcpPolicy.ProbeInterval <= 0 || tcpPolicy.ProbeTimeout <= 0 || tcpPolicy.ProbeMaxFailures <= 0 {
+		testingObject.Fatalf("expected tcp probe policy enabled, got %+v", tcpPolicy)
+	}
+
+	unknownPolicy := DefaultKeepalivePolicyForBinding(BindingType("unknown_binding"))
+	if unknownPolicy.IdleTTL <= 0 {
+		testingObject.Fatalf("expected unknown binding fallback policy, got %+v", unknownPolicy)
+	}
+}
+
+// TestNewBindingInfoIncludesKeepalivePolicy 验证 NewBindingInfo 会填充 keepalive 策略。
+func TestNewBindingInfoIncludesKeepalivePolicy(testingObject *testing.T) {
+	bindingInfo := NewBindingInfo(BindingTypeTCPFramed)
+	if bindingInfo.Type != BindingTypeTCPFramed {
+		testingObject.Fatalf("expected tcp binding type, got %s", bindingInfo.Type)
+	}
+	if bindingInfo.KeepalivePolicy.IdleTTL <= 0 {
+		testingObject.Fatalf("expected keepalive policy to be populated, got %+v", bindingInfo.KeepalivePolicy)
+	}
+}

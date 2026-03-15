@@ -571,10 +571,10 @@ func (manager *Manager) HandleSessionState(state string) (int, error) {
 		manager.pendingReason = strings.ToLower(normalizedState)
 		manager.stateMutex.Unlock()
 
-		recycledIdleCount, recycleErr := manager.recycleAllIdleWithoutRefill()
+		recycledTunnelCount, recycleErr := manager.recycleAllSessionTunnelsWithoutRefill()
 		manager.updatePoolMetrics(manager.registry.Snapshot())
 		manager.emitEvent("session_" + strings.ToLower(normalizedState))
-		return recycledIdleCount, recycleErr
+		return recycledTunnelCount, recycleErr
 	case SessionStateActive:
 		// 与 ReconcileNow 串行，确保恢复补池与上一轮 drain 行为顺序一致。
 		manager.reconcileMutex.Lock()
@@ -594,20 +594,48 @@ func (manager *Manager) HandleSessionState(state string) (int, error) {
 	}
 }
 
-func (manager *Manager) recycleAllIdleWithoutRefill() (int, error) {
-	snapshot := manager.registry.Snapshot()
-	if snapshot.IdleCount <= 0 {
+func (manager *Manager) recycleAllSessionTunnelsWithoutRefill() (int, error) {
+	records := manager.registry.List(0)
+	if len(records) == 0 {
 		return 0, nil
 	}
-	idleTunnelIDs := manager.registry.IdleIDs(snapshot.IdleCount)
-	recycledIdleCount := 0
-	for _, tunnelID := range idleTunnelIDs {
-		if err := manager.closeAndRemove(tunnelID, false, "session_state"); err != nil {
-			return recycledIdleCount, err
+	recycledCount := 0
+	var firstError error
+	for _, record := range records {
+		if strings.TrimSpace(record.TunnelID) == "" {
+			continue
 		}
-		recycledIdleCount++
+		switch record.State {
+		case StateIdle, StateReserved, StateActive:
+			if err := manager.closeAndRemove(record.TunnelID, false, "session_state"); err != nil {
+				if errors.Is(err, ErrTunnelNotFound) {
+					continue
+				}
+				if firstError == nil {
+					firstError = err
+				}
+				continue
+			}
+			recycledCount++
+		case StateOpening, StateClosing:
+			// opening/closing 无法走标准 close 路径时，兜底按 broken 收敛并摘除。
+			if err := manager.MarkBrokenAndRemove(record.TunnelID, "session_state_recycle"); err != nil {
+				if errors.Is(err, ErrTunnelNotFound) {
+					continue
+				}
+				if firstError == nil {
+					firstError = err
+				}
+				continue
+			}
+			recycledCount++
+		case StateClosed, StateBroken:
+			continue
+		default:
+			continue
+		}
 	}
-	return recycledIdleCount, nil
+	return recycledCount, firstError
 }
 
 // emitEvent 向上层通知一次池状态变化事件。

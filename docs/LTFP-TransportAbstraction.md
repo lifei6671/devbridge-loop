@@ -1125,6 +1125,7 @@ Transport/Tunnel 能力分为三类：
 * `SetDeadline`
 * `SetReadDeadline`
 * `SetWriteDeadline`
+* `TunnelHealthProber.Probe`
 
 #### 不支持时的统一行为
 
@@ -1223,6 +1224,17 @@ type Endpoint struct {
 	Address string
 }
 
+type KeepalivePolicy struct {
+	// idle tunnel 在池中的最大存活时间；0 表示不启用 TTL 轮换
+	IdleTTL time.Duration
+	// 应用层探活间隔；0 表示依赖传输层 keepalive
+	ProbeInterval time.Duration
+	// 单次探活超时；0 表示由实现方定义
+	ProbeTimeout time.Duration
+	// 连续探活失败阈值；0 表示由实现方定义
+	ProbeMaxFailures int
+}
+
 type BindingInfo struct {
 	Type                 BindingType
 	Local                Endpoint
@@ -1231,6 +1243,7 @@ type BindingInfo struct {
 	SupportsStreamReset  bool
 	SupportsDeadline     bool
 	MaxConcurrentStreams int64
+	KeepalivePolicy      KeepalivePolicy
 }
 
 type SessionMeta struct {
@@ -1316,6 +1329,12 @@ type Tunnel interface {
 	Done() <-chan struct{}
 	Err() error
 }
+
+// TunnelHealthProber 是 tunnel 的可选探活扩展能力。
+// 不支持时必须返回 ErrUnsupported。
+type TunnelHealthProber interface {
+	Probe(ctx context.Context) error
+}
 ```
 
 说明：
@@ -1325,6 +1344,7 @@ type Tunnel interface {
 3. 数据面 framing 由 runtime/protocol 负责
 4. 可选能力不支持时必须返回 `ErrUnsupported`
 5. 同一条 tunnel 的多 goroutine 并发写入不保证安全；若存在多写方，上层必须自行串行化
+6. `Probe` 作为可选扩展能力：`tcp_framed` 必须实现；`grpc_h2` 可返回 `ErrUnsupported`（连接级 keepalive 已覆盖）
 
 ---
 
@@ -1350,6 +1370,13 @@ type TunnelPool interface {
 	InUseCount() int
 }
 ```
+
+#### Tunnel 分配与探活规范（新增）
+
+1. `Acquire` 至少必须保证：不会返回已知 `closed/broken` 或已暴露运行时错误的 tunnel
+2. 若 tunnel 实现了 `TunnelHealthProber`，`Acquire` 或其上层分配器必须在真正分配前完成一次探活；探活失败的 tunnel 必须从 idle 集合移除，禁止重新放回 idle 池
+3. 探活失败必须触发补池信号（例如 `TunnelRefillRequest`）或等待 Agent 自治补充，避免容量持续下降
+4. 分配器应支持 `max_acquire_retry`（建议默认 `3`）；连续命中 stale tunnel 且超过重试后必须返回 `ErrNoTunnel`，并保留 `ErrTunnelStale` 语义供上层判因
 
 ---
 
@@ -1547,6 +1574,12 @@ rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
 2. 不得在 `TunnelEnvelope` 中直接定义 `TrafficOpen/OpenAck/Close/Reset/Data` 等业务字段
 3. 这些业务对象必须由 runtime/protocol 层先编码为二进制，再写入 `payload`
 
+#### keepalive 与 probe 约束（新增）
+
+1. `grpc_h2` 的控制面与数据面共享同一条 H2 connection，必须显式配置 gRPC keepalive（客户端/服务端），不得依赖默认值
+2. gRPC keepalive PING 覆盖该连接上的全部 stream，因此 tunnel 不要求额外应用层 probe；若实现 `TunnelHealthProber`，应返回 `ErrUnsupported`
+3. binding 必须通过 `BindingInfo.KeepalivePolicy` 暴露实际生效参数，供管理面/观测面读取
+
 #### 性能与拷贝优化建议
 
 `grpc_h2` 自身已经是 message-framed 传输，叠加 LTFP runtime/protocol frame 后，必然存在多层 framing 与额外内存拷贝成本。
@@ -1576,6 +1609,28 @@ rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
 * 控制面使用长期 framed TCP 连接
 * 数据面 tunnel 仍以一条 TCP 连接对应一条 tunnel 的方式承载
 * 同样遵循 tunnel 一次一用原则
+
+`tcp_framed` binding 规范要求（新增）：
+
+1. 每条 tunnel TCP 连接必须启用 TCP keepalive，不得仅依赖控制面 heartbeat 推断 tunnel 存活
+2. binding 必须在 tunnel 建立后立即配置 keepalive（例如 `SetKeepAlive(true)` 与 keepalive 周期设置）
+3. 若操作系统或运行时不支持细粒度 keepalive 周期配置，binding 必须启用应用层探活（`TunnelHealthProber.Probe`）作为兜底
+4. 仅靠 `idle_tunnel_ttl` 不足以覆盖僵尸 tunnel；必须与 keepalive/probe 联合治理
+
+### 19.4 Binding KeepalivePolicy 规范默认值（新增）
+
+| 参数 | grpc_h2 | tcp_framed | quic_native |
+|---|---|---|---|
+| `IdleTTL` | 300s | 120s | 300s |
+| `ProbeInterval` | 0（连接级 keepalive） | 30s | 0（依赖 QUIC idle timeout） |
+| `ProbeTimeout` | 0 | 5s | 0 |
+| `ProbeMaxFailures` | 0 | 2 | 0 |
+
+规范要求：
+
+1. binding 在初始化时必须填充 `BindingInfo.KeepalivePolicy`
+2. 允许实现方通过配置覆盖默认值，但必须在日志/指标中输出最终生效值
+3. 管理面、监控与告警应以 `BindingInfo.KeepalivePolicy` 作为统一观测入口
 
 ---
 
@@ -1645,6 +1700,8 @@ var (
 	ErrSessionClosed = errors.New("session closed")
 	ErrTunnelClosed  = errors.New("tunnel closed")
 	ErrTunnelBroken  = errors.New("tunnel broken")
+	ErrTunnelStale   = errors.New("tunnel stale: probe failed")
+	ErrNoTunnel      = errors.New("no available tunnel")
 	ErrTimeout       = errors.New("timeout")
 	ErrProtocol      = errors.New("protocol violation")
 	ErrUnsupported   = errors.New("unsupported capability")
@@ -1746,4 +1803,5 @@ ltfp/
 19. `TunnelRefillRequest` 是容量水位提示，不是硬命令；Agent 建 tunnel 必须受速率限制与 inflight 上限约束
 20. `TrafficDataStream.Write` 必须按 `max_data_frame_size` 拆包，禁止把超大 payload 直接封成单帧
 21. 同一条 tunnel 允许单读单写并发，但多写方必须串行化，避免 frame 字节交错
-22. 长驻 idle 池的 tunnel 应结合 keepalive/probe 与 TTL 一起治理僵尸连接
+22. 长驻 idle 池的 tunnel 必须结合 keepalive/probe 与 TTL 一起治理僵尸连接，不得仅依赖控制面 heartbeat 推断
+23. binding 必须通过 `BindingInfo.KeepalivePolicy` 暴露 keepalive/probe 治理参数，支持跨 binding 的可配置与可观测一致性

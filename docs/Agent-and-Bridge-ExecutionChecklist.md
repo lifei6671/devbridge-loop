@@ -319,15 +319,22 @@
 - [x] 后台模块落地：`adminapi/`（鉴权、中间件、路由）+ `adminview/`（快照/事件/诊断视图模型）
 - [x] 权限模型落地：`viewer/operator/admin` 三角色与接口级权限矩阵
 - [x] 登录与认证落地：Cookie/Token 方案二选一并明确服务端校验策略
-- [ ] CSRF 防护：Cookie 模式下写接口强制 `CSRF Token + Origin/Referer` 校验 + 安全 Cookie 属性
+- [x] CSRF 防护：Cookie 模式下写接口强制 `CSRF Token + Origin/Referer` 校验 + 安全 Cookie 属性
 - [x] 只读 API 落地：`bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域
 - [x] 查询契约落地：列表检索统一 `cursor + limit`，服务端硬上限与日志/时序时间窗口限制
 - [x] 运维 API 收敛：仅支持 reload/drain/diagnose export 等受控命令，禁止任意脚本执行
 - [x] 配置并发控制：`config_version + if_match_version` 乐观并发，版本冲突返回 `409`
 - [x] 审计能力：所有写操作记录操作者、作用域、参数摘要、结果、trace_id、时间戳
 - [x] 导出安全：日志与诊断包统一脱敏（token/cookie/secret/password/private_key 等）且仅 `admin` 可导出
-- [ ] 页面功能落地：Dashboard、Route、Connector/Session、Tunnel/Traffic、配置运维、日志指标诊断六类页面
-- [ ] 内嵌部署联调：前端构建产物内嵌 Bridge，可独立二进制访问后台并完成端到端操作
+- [x] 页面功能落地：Dashboard、Route、Connector/Session、Tunnel/Traffic、配置运维、日志指标诊断六类页面
+- [x] 内嵌部署联调：前端构建产物内嵌 Bridge，可独立二进制访问后台并完成端到端操作
+
+执行记录（2026-03-14）：
+
+- `cd cloud-bridge/web && npm run build` 通过（管理页面构建产物可内嵌）
+- `cd cloud-bridge/web && npx tsc --noEmit` 通过（前端类型检查）
+- `cd cloud-bridge && go test ./runtime/bridge/app ./runtime/bridge/adminapi -count=1` 通过（含 UI/API/SSE/写接口/cookie+csrf 集成回归）
+- `cd cloud-bridge && go test ./... -count=1` 通过（Bridge 全量回归）
 
 验收标准：
 

@@ -135,12 +135,13 @@
   - 建议代码入口：`cloud-bridge/runtime/bridge/app/config.go`、`cloud-bridge/runtime/bridge/app/bootstrap.go`。
   - 完成记录（2026-03-14）：`AdminConfig` 已新增 `enabled` 总开关并默认关闭；`config.Validate` 调整为仅在 `admin.enabled=true` 时校验 `admin.listen_addr`；`bootstrap` 调整为仅在管理面开启时初始化 admin mux/server（关闭时 `adminServer=nil`，不会注册 UI 路由）；新增 `bootstrap_test.go` 覆盖默认关闭、校验分支与 `adminServer` 初始化行为。
 
-- [ ] `UAB-A2` 分阶段补齐 Admin API 的鉴权、权限、审计与导出脱敏
+- [x] `UAB-A2` 分阶段补齐 Admin API 的鉴权、权限、审计与导出脱敏
   - 目标：先做只读域，再做受控写接口，最终满足 A16 验收标准。
   - 参考文档：`Agent-and-Bridge-ExecutionChecklist` 的 `A16` 全项；`BridgeAdminBackendTechnicalProposal.md`。
   - 建议代码入口：`cloud-bridge/runtime/bridge/app/`（后续可拆 `adminapi/` 与 `adminview/`）。
   - 阶段记录（2026-03-14）：已完成第一阶段只读域与鉴权骨架：新增 `runtime/bridge/adminapi`（Bearer Token 鉴权、`viewer/operator/admin` 角色校验、请求审计日志、`cursor+limit` 分页硬上限、日志/指标时间窗口限制）与 `runtime/bridge/adminview`（overview/routes/connectors/sessions/tunnels/traffic/diagnose 聚合模型）；管理面已注册只读接口 `bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose` 资源域；`config.snapshot` 默认返回脱敏 token。后续待补：受控写接口、CSRF（Cookie 模式）、配置并发控制、导出脱敏与角色限制。
-  - 阶段记录（2026-03-14，第二阶段）：已补齐受控写接口与并发语义骨架：新增 `POST /api/admin/ops/config/reload`、`POST /api/admin/ops/session/:sessionId/drain`、`POST /api/admin/ops/connector/:connectorId/drain`、`PUT /api/admin/config`（`if_match_version` 冲突返回 `409`）与 `POST /api/admin/ops/diagnose/export` + 短时下载链路；写操作审计新增参数摘要字段；导出默认执行敏感键与连接串凭据脱敏，且导出接口仅 `admin` 角色可调用。新增 `adminapi` 与 `app` 层单测覆盖权限、冲突、导出脱敏与 drain 生命周期副作用。后续待补：Cookie 模式 CSRF、管理面网络隔离强制校验、导出链路更细粒度审计策略。
+  - 阶段记录（2026-03-14，第二阶段）：已补齐受控写接口与并发语义骨架：新增 `POST /api/admin/ops/config/reload`、`POST /api/admin/ops/session/:sessionId/drain`、`POST /api/admin/ops/connector/:connectorId/drain`、`PUT /api/admin/config`（`if_match_version` 冲突返回 `409`）与 `POST /api/admin/ops/diagnose/export` + 短时下载链路；写操作审计新增参数摘要字段；导出默认执行敏感键与连接串凭据脱敏，且导出接口仅 `admin` 角色可调用。新增 `adminapi` 与 `app` 层单测覆盖权限、冲突、导出脱敏与 drain 生命周期副作用。
+  - 阶段记录（2026-03-14，第三阶段收口）：已完成 Cookie 模式 CSRF（`Origin/Referer + CSRF 双提交`）、管理面监听隔离校验（默认独立监听，可显式放开）、导出链路访问控制加固（导出人绑定 + 一次性下载令牌 + no-store）与 BMA-15/BMA-16 收口（六类页面真实 API、SSE 轮询兜底自动重试恢复、单实例 server UI/API/SSE/写接口端到端测试）。
 
 ---
 
@@ -156,5 +157,5 @@
 
 - [x] 第一轮：控制面业务消息闭环
 - [x] 第二轮：数据面 connector/direct/hybrid 路径闭环
-- [ ] 第三轮：UI 真实数据接入与诊断收口
-- [ ] 第四轮：Admin 能力收口
+- [x] 第三轮：UI 真实数据接入与诊断收口
+- [x] 第四轮：Admin 能力收口

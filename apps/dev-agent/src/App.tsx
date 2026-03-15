@@ -173,11 +173,33 @@ interface TunnelListItem {
   tunnel_id: string;
   service_id: string;
   state: string;
+  protocol: string;
   local_addr: string;
   remote_addr: string;
   latency_ms: number;
+  last_heartbeat_at_ms?: number | null;
   last_error: string | null;
   updated_at_ms: number;
+}
+
+interface ServiceAddInput {
+  service_id?: string;
+  service_name: string;
+  namespace?: string;
+  environment?: string;
+  protocol: string;
+  host: string;
+  port: number;
+}
+
+interface ServiceCreateDraft {
+  serviceId: string;
+  serviceName: string;
+  namespace: string;
+  environment: string;
+  protocol: string;
+  host: string;
+  portText: string;
 }
 
 interface HostConfigUpdateInput {
@@ -526,6 +548,44 @@ function formatTunnelState(state: string): string {
   return trimmed;
 }
 
+function formatTransportLabel(protocol: string): string {
+  const normalized = protocol.trim().toLowerCase();
+  if (!normalized) {
+    return "--";
+  }
+  if (normalized === "tcp_framed") {
+    return "TCP Framed";
+  }
+  if (normalized === "grpc_h2") {
+    return "gRPC h2";
+  }
+  if (normalized === "tcp") {
+    return "TCP";
+  }
+  if (normalized === "http") {
+    return "HTTP";
+  }
+  if (normalized === "https") {
+    return "HTTPS";
+  }
+  return protocol;
+}
+
+const LOG_LEVEL_RANK: Record<string, number> = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  warning: 40,
+  error: 50,
+  fatal: 60,
+};
+
+function logLevelRank(level: string): number {
+  const normalized = level.trim().toLowerCase();
+  return LOG_LEVEL_RANK[normalized] ?? LOG_LEVEL_RANK.info;
+}
+
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) {
     return 0;
@@ -636,6 +696,18 @@ export default function App(): JSX.Element {
   const [diagnoseLogs, setDiagnoseLogs] = useState<DiagnoseLogEntry[]>([]);
   const [serviceItems, setServiceItems] = useState<ServiceListItem[]>([]);
   const [tunnelItems, setTunnelItems] = useState<TunnelListItem[]>([]);
+  const [serviceCreateExpanded, setServiceCreateExpanded] = useState(false);
+  const [creatingService, setCreatingService] = useState(false);
+  const [serviceCreateDraft, setServiceCreateDraft] = useState<ServiceCreateDraft>({
+    serviceId: "",
+    serviceName: "",
+    namespace: "dev",
+    environment: "demo",
+    protocol: "tcp",
+    host: "127.0.0.1",
+    portText: "8080",
+  });
+  const [diagnoseMinLevel, setDiagnoseMinLevel] = useState("info");
   const [busyCommand, setBusyCommand] = useState<RuntimeCommand | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
   const [nowTsMs, setNowTsMs] = useState(() => Date.now());
@@ -923,7 +995,18 @@ export default function App(): JSX.Element {
   }, [hostLogs, notify]);
 
   const filteredServices = serviceItems;
-  const filteredTunnels = tunnelItems;
+  const filteredTunnels = useMemo(() => {
+    const dedup = new Map<string, TunnelListItem>();
+    tunnelItems.forEach((item) => {
+      const current = dedup.get(item.tunnel_id);
+      if (!current || item.updated_at_ms >= current.updated_at_ms) {
+        dedup.set(item.tunnel_id, item);
+      }
+    });
+    return Array.from(dedup.values()).sort((left, right) =>
+      right.updated_at_ms - left.updated_at_ms || left.tunnel_id.localeCompare(right.tunnel_id),
+    );
+  }, [tunnelItems]);
 
   const connectionState = runtimeSnapshot?.connection_state ?? "disconnected";
   const connected = connectionState === "connected";
@@ -1132,6 +1215,12 @@ export default function App(): JSX.Element {
 
   const recentLogs = useMemo(() => hostLogs.slice(0, 3), [hostLogs]);
 
+  const diagnoseDisplayLogs = useMemo(() => {
+    const source = diagnoseLogs.length > 0 ? diagnoseLogs : hostLogs;
+    const threshold = logLevelRank(diagnoseMinLevel);
+    return source.filter((log) => logLevelRank(log.level) >= threshold);
+  }, [diagnoseLogs, diagnoseMinLevel, hostLogs]);
+
   const agentVersion = useMemo(() => {
     const entry = hostLogs.find((log) => log.message.toLowerCase().includes("version"));
     if (!entry) {
@@ -1211,6 +1300,58 @@ export default function App(): JSX.Element {
     }
   }, [hostConfig, notify, refreshHostLogs, settingsDraft]);
 
+  const createService = useCallback(async () => {
+    const serviceName = serviceCreateDraft.serviceName.trim();
+    if (!serviceName) {
+      notify("warning", "参数不完整", "请输入服务名称");
+      return;
+    }
+    let port: number;
+    try {
+      port = parsePositiveInteger(serviceCreateDraft.portText, "port");
+    } catch (error) {
+      notify("warning", "参数不合法", normalizeErrorMessage(error));
+      return;
+    }
+    if (port > 65535) {
+      notify("warning", "参数不合法", "port 不能超过 65535");
+      return;
+    }
+    const payload: ServiceAddInput = {
+      service_id: serviceCreateDraft.serviceId.trim() || undefined,
+      service_name: serviceName,
+      namespace: serviceCreateDraft.namespace.trim() || undefined,
+      environment: serviceCreateDraft.environment.trim() || undefined,
+      protocol: serviceCreateDraft.protocol.trim().toLowerCase(),
+      host: serviceCreateDraft.host.trim(),
+      port,
+    };
+    setCreatingService(true);
+    try {
+      const created = await invoke<ServiceListItem>("service_add", { input: payload });
+      setServiceItems((prev) => {
+        const next = [created, ...prev.filter((item) => item.service_id !== created.service_id)];
+        return next.sort((left, right) => right.updated_at_ms - left.updated_at_ms);
+      });
+      await refreshServiceList();
+      notify("success", "新增服务成功", `${created.service_name} (${created.protocol})`);
+      setServiceCreateExpanded(false);
+      setServiceCreateDraft({
+        serviceId: "",
+        serviceName: "",
+        namespace: "dev",
+        environment: "demo",
+        protocol: "tcp",
+        host: "127.0.0.1",
+        portText: "8080",
+      });
+    } catch (error) {
+      notify("error", "新增服务失败", normalizeErrorMessage(error));
+    } finally {
+      setCreatingService(false);
+    }
+  }, [notify, refreshServiceList, serviceCreateDraft]);
+
   const renderServicesTable = (): JSX.Element => (
     <Card className="overflow-hidden">
       <CardHeader className="flex flex-row items-center justify-between pb-3">
@@ -1220,12 +1361,98 @@ export default function App(): JSX.Element {
         </div>
         <Button
           className="h-9 rounded-lg bg-[#1f67e5] px-4 text-sm font-semibold hover:bg-[#1a58c7]"
-          onClick={() => notify("warning", "功能规划中", "新增服务入口将随 config.replace 一并接入")}
+          onClick={() => setServiceCreateExpanded((prev) => !prev)}
         >
-          + 新增服务
+          {serviceCreateExpanded ? "收起新增" : "+ 新增服务"}
         </Button>
       </CardHeader>
       <CardContent className="p-0">
+        {serviceCreateExpanded ? (
+          <div className="border-y border-[#e5eaf4] bg-[#f8fbff] p-4">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <Input
+                placeholder="服务名称，例如 order-service"
+                value={serviceCreateDraft.serviceName}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
+                }
+                className="h-9 rounded-lg bg-white"
+              />
+              <Input
+                placeholder="服务 ID（可选）"
+                value={serviceCreateDraft.serviceId}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
+                }
+                className="h-9 rounded-lg bg-white"
+              />
+              <Input
+                placeholder="Namespace（默认 dev）"
+                value={serviceCreateDraft.namespace}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
+                }
+                className="h-9 rounded-lg bg-white"
+              />
+              <Input
+                placeholder="Environment（默认 demo）"
+                value={serviceCreateDraft.environment}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
+                }
+                className="h-9 rounded-lg bg-white"
+              />
+              <select
+                value={serviceCreateDraft.protocol}
+                className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
+                }
+              >
+                <option value="tcp">tcp</option>
+                <option value="http">http</option>
+                <option value="https">https</option>
+              </select>
+              <Input
+                placeholder="Host，例如 127.0.0.1"
+                value={serviceCreateDraft.host}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
+                }
+                className="h-9 rounded-lg bg-white"
+              />
+              <Input
+                placeholder="Port，例如 8080"
+                value={serviceCreateDraft.portText}
+                onChange={(event) =>
+                  setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
+                }
+                inputMode="numeric"
+                className="h-9 rounded-lg bg-white"
+              />
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  variant="outline"
+                  className="h-9 rounded-lg text-xs"
+                  disabled={creatingService}
+                  onClick={() => setServiceCreateExpanded(false)}
+                >
+                  取消
+                </Button>
+                <Button
+                  className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
+                  disabled={creatingService}
+                  onClick={() => void createService()}
+                >
+                  {creatingService ? "提交中..." : "提交新增"}
+                </Button>
+              </div>
+            </div>
+            <p className="mt-2 text-[11px] text-[#6b7892]">
+              新增后会立即进入本地服务目录，并在 Bridge 会话可用时自动尝试同步。
+            </p>
+          </div>
+        ) : null}
         <div className="overflow-x-auto">
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
@@ -1310,6 +1537,9 @@ export default function App(): JSX.Element {
     <Card>
       <CardHeader>
         <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">流量概览</CardTitle>
+        <CardDescription className="mt-1 text-xs">
+          速率表示当前每秒吞吐（B/s），累计值表示 Agent 进程启动以来的总上传/下载流量。
+        </CardDescription>
       </CardHeader>
       <CardContent>
         <div className="mb-3 grid grid-cols-2 gap-3">
@@ -1384,17 +1614,19 @@ export default function App(): JSX.Element {
               <tr className="bg-[#f4f6fb]">
                 <th className={TABLE_HEAD_CLASS}>隧道 ID</th>
                 <th className={TABLE_HEAD_CLASS}>服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>连接协议</th>
                 <th className={TABLE_HEAD_CLASS}>本地地址</th>
                 <th className={TABLE_HEAD_CLASS}>远端地址</th>
                 <th className={TABLE_HEAD_CLASS}>状态</th>
                 <th className={TABLE_HEAD_CLASS}>延迟</th>
+                <th className={TABLE_HEAD_CLASS}>最后心跳</th>
                 <th className={TABLE_HEAD_CLASS}>更新时间</th>
               </tr>
             </thead>
             <tbody>
               {filteredTunnels.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={7}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={9}>
                     当前没有可展示的隧道
                   </td>
                 </tr>
@@ -1403,6 +1635,9 @@ export default function App(): JSX.Element {
                 <tr key={item.tunnel_id} className="border-t border-[#edf1f8]">
                   <td className={TABLE_CELL_CLASS}>{item.tunnel_id}</td>
                   <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    {formatTransportLabel(item.protocol || hostConfig?.bridge_transport || "")}
+                  </td>
                   <td className={TABLE_CELL_CLASS}>{item.local_addr}</td>
                   <td className={TABLE_CELL_CLASS}>{item.remote_addr}</td>
                   <td className={TABLE_CELL_CLASS}>
@@ -1411,6 +1646,9 @@ export default function App(): JSX.Element {
                     </Badge>
                   </td>
                   <td className={TABLE_CELL_CLASS}>{item.latency_ms > 0 ? `${item.latency_ms} ms` : "--"}</td>
+                  <td className={TABLE_CELL_CLASS}>
+                    {item.last_heartbeat_at_ms ? formatRelativeMs(item.last_heartbeat_at_ms, nowTsMs) : "--"}
+                  </td>
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
                 </tr>
               ))}
@@ -1665,6 +1903,20 @@ export default function App(): JSX.Element {
           <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} />
           <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} />
         </div>
+        <div className="mb-3 flex items-center justify-end gap-2">
+          <span className="text-xs text-[#5d6983]">最小日志级别</span>
+          <select
+            value={diagnoseMinLevel}
+            className="h-8 rounded-lg border border-[#d8dfeb] bg-white px-2.5 text-xs text-[#43506b]"
+            onChange={(event) => setDiagnoseMinLevel(event.target.value)}
+          >
+            <option value="trace">TRACE 及以上</option>
+            <option value="debug">DEBUG 及以上</option>
+            <option value="info">INFO 及以上</option>
+            <option value="warn">WARN 及以上</option>
+            <option value="error">ERROR 及以上</option>
+          </select>
+        </div>
         <div className="agent-scroll max-h-[560px] overflow-y-auto rounded-xl border border-[#e5eaf4]">
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
@@ -1677,8 +1929,14 @@ export default function App(): JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {/* 优先展示 runtime diagnose.logs，runtime 不可用时回落宿主日志。 */}
-              {(diagnoseLogs.length > 0 ? diagnoseLogs : hostLogs).map((log, index) => (
+              {diagnoseDisplayLogs.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={5}>
+                    当前筛选条件下暂无日志
+                  </td>
+                </tr>
+              ) : null}
+              {diagnoseDisplayLogs.map((log, index) => (
                 <tr key={`${log.ts_ms}-${index}`} className="border-t border-[#edf1f8]">
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(log.ts_ms)}</td>
                   <td className={TABLE_CELL_CLASS}><Badge variant={log.level.toLowerCase().includes("error") ? "danger" : log.level.toLowerCase().includes("warn") ? "warning" : "success"}>{log.level}</Badge></td>
@@ -1857,6 +2115,7 @@ export default function App(): JSX.Element {
             <InfoRow label="Bridge 服务状态" value={serviceConnectionSummary.label} />
             <InfoRow label="Bridge 会话状态" value={sessionStateRaw || "--"} />
             <InfoRow label="Bridge 地址" value={hostConfig?.bridge_addr ?? "--"} valueClassName="text-[#1f67e5]" />
+            <InfoRow label="连接协议" value={formatTransportLabel(hostConfig?.bridge_transport ?? "")} />
             <InfoRow
               label="本地 RPC 延迟"
               value={`${(runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0).toFixed(0)} ms`}

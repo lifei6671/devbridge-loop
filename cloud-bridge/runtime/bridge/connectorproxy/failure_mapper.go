@@ -49,7 +49,7 @@ func (mapper *FailureMapper) Map(err error) MappedFailure {
 	}
 	mapped.Message = err.Error()
 	switch {
-	case errors.Is(err, ErrNoIdleTunnel):
+	case errors.Is(err, ErrNoIdleTunnel), errors.Is(err, ErrNoTunnel):
 		mapped.HTTPStatus = 503
 		mapped.Code = FailureCodeNoIdleTunnel
 	case isConnectorDialFailed(err):
