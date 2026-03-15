@@ -310,7 +310,9 @@ fn parse_rpc_traffic_snapshot(payload: &Value) -> Option<TrafficStatsSnapshot> {
 }
 
 /// 通过 IPC 拉取 agent traffic.stats.snapshot，避免长时间持有 supervisor 锁。
-fn request_rpc_traffic_snapshot(state: &Arc<AppRuntimeState>) -> Result<TrafficStatsSnapshot, String> {
+fn request_rpc_traffic_snapshot(
+    state: &Arc<AppRuntimeState>,
+) -> Result<TrafficStatsSnapshot, String> {
     let mut ipc_client = {
         let mut supervisor = state
             .supervisor

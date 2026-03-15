@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,19 +9,58 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
+type tunnelReportHandlerTestTunnel struct {
+	tunnelID string
+}
+
+func (tunnel *tunnelReportHandlerTestTunnel) ID() string {
+	return tunnel.tunnelID
+}
+
+func (tunnel *tunnelReportHandlerTestTunnel) ReadPayload(ctx context.Context) (pb.StreamPayload, error) {
+	_ = ctx
+	return pb.StreamPayload{}, nil
+}
+
+func (tunnel *tunnelReportHandlerTestTunnel) WritePayload(ctx context.Context, payload pb.StreamPayload) error {
+	_ = ctx
+	_ = payload
+	return nil
+}
+
+func (tunnel *tunnelReportHandlerTestTunnel) Close() error {
+	return nil
+}
+
 // TestTunnelReportHandlerHandleReport 验证 tunnel 池上报可触发补池请求。
 func TestTunnelReportHandlerHandleReport(t *testing.T) {
 	t.Parallel()
 
+	now := time.Now().UTC()
 	sessionRegistry := registry.NewSessionRegistry()
-	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
 		SessionID:   "session-1",
 		ConnectorID: "connector-1",
 		Epoch:       9,
 		State:       registry.SessionActive,
 	})
+	tunnelRegistry := registry.NewTunnelRegistry()
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-1", &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-idle"}); err != nil {
+		t.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-1", &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-active"}); err != nil {
+		t.Fatalf("upsert active tunnel failed: %v", err)
+	}
+	acquiredRuntime, ok := tunnelRegistry.AcquireIdle(now, "connector-1")
+	if !ok {
+		t.Fatalf("expected acquire idle tunnel success")
+	}
+	if err := tunnelRegistry.MarkActive(now, acquiredRuntime.TunnelID, "traffic-1"); err != nil {
+		t.Fatalf("mark active failed: %v", err)
+	}
 	handler := NewTunnelReportHandler(TunnelReportHandlerOptions{
 		SessionRegistry: sessionRegistry,
+		TunnelRegistry:  tunnelRegistry,
 		RefillController: NewRefillController(RefillControllerOptions{
 			Now: func() time.Time { return time.Unix(1700003000, 0).UTC() },
 		}),
@@ -32,6 +72,7 @@ func TestTunnelReportHandlerHandleReport(t *testing.T) {
 		SessionEpoch: 9,
 	}, pb.TunnelPoolReport{
 		IdleCount:       0,
+		InUseCount:      1,
 		TargetIdleCount: 8,
 		Trigger:         "event:pool_low",
 	})
@@ -40,6 +81,9 @@ func TestTunnelReportHandlerHandleReport(t *testing.T) {
 	}
 	if refillRequest.RequestedIdleDelta <= 0 {
 		t.Fatalf("unexpected refill delta: %d", refillRequest.RequestedIdleDelta)
+	}
+	if refillRequest.Metadata["bridge_idle_count"] != "1" || refillRequest.Metadata["bridge_in_use_count"] != "1" {
+		t.Fatalf("unexpected bridge pool metadata: %+v", refillRequest.Metadata)
 	}
 }
 

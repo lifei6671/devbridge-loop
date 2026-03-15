@@ -96,6 +96,7 @@ type testRefillScheduler struct {
 	snapshot   tunnel.Snapshot
 	lastTarget int
 	lastReason string
+	callCount  int
 }
 
 func (scheduler *testRefillScheduler) Snapshot() tunnel.Snapshot {
@@ -105,6 +106,7 @@ func (scheduler *testRefillScheduler) Snapshot() tunnel.Snapshot {
 func (scheduler *testRefillScheduler) RequestRefill(targetIdle int, reason string) bool {
 	scheduler.lastTarget = targetIdle
 	scheduler.lastReason = reason
+	scheduler.callCount++
 	return true
 }
 
@@ -248,6 +250,11 @@ func TestHandleBridgeBusinessControlFrameTunnelRefillRequest(testingObject *test
 		RequestedIdleDelta: 3,
 		Reason:             string(control.TunnelRefillReasonLowWatermark),
 		TimestampUnix:      time.Now().UTC().Unix(),
+		Metadata: map[string]string{
+			"target_idle_count":   "5",
+			"bridge_idle_count":   "11",
+			"bridge_in_use_count": "2",
+		},
 	}
 	encodedPayload, err := json.Marshal(refillPayload)
 	if err != nil {
@@ -285,6 +292,74 @@ func TestHandleBridgeBusinessControlFrameTunnelRefillRequest(testingObject *test
 	}
 	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_APPLIED") {
 		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_APPLIED")
+	}
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_EXPANSION_CHECK") {
+		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_EXPANSION_CHECK")
+	}
+}
+
+// TestHandleBridgeBusinessControlFrameTunnelRefillRequestIgnoredWhenSatisfied
+// 验证当当前 idle 已满足请求目标时，Refill 事件会标记为 ignored。
+func TestHandleBridgeBusinessControlFrameTunnelRefillRequestIgnoredWhenSatisfied(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	scheduler := &testRefillScheduler{
+		snapshot: tunnel.Snapshot{IdleCount: 8},
+	}
+	refillHandler, err := control.NewRefillHandler(scheduler, control.RefillHandlerConfig{MaxIdle: 32})
+	if err != nil {
+		testingObject.Fatalf("new refill handler failed: %v", err)
+	}
+	refillHandler.SetSession("session-002", 10)
+	runtime := &Runtime{
+		refillHandler: refillHandler,
+	}
+
+	refillPayload := pb.TunnelRefillRequest{
+		SessionID:          "session-002",
+		SessionEpoch:       10,
+		RequestID:          "req-ignored-1",
+		RequestedIdleDelta: 4,
+		Reason:             string(control.TunnelRefillReasonLowWatermark),
+		TimestampUnix:      time.Now().UTC().Unix(),
+		Metadata: map[string]string{
+			"target_idle_count":   "8",
+			"bridge_idle_count":   "24",
+			"bridge_in_use_count": "0",
+		},
+	}
+	encodedPayload, err := json.Marshal(refillPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal refill payload failed: %v", err)
+	}
+	controlFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 1,
+		VersionMinor: 0,
+		MessageType:  pb.ControlMessageTunnelRefillRequest,
+		SessionID:    "session-002",
+		SessionEpoch: 10,
+		RequestID:    "req-ignored-1",
+		Payload:      encodedPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode refill control frame failed: %v", err)
+	}
+
+	if err := runtime.handleBridgeBusinessControlFrame(context.Background(), controlFrame); err != nil {
+		testingObject.Fatalf("handle refill control frame failed: %v", err)
+	}
+	if scheduler.callCount != 0 {
+		testingObject.Fatalf("expected no refill schedule call, got=%d", scheduler.callCount)
+	}
+	diagnoseLogsPayload := runtime.diagnoseLogsPayload()
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_IGNORED") {
+		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_IGNORED")
+	}
+	if testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_APPLIED") {
+		testingObject.Fatalf("expected diagnose logs not contain TUNNEL_REFILL_APPLIED")
+	}
+	if !testHasDiagnoseCode(diagnoseLogsPayload, "TUNNEL_REFILL_EXPANSION_CHECK") {
+		testingObject.Fatalf("expected diagnose logs contain TUNNEL_REFILL_EXPANSION_CHECK")
 	}
 }
 

@@ -210,7 +210,8 @@ func (reporter *TunnelReporter) buildReport(snapshot tunnel.Snapshot, trigger st
 		// 未指定 trigger 时统一按 periodic 处理。
 		normalizedTrigger = "periodic"
 	}
-	inUseCount := snapshot.OpeningCount + snapshot.ReservedCount + snapshot.ActiveCount + snapshot.ClosingCount
+	// in_use 仅统计真实业务占用（reserved/active），避免 opening/closing 抖动触发误补池。
+	inUseCount := snapshot.ReservedCount + snapshot.ActiveCount
 	return TunnelPoolReport{
 		SessionID:       sessionID,
 		SessionEpoch:    sessionEpoch,

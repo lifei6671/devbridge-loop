@@ -1,6 +1,7 @@
 package control
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 // TunnelReportHandlerOptions 定义 tunnel 池上报处理器依赖。
 type TunnelReportHandlerOptions struct {
 	SessionRegistry  *registry.SessionRegistry
+	TunnelRegistry   *registry.TunnelRegistry
 	RefillController *RefillController
 	ReportStore      *TunnelPoolReportStore
 }
@@ -18,6 +20,7 @@ type TunnelReportHandlerOptions struct {
 // TunnelReportHandler 负责消费 Agent TunnelPoolReport 并决定是否触发补池请求。
 type TunnelReportHandler struct {
 	sessionRegistry  *registry.SessionRegistry
+	tunnelRegistry   *registry.TunnelRegistry
 	refillController *RefillController
 	reportStore      *TunnelPoolReportStore
 }
@@ -30,6 +33,7 @@ func NewTunnelReportHandler(options TunnelReportHandlerOptions) *TunnelReportHan
 	}
 	return &TunnelReportHandler{
 		sessionRegistry:  options.SessionRegistry,
+		tunnelRegistry:   options.TunnelRegistry,
 		refillController: refillController,
 		reportStore:      options.ReportStore,
 	}
@@ -64,7 +68,17 @@ func (handler *TunnelReportHandler) HandleReport(
 		}
 		handler.reportStore.Upsert(now, connectorID, sessionID, sessionEpoch, report)
 	}
-	return handler.refillController.BuildRefillRequest(sessionID, sessionEpoch, report)
+	refillRequest, shouldSend := handler.refillController.BuildRefillRequest(sessionID, sessionEpoch, report)
+	if !shouldSend {
+		return pb.TunnelRefillRequest{}, false
+	}
+	bridgeIdleCount, bridgeInUseCount := handler.snapshotBridgePoolBySession(sessionID)
+	if refillRequest.Metadata == nil {
+		refillRequest.Metadata = make(map[string]string, 6)
+	}
+	refillRequest.Metadata["bridge_idle_count"] = strconv.Itoa(bridgeIdleCount)
+	refillRequest.Metadata["bridge_in_use_count"] = strconv.Itoa(bridgeInUseCount)
+	return refillRequest, true
 }
 
 // validateSessionEpoch 校验报告会话是否与 Bridge 当前会话视图一致。
@@ -81,4 +95,28 @@ func (handler *TunnelReportHandler) validateSessionEpoch(sessionID string, sessi
 		return false
 	}
 	return sessionRuntime.Epoch == sessionEpoch
+}
+
+func (handler *TunnelReportHandler) snapshotBridgePoolBySession(sessionID string) (int, int) {
+	if handler == nil || handler.tunnelRegistry == nil {
+		return 0, 0
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" {
+		return 0, 0
+	}
+	idleCount := 0
+	inUseCount := 0
+	for _, runtime := range handler.tunnelRegistry.List() {
+		if strings.TrimSpace(runtime.SessionID) != normalizedSessionID {
+			continue
+		}
+		switch runtime.State {
+		case registry.TunnelStateIdle:
+			idleCount++
+		case registry.TunnelStateReserved, registry.TunnelStateActive:
+			inUseCount++
+		}
+	}
+	return idleCount, inUseCount
 }

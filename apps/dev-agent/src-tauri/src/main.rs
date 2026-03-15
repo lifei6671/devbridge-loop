@@ -11,19 +11,28 @@ use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager};
 
 use agent_host::launcher::{ensure_single_instance_guard, resolve_runtime_dir};
-use agent_host::supervisor::{app_shutdown_impl, spawn_supervisor_monitor};
+use agent_host::supervisor::{
+    app_shutdown_impl, run_mock_agent_runtime_if_requested, spawn_supervisor_monitor,
+};
 use commands::{
     agent_crash_inject, agent_restart, agent_snapshot, agent_start, agent_stop, app_bootstrap,
-    app_shutdown, diagnose_logs_snapshot, diagnose_snapshot, host_config_snapshot,
-    host_config_update, host_logs_snapshot, service_add, service_list_snapshot, session_drain,
-    session_reconnect, session_snapshot, system_resource_snapshot, traffic_stats_snapshot,
-    tunnel_list_snapshot,
+    app_confirm_exit, app_hide_to_tray, app_shutdown, diagnose_logs_snapshot, diagnose_snapshot,
+    host_config_snapshot, host_config_update, host_logs_snapshot, service_add,
+    service_list_snapshot, session_drain, session_reconnect, session_snapshot,
+    system_resource_snapshot, traffic_stats_snapshot, tunnel_list_snapshot,
 };
 use state::app_state::{now_ms, push_host_log, AppRuntimeState, HostRuntimeConfig};
+
+const EVENT_APP_CLOSE_REQUESTED: &str = "app-close-requested";
+const TRAY_MENU_SHOW_MAIN_ID: &str = "tray-show-main";
+const TRAY_MENU_EXIT_ID: &str = "tray-exit-app";
 
 /// 计算启动日志文件路径：默认放到运行目录下的 logs 目录。
 fn startup_log_path() -> PathBuf {
@@ -95,8 +104,70 @@ fn report_fatal_startup_error(context: &str, err: &str) {
     }
 }
 
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.show();
+        let _ = main_window.unminimize();
+        let _ = main_window.set_focus();
+    }
+}
+
+fn request_app_exit(app: &tauri::AppHandle) {
+    let runtime_state = app.state::<Arc<AppRuntimeState>>().inner().clone();
+    if let Err(err) = app_shutdown_impl(app, &runtime_state) {
+        append_startup_log("error", &format!("托盘退出时执行 app_shutdown 失败: {err}"));
+    }
+    app.exit(0);
+}
+
+fn setup_tray_icon(app: &tauri::AppHandle) -> Result<(), String> {
+    let show_main_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_SHOW_MAIN_ID,
+        "显示主窗口",
+        true,
+        None::<&str>,
+    )
+    .map_err(|err| format!("创建托盘菜单项失败(显示主窗口): {err}"))?;
+    let exit_item = MenuItem::with_id(app, TRAY_MENU_EXIT_ID, "退出应用", true, None::<&str>)
+        .map_err(|err| format!("创建托盘菜单项失败(退出应用): {err}"))?;
+    let tray_menu = Menu::with_items(app, &[&show_main_item, &exit_item])
+        .map_err(|err| format!("创建托盘菜单失败: {err}"))?;
+
+    let mut tray_builder = TrayIconBuilder::with_id("dev-agent-tray")
+        .menu(&tray_menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW_MAIN_ID => show_main_window(app),
+            TRAY_MENU_EXIT_ID => request_app_exit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(&tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray_builder = tray_builder.icon(icon);
+    }
+    let _tray_icon = tray_builder
+        .build(app)
+        .map_err(|err| format!("创建托盘图标失败: {err}"))?;
+    Ok(())
+}
+
 /// 程序入口：启动 Tauri 宿主并拉起真实 Agent runtime。
 fn main() {
+    if run_mock_agent_runtime_if_requested() {
+        // 当前进程被用于 mock runtime，已完成无 UI 执行路径。
+        return;
+    }
+
     let (runtime_config, config_warning) = match HostRuntimeConfig::load_with_yaml_fallback() {
         Ok(payload) => payload,
         Err(err) => {
@@ -119,17 +190,28 @@ fn main() {
     }
 
     let app = match tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 第二个实例启动时触发这里
+            // 把已有窗口拉到前台
+            let window = app.get_webview_window("main").unwrap();
+            window.show().unwrap();
+            window.set_focus().unwrap();
+        }))
         .manage(shared_state.clone())
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
             ensure_single_instance_guard(&state)
                 .map_err(|err| std::io::Error::new(std::io::ErrorKind::AlreadyExists, err))?;
             spawn_supervisor_monitor(app.handle().clone(), state);
+            setup_tray_icon(&app.handle())
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_bootstrap,
             app_shutdown,
+            app_hide_to_tray,
+            app_confirm_exit,
             agent_start,
             agent_stop,
             agent_restart,
@@ -160,6 +242,19 @@ fn main() {
 
     let mut exit_cleanup_done = false;
     app.run(move |app_handle, run_event| {
+        if let tauri::RunEvent::WindowEvent { label, event, .. } = &run_event {
+            if label == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let runtime_state = app_handle.state::<Arc<AppRuntimeState>>().inner().clone();
+                    // 已经进入主动退出流程时放行 close，避免确认弹窗阻塞真实退出。
+                    if !runtime_state.shutdown_requested.load(Ordering::SeqCst) {
+                        api.prevent_close();
+                        let _ = app_handle.emit_to("main", EVENT_APP_CLOSE_REQUESTED, ());
+                    }
+                }
+            }
+        }
+
         let should_cleanup = matches!(
             run_event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
@@ -169,8 +264,10 @@ fn main() {
         }
         exit_cleanup_done = true;
         let runtime_state = app_handle.state::<Arc<AppRuntimeState>>().inner().clone();
-        if let Err(err) = app_shutdown_impl(app_handle, &runtime_state) {
-            append_startup_log("error", &format!("退出时执行 app_shutdown 失败: {err}"));
+        if !runtime_state.shutdown_requested.load(Ordering::SeqCst) {
+            if let Err(err) = app_shutdown_impl(app_handle, &runtime_state) {
+                append_startup_log("error", &format!("退出时执行 app_shutdown 失败: {err}"));
+            }
         }
     });
 }

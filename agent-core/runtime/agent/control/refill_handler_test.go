@@ -189,6 +189,44 @@ func TestRefillHandlerMergePendingTarget(testingObject *testing.T) {
 	}
 }
 
+// TestRefillHandlerSkipSatisfiedAbsoluteTarget 验证绝对目标已满足时不会重复补池。
+func TestRefillHandlerSkipSatisfiedAbsoluteTarget(testingObject *testing.T) {
+	testingObject.Parallel()
+	scheduler := &refillTestScheduler{
+		snapshot: tunnel.Snapshot{IdleCount: 8},
+	}
+	handler, err := NewRefillHandler(scheduler, RefillHandlerConfig{
+		RequestDeduplicateTTL: time.Minute,
+		MaxIdle:               32,
+	})
+	if err != nil {
+		testingObject.Fatalf("new refill handler failed: %v", err)
+	}
+	handler.SetSession("session-satisfied", 11)
+
+	result, err := handler.Handle(context.Background(), TunnelRefillRequest{
+		SessionID:           "session-satisfied",
+		SessionEpoch:        11,
+		RequestID:           "req-satisfied-1",
+		RequestedIdleDelta:  6,
+		RequestedTargetIdle: 8,
+		Reason:              TunnelRefillReasonLowWatermark,
+		Timestamp:           time.Now().UTC(),
+	})
+	if err != nil {
+		testingObject.Fatalf("handle satisfied request failed: %v", err)
+	}
+	if result.Accepted {
+		testingObject.Fatalf("expected satisfied request not accepted")
+	}
+	if result.EffectiveTargetIdle != 8 {
+		testingObject.Fatalf("unexpected effective target: %d", result.EffectiveTargetIdle)
+	}
+	if len(scheduler.Calls()) != 0 {
+		testingObject.Fatalf("expected no scheduler calls when target already satisfied")
+	}
+}
+
 // TestRefillHandlerRejectStaleSession 验证旧 session 请求会被拒绝。
 func TestRefillHandlerRejectStaleSession(testingObject *testing.T) {
 	testingObject.Parallel()

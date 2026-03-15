@@ -26,6 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { toast } from "sonner";
 
 import { NetworkRateValue } from "@/components/traffic/network_rate_value";
+import { AlertDialog } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -44,6 +45,7 @@ type AgentRuntimeCommand = "agent_start" | "agent_stop" | "agent_restart" | "age
 type BridgeSessionCommand = "session_reconnect" | "session_drain";
 type RuntimeCommand = AgentRuntimeCommand | BridgeSessionCommand;
 type NavKey = "overview" | "services" | "tunnels" | "traffic" | "connections" | "diagnose" | "settings";
+const APP_CLOSE_REQUESTED_EVENT = "app-close-requested";
 
 interface HostMetricsSnapshot {
   agent_host_ipc_connected: boolean;
@@ -672,9 +674,19 @@ function NavButton(props: {
   );
 }
 
-function InfoRow(props: { label: string; value: string; valueClassName?: string }): JSX.Element {
+function InfoRow(props: {
+  label: string;
+  value: string;
+  valueClassName?: string;
+  compact?: boolean;
+}): JSX.Element {
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-[#ebeff6] py-2.5 last:border-b-0">
+    <div
+      className={cn(
+        "flex items-center gap-3 border-b border-[#ebeff6] py-2.5 last:border-b-0",
+        props.compact ? "justify-start" : "justify-between",
+      )}
+    >
       <span className="text-sm text-[#4f5b74]">{props.label}</span>
       <span className={cn("text-base font-semibold text-[#1f293d]", props.valueClassName)}>{props.value}</span>
     </div>
@@ -696,6 +708,8 @@ export default function App(): JSX.Element {
   const [diagnoseLogs, setDiagnoseLogs] = useState<DiagnoseLogEntry[]>([]);
   const [serviceItems, setServiceItems] = useState<ServiceListItem[]>([]);
   const [tunnelItems, setTunnelItems] = useState<TunnelListItem[]>([]);
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const [closeActionLoading, setCloseActionLoading] = useState(false);
   const [serviceCreateExpanded, setServiceCreateExpanded] = useState(false);
   const [creatingService, setCreatingService] = useState(false);
   const [serviceCreateDraft, setServiceCreateDraft] = useState<ServiceCreateDraft>({
@@ -885,9 +899,31 @@ export default function App(): JSX.Element {
     ],
   );
 
+  const hideToTray = useCallback(async () => {
+    setCloseActionLoading(true);
+    try {
+      await invoke("app_hide_to_tray");
+      setCloseConfirmOpen(false);
+    } catch (error) {
+      notify("error", "隐藏到托盘失败", normalizeErrorMessage(error));
+    } finally {
+      setCloseActionLoading(false);
+    }
+  }, [notify]);
+
+  const confirmExit = useCallback(async () => {
+    setCloseActionLoading(true);
+    try {
+      await invoke("app_confirm_exit");
+    } catch (error) {
+      notify("error", "退出应用失败", normalizeErrorMessage(error));
+      setCloseActionLoading(false);
+    }
+  }, [notify]);
+
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | null = null;
+    const unlisteners: UnlistenFn[] = [];
 
     const pollTimer = window.setInterval(() => {
       void refreshSnapshot();
@@ -913,7 +949,7 @@ export default function App(): JSX.Element {
         return;
       }
       try {
-        unlisten = await registerManagedListener<AgentRuntimeChangedEvent>(
+        const runtimeUnlisten = await registerManagedListener<AgentRuntimeChangedEvent>(
           listen,
           "agent-runtime-changed",
           (payload) => {
@@ -921,6 +957,20 @@ export default function App(): JSX.Element {
           },
           () => disposed,
         );
+        if (runtimeUnlisten) {
+          unlisteners.push(runtimeUnlisten);
+        }
+        const closeRequestUnlisten = await registerManagedListener<unknown>(
+          listen,
+          APP_CLOSE_REQUESTED_EVENT,
+          () => {
+            setCloseConfirmOpen(true);
+          },
+          () => disposed,
+        );
+        if (closeRequestUnlisten) {
+          unlisteners.push(closeRequestUnlisten);
+        }
       } catch (error) {
         if (!disposed) {
           notify("error", "事件订阅失败", normalizeErrorMessage(error));
@@ -931,9 +981,9 @@ export default function App(): JSX.Element {
     return () => {
       disposed = true;
       window.clearInterval(pollTimer);
-      if (unlisten) {
+      unlisteners.forEach((unlisten) => {
         void unlisten();
-      }
+      });
     };
   }, [
     bootstrap,
@@ -1619,14 +1669,13 @@ export default function App(): JSX.Element {
                 <th className={TABLE_HEAD_CLASS}>远端地址</th>
                 <th className={TABLE_HEAD_CLASS}>状态</th>
                 <th className={TABLE_HEAD_CLASS}>延迟</th>
-                <th className={TABLE_HEAD_CLASS}>最后心跳</th>
                 <th className={TABLE_HEAD_CLASS}>更新时间</th>
               </tr>
             </thead>
             <tbody>
               {filteredTunnels.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={9}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={8}>
                     当前没有可展示的隧道
                   </td>
                 </tr>
@@ -1646,9 +1695,6 @@ export default function App(): JSX.Element {
                     </Badge>
                   </td>
                   <td className={TABLE_CELL_CLASS}>{item.latency_ms > 0 ? `${item.latency_ms} ms` : "--"}</td>
-                  <td className={TABLE_CELL_CLASS}>
-                    {item.last_heartbeat_at_ms ? formatRelativeMs(item.last_heartbeat_at_ms, nowTsMs) : "--"}
-                  </td>
                   <td className={TABLE_CELL_CLASS}>{formatDateTime(item.updated_at_ms)}</td>
                 </tr>
               ))}
@@ -1891,17 +1937,17 @@ export default function App(): JSX.Element {
   };
 
   const renderDiagnosePanel = (): JSX.Element => (
-    <Card>
+    <Card className="flex h-full min-h-0 flex-col">
       <CardHeader>
         <CardTitle className="text-[27px] leading-none tracking-[-0.01em]">日志与诊断</CardTitle>
         <CardDescription className="text-xs">优先展示 runtime 诊断事件，宿主日志作为兜底补充</CardDescription>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex min-h-0 flex-1 flex-col">
         <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-4">
-          <InfoRow label="诊断状态" value={diagnoseSnapshot?.state ?? "--"} />
-          <InfoRow label="事件总数" value={String(diagnoseSnapshot?.event_total ?? 0)} />
-          <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} />
-          <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} />
+          <InfoRow label="诊断状态" value={diagnoseSnapshot?.state ?? "--"} compact />
+          <InfoRow label="事件总数" value={String(diagnoseSnapshot?.event_total ?? 0)} compact />
+          <InfoRow label="错误事件" value={String(diagnoseSnapshot?.event_error_count ?? 0)} compact />
+          <InfoRow label="补池事件" value={String(diagnoseSnapshot?.event_refill_total ?? 0)} compact />
         </div>
         <div className="mb-3 flex items-center justify-end gap-2">
           <span className="text-xs text-[#5d6983]">最小日志级别</span>
@@ -1917,7 +1963,7 @@ export default function App(): JSX.Element {
             <option value="error">ERROR 及以上</option>
           </select>
         </div>
-        <div className="agent-scroll max-h-[560px] overflow-y-auto rounded-xl border border-[#e5eaf4]">
+        <div className="agent-scroll min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#e5eaf4]">
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
               <tr className="bg-[#f4f6fb]">
@@ -2295,7 +2341,12 @@ export default function App(): JSX.Element {
             </div>
           </header>
 
-          <section className="agent-scroll min-h-0 flex-1 overflow-y-auto px-4 py-3.5 lg:px-5">
+          <section
+            className={cn(
+              "agent-scroll min-h-0 flex-1 px-4 py-3.5 lg:px-5",
+              activeNav === "diagnose" ? "flex flex-col overflow-hidden" : "overflow-y-auto",
+            )}
+          >
             <div className="mb-2.5 flex items-center justify-end gap-2 text-[11px] text-[#6e7a93]">
               <span className="inline-flex items-center gap-1 rounded-full bg-white/65 px-2 py-1">
                 <Cable size={12} /> IPC {hostConfig?.ipc_transport ?? "--"}
@@ -2308,10 +2359,29 @@ export default function App(): JSX.Element {
               </span>
             </div>
 
-            {renderPageByNav()}
+            <div className={cn(activeNav === "diagnose" && "min-h-0 flex-1")}>{renderPageByNav()}</div>
           </section>
         </main>
       </div>
+      <AlertDialog
+        open={closeConfirmOpen}
+        onOpenChange={setCloseConfirmOpen}
+        title="关闭 Dev Agent？"
+        description="你可以将窗口隐藏到系统托盘继续保持 Agent 进程运行，或直接退出应用并停止宿主。"
+        cancelText={closeActionLoading ? "退出中..." : "退出应用"}
+        actionText={closeActionLoading ? "处理中..." : "隐藏到托盘"}
+        onCancel={() => {
+          if (!closeActionLoading) {
+            void confirmExit();
+          }
+        }}
+        onAction={() => {
+          if (!closeActionLoading) {
+            void hideToTray();
+          }
+        }}
+        actionClassName="bg-[#1f67e5] hover:bg-[#1a58c7]"
+      />
       <Toaster />
     </div>
   );

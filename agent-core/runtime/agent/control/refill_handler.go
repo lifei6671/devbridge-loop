@@ -34,12 +34,13 @@ const (
 
 // TunnelRefillRequest 描述 Bridge 侧发起的补池请求。
 type TunnelRefillRequest struct {
-	SessionID          string
-	SessionEpoch       uint64
-	RequestID          string
-	RequestedIdleDelta int
-	Reason             TunnelRefillReason
-	Timestamp          time.Time
+	SessionID           string
+	SessionEpoch        uint64
+	RequestID           string
+	RequestedIdleDelta  int
+	RequestedTargetIdle int
+	Reason              TunnelRefillReason
+	Timestamp           time.Time
 }
 
 // Normalize 归一化请求字段。
@@ -48,6 +49,9 @@ func (request TunnelRefillRequest) Normalize() TunnelRefillRequest {
 	normalizedRequest.SessionID = strings.TrimSpace(normalizedRequest.SessionID)
 	normalizedRequest.RequestID = strings.TrimSpace(normalizedRequest.RequestID)
 	normalizedRequest.Reason = TunnelRefillReason(strings.TrimSpace(string(normalizedRequest.Reason)))
+	if normalizedRequest.RequestedTargetIdle < 0 {
+		normalizedRequest.RequestedTargetIdle = 0
+	}
 	if normalizedRequest.Timestamp.IsZero() {
 		// 缺失时间戳时补 UTC now，便于链路追踪。
 		normalizedRequest.Timestamp = time.Now().UTC()
@@ -117,8 +121,10 @@ type RefillHandleResult struct {
 	Deduplicated        bool
 	Accepted            bool
 	BeforeIdleCount     int
+	BeforeInUseCount    int
 	RequestedTargetIdle int
 	EffectiveTargetIdle int
+	NeedExpansion       bool
 	Reason              TunnelRefillReason
 }
 
@@ -196,21 +202,30 @@ func (handler *RefillHandler) Handle(ctx context.Context, request TunnelRefillRe
 	}
 
 	result := RefillHandleResult{
-		RequestID:       normalizedRequest.RequestID,
-		Reason:          normalizedRequest.Reason,
-		BeforeIdleCount: handler.scheduler.Snapshot().IdleCount,
+		RequestID: normalizedRequest.RequestID,
+		Reason:    normalizedRequest.Reason,
 	}
+	currentSnapshot := handler.scheduler.Snapshot()
+	result.BeforeIdleCount = currentSnapshot.IdleCount
+	result.BeforeInUseCount = currentSnapshot.ReservedCount + currentSnapshot.ActiveCount
+	result.RequestedTargetIdle = handler.resolveRequestedTargetIdle(
+		normalizedRequest,
+		result.BeforeIdleCount,
+	)
+	result.EffectiveTargetIdle = handler.clampTargetIdle(result.RequestedTargetIdle)
+	result.NeedExpansion = result.EffectiveTargetIdle > result.BeforeIdleCount
 	if _, exists := handler.requestSeenAt[normalizedRequest.RequestID]; exists {
 		// request_id 重复时按幂等命中返回。
 		result.Deduplicated = true
-		result.RequestedTargetIdle = result.BeforeIdleCount + normalizedRequest.RequestedIdleDelta
-		result.EffectiveTargetIdle = handler.clampTargetIdle(result.RequestedTargetIdle)
 		return result, nil
 	}
 	handler.requestSeenAt[normalizedRequest.RequestID] = now
 
-	result.RequestedTargetIdle = result.BeforeIdleCount + normalizedRequest.RequestedIdleDelta
-	result.EffectiveTargetIdle = handler.clampTargetIdle(result.RequestedTargetIdle)
+	if !result.NeedExpansion {
+		// 当前 idle 已满足目标时无需再次调度，避免旧请求导致过量补池。
+		return result, nil
+	}
+
 	mergedTargetIdle := result.EffectiveTargetIdle
 	if handler.pendingTargetIdle > mergedTargetIdle {
 		// 多请求合并时按更高目标处理，避免重复建连。
@@ -235,6 +250,15 @@ func (handler *RefillHandler) Handle(ctx context.Context, request TunnelRefillRe
 		handler.pendingMergedReason = ""
 	}
 	return result, nil
+}
+
+func (handler *RefillHandler) resolveRequestedTargetIdle(request TunnelRefillRequest, beforeIdleCount int) int {
+	requestedTargetIdle := beforeIdleCount + request.RequestedIdleDelta
+	if request.RequestedTargetIdle > 0 {
+		// Bridge 已给出绝对目标时优先使用，避免网络延迟导致重复叠加 delta。
+		requestedTargetIdle = request.RequestedTargetIdle
+	}
+	return requestedTargetIdle
 }
 
 // cleanupSeenLocked 清理过期 request_id 去重记录。

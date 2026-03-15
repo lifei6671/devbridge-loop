@@ -332,11 +332,7 @@ impl HostRuntimeConfig {
             }
             let direct_candidate = search_dir.join(file_name);
             if direct_candidate.is_file() {
-                return Some(
-                    direct_candidate
-                        .canonicalize()
-                        .unwrap_or(direct_candidate),
-                );
+                return Some(direct_candidate.canonicalize().unwrap_or(direct_candidate));
             }
             #[cfg(windows)]
             {
@@ -556,8 +552,7 @@ impl HostRuntimeConfig {
             .file_name()
             .map(|value| value.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
-        let is_go_run_wrapper = (runtime_program_name == "go"
-            || runtime_program_name == "go.exe")
+        let is_go_run_wrapper = (runtime_program_name == "go" || runtime_program_name == "go.exe")
             && self
                 .runtime_args
                 .first()
@@ -601,10 +596,7 @@ impl HostRuntimeConfig {
         if bridge_transport.is_empty() {
             return Err("bridge_transport 不能为空".to_string());
         }
-        if !matches!(
-            bridge_transport,
-            "tcp_framed" | "grpc_h2"
-        ) {
+        if !matches!(bridge_transport, "tcp_framed" | "grpc_h2") {
             return Err(format!("bridge_transport 不支持: {bridge_transport}"));
         }
         if self.tunnel_pool_max_idle == 0 {
@@ -1071,10 +1063,8 @@ mod tests {
     fn validate_agent_runtime_fields_rejects_go_run_wrapper_mode() {
         let mut runtime_config = build_valid_runtime_config();
         runtime_config.runtime_program = PathBuf::from("go");
-        runtime_config.runtime_args = vec![
-            "run".to_string(),
-            "./agent-core/cmd/agent-core".to_string(),
-        ];
+        runtime_config.runtime_args =
+            vec!["run".to_string(), "./agent-core/cmd/agent-core".to_string()];
         let validate_result = runtime_config.validate_agent_runtime_fields();
         assert!(validate_result.is_err());
     }

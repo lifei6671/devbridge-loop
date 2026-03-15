@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -914,25 +915,30 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 	if refillPayload.TimestampUnix > 0 {
 		requestTimestamp = time.Unix(refillPayload.TimestampUnix, 0).UTC()
 	}
+	requestedTargetIdle := parseRefillMetadataCount(refillPayload.Metadata, "target_idle_count")
+	bridgeIdleCount := parseRefillMetadataCount(refillPayload.Metadata, "bridge_idle_count")
+	bridgeInUseCount := parseRefillMetadataCount(refillPayload.Metadata, "bridge_in_use_count")
 	refillRequest := control.TunnelRefillRequest{
-		SessionID:          sessionID,
-		SessionEpoch:       sessionEpoch,
-		RequestID:          requestID,
-		RequestedIdleDelta: refillPayload.RequestedIdleDelta,
-		Reason:             control.TunnelRefillReason(strings.TrimSpace(refillPayload.Reason)),
-		Timestamp:          requestTimestamp,
+		SessionID:           sessionID,
+		SessionEpoch:        sessionEpoch,
+		RequestID:           requestID,
+		RequestedIdleDelta:  refillPayload.RequestedIdleDelta,
+		RequestedTargetIdle: requestedTargetIdle,
+		Reason:              control.TunnelRefillReason(strings.TrimSpace(refillPayload.Reason)),
+		Timestamp:           requestTimestamp,
 	}
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
 		Level:        "info",
 		Module:       "agent.runtime.refill",
 		Code:         "TUNNEL_REFILL_REQUEST_RECEIVED",
-		Message:      fmt.Sprintf("receive tunnel refill request idle_delta=%d", refillRequest.RequestedIdleDelta),
+		Message:      fmt.Sprintf("receive tunnel refill request idle_delta=%d target_idle=%d bridge_idle=%d bridge_in_use=%d", refillRequest.RequestedIdleDelta, refillRequest.RequestedTargetIdle, bridgeIdleCount, bridgeInUseCount),
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
 		RequestID:    requestID,
 		Reason:       string(refillRequest.Reason),
 	})
-	if _, err := r.refillHandler.Handle(ctx, refillRequest); err != nil {
+	handleResult, err := r.refillHandler.Handle(ctx, refillRequest)
+	if err != nil {
 		wrappedErr := fmt.Errorf("handle tunnel refill request failed: %w", err)
 		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
 			Level:        "error",
@@ -949,14 +955,72 @@ func (r *Runtime) handleTunnelRefillRequestEnvelope(ctx context.Context, envelop
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
 		Level:        "info",
 		Module:       "agent.runtime.refill",
-		Code:         "TUNNEL_REFILL_APPLIED",
-		Message:      fmt.Sprintf("tunnel refill applied idle_delta=%d", refillRequest.RequestedIdleDelta),
+		Code:         "TUNNEL_REFILL_EXPANSION_CHECK",
+		Message:      fmt.Sprintf("tunnel refill expansion check need_expansion=%t before_idle=%d before_in_use=%d effective_target_idle=%d bridge_idle=%d bridge_in_use=%d", handleResult.NeedExpansion, handleResult.BeforeIdleCount, handleResult.BeforeInUseCount, handleResult.EffectiveTargetIdle, bridgeIdleCount, bridgeInUseCount),
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		RequestID:    requestID,
+		Reason:       string(refillRequest.Reason),
+	})
+	refillEventCode := "TUNNEL_REFILL_APPLIED"
+	refillEventMessage := fmt.Sprintf(
+		"tunnel refill applied idle_delta=%d before_idle=%d before_in_use=%d effective_target_idle=%d bridge_idle=%d bridge_in_use=%d",
+		refillRequest.RequestedIdleDelta,
+		handleResult.BeforeIdleCount,
+		handleResult.BeforeInUseCount,
+		handleResult.EffectiveTargetIdle,
+		bridgeIdleCount,
+		bridgeInUseCount,
+	)
+	if !handleResult.Accepted {
+		refillEventCode = "TUNNEL_REFILL_IGNORED"
+		ignoreReason := "not_accepted"
+		if handleResult.Deduplicated {
+			ignoreReason = "deduplicated"
+		} else if !handleResult.NeedExpansion {
+			ignoreReason = "already_satisfied"
+		}
+		refillEventMessage = fmt.Sprintf(
+			"tunnel refill ignored reason=%s idle_delta=%d before_idle=%d before_in_use=%d effective_target_idle=%d bridge_idle=%d bridge_in_use=%d",
+			ignoreReason,
+			refillRequest.RequestedIdleDelta,
+			handleResult.BeforeIdleCount,
+			handleResult.BeforeInUseCount,
+			handleResult.EffectiveTargetIdle,
+			bridgeIdleCount,
+			bridgeInUseCount,
+		)
+	}
+	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
+		Level:        "info",
+		Module:       "agent.runtime.refill",
+		Code:         refillEventCode,
+		Message:      refillEventMessage,
 		SessionID:    sessionID,
 		SessionEpoch: sessionEpoch,
 		RequestID:    requestID,
 		Reason:       string(refillRequest.Reason),
 	})
 	return nil
+}
+
+func parseRefillMetadataCount(metadata map[string]string, key string) int {
+	if len(metadata) == 0 {
+		return 0
+	}
+	normalizedKey := strings.TrimSpace(key)
+	if normalizedKey == "" {
+		return 0
+	}
+	countText := strings.TrimSpace(metadata[normalizedKey])
+	if countText == "" {
+		return 0
+	}
+	parsedCount, parseErr := strconv.Atoi(countText)
+	if parseErr != nil || parsedCount < 0 {
+		return 0
+	}
+	return parsedCount
 }
 
 // handleControlErrorEnvelope 记录 Bridge 侧上报的控制面错误，便于 UI 与诊断输出。

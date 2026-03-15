@@ -9,7 +9,7 @@ pub mod traffic;
 pub mod tunnel;
 
 pub use agent::{agent_crash_inject, agent_restart, agent_snapshot, agent_start, agent_stop};
-pub use app::{app_bootstrap, app_shutdown};
+pub use app::{app_bootstrap, app_confirm_exit, app_hide_to_tray, app_shutdown};
 pub use config::{host_config_snapshot, host_config_update};
 pub use diagnose::{diagnose_logs_snapshot, diagnose_snapshot, host_logs_snapshot};
 pub use service::{service_add, service_list_snapshot};

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +33,10 @@ const (
 	tcpConnectionClassifierReadTimeout = 2 * time.Second
 	// defaultIncomingTunnelIDPrefixTCP 定义 Bridge 侧 TCP 入站 tunnel_id 前缀。
 	defaultIncomingTunnelIDPrefixTCP = "tcp-bridge-tunnel"
+	// incomingTunnelProbeInterval 定义入站 tunnel 生命周期探测间隔，兜底处理远端静默断开。
+	incomingTunnelProbeInterval = 250 * time.Millisecond
+	// incomingTunnelProbeTimeout 定义单次探测超时时间，避免阻塞生命周期协程。
+	incomingTunnelProbeTimeout = 120 * time.Millisecond
 )
 
 // controlMessageDispatcher 负责把控制面业务帧分发给 Bridge 控制处理器。
@@ -121,6 +127,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		}),
 		tunnelHandler: bridgecontrol.NewTunnelReportHandler(bridgecontrol.TunnelReportHandlerOptions{
 			SessionRegistry: sessionRegistry,
+			TunnelRegistry:  tunnelRegistry,
 			ReportStore:     options.tunnelPoolReportStore,
 		}),
 		routeHandler: bridgecontrol.NewRouteHandler(bridgecontrol.RouteHandlerOptions{
@@ -214,13 +221,60 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 		if err := decodeControlPayload(envelope.Payload, &message); err != nil {
 			return nil, err
 		}
+		reportSessionID := strings.TrimSpace(message.SessionID)
+		if reportSessionID == "" {
+			reportSessionID = strings.TrimSpace(envelope.SessionID)
+		}
+		reportSessionEpoch := message.SessionEpoch
+		if reportSessionEpoch == 0 {
+			reportSessionEpoch = envelope.SessionEpoch
+		}
+		reportConnectorID := strings.TrimSpace(envelope.ConnectorID)
+		if reportConnectorID == "" && dispatcher.sessionRegistry != nil {
+			if sessionRuntime, exists := dispatcher.sessionRegistry.GetBySession(reportSessionID); exists {
+				reportConnectorID = strings.TrimSpace(sessionRuntime.ConnectorID)
+			}
+		}
+		slog.Info(
+			"bridge receive tunnel pool report",
+			"connector_id", reportConnectorID,
+			"session_id", reportSessionID,
+			"session_epoch", reportSessionEpoch,
+			"idle_count", message.IdleCount,
+			"in_use_count", message.InUseCount,
+			"target_idle_count", message.TargetIdleCount,
+			"trigger", strings.TrimSpace(message.Trigger),
+		)
 		if dispatcher.tunnelHandler == nil {
 			return nil, nil
 		}
 		refillRequest, shouldSend := dispatcher.tunnelHandler.HandleReport(envelope, message)
 		if !shouldSend {
+			slog.Info(
+				"bridge skip tunnel refill request",
+				"connector_id", reportConnectorID,
+				"session_id", reportSessionID,
+				"session_epoch", reportSessionEpoch,
+				"idle_count", message.IdleCount,
+				"in_use_count", message.InUseCount,
+				"target_idle_count", message.TargetIdleCount,
+				"trigger", strings.TrimSpace(message.Trigger),
+			)
 			return nil, nil
 		}
+		slog.Info(
+			"bridge send tunnel refill request",
+			"connector_id", reportConnectorID,
+			"session_id", refillRequest.SessionID,
+			"session_epoch", refillRequest.SessionEpoch,
+			"request_id", refillRequest.RequestID,
+			"requested_idle_delta", refillRequest.RequestedIdleDelta,
+			"reason", strings.TrimSpace(refillRequest.Reason),
+			"bridge_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "bridge_idle_count"),
+			"bridge_in_use_count", parseRefillMetadataInt(refillRequest.Metadata, "bridge_in_use_count"),
+			"agent_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "idle_count"),
+			"agent_target_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "target_idle_count"),
+		)
 		return buildTunnelRefillEnvelope(envelope, refillRequest)
 	case pb.ControlMessageRouteAssign:
 		var message pb.RouteAssign
@@ -673,6 +727,25 @@ func buildTunnelRefillEnvelope(
 		ResourceVersion: requestEnvelope.ResourceVersion,
 		Payload:         encodedPayload,
 	}, nil
+}
+
+func parseRefillMetadataInt(metadata map[string]string, key string) int {
+	if len(metadata) == 0 {
+		return 0
+	}
+	normalizedKey := strings.TrimSpace(key)
+	if normalizedKey == "" {
+		return 0
+	}
+	countText := strings.TrimSpace(metadata[normalizedKey])
+	if countText == "" {
+		return 0
+	}
+	parsedCount, parseErr := strconv.Atoi(countText)
+	if parseErr != nil {
+		return 0
+	}
+	return parsedCount
 }
 
 type controlPlaneServer struct {
@@ -1163,9 +1236,56 @@ func (server *controlPlaneServer) watchAcceptedTunnelLifecycle(
 	if normalizedTunnelID == "" {
 		return
 	}
-	<-rawTunnel.Done()
+	probeTicker := time.NewTicker(incomingTunnelProbeInterval)
+	defer probeTicker.Stop()
+	for {
+		select {
+		case <-rawTunnel.Done():
+			server.recycleAcceptedIdleTunnel(normalizedTunnelID, rawTunnel, bindingType, rawTunnel.Err())
+			return
+		case <-probeTicker.C:
+			runtimeSnapshot, exists := server.dispatcher.tunnelRegistry.Get(normalizedTunnelID)
+			if !exists {
+				return
+			}
+			// active tunnel 的生命周期由 connector dispatcher 收敛，避免与 dispatch 回收路径竞争。
+			if runtimeSnapshot.State != registry.TunnelStateIdle && runtimeSnapshot.State != registry.TunnelStateReserved {
+				continue
+			}
+			prober, supportsProbe := rawTunnel.(transport.TunnelHealthProber)
+			if !supportsProbe {
+				continue
+			}
+			probeContext, cancelProbe := context.WithTimeout(context.Background(), incomingTunnelProbeTimeout)
+			probeErr := prober.Probe(probeContext)
+			cancelProbe()
+			if probeErr == nil ||
+				errors.Is(probeErr, transport.ErrTimeout) ||
+				errors.Is(probeErr, transport.ErrUnsupported) ||
+				errors.Is(probeErr, context.Canceled) ||
+				errors.Is(probeErr, context.DeadlineExceeded) {
+				continue
+			}
+			server.recycleAcceptedIdleTunnel(normalizedTunnelID, rawTunnel, bindingType, probeErr)
+			return
+		}
+	}
+}
 
-	// active tunnel 的生命周期由 connector dispatcher 收敛，避免与 dispatch 回收路径竞争。
+func (server *controlPlaneServer) recycleAcceptedIdleTunnel(
+	tunnelID string,
+	rawTunnel transport.Tunnel,
+	bindingType transport.BindingType,
+	cause error,
+) {
+	if server == nil || rawTunnel == nil || server.dispatcher == nil || server.dispatcher.tunnelRegistry == nil {
+		return
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnelID)
+	if normalizedTunnelID == "" {
+		return
+	}
+
 	runtimeSnapshot, exists := server.dispatcher.tunnelRegistry.Get(normalizedTunnelID)
 	if !exists {
 		return
@@ -1173,9 +1293,14 @@ func (server *controlPlaneServer) watchAcceptedTunnelLifecycle(
 	if runtimeSnapshot.State != registry.TunnelStateIdle && runtimeSnapshot.State != registry.TunnelStateReserved {
 		return
 	}
+
 	lastError := "incoming_tunnel_closed"
-	if rawTunnelErr := rawTunnel.Err(); rawTunnelErr != nil && !errors.Is(rawTunnelErr, transport.ErrClosed) {
-		lastError = strings.TrimSpace(rawTunnelErr.Error())
+	effectiveCause := cause
+	if effectiveCause == nil {
+		effectiveCause = rawTunnel.Err()
+	}
+	if effectiveCause != nil && !errors.Is(effectiveCause, transport.ErrClosed) {
+		lastError = strings.TrimSpace(effectiveCause.Error())
 		if lastError == "" {
 			lastError = "incoming_tunnel_closed"
 		}

@@ -398,8 +398,24 @@ func TestControlMessageDispatcherHandleTunnelPoolReport(testingObject *testing.T
 		Epoch:       7,
 		State:       registry.SessionActive,
 	})
+	now := time.Now().UTC()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-3001", &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-3001-idle"}); err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-3001", &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-3001-active"}); err != nil {
+		testingObject.Fatalf("upsert active tunnel failed: %v", err)
+	}
+	acquiredTunnel, ok := tunnelRegistry.AcquireIdle(now, "connector-1")
+	if !ok {
+		testingObject.Fatalf("expected acquire idle tunnel success")
+	}
+	if err := tunnelRegistry.MarkActive(now, acquiredTunnel.TunnelID, "traffic-3001"); err != nil {
+		testingObject.Fatalf("mark active tunnel failed: %v", err)
+	}
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
 	})
 
 	reportPayload := pb.TunnelPoolReport{
@@ -445,6 +461,9 @@ func TestControlMessageDispatcherHandleTunnelPoolReport(testingObject *testing.T
 	}
 	if refillRequest.SessionID != "session-3001" || refillRequest.SessionEpoch != 7 {
 		testingObject.Fatalf("unexpected refill session fields: %+v", refillRequest)
+	}
+	if refillRequest.Metadata["bridge_idle_count"] != "1" || refillRequest.Metadata["bridge_in_use_count"] != "1" {
+		testingObject.Fatalf("unexpected bridge pool metadata: %+v", refillRequest.Metadata)
 	}
 }
 
@@ -912,6 +931,44 @@ func TestRegisterAcceptedTunnelSingleActiveSession(testingObject *testing.T) {
 	testingObject.Fatalf("expected idle tunnel removed after close")
 }
 
+// TestRegisterAcceptedTunnelLifecycleProbeRemoteClose 验证 idle tunnel 在 Done 未触发时也会被探活回收。
+func TestRegisterAcceptedTunnelLifecycleProbeRemoteClose(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-local-probe",
+		ConnectorID:   "agent-local",
+		Epoch:         9,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("inbound-tunnel-probe")
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeTCPFramed); err != nil {
+		testingObject.Fatalf("register accepted tunnel failed: %v", err)
+	}
+
+	rawTunnel.simulateRemoteCloseWithoutDone()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, exists := tunnelRegistry.Get("inbound-tunnel-probe"); !exists {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	testingObject.Fatalf("expected idle tunnel removed after lifecycle probe close")
+}
+
 // TestRegisterAcceptedTunnelAmbiguousOwner 验证 owner 不唯一时入站 tunnel 不会被登记。
 func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -961,9 +1018,10 @@ type controlPlaneInboundTestTunnel struct {
 	doneOnce sync.Once
 	doneChan chan struct{}
 
-	mu      sync.Mutex
-	lastErr error
-	closedV bool
+	mu       sync.Mutex
+	lastErr  error
+	probeErr error
+	closedV  bool
 }
 
 // newControlPlaneInboundTestTunnel 创建可手动关闭的测试 tunnel。
@@ -1081,6 +1139,17 @@ func (tunnel *controlPlaneInboundTestTunnel) Err() error {
 	return tunnel.lastErr
 }
 
+// Probe 返回预设探活错误，用于模拟远端静默断开。
+func (tunnel *controlPlaneInboundTestTunnel) Probe(ctx context.Context) error {
+	_ = ctx
+	if tunnel == nil {
+		return transport.ErrInvalidArgument
+	}
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	return tunnel.probeErr
+}
+
 // closed 返回 tunnel 是否已关闭，供测试断言。
 func (tunnel *controlPlaneInboundTestTunnel) closed() bool {
 	if tunnel == nil {
@@ -1089,4 +1158,15 @@ func (tunnel *controlPlaneInboundTestTunnel) closed() bool {
 	tunnel.mu.Lock()
 	defer tunnel.mu.Unlock()
 	return tunnel.closedV
+}
+
+func (tunnel *controlPlaneInboundTestTunnel) simulateRemoteCloseWithoutDone() {
+	if tunnel == nil {
+		return
+	}
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	tunnel.closedV = true
+	tunnel.lastErr = transport.ErrClosed
+	tunnel.probeErr = transport.ErrClosed
 }

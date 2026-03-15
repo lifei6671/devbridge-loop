@@ -81,7 +81,7 @@ func TestTunnelReporterEventAndPeriodic(testingObject *testing.T) {
 	if firstReport.IdleCount != 3 {
 		testingObject.Fatalf("unexpected idle count: %d", firstReport.IdleCount)
 	}
-	if firstReport.InUseCount != 5 {
+	if firstReport.InUseCount != 3 {
 		testingObject.Fatalf("unexpected in_use count: %d", firstReport.InUseCount)
 	}
 

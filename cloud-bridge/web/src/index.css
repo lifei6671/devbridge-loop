@@ -163,6 +163,12 @@ body {
   gap: 14px;
 }
 
+.main-area.main-area-traffic {
+  height: calc(100vh - 32px);
+  min-height: calc(100vh - 32px);
+  overflow: hidden;
+}
+
 .topbar {
   padding: 14px 16px;
   display: flex;
@@ -302,6 +308,30 @@ select:focus {
 .content-stack {
   display: grid;
   gap: 14px;
+}
+
+.traffic-content-stack {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.traffic-summary-panel {
+  flex: 0 0 auto;
+}
+
+.traffic-list-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.traffic-table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: auto;
 }
 
 .panel {
@@ -931,6 +961,20 @@ tbody tr.table-row-active td:first-child {
 
   .sidebar {
     position: static;
+  }
+
+  .main-area.main-area-traffic {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .traffic-content-stack {
+    overflow: visible;
+  }
+
+  .traffic-table-wrap {
+    max-height: 56vh;
   }
 
   .kpi-grid.compact {

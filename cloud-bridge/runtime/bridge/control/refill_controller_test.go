@@ -27,6 +27,7 @@ func TestRefillControllerBuildRefillRequest(t *testing.T) {
 			SessionID:       "session-1",
 			SessionEpoch:    5,
 			IdleCount:       1,
+			InUseCount:      2,
 			TargetIdleCount: 8,
 			Trigger:         "event:idle_low",
 		},
@@ -64,6 +65,7 @@ func TestRefillControllerSuppressDuplicate(t *testing.T) {
 		3,
 		pb.TunnelPoolReport{
 			IdleCount:       0,
+			InUseCount:      1,
 			TargetIdleCount: 6,
 			Trigger:         "event:idle_low",
 		},
@@ -77,6 +79,7 @@ func TestRefillControllerSuppressDuplicate(t *testing.T) {
 		3,
 		pb.TunnelPoolReport{
 			IdleCount:       0,
+			InUseCount:      1,
 			TargetIdleCount: 6,
 			Trigger:         "event:idle_low",
 		},
@@ -86,5 +89,89 @@ func TestRefillControllerSuppressDuplicate(t *testing.T) {
 	}
 	if firstRequest.RequestID == "" {
 		t.Fatalf("expected first request id not empty")
+	}
+}
+
+// TestRefillControllerSkipWhenNoInUseTraffic 验证无占用且非 acquire_timeout 时不会触发补池。
+func TestRefillControllerSkipWhenNoInUseTraffic(t *testing.T) {
+	t.Parallel()
+
+	controller := NewRefillController(RefillControllerOptions{
+		Config: RefillControllerConfig{
+			TriggerThreshold: 2,
+			RequestCooldown:  time.Second,
+			MinRequestDelta:  1,
+			MaxRequestDelta:  16,
+		},
+		Now: func() time.Time { return time.Unix(1700003000, 0).UTC() },
+	})
+	_, shouldSend := controller.BuildRefillRequest(
+		"session-3",
+		7,
+		pb.TunnelPoolReport{
+			IdleCount:       0,
+			InUseCount:      0,
+			TargetIdleCount: 8,
+			Trigger:         "event:pool_changed",
+		},
+	)
+	if shouldSend {
+		t.Fatalf("expected no refill request when in_use=0 and trigger is not acquire_timeout")
+	}
+}
+
+// TestRefillControllerAllowAcquireTimeoutWithoutInUse 验证 acquire_timeout 触发可绕过 in_use=0 限制。
+func TestRefillControllerAllowAcquireTimeoutWithoutInUse(t *testing.T) {
+	t.Parallel()
+
+	controller := NewRefillController(RefillControllerOptions{
+		Config: RefillControllerConfig{
+			TriggerThreshold: 2,
+			RequestCooldown:  time.Second,
+			MinRequestDelta:  1,
+			MaxRequestDelta:  16,
+		},
+		Now: func() time.Time { return time.Unix(1700004000, 0).UTC() },
+	})
+	_, shouldSend := controller.BuildRefillRequest(
+		"session-4",
+		3,
+		pb.TunnelPoolReport{
+			IdleCount:       0,
+			InUseCount:      0,
+			TargetIdleCount: 8,
+			Trigger:         "event:acquire_timeout",
+		},
+	)
+	if !shouldSend {
+		t.Fatalf("expected refill request for acquire_timeout trigger even when in_use=0")
+	}
+}
+
+// TestRefillControllerSkipSessionActiveTrigger 验证 session_active 事件不会触发补池请求。
+func TestRefillControllerSkipSessionActiveTrigger(t *testing.T) {
+	t.Parallel()
+
+	controller := NewRefillController(RefillControllerOptions{
+		Config: RefillControllerConfig{
+			TriggerThreshold: 2,
+			RequestCooldown:  time.Second,
+			MinRequestDelta:  1,
+			MaxRequestDelta:  16,
+		},
+		Now: func() time.Time { return time.Unix(1700005000, 0).UTC() },
+	})
+	_, shouldSend := controller.BuildRefillRequest(
+		"session-5",
+		4,
+		pb.TunnelPoolReport{
+			IdleCount:       0,
+			InUseCount:      3,
+			TargetIdleCount: 8,
+			Trigger:         "event:session_active",
+		},
+	)
+	if shouldSend {
+		t.Fatalf("expected no refill request for session_active trigger")
 	}
 }

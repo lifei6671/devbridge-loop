@@ -1,0 +1,10 @@
+{
+    "identifier": "main-capability",
+    "description": "",
+    "windows": [
+        "main"
+    ],
+    "permissions": [
+        "core:default"
+    ]
+}

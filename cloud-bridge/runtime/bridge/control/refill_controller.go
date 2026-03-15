@@ -106,6 +106,19 @@ func (controller *RefillController) BuildRefillRequest(
 		// target_idle<=0 表示无需 Bridge 触发补池。
 		return pb.TunnelRefillRequest{}, false
 	}
+	inUseCount := report.InUseCount
+	if inUseCount < 0 {
+		inUseCount = 0
+	}
+	normalizedTrigger := strings.ToLower(strings.TrimSpace(report.Trigger))
+	if strings.Contains(normalizedTrigger, "session_active") {
+		// 会话恢复事件只做状态对账，不应触发 Bridge 侧补池回路。
+		return pb.TunnelRefillRequest{}, false
+	}
+	if inUseCount == 0 && !strings.Contains(normalizedTrigger, "acquire_timeout") {
+		// 无真实占用且非 acquire_timeout 触发时，不由 Bridge 下发补池，避免空转抖动。
+		return pb.TunnelRefillRequest{}, false
+	}
 	idleCount := report.IdleCount
 	if idleCount < 0 {
 		idleCount = 0

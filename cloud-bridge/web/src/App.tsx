@@ -1695,8 +1695,8 @@ export default function App() {
   );
 
   const renderTraffic = () => (
-    <div className="content-stack">
-      <section className="panel">
+    <div className="content-stack traffic-content-stack">
+      <section className="panel traffic-summary-panel">
         <header className="panel-head">
           <h3>Tunnel Pool 摘要</h3>
           <span className="panel-sub">
@@ -1747,7 +1747,7 @@ export default function App() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel traffic-list-panel">
         <header className="panel-head">
           <h3>Tunnel 列表</h3>
           <div className="inline-actions">
@@ -1787,7 +1787,7 @@ export default function App() {
             </button>
           </div>
         </header>
-        <div className="table-wrap">
+        <div className="table-wrap traffic-table-wrap">
           <table>
             <thead>
               <tr>
@@ -2156,7 +2156,7 @@ export default function App() {
         </div>
         </aside>
 
-        <main className="main-area">
+        <main className={`main-area ${activePage === "traffic" ? "main-area-traffic" : ""}`}>
           <header className="topbar panel">
             <div>
               <p className="topbar-title">{activeMeta.title}</p>
