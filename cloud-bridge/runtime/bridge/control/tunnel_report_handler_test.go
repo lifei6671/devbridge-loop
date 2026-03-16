@@ -221,3 +221,57 @@ func TestTunnelReportHandlerReconcileExcessIdle(t *testing.T) {
 		t.Fatalf("expected 2 recycled tunnels closed, got=%d", closedCount)
 	}
 }
+
+// TestTunnelReportHandlerSkipReconcileOnEventTrigger 验证 event 报告不会触发 Bridge 端 idle 强制对账回收。
+func TestTunnelReportHandlerSkipReconcileOnEventTrigger(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-5",
+		ConnectorID: "connector-5",
+		Epoch:       13,
+		State:       registry.SessionActive,
+	})
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnelA := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-a"}
+	tunnelB := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-b"}
+	tunnelC := &tunnelReportHandlerTestTunnel{tunnelID: "tunnel-c"}
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-5", "session-5", tunnelA); err != nil {
+		t.Fatalf("upsert tunnel-a failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now.Add(time.Millisecond), "connector-5", "session-5", tunnelB); err != nil {
+		t.Fatalf("upsert tunnel-b failed: %v", err)
+	}
+	if _, err := tunnelRegistry.UpsertIdle(now.Add(2*time.Millisecond), "connector-5", "session-5", tunnelC); err != nil {
+		t.Fatalf("upsert tunnel-c failed: %v", err)
+	}
+	handler := NewTunnelReportHandler(TunnelReportHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		TunnelRegistry:  tunnelRegistry,
+	})
+
+	_, shouldSend := handler.HandleReport(pb.ControlEnvelope{
+		MessageType:  pb.ControlMessageTunnelPoolReport,
+		SessionID:    "session-5",
+		SessionEpoch: 13,
+	}, pb.TunnelPoolReport{
+		IdleCount:       1,
+		InUseCount:      0,
+		TargetIdleCount: 0,
+		Trigger:         "event:tunnel_closed",
+	})
+	if shouldSend {
+		t.Fatalf("expected no refill request when target_idle_count is zero")
+	}
+	snapshot := tunnelRegistry.Snapshot()
+	if snapshot.IdleCount != 3 || snapshot.TotalCount != 3 {
+		t.Fatalf("unexpected registry snapshot after event trigger: %+v", snapshot)
+	}
+	for _, tunnel := range []*tunnelReportHandlerTestTunnel{tunnelA, tunnelB, tunnelC} {
+		if tunnel.closed {
+			t.Fatalf("expected no tunnel recycled on event trigger")
+		}
+	}
+}

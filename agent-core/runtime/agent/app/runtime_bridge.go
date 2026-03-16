@@ -403,7 +403,22 @@ func (r *Runtime) bridgeDesiredUpState() bool {
 func (r *Runtime) bridgeSessionMeta() (string, uint64, bool) {
 	r.bridgeMu.RLock()
 	defer r.bridgeMu.RUnlock()
-	if r.bridgeState != events.BridgeStateActive || r.bridgeSession == "" || r.bridgeEpoch == 0 {
+	if r.bridgeState != events.BridgeStateActive ||
+		!r.bridgeSessionReady ||
+		r.bridgeSession == "" ||
+		r.bridgeEpoch == 0 {
+		return "", 0, false
+	}
+	return r.bridgeSession, r.bridgeEpoch, true
+}
+
+// bridgeSessionConnectedMeta 返回控制通道已连通时的会话元信息（不要求 warmup 完成）。
+func (r *Runtime) bridgeSessionConnectedMeta() (string, uint64, bool) {
+	r.bridgeMu.RLock()
+	defer r.bridgeMu.RUnlock()
+	if r.bridgeState != events.BridgeStateActive ||
+		r.bridgeSession == "" ||
+		r.bridgeEpoch == 0 {
 		return "", 0, false
 	}
 	return r.bridgeSession, r.bridgeEpoch, true
@@ -518,6 +533,7 @@ func (r *Runtime) setBridgeConnecting() {
 	sessionID := r.bridgeSession
 	sessionEpoch := r.bridgeEpoch
 	r.bridgeState = events.BridgeStateConnecting
+	r.bridgeSessionReady = false
 	r.updatedAt = time.Now().UTC()
 	r.bridgeMu.Unlock()
 	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
@@ -548,6 +564,7 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 	now := time.Now().UTC()
 	r.bridgeDesiredUp = true
 	r.bridgeState = events.BridgeStateActive
+	r.bridgeSessionReady = false
 	r.heartbeatAt = now
 	r.heartbeatSentAt = now
 	r.updatedAt = now
@@ -593,10 +610,20 @@ func (r *Runtime) setBridgeConnected(sessionID string) {
 	}
 }
 
+func (r *Runtime) setBridgeSessionReady(ready bool) {
+	if r == nil {
+		return
+	}
+	r.bridgeMu.Lock()
+	r.bridgeSessionReady = ready
+	r.bridgeMu.Unlock()
+}
+
 func (r *Runtime) setBridgeRetrying(connectErr error, failStreak uint32, backoff time.Duration) {
 	r.bridgeMu.Lock()
 	now := time.Now().UTC()
 	r.bridgeState = events.BridgeStateReconnecting
+	r.bridgeSessionReady = false
 	r.updatedAt = now
 	r.retryFailStreak = failStreak
 	r.retryBackoff = backoff
@@ -637,6 +664,7 @@ func (r *Runtime) setBridgeLost(readErr error) {
 	sessionID := r.bridgeSession
 	sessionEpoch := r.bridgeEpoch
 	r.bridgeState = events.BridgeStateStale
+	r.bridgeSessionReady = false
 	r.updatedAt = time.Now().UTC()
 	errorText := ""
 	if readErr != nil {
@@ -664,6 +692,7 @@ func (r *Runtime) setBridgeDrained() {
 	closedSessionEpoch := r.bridgeEpoch
 	r.bridgeDesiredUp = false
 	r.bridgeState = events.BridgeStateClosed
+	r.bridgeSessionReady = false
 	r.bridgeSession = ""
 	r.updatedAt = time.Now().UTC()
 	r.retryFailStreak = 0
@@ -791,7 +820,6 @@ func (r *Runtime) connectBridgeControlTCP(ctx context.Context) error {
 	r.controlChannel = controlChannel
 	r.bridgeMu.Unlock()
 	r.setBridgeConnected(newRuntimeSessionID())
-	r.notifyTunnelManagerState(tunnel.SessionStateActive)
 	return nil
 }
 
@@ -834,7 +862,6 @@ func (r *Runtime) connectBridgeControlGRPC(ctx context.Context) error {
 	r.grpcClient = client
 	r.bridgeMu.Unlock()
 	r.setBridgeConnected(newRuntimeSessionID())
-	r.notifyTunnelManagerState(tunnel.SessionStateActive)
 	return nil
 }
 
@@ -1263,6 +1290,9 @@ func (r *Runtime) syncServiceControlState(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
+	if err := r.publishControlHeartbeat(ctx); err != nil {
+		return err
+	}
 	if err := r.publishCatalogServices(ctx); err != nil {
 		return err
 	}
@@ -1271,6 +1301,31 @@ func (r *Runtime) syncServiceControlState(ctx context.Context) error {
 	}
 	if err := r.reportCatalogHealth(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+// publishControlHeartbeat 在会话激活后优先发送一条业务心跳，用于 Bridge 侧建立 session 上下文。
+func (r *Runtime) publishControlHeartbeat(ctx context.Context) error {
+	if r == nil || r.controlPublisher == nil {
+		return nil
+	}
+	heartbeatPayload := pb.Heartbeat{
+		TimestampUnix: time.Now().UTC().Unix(),
+		SessionState:  pb.SessionStateActive,
+	}
+	envelope, err := r.controlPublisher.Publish(
+		ctx,
+		pb.ControlMessageHeartbeat,
+		"session",
+		"heartbeat",
+		heartbeatPayload,
+	)
+	if err != nil {
+		return fmt.Errorf("build heartbeat envelope failed: %w", err)
+	}
+	if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
+		return fmt.Errorf("send heartbeat failed: %w", err)
 	}
 	return nil
 }
@@ -1759,6 +1814,8 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			}
 			continue
 		}
+		r.setBridgeSessionReady(true)
+		r.notifyTunnelManagerState(tunnel.SessionStateActive)
 		// 会话建连成功后立即上报一次 tunnel 池快照，触发 Bridge 侧补池判定。
 		r.reportTunnelPoolNow(ctx, "session_active")
 		activeExit := r.waitForActiveExit(ctx)
@@ -1899,7 +1956,7 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	if strings.TrimSpace(record.Registration.ServiceID) == "" {
 		return nil, errors.New("add service failed: empty service identity")
 	}
-	if _, _, active := r.bridgeSessionMeta(); active {
+	if _, _, active := r.bridgeSessionConnectedMeta(); active {
 		// 会话可用时尽力触发一次全量同步；失败仅记录诊断，不回滚本地目录。
 		if err := r.syncServiceControlState(context.Background()); err != nil {
 			r.appendDiagnoseEvent(runtimeDiagnoseEvent{
@@ -1982,7 +2039,7 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 	}
 
 	if deleted {
-		if _, _, active := r.bridgeSessionMeta(); active && r.controlPublisher != nil {
+		if _, _, active := r.bridgeSessionConnectedMeta(); active && r.controlPublisher != nil {
 			if routeID := buildAutoRouteID(targetRegistration); routeID != "" {
 				routeRevokePayload := pb.RouteRevoke{
 					RouteID:     routeID,

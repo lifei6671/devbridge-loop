@@ -547,29 +547,40 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 		testingObject.Fatalf("sync service control state failed: %v", err)
 	}
 	frames := controlChannel.Frames()
-	if len(frames) != 3 {
-		testingObject.Fatalf("unexpected control frame count: got=%d want=3", len(frames))
+	if len(frames) != 4 {
+		testingObject.Fatalf("unexpected control frame count: got=%d want=4", len(frames))
 	}
 	firstEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
 	if err != nil {
 		testingObject.Fatalf("decode first business frame failed: %v", err)
 	}
-	if firstEnvelope.MessageType != pb.ControlMessagePublishService {
-		testingObject.Fatalf("unexpected first message type: got=%s want=%s", firstEnvelope.MessageType, pb.ControlMessagePublishService)
+	if firstEnvelope.MessageType != pb.ControlMessageHeartbeat {
+		testingObject.Fatalf("unexpected first message type: got=%s want=%s", firstEnvelope.MessageType, pb.ControlMessageHeartbeat)
 	}
 	secondEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[1].Frame)
 	if err != nil {
 		testingObject.Fatalf("decode second business frame failed: %v", err)
 	}
-	if secondEnvelope.MessageType != pb.ControlMessageRouteAssign {
+	if secondEnvelope.MessageType != pb.ControlMessagePublishService {
 		testingObject.Fatalf(
 			"unexpected second message type: got=%s want=%s",
 			secondEnvelope.MessageType,
+			pb.ControlMessagePublishService,
+		)
+	}
+	thirdEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[2].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode third business frame failed: %v", err)
+	}
+	if thirdEnvelope.MessageType != pb.ControlMessageRouteAssign {
+		testingObject.Fatalf(
+			"unexpected third message type: got=%s want=%s",
+			thirdEnvelope.MessageType,
 			pb.ControlMessageRouteAssign,
 		)
 	}
 	var routeAssignPayload pb.RouteAssign
-	if err := json.Unmarshal(secondEnvelope.Payload, &routeAssignPayload); err != nil {
+	if err := json.Unmarshal(thirdEnvelope.Payload, &routeAssignPayload); err != nil {
 		testingObject.Fatalf("decode route assign payload failed: %v", err)
 	}
 	if routeAssignPayload.RouteID != "agent-auto-route-svc-5001" {
@@ -584,14 +595,14 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	if routeAssignPayload.Target.ConnectorService == nil || routeAssignPayload.Target.ConnectorService.ServiceKey != "dev/demo/order-service" {
 		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
 	}
-	thirdEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[2].Frame)
+	fourthEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[3].Frame)
 	if err != nil {
-		testingObject.Fatalf("decode third business frame failed: %v", err)
+		testingObject.Fatalf("decode fourth business frame failed: %v", err)
 	}
-	if thirdEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
+	if fourthEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
 		testingObject.Fatalf(
-			"unexpected third message type: got=%s want=%s",
-			thirdEnvelope.MessageType,
+			"unexpected fourth message type: got=%s want=%s",
+			fourthEnvelope.MessageType,
 			pb.ControlMessageServiceHealthReport,
 		)
 	}
@@ -608,6 +619,87 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	}
 	if services[0]["sni_name"] != "order.demo.example.com" {
 		testingObject.Fatalf("unexpected sni_name in service.list: %+v", services[0]["sni_name"])
+	}
+}
+
+// TestSyncServiceControlStateSendsHeartbeatWithoutCatalog 验证空目录场景仍会上报业务心跳建立会话上下文。
+func TestSyncServiceControlStateSendsHeartbeatWithoutCatalog(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	controlChannel := newTestPrioritizedControlChannel()
+	runtime := &Runtime{
+		controlChannel:   controlChannel,
+		controlPublisher: control.NewPublisher("session-empty", 5, 0),
+		serviceCatalog:   service.NewCatalog(),
+	}
+
+	if err := runtime.syncServiceControlState(context.Background()); err != nil {
+		testingObject.Fatalf("sync service control state failed: %v", err)
+	}
+	frames := controlChannel.Frames()
+	if len(frames) != 1 {
+		testingObject.Fatalf("unexpected control frame count: got=%d want=1", len(frames))
+	}
+	envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode heartbeat frame failed: %v", err)
+	}
+	if envelope.MessageType != pb.ControlMessageHeartbeat {
+		testingObject.Fatalf("unexpected heartbeat message type: got=%s want=%s", envelope.MessageType, pb.ControlMessageHeartbeat)
+	}
+}
+
+// TestAddOrUpdateServiceSyncsDuringSessionWarmup 验证会话 warmup 期间新增服务仍会触发控制面同步。
+func TestAddOrUpdateServiceSyncsDuringSessionWarmup(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	controlChannel := newTestPrioritizedControlChannel()
+	now := time.Unix(1700001200, 0).UTC()
+	runtime := &Runtime{
+		controlChannel:     controlChannel,
+		controlPublisher:   control.NewPublisher("session-8101", 4, 0),
+		serviceCatalog:     service.NewCatalog(),
+		healthReporter:     control.NewHealthReporter(control.HealthReporterOptions{Probe: &runtimeBridgeTestHealthProbe{result: pb.HealthStatusHealthy}, Now: func() time.Time { return now }}),
+		bridgeState:        events.BridgeStateActive,
+		bridgeSession:      "session-8101",
+		bridgeEpoch:        4,
+		bridgeSessionReady: false,
+	}
+
+	if _, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		ServiceID:   "svc-8101",
+		ServiceName: "inventory-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		Protocol:    "http",
+		Host:        "127.0.0.1",
+		Port:        18081,
+		SNIName:     "inventory.demo.example.com",
+	}); err != nil {
+		testingObject.Fatalf("add or update service failed: %v", err)
+	}
+
+	frames := controlChannel.Frames()
+	if len(frames) != 4 {
+		testingObject.Fatalf("unexpected control frame count during warmup sync: got=%d want=4", len(frames))
+	}
+	firstEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode first business frame failed: %v", err)
+	}
+	if firstEnvelope.MessageType != pb.ControlMessageHeartbeat {
+		testingObject.Fatalf("unexpected first message type: got=%s want=%s", firstEnvelope.MessageType, pb.ControlMessageHeartbeat)
+	}
+	secondEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[1].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode second business frame failed: %v", err)
+	}
+	if secondEnvelope.MessageType != pb.ControlMessagePublishService {
+		testingObject.Fatalf(
+			"unexpected second message type: got=%s want=%s",
+			secondEnvelope.MessageType,
+			pb.ControlMessagePublishService,
+		)
 	}
 }
 
@@ -629,12 +721,13 @@ func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing
 		},
 	})
 	runtime := &Runtime{
-		controlChannel:   controlChannel,
-		controlPublisher: control.NewPublisher("session-7001", 1, 0),
-		serviceCatalog:   serviceCatalog,
-		bridgeState:      events.BridgeStateActive,
-		bridgeSession:    "session-7001",
-		bridgeEpoch:      1,
+		controlChannel:     controlChannel,
+		controlPublisher:   control.NewPublisher("session-7001", 1, 0),
+		serviceCatalog:     serviceCatalog,
+		bridgeState:        events.BridgeStateActive,
+		bridgeSession:      "session-7001",
+		bridgeEpoch:        1,
+		bridgeSessionReady: false,
 	}
 
 	payload, err := runtime.removeService(runtimeServiceDeleteInput{ServiceID: "svc-7001"})
@@ -688,12 +781,13 @@ func TestSendTunnelPoolReport(testingObject *testing.T) {
 
 	controlChannel := newTestPrioritizedControlChannel()
 	runtime := &Runtime{
-		cfg:              Config{AgentID: "agent-6001"},
-		controlChannel:   controlChannel,
-		controlPublisher: control.NewPublisher("session-6001", 3, 0),
-		bridgeState:      events.BridgeStateActive,
-		bridgeSession:    "session-6001",
-		bridgeEpoch:      3,
+		cfg:                Config{AgentID: "agent-6001"},
+		controlChannel:     controlChannel,
+		controlPublisher:   control.NewPublisher("session-6001", 3, 0),
+		bridgeState:        events.BridgeStateActive,
+		bridgeSession:      "session-6001",
+		bridgeEpoch:        3,
+		bridgeSessionReady: true,
 	}
 	report := control.TunnelPoolReport{
 		SessionID:       "session-6001",

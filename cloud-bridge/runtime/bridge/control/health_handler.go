@@ -1,6 +1,7 @@
 package control
 
 import (
+	"log/slog"
 	"strings"
 	"time"
 
@@ -44,20 +45,50 @@ func (handler *HealthHandler) HandleReport(envelope pb.ControlEnvelope, report p
 	if handler == nil || handler.serviceRegistry == nil {
 		return
 	}
-	if !handler.validateSessionEpoch(envelope) {
-		// 旧会话上报直接丢弃，避免覆盖新 session 真相源。
-		return
-	}
-
 	normalizedServiceID := strings.TrimSpace(report.ServiceID)
 	normalizedServiceKey := strings.TrimSpace(report.ServiceKey)
+	if !handler.validateSessionEpoch(envelope) {
+		// 旧会话上报直接丢弃，避免覆盖新 session 真相源。
+		slog.Info(
+			"bridge ignore service health report: invalid session epoch",
+			"connector_id", strings.TrimSpace(envelope.ConnectorID),
+			"session_id", strings.TrimSpace(envelope.SessionID),
+			"session_epoch", envelope.SessionEpoch,
+			"service_id", normalizedServiceID,
+			"service_key", normalizedServiceKey,
+			"reported_health_status", report.ServiceHealthStatus,
+		)
+		return
+	}
 	serviceSnapshot, exists := handler.lookupService(normalizedServiceID, normalizedServiceKey)
 	if !exists {
 		// 健康上报先于发布到达时保持无副作用，等待 publish 建立主记录。
+		slog.Info(
+			"bridge ignore service health report: service not found",
+			"connector_id", strings.TrimSpace(envelope.ConnectorID),
+			"session_id", strings.TrimSpace(envelope.SessionID),
+			"session_epoch", envelope.SessionEpoch,
+			"service_id", normalizedServiceID,
+			"service_key", normalizedServiceKey,
+			"reported_health_status", report.ServiceHealthStatus,
+		)
 		return
 	}
+	previousHealthStatus := serviceSnapshot.HealthStatus
 	serviceSnapshot.HealthStatus = normalizeHealthStatus(report.ServiceHealthStatus)
 	handler.serviceRegistry.Upsert(handler.now(), serviceSnapshot)
+	slog.Info(
+		"bridge apply service health report",
+		"connector_id", strings.TrimSpace(envelope.ConnectorID),
+		"session_id", strings.TrimSpace(envelope.SessionID),
+		"session_epoch", envelope.SessionEpoch,
+		"service_id", strings.TrimSpace(serviceSnapshot.ServiceID),
+		"service_key", strings.TrimSpace(serviceSnapshot.ServiceKey),
+		"service_status", serviceSnapshot.Status,
+		"health_status_before", previousHealthStatus,
+		"health_status_after", serviceSnapshot.HealthStatus,
+		"resource_version", serviceSnapshot.ResourceVersion,
+	)
 }
 
 // lookupService 按 service_id/service_key 查找当前服务快照。

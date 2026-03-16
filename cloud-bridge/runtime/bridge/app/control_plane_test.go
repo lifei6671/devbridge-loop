@@ -1426,6 +1426,105 @@ func TestRegisterAcceptedTunnelDropsWhenClientTunnelIDMissingForGRPC(testingObje
 	}
 }
 
+// TestRegisterAcceptedTunnelUsesSessionMetadataOwnerForGRPC
+// 验证 gRPC 在 owner 歧义场景下可按 session metadata 精确归属 tunnel。
+func TestRegisterAcceptedTunnelUsesSessionMetadataOwnerForGRPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-a",
+		ConnectorID:   "agent-a",
+		Epoch:         3,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-b",
+		ConnectorID:   "agent-b",
+		Epoch:         6,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	server := &controlPlaneServer{dispatcher: dispatcher}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("tun-grpc-owner-1")
+	rawTunnel.meta.SessionID = "session-b"
+	rawTunnel.meta.SessionEpoch = 6
+	rawTunnel.meta.Labels = map[string]string{
+		grpcbinding.TunnelMetaLabelTunnelIDSource: grpcbinding.TunnelIDSourceStreamMetadata,
+	}
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeGRPCH2); err != nil {
+		testingObject.Fatalf("register accepted grpc tunnel failed: %v", err)
+	}
+
+	runtimeSnapshot, exists := tunnelRegistry.Get("tun-grpc-owner-1")
+	if !exists {
+		testingObject.Fatalf("expected grpc tunnel registered")
+	}
+	if runtimeSnapshot.ConnectorID != "agent-b" || runtimeSnapshot.SessionID != "session-b" {
+		testingObject.Fatalf(
+			"unexpected grpc tunnel owner with session metadata: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+	if rawTunnel.closed() {
+		testingObject.Fatalf("expected grpc tunnel open after successful registration")
+	}
+}
+
+// TestResolveAcceptedTunnelOwnerRejectsFallbackWhenGRPCMetadataUnresolved
+// 验证 gRPC 已携带 session metadata 但 owner 无法解析时，不会回退到单活会话归属。
+func TestResolveAcceptedTunnelOwnerRejectsFallbackWhenGRPCMetadataUnresolved(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-active",
+		ConnectorID:   "agent-active",
+		Epoch:         5,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	server := &controlPlaneServer{dispatcher: dispatcher}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("tun-grpc-owner-unresolved")
+	rawTunnel.meta.SessionID = "session-missing"
+	rawTunnel.meta.SessionEpoch = 9
+
+	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(
+		rawTunnel,
+		transport.BindingTypeGRPCH2,
+		20*time.Millisecond,
+	)
+	if ok {
+		testingObject.Fatalf(
+			"expected unresolved grpc metadata owner, got connector=%s session=%s epoch=%d",
+			connectorID,
+			sessionID,
+			sessionEpoch,
+		)
+	}
+}
+
 // TestRegisterAcceptedTunnelAmbiguousOwner 验证 owner 不唯一时入站 tunnel 不会被登记。
 func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
 	testingObject.Parallel()

@@ -146,6 +146,13 @@ func TestTunnelAcceptorHandleAndAcceptUsesIncomingMetadataTunnelID(testingObject
 	if meta.Labels[TunnelMetaLabelTunnelIDSource] != TunnelIDSourceStreamMetadata {
 		testingObject.Fatalf("unexpected tunnel id source label: %+v", meta.Labels)
 	}
+	if meta.SessionID != "session-a" || meta.SessionEpoch != 7 {
+		testingObject.Fatalf(
+			"unexpected session metadata on accepted tunnel: session_id=%s session_epoch=%d",
+			meta.SessionID,
+			meta.SessionEpoch,
+		)
+	}
 
 	if err := acceptedTunnel.Close(); err != nil {
 		testingObject.Fatalf("close accepted tunnel failed: %v", err)

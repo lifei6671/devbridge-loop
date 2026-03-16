@@ -35,7 +35,7 @@ const (
 	// incomingTunnelProbeTimeout 定义单次探测超时时间，避免阻塞生命周期协程。
 	incomingTunnelProbeTimeout = 120 * time.Millisecond
 	// incomingTunnelOwnerResolveWait 定义入站 tunnel 等待 owner 会话对账的窗口。
-	incomingTunnelOwnerResolveWait = 2 * time.Second
+	incomingTunnelOwnerResolveWait = 5 * time.Second
 	// incomingTCPTunnelHandshakeTimeout 定义 TCP 入站读取首帧 tunnel 握手超时。
 	incomingTCPTunnelHandshakeTimeout = 2 * time.Second
 )
@@ -1273,8 +1273,18 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	if rawTunnel == nil {
 		return errors.New("register accepted tunnel: nil tunnel")
 	}
-	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(bindingType, incomingTunnelOwnerResolveWait)
+	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(rawTunnel, bindingType, incomingTunnelOwnerResolveWait)
 	if !ok {
+		if bindingType == transport.BindingTypeGRPCH2 {
+			rawMeta := rawTunnel.Meta()
+			slog.Info(
+				"bridge register grpc tunnel dropped: owner unresolved",
+				"raw_tunnel_id", strings.TrimSpace(rawTunnel.ID()),
+				"meta_session_id", strings.TrimSpace(rawMeta.SessionID),
+				"meta_session_epoch", rawMeta.SessionEpoch,
+				"tunnel_id_source", grpcTunnelIDSource(rawTunnel),
+			)
+		}
 		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
 		_ = rawTunnel.Close()
 		return nil
@@ -1365,13 +1375,49 @@ func readIncomingTCPTunnelHandshake(
 }
 
 func (server *controlPlaneServer) resolveAcceptedTunnelOwner(
+	rawTunnel transport.Tunnel,
 	bindingType transport.BindingType,
 	wait time.Duration,
 ) (string, string, uint64, bool) {
 	if bindingType != transport.BindingTypeGRPCH2 {
 		return server.resolveSingleActiveSessionOwner()
 	}
+	if connectorID, sessionID, sessionEpoch, ok := server.resolveGRPCTunnelOwnerBySessionMeta(rawTunnel, wait); ok {
+		return connectorID, sessionID, sessionEpoch, true
+	}
+	// metadata 已提供但无法解析 owner 时直接失败，避免重复等待与错误回退归属。
+	if grpcTunnelHasSessionMeta(rawTunnel) {
+		return "", "", 0, false
+	}
 	return server.waitSingleActiveSessionOwner(wait)
+}
+
+func grpcTunnelHasSessionMeta(rawTunnel transport.Tunnel) bool {
+	if rawTunnel == nil {
+		return false
+	}
+	rawMeta := rawTunnel.Meta()
+	return strings.TrimSpace(rawMeta.SessionID) != "" && rawMeta.SessionEpoch > 0
+}
+
+func (server *controlPlaneServer) resolveGRPCTunnelOwnerBySessionMeta(
+	rawTunnel transport.Tunnel,
+	wait time.Duration,
+) (string, string, uint64, bool) {
+	if server == nil || rawTunnel == nil {
+		return "", "", 0, false
+	}
+	rawMeta := rawTunnel.Meta()
+	sessionID := strings.TrimSpace(rawMeta.SessionID)
+	sessionEpoch := rawMeta.SessionEpoch
+	if sessionID == "" || sessionEpoch == 0 {
+		return "", "", 0, false
+	}
+	connectorID, ok := server.waitSessionOwnerBySessionID(sessionID, sessionEpoch, wait)
+	if !ok {
+		return "", "", 0, false
+	}
+	return connectorID, sessionID, sessionEpoch, true
 }
 
 func (server *controlPlaneServer) waitSingleActiveSessionOwner(
@@ -1390,6 +1436,39 @@ func (server *controlPlaneServer) waitSingleActiveSessionOwner(
 		now := time.Now().UTC()
 		if normalizedWait == 0 || !now.Before(deadline) {
 			return "", "", 0, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (server *controlPlaneServer) waitSessionOwnerBySessionID(
+	sessionID string,
+	sessionEpoch uint64,
+	wait time.Duration,
+) (string, bool) {
+	if server == nil || server.dispatcher == nil || server.dispatcher.sessionRegistry == nil {
+		return "", false
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" || sessionEpoch == 0 {
+		return "", false
+	}
+	normalizedWait := wait
+	if normalizedWait < 0 {
+		normalizedWait = 0
+	}
+	deadline := time.Now().UTC().Add(normalizedWait)
+	for {
+		sessionRuntime, exists := server.dispatcher.sessionRegistry.GetBySession(normalizedSessionID)
+		if exists &&
+			sessionRuntime.State == registry.SessionActive &&
+			sessionRuntime.Epoch == sessionEpoch &&
+			strings.TrimSpace(sessionRuntime.ConnectorID) != "" {
+			return strings.TrimSpace(sessionRuntime.ConnectorID), true
+		}
+		now := time.Now().UTC()
+		if normalizedWait == 0 || !now.Before(deadline) {
+			return "", false
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

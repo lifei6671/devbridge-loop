@@ -68,7 +68,10 @@ func (handler *TunnelReportHandler) HandleReport(
 		}
 		handler.reportStore.Upsert(now, connectorID, sessionID, sessionEpoch, report)
 	}
-	recycledIdleCount := handler.reconcileBridgeIdleWithAgentReport(now, sessionID, report)
+	recycledIdleCount := 0
+	if shouldReconcileBridgeIdleWithAgentReport(report.Trigger) {
+		recycledIdleCount = handler.reconcileBridgeIdleWithAgentReport(now, sessionID, report)
+	}
 	refillRequest, shouldSend := handler.refillController.BuildRefillRequest(sessionID, sessionEpoch, report)
 	if !shouldSend {
 		return pb.TunnelRefillRequest{}, false
@@ -151,4 +154,9 @@ func (handler *TunnelReportHandler) reconcileBridgeIdleWithAgentReport(
 		"agent_pool_reconcile",
 	)
 	return len(recycled)
+}
+
+func shouldReconcileBridgeIdleWithAgentReport(trigger string) bool {
+	// event:* 报告在隧道状态切换阶段会抖动，强行对齐容易误回收新建 tunnel。
+	return strings.EqualFold(strings.TrimSpace(trigger), "periodic")
 }

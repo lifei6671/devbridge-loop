@@ -139,6 +139,12 @@ func (acceptor *TunnelAcceptor) HandleTunnelStream(
 		idSource = TunnelIDSourceStreamMetadata
 	}
 	tunnelMeta := buildTunnelMeta(acceptor.identityConfig, tunnelID, time.Now().UTC())
+	if incomingSessionID := IncomingTunnelStreamSessionID(stream.Context()); incomingSessionID != "" {
+		tunnelMeta.SessionID = incomingSessionID
+	}
+	if incomingSessionEpoch := IncomingTunnelStreamSessionEpoch(stream.Context()); incomingSessionEpoch > 0 {
+		tunnelMeta.SessionEpoch = incomingSessionEpoch
+	}
 	if idSource != "" {
 		if tunnelMeta.Labels == nil {
 			tunnelMeta.Labels = make(map[string]string, 1)

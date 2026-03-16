@@ -33,21 +33,22 @@ type Runtime struct {
 
 	startedAt time.Time
 
-	bridgeMu          sync.RWMutex
-	bridgeDesiredUp   bool
-	bridgeState       string
-	bridgeSession     string
-	bridgeEpoch       uint64
-	reconnects        uint64
-	heartbeatAt       time.Time
-	heartbeatSentAt   time.Time
-	updatedAt         time.Time
-	lastErr           string
-	retryFailStreak   uint32
-	retryBackoff      time.Duration
-	nextRetryAt       time.Time
-	tunnelIDSequence  uint64
-	bridgeCommandChan chan bridgeCommand
+	bridgeMu           sync.RWMutex
+	bridgeDesiredUp    bool
+	bridgeState        string
+	bridgeSession      string
+	bridgeEpoch        uint64
+	bridgeSessionReady bool
+	reconnects         uint64
+	heartbeatAt        time.Time
+	heartbeatSentAt    time.Time
+	updatedAt          time.Time
+	lastErr            string
+	retryFailStreak    uint32
+	retryBackoff       time.Duration
+	nextRetryAt        time.Time
+	tunnelIDSequence   uint64
+	bridgeCommandChan  chan bridgeCommand
 
 	controlChannel   transport.ControlChannel
 	tcpTransport     *tcpbinding.Transport

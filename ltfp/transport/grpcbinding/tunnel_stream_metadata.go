@@ -60,3 +60,45 @@ func IncomingTunnelStreamTunnelID(ctx context.Context) string {
 	}
 	return ""
 }
+
+// IncomingTunnelStreamSessionID 从 incoming context 中提取 session_id。
+func IncomingTunnelStreamSessionID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	for _, value := range md.Get(TunnelStreamMetadataSessionIDKey) {
+		if normalizedSessionID := strings.TrimSpace(value); normalizedSessionID != "" {
+			return normalizedSessionID
+		}
+	}
+	return ""
+}
+
+// IncomingTunnelStreamSessionEpoch 从 incoming context 中提取 session_epoch。
+func IncomingTunnelStreamSessionEpoch(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return 0
+	}
+	for _, value := range md.Get(TunnelStreamMetadataSessionEpochKey) {
+		normalizedEpochText := strings.TrimSpace(value)
+		if normalizedEpochText == "" {
+			continue
+		}
+		sessionEpoch, err := strconv.ParseUint(normalizedEpochText, 10, 64)
+		if err != nil {
+			continue
+		}
+		if sessionEpoch > 0 {
+			return sessionEpoch
+		}
+	}
+	return 0
+}
