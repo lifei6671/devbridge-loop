@@ -224,7 +224,14 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 		routes := safeListRoutes(server.dependencies)
 		tunnelSnapshot := safeTunnelSnapshot(server.dependencies)
 		return map[string]any{
-			"overview":         adminview.BuildBridgeOverview(server.now(), sessions, services, routes, tunnelSnapshot),
+			"overview": adminview.BuildBridgeOverview(
+				server.now(),
+				sessions,
+				services,
+				routes,
+				tunnelSnapshot,
+				safeBuildConfigSnapshot(server.dependencies),
+			),
 			"tunnel_summary":   adminview.BuildTunnelSummary(server.now(), tunnelSnapshot),
 			"traffic_summary":  adminview.BuildTrafficSummary(server.now(), server.dependencies.Metrics),
 			"diagnose_summary": adminview.BuildDiagnoseSummary(server.now(), sessions, tunnelSnapshot, server.dependencies.Metrics),

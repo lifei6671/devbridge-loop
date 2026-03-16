@@ -37,8 +37,9 @@ const (
 	incomingTunnelProbeInterval = 250 * time.Millisecond
 	// incomingTunnelProbeTimeout 定义单次探测超时时间，避免阻塞生命周期协程。
 	incomingTunnelProbeTimeout = 120 * time.Millisecond
-	// incomingTunnelDialAnnounceWait 定义入站 tunnel 等待 Agent 宣告 tunnel_id 的窗口。
-	incomingTunnelDialAnnounceWait = 180 * time.Millisecond
+	// incomingTunnelDialAnnounceWait 定义入站 tunnel 等待 Agent 宣告/会话对账的窗口。
+	// gRPC tunnel 依赖该宣告对齐 tunnel_id；窗口过短会在控制面轻微抖动时误关可用 tunnel。
+	incomingTunnelDialAnnounceWait = 2 * time.Second
 	// incomingTunnelDialAnnounceTTL 定义宣告 tunnel_id 在队列中的最大保留时长。
 	incomingTunnelDialAnnounceTTL = 3 * time.Second
 )
@@ -249,6 +250,23 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 				reportConnectorID = strings.TrimSpace(sessionRuntime.ConnectorID)
 			}
 		}
+		reportTrigger := strings.TrimSpace(message.Trigger)
+		if reportTrigger == "event:tunnel_active" {
+			agentConnectedCount := message.IdleCount + message.InUseCount
+			if agentConnectedCount < 0 {
+				agentConnectedCount = 0
+			}
+			slog.Info(
+				"bridge observe tunnel_active report",
+				"connector_id", reportConnectorID,
+				"session_id", reportSessionID,
+				"session_epoch", reportSessionEpoch,
+				"agent_idle_count", message.IdleCount,
+				"agent_in_use_count", message.InUseCount,
+				"agent_connected_count", agentConnectedCount,
+				"agent_target_idle_count", message.TargetIdleCount,
+			)
+		}
 		slog.Info(
 			"bridge receive tunnel pool report",
 			"connector_id", reportConnectorID,
@@ -257,7 +275,7 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 			"idle_count", message.IdleCount,
 			"in_use_count", message.InUseCount,
 			"target_idle_count", message.TargetIdleCount,
-			"trigger", strings.TrimSpace(message.Trigger),
+			"trigger", reportTrigger,
 		)
 		if dispatcher.tunnelHandler == nil {
 			return nil, nil
@@ -272,7 +290,7 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 				"idle_count", message.IdleCount,
 				"in_use_count", message.InUseCount,
 				"target_idle_count", message.TargetIdleCount,
-				"trigger", strings.TrimSpace(message.Trigger),
+				"trigger", reportTrigger,
 			)
 			return nil, nil
 		}
@@ -361,6 +379,10 @@ func (dispatcher *controlMessageDispatcher) enqueueTunnelDialAnnounce(message pb
 	cleanQueue := make([]announcedTunnelDialRuntime, 0, len(queue)+1)
 	for _, item := range queue {
 		if normalizedNow.Sub(item.announcedAt) <= incomingTunnelDialAnnounceTTL {
+			if item.tunnelID == normalizedTunnelID {
+				// 同一 tunnel_id 的重复宣告仅刷新时间戳，避免后续消费错配。
+				continue
+			}
 			cleanQueue = append(cleanQueue, item)
 		}
 	}
@@ -1329,6 +1351,7 @@ func (server *controlPlaneServer) handleAcceptedTCPTunnel(rawConn net.Conn) erro
 		transport.BindingTypeTCPFramed,
 		connectorID,
 		sessionID,
+		tunnelID,
 	)
 }
 
@@ -1346,13 +1369,89 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	if rawTunnel == nil {
 		return errors.New("register accepted tunnel: nil tunnel")
 	}
-	connectorID, sessionID, _, ok := server.resolveSingleActiveSessionOwner()
+	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(bindingType, incomingTunnelDialAnnounceWait)
 	if !ok {
 		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
 		_ = rawTunnel.Close()
 		return nil
 	}
-	return server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID)
+	registeredTunnelID := strings.TrimSpace(rawTunnel.ID())
+	tunnelIDSource := "raw_tunnel_id"
+	if bindingType == transport.BindingTypeGRPCH2 {
+		tunnelIDSource = grpcTunnelIDSource(rawTunnel)
+		// 优先使用 stream metadata 对齐后的 tunnel_id，无法判定来源时回退 announce 队列。
+		useDialAnnounceFallback := shouldUseGRPCTunnelDialAnnounce(rawTunnel)
+		if useDialAnnounceFallback {
+			announcedTunnelID := server.dispatcher.consumeTunnelDialAnnounce(
+				sessionID,
+				sessionEpoch,
+				"",
+				incomingTunnelDialAnnounceWait,
+			)
+			if strings.TrimSpace(announcedTunnelID) == "" {
+				_ = rawTunnel.Close()
+				return nil
+			}
+			registeredTunnelID = strings.TrimSpace(announcedTunnelID)
+			tunnelIDSource = "announce_fallback"
+		}
+		slog.Info(
+			"bridge register grpc tunnel",
+			"connector_id", connectorID,
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"raw_tunnel_id", strings.TrimSpace(rawTunnel.ID()),
+			"registered_tunnel_id", registeredTunnelID,
+			"tunnel_id_source", tunnelIDSource,
+		)
+	}
+	return server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID, registeredTunnelID)
+}
+
+func shouldUseGRPCTunnelDialAnnounce(rawTunnel transport.Tunnel) bool {
+	return grpcTunnelIDSource(rawTunnel) != grpcbinding.TunnelIDSourceStreamMetadata
+}
+
+func grpcTunnelIDSource(rawTunnel transport.Tunnel) string {
+	if rawTunnel == nil {
+		return ""
+	}
+	meta := rawTunnel.Meta()
+	if len(meta.Labels) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(meta.Labels[grpcbinding.TunnelMetaLabelTunnelIDSource])
+}
+
+func (server *controlPlaneServer) resolveAcceptedTunnelOwner(
+	bindingType transport.BindingType,
+	wait time.Duration,
+) (string, string, uint64, bool) {
+	if bindingType != transport.BindingTypeGRPCH2 {
+		return server.resolveSingleActiveSessionOwner()
+	}
+	return server.waitSingleActiveSessionOwner(wait)
+}
+
+func (server *controlPlaneServer) waitSingleActiveSessionOwner(
+	wait time.Duration,
+) (string, string, uint64, bool) {
+	normalizedWait := wait
+	if normalizedWait < 0 {
+		normalizedWait = 0
+	}
+	deadline := time.Now().UTC().Add(normalizedWait)
+	for {
+		connectorID, sessionID, sessionEpoch, ok := server.resolveSingleActiveSessionOwner()
+		if ok {
+			return connectorID, sessionID, sessionEpoch, true
+		}
+		now := time.Now().UTC()
+		if normalizedWait == 0 || !now.Before(deadline) {
+			return "", "", 0, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
@@ -1360,6 +1459,7 @@ func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
 	bindingType transport.BindingType,
 	connectorID string,
 	sessionID string,
+	tunnelID string,
 ) error {
 	if server == nil || server.dispatcher == nil || server.dispatcher.tunnelRegistry == nil {
 		if rawTunnel != nil {
@@ -1377,7 +1477,7 @@ func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
 		return nil
 	}
 	normalizedNow := time.Now().UTC()
-	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel)
+	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel, tunnelID)
 	if adapter == nil {
 		_ = rawTunnel.Close()
 		return errors.New("register accepted tunnel: build runtime adapter failed")

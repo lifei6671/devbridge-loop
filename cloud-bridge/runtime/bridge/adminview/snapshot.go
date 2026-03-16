@@ -2,6 +2,7 @@ package adminview
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -13,17 +14,27 @@ import (
 
 // BridgeOverviewSnapshot 描述管理后台总览页需要的聚合快照。
 type BridgeOverviewSnapshot struct {
-	ConnectorTotal int    `json:"connector_total"`
-	SessionTotal   int    `json:"session_total"`
-	SessionActive  int    `json:"session_active"`
-	SessionStale   int    `json:"session_stale"`
-	ServiceTotal   int    `json:"service_total"`
-	RouteTotal     int    `json:"route_total"`
-	TunnelIdle     int    `json:"tunnel_idle"`
-	TunnelReserved int    `json:"tunnel_reserved"`
-	TunnelActive   int    `json:"tunnel_active"`
-	TunnelBroken   int    `json:"tunnel_broken"`
-	UpdatedAtMS    uint64 `json:"updated_at_ms"`
+	ConnectorTotal int                  `json:"connector_total"`
+	SessionTotal   int                  `json:"session_total"`
+	SessionActive  int                  `json:"session_active"`
+	SessionStale   int                  `json:"session_stale"`
+	ServiceTotal   int                  `json:"service_total"`
+	RouteTotal     int                  `json:"route_total"`
+	TunnelIdle     int                  `json:"tunnel_idle"`
+	TunnelReserved int                  `json:"tunnel_reserved"`
+	TunnelActive   int                  `json:"tunnel_active"`
+	TunnelBroken   int                  `json:"tunnel_broken"`
+	Listeners      []BridgeListenerItem `json:"listeners"`
+	UpdatedAtMS    uint64               `json:"updated_at_ms"`
+}
+
+// BridgeListenerItem 描述 Bridge 当前启用的监听器及用途。
+type BridgeListenerItem struct {
+	ListenerID string `json:"listener_id"`
+	Label      string `json:"label"`
+	ListenAddr string `json:"listen_addr"`
+	Port       string `json:"port"`
+	Purpose    string `json:"purpose"`
 }
 
 // RouteItem 定义管理后台 routes 列表项。
@@ -135,6 +146,7 @@ func BuildBridgeOverview(
 	services []pb.Service,
 	routes []pb.Route,
 	tunnelSnapshot registry.TunnelSnapshot,
+	configSnapshot map[string]any,
 ) BridgeOverviewSnapshot {
 	normalizedNow := now
 	if normalizedNow.IsZero() {
@@ -166,8 +178,124 @@ func BuildBridgeOverview(
 		TunnelReserved: tunnelSnapshot.ReservedCount,
 		TunnelActive:   tunnelSnapshot.ActiveCount,
 		TunnelBroken:   tunnelSnapshot.BrokenCount,
+		Listeners:      BuildBridgeListeners(configSnapshot),
 		UpdatedAtMS:    uint64(normalizedNow.UnixMilli()),
 	}
+}
+
+// BuildBridgeListeners 基于当前配置快照提取 Bridge 已启用的监听器清单。
+func BuildBridgeListeners(configSnapshot map[string]any) []BridgeListenerItem {
+	if len(configSnapshot) == 0 {
+		return []BridgeListenerItem{}
+	}
+
+	ingressConfig := nestedConfigMap(configSnapshot, "ingress")
+	adminConfig := nestedConfigMap(configSnapshot, "admin")
+	controlPlaneConfig := nestedConfigMap(configSnapshot, "control_plane")
+
+	listeners := make([]BridgeListenerItem, 0, 5)
+	appendListener := func(listenerID string, label string, listenAddr string, purpose string) {
+		normalizedListenAddr := strings.TrimSpace(listenAddr)
+		if normalizedListenAddr == "" {
+			return
+		}
+		listeners = append(listeners, BridgeListenerItem{
+			ListenerID: listenerID,
+			Label:      label,
+			ListenAddr: normalizedListenAddr,
+			Port:       extractListenPort(normalizedListenAddr),
+			Purpose:    purpose,
+		})
+	}
+
+	appendListener(
+		"ingress_http",
+		"Ingress HTTP",
+		readConfigString(ingressConfig, "http_addr"),
+		"HTTP L7 入口，承接共享的浏览器与 API 流量。",
+	)
+	appendListener(
+		"ingress_grpc",
+		"Ingress gRPC",
+		readConfigString(ingressConfig, "grpc_addr"),
+		"gRPC 入口，承接共享的 gRPC 协议流量。",
+	)
+	appendListener(
+		"control_plane_tcp",
+		"Control Plane TCP",
+		readConfigString(controlPlaneConfig, "listen_addr"),
+		"Agent 控制面 TCP framed 通道，同时接收 TCP tunnel。",
+	)
+	appendListener(
+		"control_plane_grpc",
+		"Control Plane gRPC",
+		readConfigString(controlPlaneConfig, "grpc_h2_listen_addr"),
+		"Agent 控制面 gRPC H2 通道，同时接收 gRPC tunnel。",
+	)
+	if readConfigBool(adminConfig, "enabled") {
+		appendListener(
+			"admin_ui_api",
+			"Admin UI / API",
+			readConfigString(adminConfig, "listen_addr"),
+			"管理后台 UI 与 Admin API 入口。",
+		)
+	}
+	return listeners
+}
+
+func nestedConfigMap(snapshot map[string]any, key string) map[string]any {
+	if snapshot == nil {
+		return map[string]any{}
+	}
+	rawSection, exists := snapshot[key]
+	if !exists {
+		return map[string]any{}
+	}
+	section, ok := rawSection.(map[string]any)
+	if !ok || section == nil {
+		return map[string]any{}
+	}
+	return section
+}
+
+func readConfigString(section map[string]any, key string) string {
+	if section == nil {
+		return ""
+	}
+	rawValue, exists := section[key]
+	if !exists {
+		return ""
+	}
+	if textValue, ok := rawValue.(string); ok {
+		return strings.TrimSpace(textValue)
+	}
+	return ""
+}
+
+func readConfigBool(section map[string]any, key string) bool {
+	if section == nil {
+		return false
+	}
+	rawValue, exists := section[key]
+	if !exists {
+		return false
+	}
+	if boolValue, ok := rawValue.(bool); ok {
+		return boolValue
+	}
+	return false
+}
+
+func extractListenPort(listenAddr string) string {
+	normalizedListenAddr := strings.TrimSpace(listenAddr)
+	if normalizedListenAddr == "" {
+		return "--"
+	}
+	_, port, err := net.SplitHostPort(normalizedListenAddr)
+	if err == nil && strings.TrimSpace(port) != "" {
+		return strings.TrimSpace(port)
+	}
+	return "--"
 }
 
 // BuildRouteItems 构建 routes 只读列表项（按 route_id 排序保证稳定分页）。

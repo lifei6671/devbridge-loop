@@ -84,8 +84,8 @@ type TunnelReuseConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Ingress: IngressConfig{
-			HTTPAddr:     ":8080",
-			GRPCAddr:     ":8081",
+			HTTPAddr:     ":38080",
+			GRPCAddr:     ":38081",
 			HTTPSAddr:    ":8443",
 			TLSSNIAddr:   ":8443",
 			TCPPortRange: "9000-9100",

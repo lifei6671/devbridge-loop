@@ -272,7 +272,14 @@ func (server *Server) buildDiagnoseExportPayload() map[string]any {
 	tunnelSnapshot := safeTunnelSnapshot(server.dependencies)
 	payload := map[string]any{
 		"generated_at_ms": uint64(now.UnixMilli()),
-		"overview":        adminview.BuildBridgeOverview(now, sessions, services, routes, tunnelSnapshot),
+		"overview": adminview.BuildBridgeOverview(
+			now,
+			sessions,
+			services,
+			routes,
+			tunnelSnapshot,
+			safeBuildConfigSnapshot(server.dependencies),
+		),
 		"routes":          adminview.BuildRouteItems(routes),
 		"connectors":      adminview.BuildConnectorItems(sessions, services),
 		"sessions":        adminview.BuildSessionItems(sessions),

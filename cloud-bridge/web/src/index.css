@@ -385,6 +385,77 @@ select:focus {
   background: linear-gradient(150deg, #eff8f4 0%, #f8fbfa 100%);
 }
 
+.listener-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.listener-card {
+  border: 1px solid color-mix(in srgb, var(--line) 86%, white 14%);
+  border-radius: 12px;
+  padding: 12px 13px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, white 8%) 0%, var(--surface-2) 100%);
+}
+
+.listener-top {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.listener-label {
+  margin: 0 0 6px;
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.listener-addr {
+  display: inline-block;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent-soft) 42%, white 58%);
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+
+.listener-port-wrap {
+  min-width: 64px;
+  text-align: right;
+}
+
+.listener-port-label {
+  display: block;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.listener-port {
+  display: block;
+  margin-top: 4px;
+  font-size: 1.02rem;
+  color: var(--accent);
+}
+
+.listener-purpose {
+  margin: 12px 0 0;
+  color: var(--text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.listener-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
 .kpi-label {
   margin: 0;
   font-size: 0.76rem;

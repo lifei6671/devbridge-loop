@@ -9,9 +9,9 @@
 
 ingress:
   # HTTP L7 入口监听地址（用于 host/path 路由流量）。
-  http_addr: ":8080"
+  http_addr: ":38080"
   # gRPC 入口监听地址（用于 gRPC 协议流量）。
-  grpc_addr: ":8081"
+  grpc_addr: ":38081"
   # HTTPS 入口监听地址。
   https_addr: ":8443"
   # TLS-SNI 入口监听地址。

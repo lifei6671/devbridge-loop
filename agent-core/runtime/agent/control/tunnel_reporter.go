@@ -80,11 +80,17 @@ type TunnelReporter struct {
 	source TunnelPoolSnapshotSource
 	sender TunnelPoolReportSender
 
-	eventChannel chan string
+	eventChannel chan tunnelReportEvent
 
 	mutex        sync.RWMutex
 	sessionID    string
 	sessionEpoch uint64
+}
+
+type tunnelReportEvent struct {
+	trigger  string
+	snapshot tunnel.Snapshot
+	at       time.Time
 }
 
 // NewTunnelReporter 创建 tunnel 池状态上报器。
@@ -102,7 +108,7 @@ func NewTunnelReporter(source TunnelPoolSnapshotSource, sender TunnelPoolReportS
 		config:       normalizedConfig,
 		source:       source,
 		sender:       sender,
-		eventChannel: make(chan string, normalizedConfig.EventBuffer),
+		eventChannel: make(chan tunnelReportEvent, normalizedConfig.EventBuffer),
 	}, nil
 }
 
@@ -133,8 +139,13 @@ func (reporter *TunnelReporter) NotifyEvent(trigger string) {
 		// 空 trigger 统一回落到通用事件标签。
 		normalizedTrigger = "pool_event"
 	}
+	event := tunnelReportEvent{
+		trigger:  normalizedTrigger,
+		snapshot: reporter.source.Snapshot(),
+		at:       time.Now().UTC(),
+	}
 	select {
-	case reporter.eventChannel <- normalizedTrigger:
+	case reporter.eventChannel <- event:
 		// 成功入队后由 Run 协程异步发送。
 	default:
 		// 队列满时丢弃本次通知，避免阻塞业务主路径。
@@ -161,20 +172,14 @@ func (reporter *TunnelReporter) Run(ctx context.Context) error {
 			if err := reporter.ReportNow(normalizedContext, "periodic"); err != nil {
 				return err
 			}
-		case trigger := <-reporter.eventChannel:
+		case event := <-reporter.eventChannel:
 			// 事件驱动：发生池变化时尽快上报。
-			effectiveTrigger := trigger
-			for {
-				select {
-				case pendingTrigger := <-reporter.eventChannel:
-					// 连续事件合并为一次发送，保留最后一个触发原因。
-					effectiveTrigger = pendingTrigger
-				default:
-					goto sendEvent
-				}
-			}
-		sendEvent:
-			if err := reporter.ReportNow(normalizedContext, "event:"+effectiveTrigger); err != nil {
+			if err := reporter.reportWithSnapshot(
+				normalizedContext,
+				event.snapshot,
+				"event:"+event.trigger,
+				event.at,
+			); err != nil {
 				return err
 			}
 		}
@@ -189,7 +194,20 @@ func (reporter *TunnelReporter) ReportNow(ctx context.Context, trigger string) e
 		normalizedContext = context.Background()
 	}
 	snapshot := reporter.source.Snapshot()
-	report := reporter.buildReport(snapshot, trigger, time.Now().UTC())
+	return reporter.reportWithSnapshot(normalizedContext, snapshot, trigger, time.Now().UTC())
+}
+
+func (reporter *TunnelReporter) reportWithSnapshot(
+	ctx context.Context,
+	snapshot tunnel.Snapshot,
+	trigger string,
+	now time.Time,
+) error {
+	normalizedContext := ctx
+	if normalizedContext == nil {
+		normalizedContext = context.Background()
+	}
+	report := reporter.buildReport(snapshot, trigger, now)
 	if err := reporter.sender.SendTunnelPoolReport(normalizedContext, report); err != nil {
 		// 发送失败直接返回，交由上层决定重试策略。
 		return fmt.Errorf("report tunnel pool: %w", err)

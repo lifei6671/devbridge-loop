@@ -105,3 +105,46 @@ func TestBuildServiceItemsIncludesConnectorAndAccessHint(testingObject *testing.
 		)
 	}
 }
+
+// TestBuildBridgeOverviewIncludesActiveListeners 验证 overview 会附带当前启用的监听地址、端口和用途。
+func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_200_000, 0).UTC()
+	overview := BuildBridgeOverview(
+		now,
+		[]registry.SessionRuntime{
+			{SessionID: "session-a", ConnectorID: "agent-a", State: registry.SessionActive},
+		},
+		[]pb.Service{{ServiceID: "svc-a"}},
+		[]pb.Route{{RouteID: "route-a"}},
+		registry.TunnelSnapshot{IdleCount: 2, ActiveCount: 1, BrokenCount: 0},
+		map[string]any{
+			"ingress": map[string]any{
+				"http_addr": ":38080",
+				"grpc_addr": "127.0.0.1:38081",
+			},
+			"admin": map[string]any{
+				"enabled":     true,
+				"listen_addr": ":39081",
+			},
+			"control_plane": map[string]any{
+				"listen_addr":         ":39080",
+				"grpc_h2_listen_addr": ":39082",
+			},
+		},
+	)
+
+	if len(overview.Listeners) != 5 {
+		testingObject.Fatalf("unexpected listener size: got=%d want=5", len(overview.Listeners))
+	}
+	if overview.Listeners[0].ListenerID != "ingress_http" || overview.Listeners[0].Port != "38080" {
+		testingObject.Fatalf("unexpected ingress http listener: %+v", overview.Listeners[0])
+	}
+	if overview.Listeners[1].ListenerID != "ingress_grpc" || overview.Listeners[1].Port != "38081" {
+		testingObject.Fatalf("unexpected ingress grpc listener: %+v", overview.Listeners[1])
+	}
+	if overview.Listeners[4].ListenerID != "admin_ui_api" || overview.Listeners[4].Port != "39081" {
+		testingObject.Fatalf("unexpected admin listener: %+v", overview.Listeners[4])
+	}
+}

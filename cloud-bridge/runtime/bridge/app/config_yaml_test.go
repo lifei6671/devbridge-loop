@@ -52,8 +52,11 @@ observability:
 		testingObject.Fatalf("unexpected heartbeat timeout: got=%s want=%s", config.ControlPlane.HeartbeatTimeout, 45*time.Second)
 	}
 	// 未在 YAML 中配置的字段应继续沿用默认值。
-	if config.Ingress.HTTPAddr != ":8080" {
-		testingObject.Fatalf("unexpected ingress http addr default: got=%s want=%s", config.Ingress.HTTPAddr, ":8080")
+	if config.Ingress.HTTPAddr != ":38080" {
+		testingObject.Fatalf("unexpected ingress http addr default: got=%s want=%s", config.Ingress.HTTPAddr, ":38080")
+	}
+	if config.Ingress.GRPCAddr != ":38081" {
+		testingObject.Fatalf("unexpected ingress grpc addr default: got=%s want=%s", config.Ingress.GRPCAddr, ":38081")
 	}
 	if len(config.Admin.AuthTokens) != 3 {
 		testingObject.Fatalf("unexpected admin token count: got=%d want=%d", len(config.Admin.AuthTokens), 3)

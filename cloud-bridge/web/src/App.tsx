@@ -1555,6 +1555,8 @@ export default function App() {
     return diagnoseSummary.issues.map((item) => String(item));
   }, [diagnoseSummary]);
 
+  const overviewListeners = useMemo(() => asRecordArray(overview.listeners), [overview]);
+
   const metricKeyOptions = useMemo(() => {
     const defaultKeys = [
       "open_timeout_total",
@@ -1633,6 +1635,37 @@ export default function App() {
             </article>
           ))}
         </div>
+      </section>
+
+      <section className="panel">
+        <header className="panel-head">
+          <h3>监听入口</h3>
+          <span className="panel-sub">当前 Bridge 已启用的地址、端口与用途</span>
+        </header>
+        {overviewListeners.length === 0 ? (
+          <p className="listener-empty">当前未发现启用中的监听入口。</p>
+        ) : (
+          <div className="listener-grid">
+            {overviewListeners.map((item, index) => (
+              <article
+                key={`${readText(item, "listener_id", "listener")}-${index}`}
+                className="listener-card"
+              >
+                <div className="listener-top">
+                  <div>
+                    <p className="listener-label">{readText(item, "label", "--")}</p>
+                    <code className="listener-addr">{readText(item, "listen_addr", "--")}</code>
+                  </div>
+                  <div className="listener-port-wrap">
+                    <span className="listener-port-label">Port</span>
+                    <strong className="listener-port">{readText(item, "port", "--")}</strong>
+                  </div>
+                </div>
+                <p className="listener-purpose">{readText(item, "purpose", "--")}</p>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="panel">

@@ -24,6 +24,7 @@ const (
 // runtimeBridgeTunnelAdapter 把 transport.Tunnel 适配为 registry.RuntimeTunnel。
 type runtimeBridgeTunnelAdapter struct {
 	tunnel          transport.Tunnel
+	tunnelID        string
 	jsonCodec       *codec.JSONCodec
 	maxPayloadBytes int
 	ioPollInterval  time.Duration
@@ -33,9 +34,10 @@ var _ registry.RuntimeTunnel = (*runtimeBridgeTunnelAdapter)(nil)
 var _ registry.RuntimeTunnelHealthProber = (*runtimeBridgeTunnelAdapter)(nil)
 
 // newRuntimeBridgeTunnelAdapter 创建 Bridge data-plane tunnel payload 适配器。
-func newRuntimeBridgeTunnelAdapter(rawTunnel transport.Tunnel) *runtimeBridgeTunnelAdapter {
+func newRuntimeBridgeTunnelAdapter(rawTunnel transport.Tunnel, tunnelID string) *runtimeBridgeTunnelAdapter {
 	return &runtimeBridgeTunnelAdapter{
 		tunnel:          rawTunnel,
+		tunnelID:        strings.TrimSpace(tunnelID),
 		jsonCodec:       codec.NewJSONCodec(),
 		maxPayloadBytes: defaultBridgeTunnelMaxPayloadBytes,
 		ioPollInterval:  defaultBridgeTunnelIOPollInterval,
@@ -44,7 +46,13 @@ func newRuntimeBridgeTunnelAdapter(rawTunnel transport.Tunnel) *runtimeBridgeTun
 
 // ID 返回 tunnel 唯一标识。
 func (adapter *runtimeBridgeTunnelAdapter) ID() string {
-	if adapter == nil || adapter.tunnel == nil {
+	if adapter == nil {
+		return ""
+	}
+	if normalizedTunnelID := strings.TrimSpace(adapter.tunnelID); normalizedTunnelID != "" {
+		return normalizedTunnelID
+	}
+	if adapter.tunnel == nil {
 		return ""
 	}
 	return strings.TrimSpace(adapter.tunnel.ID())

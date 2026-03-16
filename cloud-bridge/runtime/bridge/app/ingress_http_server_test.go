@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -237,29 +239,29 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 				time.Sleep(2 * time.Millisecond)
 				continue
 			}
-				testTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: writes[0].OpenReq.TrafficID,
+				Success:   true,
+			}})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"),
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
 					TrafficID: writes[0].OpenReq.TrafficID,
-					Success:   true,
-				}})
-				testTunnel.EnqueueReadPayload(pb.StreamPayload{
-					Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"),
-				})
-				testTunnel.EnqueueReadPayload(pb.StreamPayload{
-					CloseAck: &pb.TrafficCloseAck{
-						TrafficID: writes[0].OpenReq.TrafficID,
-						Accepted:  true,
-					},
-				})
-				testTunnel.EnqueueReadPayload(pb.StreamPayload{
-					RecycleAck: &pb.TunnelRecycleAck{
-						TunnelID:   "tunnel-http-connector-1",
-						RecycleSeq: 1,
-						Accepted:   true,
-					},
-				})
-				return
-			}
-		}()
+					Accepted:  true,
+				},
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				RecycleAck: &pb.TunnelRecycleAck{
+					TunnelID:   "tunnel-http-connector-1",
+					RecycleSeq: 1,
+					Accepted:   true,
+				},
+			})
+			return
+		}
+	}()
 	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
 		testingObject.Fatalf("register idle tunnel failed: %v", err)
 	}
@@ -334,6 +336,169 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 	}
 }
 
+// TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests 验证同一 tunnel 连续请求可回收入池并继续复用。
+func TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID:     "route-http-connector-reuse",
+		Namespace:   "dev",
+		Environment: "demo",
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.reuse.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: "dev/demo/order-service",
+			},
+		},
+	})
+
+	const expectedRequests = 3
+	testTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-connector-reuse-1")
+	go func() {
+		handledRequests := 0
+		seenTrafficIDs := make(map[string]struct{}, expectedRequests)
+		for handledRequests < expectedRequests {
+			matchedOpen := false
+			writes := testTunnel.Writes()
+			for _, payload := range writes {
+				if payload.OpenReq == nil {
+					continue
+				}
+				trafficID := strings.TrimSpace(payload.OpenReq.TrafficID)
+				if trafficID == "" {
+					continue
+				}
+				if _, exists := seenTrafficIDs[trafficID]; exists {
+					continue
+				}
+				seenTrafficIDs[trafficID] = struct{}{}
+				handledRequests++
+				matchedOpen = true
+				responseBody := fmt.Sprintf("reuse-hello-%d", handledRequests)
+				testTunnel.EnqueueReadPayload(pb.StreamPayload{
+					OpenAck: &pb.TrafficOpenAck{
+						TrafficID: trafficID,
+						Success:   true,
+					},
+				})
+				testTunnel.EnqueueReadPayload(pb.StreamPayload{
+					Data: []byte(fmt.Sprintf(
+						"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s",
+						len(responseBody),
+						responseBody,
+					)),
+				})
+				testTunnel.EnqueueReadPayload(pb.StreamPayload{
+					CloseAck: &pb.TrafficCloseAck{
+						TrafficID: trafficID,
+						Accepted:  true,
+					},
+				})
+				testTunnel.EnqueueReadPayload(pb.StreamPayload{
+					RecycleAck: &pb.TunnelRecycleAck{
+						TunnelID:   "tunnel-http-connector-reuse-1",
+						RecycleSeq: uint64(handledRequests),
+						Accepted:   true,
+					},
+				})
+				break
+			}
+			if matchedOpen {
+				continue
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	for requestIndex := 1; requestIndex <= expectedRequests; requestIndex++ {
+		request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1/v1/orders?req=%d", requestIndex), nil)
+		request.Host = "api.reuse.local"
+		request.Header.Set("X-Namespace", "dev")
+		request.Header.Set("X-Env", "demo")
+		recorder := httptest.NewRecorder()
+
+		doneChannel := make(chan struct{})
+		go func() {
+			runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+			close(doneChannel)
+		}()
+		select {
+		case <-doneChannel:
+		case <-time.After(2 * time.Second):
+			testingObject.Fatalf("connector request #%d timed out (possible stall)", requestIndex)
+		}
+
+		if recorder.Code != http.StatusOK {
+			testingObject.Fatalf(
+				"unexpected status code for request #%d: got=%d want=%d body=%s",
+				requestIndex,
+				recorder.Code,
+				http.StatusOK,
+				recorder.Body.String(),
+			)
+		}
+		expectedBody := fmt.Sprintf("reuse-hello-%d", requestIndex)
+		if recorder.Body.String() != expectedBody {
+			testingObject.Fatalf(
+				"unexpected body for request #%d: got=%s want=%s",
+				requestIndex,
+				recorder.Body.String(),
+				expectedBody,
+			)
+		}
+	}
+
+	writes := testTunnel.Writes()
+	openCount := 0
+	closeCount := 0
+	recycleCount := 0
+	for _, payload := range writes {
+		if payload.OpenReq != nil {
+			openCount++
+		}
+		if payload.Close != nil {
+			closeCount++
+		}
+		if payload.Recycle != nil {
+			recycleCount++
+		}
+	}
+	if openCount != expectedRequests {
+		testingObject.Fatalf("unexpected open request count: got=%d want=%d", openCount, expectedRequests)
+	}
+	if closeCount != expectedRequests {
+		testingObject.Fatalf("unexpected close write count: got=%d want=%d", closeCount, expectedRequests)
+	}
+	if recycleCount != expectedRequests {
+		testingObject.Fatalf("unexpected recycle write count: got=%d want=%d", recycleCount, expectedRequests)
+	}
+	if testTunnel.closeCount != 0 {
+		testingObject.Fatalf("expected tunnel kept for reuse, close_count=%d", testTunnel.closeCount)
+	}
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 || snapshot.ActiveCount != 0 {
+		testingObject.Fatalf(
+			"unexpected registry snapshot after sequential reuse: total=%d idle=%d active=%d",
+			snapshot.TotalCount,
+			snapshot.IdleCount,
+			snapshot.ActiveCount,
+		)
+	}
+}
+
 // TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF 验证 connector 响应读 EOF 时会对幂等请求重试一次。
 func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -385,29 +550,29 @@ func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.
 				time.Sleep(2 * time.Millisecond)
 				continue
 			}
-				secondTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: writes[0].OpenReq.TrafficID,
+				Success:   true,
+			}})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nretry-hello"),
+			})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
 					TrafficID: writes[0].OpenReq.TrafficID,
-					Success:   true,
-				}})
-				secondTunnel.EnqueueReadPayload(pb.StreamPayload{
-					Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nretry-hello"),
-				})
-				secondTunnel.EnqueueReadPayload(pb.StreamPayload{
-					CloseAck: &pb.TrafficCloseAck{
-						TrafficID: writes[0].OpenReq.TrafficID,
-						Accepted:  true,
-					},
-				})
-				secondTunnel.EnqueueReadPayload(pb.StreamPayload{
-					RecycleAck: &pb.TunnelRecycleAck{
-						TunnelID:   "tunnel-http-retry-2",
-						RecycleSeq: 1,
-						Accepted:   true,
-					},
-				})
-				return
-			}
-		}()
+					Accepted:  true,
+				},
+			})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				RecycleAck: &pb.TunnelRecycleAck{
+					TunnelID:   "tunnel-http-retry-2",
+					RecycleSeq: 1,
+					Accepted:   true,
+				},
+			})
+			return
+		}
+	}()
 
 	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", firstTunnel); err != nil {
 		testingObject.Fatalf("register first retry tunnel failed: %v", err)
@@ -438,6 +603,166 @@ func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.
 	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
 	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
 		testingObject.Fatalf("expected one recycled idle tunnel after retry success, total=%d idle=%d", snapshot.TotalCount, snapshot.IdleCount)
+	}
+}
+
+// TestIngressHTTPHandlerConnectorNoRetryAfterCommittedEOF 验证响应已写回后出现 EOF 不会触发二次重试。
+func TestIngressHTTPHandlerConnectorNoRetryAfterCommittedEOF(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID:     "route-http-connector-committed-eof",
+		Namespace:   "dev",
+		Environment: "demo",
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.committed-eof.local",
+			PathPrefix: "/",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: "dev/demo/order-service",
+			},
+		},
+	})
+
+	firstTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-committed-eof-1")
+	go func() {
+		for {
+			writes := firstTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			trafficID := strings.TrimSpace(writes[0].OpenReq.TrafficID)
+			firstTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: trafficID,
+				Success:   true,
+			}})
+			firstTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello"),
+			})
+			firstTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Close: &pb.TrafficClose{
+					TrafficID: trafficID,
+					Reason:    "upstream_body_eof",
+				},
+			})
+			return
+		}
+	}()
+
+	secondTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-committed-eof-2")
+	go func() {
+		deadline := time.Now().UTC().Add(1500 * time.Millisecond)
+		for time.Now().UTC().Before(deadline) {
+			writes := secondTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			trafficID := strings.TrimSpace(writes[0].OpenReq.TrafficID)
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: trafficID,
+				Success:   true,
+			}})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\nretry-body"),
+			})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: trafficID,
+					Accepted:  true,
+				},
+			})
+			secondTunnel.EnqueueReadPayload(pb.StreamPayload{
+				RecycleAck: &pb.TunnelRecycleAck{
+					TunnelID:   "tunnel-http-committed-eof-2",
+					RecycleSeq: 1,
+					Accepted:   true,
+				},
+			})
+			return
+		}
+	}()
+
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", firstTunnel); err != nil {
+		testingObject.Fatalf("register first tunnel failed: %v", err)
+	}
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", secondTunnel); err != nil {
+		testingObject.Fatalf("register second tunnel failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
+	request.Host = "api.committed-eof.local"
+	request.Header.Set("X-Namespace", "dev")
+	request.Header.Set("X-Env", "demo")
+	recorder := httptest.NewRecorder()
+	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status code after committed eof: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if recorder.Body.String() != "hello" {
+		testingObject.Fatalf("unexpected response body after committed eof: %s", recorder.Body.String())
+	}
+	if firstTunnel.closeCount != 1 {
+		testingObject.Fatalf("expected first tunnel closed once after committed eof, got=%d", firstTunnel.closeCount)
+	}
+	if secondTunnel.closeCount != 0 {
+		testingObject.Fatalf("expected second tunnel untouched, close_count=%d", secondTunnel.closeCount)
+	}
+	if len(secondTunnel.Writes()) != 0 {
+		testingObject.Fatalf("expected no retry dispatch to second tunnel, writes=%d", len(secondTunnel.Writes()))
+	}
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
+		testingObject.Fatalf(
+			"expected only second tunnel kept idle after committed eof, total=%d idle=%d",
+			snapshot.TotalCount,
+			snapshot.IdleCount,
+		)
+	}
+}
+
+// TestWrapIngressConnectorDispatchErrorPreservesCommittedMarker 验证 dispatch 错误包装会保留 committed 语义。
+func TestWrapIngressConnectorDispatchErrorPreservesCommittedMarker(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	committedByStateErr := wrapIngressConnectorDispatchError(
+		"proxy connector ingress: dispatch connector path",
+		io.ErrUnexpectedEOF,
+		true,
+	)
+	if !errors.Is(committedByStateErr, errIngressResponseCommitted) {
+		testingObject.Fatalf("expected committed marker from responseCommitted=true, got=%v", committedByStateErr)
+	}
+
+	committedBySourceErr := wrapIngressConnectorDispatchError(
+		"proxy connector ingress: dispatch connector path",
+		markIngressResponseCommitted(io.EOF),
+		false,
+	)
+	if !errors.Is(committedBySourceErr, errIngressResponseCommitted) {
+		testingObject.Fatalf("expected committed marker from source error, got=%v", committedBySourceErr)
+	}
+
+	normalErr := wrapIngressConnectorDispatchError(
+		"proxy connector ingress: dispatch connector path",
+		io.EOF,
+		false,
+	)
+	if errors.Is(normalErr, errIngressResponseCommitted) {
+		testingObject.Fatalf("unexpected committed marker for non-committed error: %v", normalErr)
+	}
+	if !errors.Is(normalErr, io.EOF) {
+		testingObject.Fatalf("expected wrapped EOF retained, got=%v", normalErr)
 	}
 }
 

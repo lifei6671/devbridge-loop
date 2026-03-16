@@ -133,7 +133,18 @@ func (acceptor *TunnelAcceptor) HandleTunnelStream(
 		return fmt.Errorf("handle grpc tunnel stream: %w", err)
 	}
 	tunnelID := acceptor.idGenerator.Next()
+	idSource := ""
+	if incomingTunnelID := IncomingTunnelStreamTunnelID(stream.Context()); incomingTunnelID != "" {
+		tunnelID = incomingTunnelID
+		idSource = TunnelIDSourceStreamMetadata
+	}
 	tunnelMeta := buildTunnelMeta(acceptor.identityConfig, tunnelID, time.Now().UTC())
+	if idSource != "" {
+		if tunnelMeta.Labels == nil {
+			tunnelMeta.Labels = make(map[string]string, 1)
+		}
+		tunnelMeta.Labels[TunnelMetaLabelTunnelIDSource] = idSource
+	}
 	tunnel, err := NewGRPCH2Tunnel(tunnelStream, tunnelMeta)
 	if err != nil {
 		_ = tunnelStream.Close(context.Background())

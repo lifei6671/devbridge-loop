@@ -56,9 +56,25 @@ func TestViewerTokenCanReadOverview(testingObject *testing.T) {
 			ListSessions: func() []registry.SessionRuntime {
 				return []registry.SessionRuntime{{SessionID: "sess-1", ConnectorID: "conn-1", State: registry.SessionActive}}
 			},
-			ListTunnels:         func() []registry.TunnelRuntime { return []registry.TunnelRuntime{} },
-			TunnelSnapshot:      func() registry.TunnelSnapshot { return registry.TunnelSnapshot{IdleCount: 1, TotalCount: 1} },
-			BuildConfigSnapshot: func() map[string]any { return map[string]any{"config_version": uint64(1)} },
+			ListTunnels:    func() []registry.TunnelRuntime { return []registry.TunnelRuntime{} },
+			TunnelSnapshot: func() registry.TunnelSnapshot { return registry.TunnelSnapshot{IdleCount: 1, TotalCount: 1} },
+			BuildConfigSnapshot: func() map[string]any {
+				return map[string]any{
+					"config_version": uint64(1),
+					"ingress": map[string]any{
+						"http_addr": ":38080",
+						"grpc_addr": ":38081",
+					},
+					"admin": map[string]any{
+						"enabled":     true,
+						"listen_addr": ":39081",
+					},
+					"control_plane": map[string]any{
+						"listen_addr":         ":39080",
+						"grpc_h2_listen_addr": ":39082",
+					},
+				}
+			},
 		},
 		BearerTokens: []BearerToken{
 			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
@@ -79,6 +95,9 @@ func TestViewerTokenCanReadOverview(testingObject *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "\"connector_total\":1") {
 		testingObject.Fatalf("unexpected overview payload: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "\"listener_id\":\"ingress_http\"") {
+		testingObject.Fatalf("expected overview payload to include ingress listener: %s", recorder.Body.String())
 	}
 }
 

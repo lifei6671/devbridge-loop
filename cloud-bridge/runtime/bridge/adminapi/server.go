@@ -557,7 +557,14 @@ func (server *Server) handleBridgeOverview(writer http.ResponseWriter, request *
 	services := safeListServices(server.dependencies)
 	routes := safeListRoutes(server.dependencies)
 	tunnelSnapshot := safeTunnelSnapshot(server.dependencies)
-	overview := adminview.BuildBridgeOverview(server.now(), sessions, services, routes, tunnelSnapshot)
+	overview := adminview.BuildBridgeOverview(
+		server.now(),
+		sessions,
+		services,
+		routes,
+		tunnelSnapshot,
+		safeBuildConfigSnapshot(server.dependencies),
+	)
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"overview": overview,
 		"source":   "bridge.adminapi.readonly",
@@ -1150,6 +1157,17 @@ func safeListTunnelPoolReports(dependencies Dependencies) []TunnelPoolReportSnap
 		return []TunnelPoolReportSnapshot{}
 	}
 	return dependencies.ListTunnelPoolReports()
+}
+
+func safeBuildConfigSnapshot(dependencies Dependencies) map[string]any {
+	if dependencies.BuildConfigSnapshot == nil {
+		return map[string]any{}
+	}
+	snapshot := dependencies.BuildConfigSnapshot()
+	if snapshot == nil {
+		return map[string]any{}
+	}
+	return snapshot
 }
 
 // filterTunnelsByConnector 仅保留指定 connector 的 tunnel 运行态。

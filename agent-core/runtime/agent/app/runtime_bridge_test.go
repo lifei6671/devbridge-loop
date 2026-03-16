@@ -771,6 +771,48 @@ func TestTunnelListPayloadUsesRuntimeAssociation(testingObject *testing.T) {
 	}
 }
 
+// TestTunnelListPayloadShowsActiveStateForGRPCH2 验证 grpc_h2 tunnel 处于 active 时可被 tunnel.list 正确展示。
+func TestTunnelListPayloadShowsActiveStateForGRPCH2(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	registry := tunnel.NewRegistry()
+	now := time.Unix(1700001200, 0).UTC()
+	added, err := registry.TryAddOpenedAsIdle(now, &runtimeBridgeTestTunnel{tunnelID: "tunnel-grpc-1"}, 4)
+	if err != nil {
+		testingObject.Fatalf("add grpc idle tunnel failed: %v", err)
+	}
+	if !added {
+		testingObject.Fatalf("expected grpc tunnel added to registry")
+	}
+	if _, err := registry.ActivateIdleByID(now.Add(time.Millisecond), "tunnel-grpc-1"); err != nil {
+		testingObject.Fatalf("activate grpc tunnel failed: %v", err)
+	}
+
+	runtime := &Runtime{
+		cfg: Config{
+			BridgeAddr:      "127.0.0.1:39081",
+			BridgeTransport: "grpc_h2",
+		},
+		tunnelRegistry:     registry,
+		tunnelAssociations: make(map[string]tunnelAssociation),
+	}
+	payload := runtime.tunnelListPayload()
+	tunnels, ok := payload["tunnels"].([]map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected tunnels payload type: %T", payload["tunnels"])
+	}
+	if len(tunnels) != 1 {
+		testingObject.Fatalf("unexpected tunnel list size: got=%d want=1", len(tunnels))
+	}
+	item := tunnels[0]
+	if item["state"] != string(tunnel.StateActive) {
+		testingObject.Fatalf("unexpected grpc tunnel state: got=%v want=%s", item["state"], tunnel.StateActive)
+	}
+	if item["protocol"] != "grpc_h2" {
+		testingObject.Fatalf("unexpected grpc tunnel protocol: got=%v want=%s", item["protocol"], "grpc_h2")
+	}
+}
+
 // TestTrafficStatsSnapshotPayloadUsesRuntimeMetrics 验证 traffic.stats.snapshot 返回 runtime 真实链路指标。
 func TestTrafficStatsSnapshotPayloadUsesRuntimeMetrics(testingObject *testing.T) {
 	testingObject.Parallel()

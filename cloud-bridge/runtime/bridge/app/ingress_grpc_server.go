@@ -214,85 +214,65 @@ func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
 	hybridPath string,
 	hybridFallbackStage string,
 ) error {
-	upstreamTunnel, upstreamConnection, openErr := runtime.openConnectorGRPCUpstream(ctx, resolution, trafficOpen)
-	if openErr != nil {
-		return openErr
-	}
-	response, roundTripErr := roundTripGRPCOverConn(ctx, request, upstreamConnection)
-	if roundTripErr != nil {
-		_ = runtime.recycleIngressTunnelBroken(upstreamTunnel, roundTripErr.Error())
-		return roundTripErr
-	}
-	writer.Header().Set("X-DevBridge-Route-Id", strings.TrimSpace(trafficOpen.RouteID))
-	writer.Header().Set("X-DevBridge-Target-Kind", strings.TrimSpace(targetKindHeader))
-	if strings.TrimSpace(hybridPath) != "" {
-		writer.Header().Set("X-DevBridge-Hybrid-Path", strings.TrimSpace(hybridPath))
-	}
-	if strings.TrimSpace(hybridFallbackStage) != "" {
-		writer.Header().Set("X-DevBridge-Hybrid-Fallback-Stage", strings.TrimSpace(hybridFallbackStage))
-	}
-	committed, proxyErr := writeUpstreamHTTPResponse(writer, response)
-	if proxyErr != nil {
-		_ = runtime.recycleIngressTunnelBroken(upstreamTunnel, proxyErr.Error())
-		if committed {
-			return markIngressResponseCommitted(proxyErr)
-		}
-		return proxyErr
-	}
-	postCommitContext := detachedPostCommitContext(ctx)
-	if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, upstreamTunnel.Tunnel, trafficOpen.TrafficID, "grpc_response_complete"); closeErr != nil {
-		// close_ack 等待失败时先不立即断 tunnel，继续尝试 recycle 握手，减少可回收 tunnel 的误判损耗。
-		log.Printf(
-			"bridge ingress grpc close-ack wait failed, continue recycle traffic_id=%s tunnel_id=%s err=%v",
-			strings.TrimSpace(trafficOpen.TrafficID),
-			strings.TrimSpace(upstreamTunnel.TunnelID),
-			closeErr,
-		)
-	}
-	if recycleErr := runtime.recycleIngressTunnelClosed(postCommitContext, upstreamTunnel); recycleErr != nil {
-		return markIngressResponseCommitted(recycleErr)
-	}
-	return nil
-}
-
-func (runtime *Runtime) openConnectorGRPCUpstream(
-	ctx context.Context,
-	resolution routing.ResolveResult,
-	trafficOpen pb.TrafficOpen,
-) (registry.TunnelRuntime, net.Conn, error) {
-	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil {
-		return registry.TunnelRuntime{}, nil, ErrRuntimeDataPlaneDependencyMissing
+	if runtime == nil || runtime.dataPlane == nil {
+		return ErrRuntimeDataPlaneDependencyMissing
 	}
 	if resolution.Connector == nil {
-		return registry.TunnelRuntime{}, nil, ErrRuntimeDataPlaneDependencyMissing
+		return ErrRuntimeDataPlaneDependencyMissing
 	}
 	connectorID := strings.TrimSpace(resolution.Connector.Session.ConnectorID)
-	tunnelAcquirer, acquirerErr := connectorproxy.NewTunnelAcquirer(connectorproxy.TunnelAcquirerOptions{
-		Registry:       runtime.dataPlane.tunnelRegistry,
-		WaitHint:       defaultBridgeAcquireWaitHint,
-		PollInterval:   defaultBridgeAcquirePollInterval,
-		EnableNoIdleWT: true,
-	})
-	if acquirerErr != nil {
-		return registry.TunnelRuntime{}, nil, acquirerErr
+	if connectorID == "" {
+		return ErrRuntimeDataPlaneDependencyMissing
 	}
-	acquiredTunnel, acquireErr := tunnelAcquirer.AcquireIdleTunnel(ctx, connectorID)
-	if acquireErr != nil {
-		return registry.TunnelRuntime{}, nil, acquireErr
+	responseCommitted := false
+	_, dispatchErr := runtime.dispatchConnectorIngressWithRelay(
+		ctx,
+		connectorID,
+		trafficOpen,
+		connectorproxy.RelayFunc(func(relayContext context.Context, tunnel registry.RuntimeTunnel, trafficID string) error {
+			upstreamConnection := newIngressTunnelDataConn(relayContext, tunnel, trafficID)
+			response, roundTripErr := roundTripGRPCOverConn(relayContext, request, upstreamConnection)
+			if roundTripErr != nil {
+				return roundTripErr
+			}
+			writer.Header().Set("X-DevBridge-Route-Id", strings.TrimSpace(trafficOpen.RouteID))
+			writer.Header().Set("X-DevBridge-Target-Kind", strings.TrimSpace(targetKindHeader))
+			if strings.TrimSpace(hybridPath) != "" {
+				writer.Header().Set("X-DevBridge-Hybrid-Path", strings.TrimSpace(hybridPath))
+			}
+			if strings.TrimSpace(hybridFallbackStage) != "" {
+				writer.Header().Set("X-DevBridge-Hybrid-Fallback-Stage", strings.TrimSpace(hybridFallbackStage))
+			}
+			committed, proxyErr := writeUpstreamHTTPResponse(writer, response)
+			if committed {
+				responseCommitted = true
+			}
+			if proxyErr != nil {
+				if committed {
+					return markIngressResponseCommitted(proxyErr)
+				}
+				return proxyErr
+			}
+			postCommitContext := detachedPostCommitContext(relayContext)
+			if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "grpc_response_complete"); closeErr != nil {
+				// close_ack 等待失败时先不立即返回失败，继续交给 dispatcher 尝试 recycle，尽量保留可复用 tunnel。
+				log.Printf(
+					"bridge ingress grpc close-ack wait failed, continue recycle traffic_id=%s err=%v",
+					strings.TrimSpace(trafficID),
+					closeErr,
+				)
+			}
+			return nil
+		}),
+	)
+	if dispatchErr != nil {
+		return wrapIngressConnectorDispatchError(
+			"proxy grpc ingress: dispatch connector path",
+			dispatchErr,
+			responseCommitted,
+		)
 	}
-	if markActiveErr := runtime.dataPlane.tunnelRegistry.MarkActive(time.Now().UTC(), acquiredTunnel.TunnelID, trafficOpen.TrafficID); markActiveErr != nil {
-		_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, markActiveErr.Error())
-		return registry.TunnelRuntime{}, nil, markActiveErr
-	}
-	openHandshake := connectorproxy.NewOpenHandshake(connectorproxy.OpenHandshakeOptions{
-		OpenTimeout:         defaultBridgeTrafficOpenTimeout,
-		LateAckDrainTimeout: defaultBridgeLateAckDrainTimeout,
-	})
-	if _, openErr := openHandshake.Execute(ctx, acquiredTunnel.Tunnel, trafficOpen); openErr != nil {
-		_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, openErr.Error())
-		return registry.TunnelRuntime{}, nil, openErr
-	}
-	return acquiredTunnel, newIngressTunnelDataConn(ctx, acquiredTunnel.Tunnel, trafficOpen.TrafficID), nil
+	return nil
 }
 
 func (runtime *Runtime) proxyGRPCIngressExternalTarget(

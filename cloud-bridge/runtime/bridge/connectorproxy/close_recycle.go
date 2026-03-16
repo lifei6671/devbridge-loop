@@ -48,6 +48,25 @@ func WriteTrafficCloseAndAwaitAck(
 		if err != nil {
 			return fmt.Errorf("write traffic close and await ack: read close ack: %w", err)
 		}
+		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == normalizedTrafficID {
+			// close 双向并发时优先 ACK 对端 close，避免双方都在等待 close_ack 导致僵持。
+			if err := tunnel.WritePayload(normalizedContext, pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: normalizedTrafficID,
+					Accepted:  true,
+				},
+			}); err != nil {
+				return fmt.Errorf("write traffic close and await ack: write peer close ack: %w", err)
+			}
+			return nil
+		}
+		if payload.Reset != nil && strings.TrimSpace(payload.Reset.TrafficID) == normalizedTrafficID {
+			return fmt.Errorf(
+				"write traffic close and await ack: relay reset code=%s message=%s",
+				strings.TrimSpace(payload.Reset.ErrorCode),
+				strings.TrimSpace(payload.Reset.ErrorMessage),
+			)
+		}
 		if payload.CloseAck == nil {
 			// 忽略非 close_ack 帧，继续等待目标确认帧。
 			continue

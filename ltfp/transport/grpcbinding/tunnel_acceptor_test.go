@@ -106,6 +106,60 @@ func TestTunnelAcceptorHandleAndAccept(testingObject *testing.T) {
 	}
 }
 
+// TestTunnelAcceptorHandleAndAcceptUsesIncomingMetadataTunnelID 验证 acceptor 可从 gRPC metadata 对齐 tunnel_id。
+func TestTunnelAcceptorHandleAndAcceptUsesIncomingMetadataTunnelID(testingObject *testing.T) {
+	streamContext := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			TunnelStreamMetadataTunnelIDKey, "tun-321",
+			TunnelStreamMetadataSessionIDKey, "session-a",
+			TunnelStreamMetadataSessionEpochKey, "7",
+		),
+	)
+	acceptor := NewTunnelAcceptor(TunnelAcceptorConfig{
+		IdentityConfig: TunnelIdentityConfig{
+			SessionID:      "server-session",
+			SessionEpoch:   11,
+			TunnelIDPrefix: "server-tunnel",
+		},
+		QueueSize: 1,
+	})
+	serverStream := &fakeGeneratedTunnelBidiServerStream{
+		base: &fakeTunnelEnvelopeStream{ctx: streamContext},
+	}
+
+	handleResultChannel := make(chan error, 1)
+	go func() {
+		handleResultChannel <- acceptor.HandleTunnelStream(serverStream)
+	}()
+
+	acceptContext, cancelAccept := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAccept()
+	acceptedTunnel, err := acceptor.AcceptTunnel(acceptContext)
+	if err != nil {
+		testingObject.Fatalf("accept tunnel failed: %v", err)
+	}
+	if acceptedTunnel.ID() != "tun-321" {
+		testingObject.Fatalf("unexpected accepted tunnel id: got=%s want=tun-321", acceptedTunnel.ID())
+	}
+	meta := acceptedTunnel.Meta()
+	if meta.Labels[TunnelMetaLabelTunnelIDSource] != TunnelIDSourceStreamMetadata {
+		testingObject.Fatalf("unexpected tunnel id source label: %+v", meta.Labels)
+	}
+
+	if err := acceptedTunnel.Close(); err != nil {
+		testingObject.Fatalf("close accepted tunnel failed: %v", err)
+	}
+	select {
+	case handleErr := <-handleResultChannel:
+		if handleErr != nil {
+			testingObject.Fatalf("expected handle stream to exit cleanly, got %v", handleErr)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("handle stream did not exit after tunnel close")
+	}
+}
+
 // TestTunnelAcceptorAcceptTunnelToPool 验证接收 tunnel 后可直接写入 idle pool。
 func TestTunnelAcceptorAcceptTunnelToPool(testingObject *testing.T) {
 	streamContext, cancelStream := context.WithCancel(context.Background())

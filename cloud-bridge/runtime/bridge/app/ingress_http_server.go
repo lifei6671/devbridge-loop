@@ -201,7 +201,7 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 	resolution routing.ResolveResult,
 	trafficOpen pb.TrafficOpen,
 ) error {
-	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil {
+	if runtime == nil || runtime.dataPlane == nil {
 		return ErrRuntimeDataPlaneDependencyMissing
 	}
 	if request == nil || writer == nil {
@@ -218,93 +218,75 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 	if retryAttempts <= 0 {
 		retryAttempts = 1
 	}
-	var lastReadErr error
+	var lastDispatchErr error
 	for attempt := 1; attempt <= retryAttempts; attempt++ {
-		tunnelAcquirer, acquirerErr := connectorproxy.NewTunnelAcquirer(connectorproxy.TunnelAcquirerOptions{
-			Registry:       runtime.dataPlane.tunnelRegistry,
-			WaitHint:       defaultBridgeAcquireWaitHint,
-			PollInterval:   defaultBridgeAcquirePollInterval,
-			EnableNoIdleWT: true,
-		})
-		if acquirerErr != nil {
-			return fmt.Errorf("proxy connector ingress: new tunnel acquirer: %w", acquirerErr)
-		}
-		acquiredTunnel, acquireErr := tunnelAcquirer.AcquireIdleTunnel(ctx, connectorID)
-		if acquireErr != nil {
-			return fmt.Errorf("proxy connector ingress: acquire idle tunnel: %w", acquireErr)
-		}
-		if markActiveErr := runtime.dataPlane.tunnelRegistry.MarkActive(time.Now().UTC(), acquiredTunnel.TunnelID, trafficOpen.TrafficID); markActiveErr != nil {
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, markActiveErr.Error())
-			return fmt.Errorf("proxy connector ingress: mark tunnel active: %w", markActiveErr)
-		}
+		responseCommitted := false
+		_, dispatchErr := runtime.dispatchConnectorIngressWithRelay(ctx, connectorID, trafficOpen, connectorproxy.RelayFunc(
+			func(relayContext context.Context, tunnel registry.RuntimeTunnel, trafficID string) error {
+				serializedRequest, serializeErr := serializeHTTPRequestForTunnel(request)
+				if serializeErr != nil {
+					return fmt.Errorf("proxy connector ingress: serialize http request: %w", serializeErr)
+				}
+				if writeErr := writeTunnelDataFrames(relayContext, tunnel, serializedRequest); writeErr != nil {
+					return fmt.Errorf("proxy connector ingress: write request frames: %w", writeErr)
+				}
 
-		openHandshake := connectorproxy.NewOpenHandshake(connectorproxy.OpenHandshakeOptions{
-			OpenTimeout:         defaultBridgeTrafficOpenTimeout,
-			LateAckDrainTimeout: defaultBridgeLateAckDrainTimeout,
-		})
-		if _, openErr := openHandshake.Execute(ctx, acquiredTunnel.Tunnel, trafficOpen); openErr != nil {
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, openErr.Error())
-			return fmt.Errorf("proxy connector ingress: open handshake: %w", openErr)
-		}
+				upstreamResponse, responseErr := readHTTPResponseFromTunnel(relayContext, tunnel, trafficID, request)
+				if responseErr != nil {
+					return fmt.Errorf("proxy connector ingress: read upstream response: %w", responseErr)
+				}
+				copyHTTPHeaders(writer.Header(), upstreamResponse.Header)
+				writer.Header().Set("X-DevBridge-Traffic-Id", strings.TrimSpace(trafficOpen.TrafficID))
+				writer.Header().Set("X-DevBridge-Trace-Id", strings.TrimSpace(trafficOpen.TraceID))
+				writer.Header().Set("X-DevBridge-Route-Id", strings.TrimSpace(trafficOpen.RouteID))
+				writer.Header().Set("X-DevBridge-Target-Kind", string(pb.RouteTargetTypeConnectorService))
+				writer.WriteHeader(upstreamResponse.StatusCode)
+				responseCommitted = true
+				if _, copyErr := io.Copy(writer, upstreamResponse.Body); copyErr != nil {
+					_ = upstreamResponse.Body.Close()
+					return markIngressResponseCommitted(fmt.Errorf("proxy connector ingress: copy upstream body: %w", copyErr))
+				}
+				_ = upstreamResponse.Body.Close()
 
-		serializedRequest, serializeErr := serializeHTTPRequestForTunnel(request)
-		if serializeErr != nil {
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, serializeErr.Error())
-			return fmt.Errorf("proxy connector ingress: serialize http request: %w", serializeErr)
-		}
-		if writeErr := writeTunnelDataFrames(ctx, acquiredTunnel.Tunnel, serializedRequest); writeErr != nil {
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, writeErr.Error())
-			return fmt.Errorf("proxy connector ingress: write request frames: %w", writeErr)
-		}
-
-		upstreamResponse, responseErr := readHTTPResponseFromTunnel(ctx, acquiredTunnel.Tunnel, trafficOpen.TrafficID, request)
-		if responseErr != nil {
-			lastReadErr = responseErr
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, responseErr.Error())
-			if attempt < retryAttempts && shouldRetryConnectorIngressRead(request, responseErr) {
+				postCommitContext := detachedPostCommitContext(relayContext)
+				if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "http_response_complete"); closeErr != nil {
+					// close_ack 等待失败时先不立即返回失败，继续交给 dispatcher 尝试 recycle，尽量保留可复用 tunnel。
+					log.Printf(
+						"bridge ingress http close-ack wait failed, continue recycle traffic_id=%s err=%v",
+						strings.TrimSpace(trafficID),
+						closeErr,
+					)
+				}
+				return nil
+			},
+		))
+		if dispatchErr != nil {
+			wrappedDispatchErr := wrapIngressConnectorDispatchError(
+				"proxy connector ingress: dispatch connector path",
+				dispatchErr,
+				responseCommitted,
+			)
+			lastDispatchErr = wrappedDispatchErr
+			if errors.Is(wrappedDispatchErr, errIngressResponseCommitted) {
+				return wrappedDispatchErr
+			}
+			if attempt < retryAttempts && shouldRetryConnectorIngressRead(request, wrappedDispatchErr) {
 				log.Printf(
 					"bridge ingress http connector retry traffic_id=%s route_id=%s attempt=%d/%d err=%v",
 					strings.TrimSpace(trafficOpen.TrafficID),
 					strings.TrimSpace(trafficOpen.RouteID),
 					attempt+1,
 					retryAttempts,
-					responseErr,
+					wrappedDispatchErr,
 				)
 				continue
 			}
-			return fmt.Errorf("proxy connector ingress: read upstream response: %w", responseErr)
-		}
-
-		copyHTTPHeaders(writer.Header(), upstreamResponse.Header)
-		writer.Header().Set("X-DevBridge-Traffic-Id", strings.TrimSpace(trafficOpen.TrafficID))
-		writer.Header().Set("X-DevBridge-Trace-Id", strings.TrimSpace(trafficOpen.TraceID))
-		writer.Header().Set("X-DevBridge-Route-Id", strings.TrimSpace(trafficOpen.RouteID))
-		writer.Header().Set("X-DevBridge-Target-Kind", string(pb.RouteTargetTypeConnectorService))
-		writer.WriteHeader(upstreamResponse.StatusCode)
-		if _, copyErr := io.Copy(writer, upstreamResponse.Body); copyErr != nil {
-			_ = upstreamResponse.Body.Close()
-			_ = runtime.recycleIngressTunnelBroken(acquiredTunnel, copyErr.Error())
-			return markIngressResponseCommitted(fmt.Errorf("proxy connector ingress: copy upstream body: %w", copyErr))
-		}
-		_ = upstreamResponse.Body.Close()
-
-		postCommitContext := detachedPostCommitContext(ctx)
-		if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, acquiredTunnel.Tunnel, trafficOpen.TrafficID, "http_response_complete"); closeErr != nil {
-			// close_ack 等待失败时先不立即断 tunnel，继续尝试 recycle 握手，减少可回收 tunnel 的误判损耗。
-			log.Printf(
-				"bridge ingress http close-ack wait failed, continue recycle traffic_id=%s tunnel_id=%s err=%v",
-				strings.TrimSpace(trafficOpen.TrafficID),
-				strings.TrimSpace(acquiredTunnel.TunnelID),
-				closeErr,
-			)
-		}
-		if recycleErr := runtime.recycleIngressTunnelClosed(postCommitContext, acquiredTunnel); recycleErr != nil {
-			return markIngressResponseCommitted(fmt.Errorf("proxy connector ingress: recycle tunnel closed: %w", recycleErr))
+			return wrappedDispatchErr
 		}
 		return nil
 	}
-	if lastReadErr != nil {
-		return fmt.Errorf("proxy connector ingress: read upstream response: %w", lastReadErr)
+	if lastDispatchErr != nil {
+		return lastDispatchErr
 	}
 	return fmt.Errorf("proxy connector ingress: connector retries exhausted")
 }
@@ -499,6 +481,21 @@ func markIngressResponseCommitted(err error) error {
 	return errors.Join(errIngressResponseCommitted, err)
 }
 
+func wrapIngressConnectorDispatchError(
+	prefix string,
+	dispatchErr error,
+	responseCommitted bool,
+) error {
+	if dispatchErr == nil {
+		return nil
+	}
+	wrappedErr := fmt.Errorf("%s: %w", prefix, dispatchErr)
+	if responseCommitted || errors.Is(dispatchErr, errIngressResponseCommitted) {
+		return markIngressResponseCommitted(wrappedErr)
+	}
+	return wrappedErr
+}
+
 func serializeHTTPRequestForTunnel(request *http.Request) ([]byte, error) {
 	if request == nil {
 		return nil, fmt.Errorf("request is required")
@@ -603,6 +600,53 @@ func (runtime *Runtime) writeTunnelCloseAndAwaitAck(
 		reason,
 		runtime.cfg.TunnelReuse.CloseAckTimeout,
 	)
+}
+
+func (runtime *Runtime) dispatchConnectorIngressWithRelay(
+	ctx context.Context,
+	connectorID string,
+	trafficOpen pb.TrafficOpen,
+	relay connectorproxy.RelayPump,
+) (connectorproxy.DispatchResult, error) {
+	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil {
+		return connectorproxy.DispatchResult{}, ErrRuntimeDataPlaneDependencyMissing
+	}
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" || relay == nil {
+		return connectorproxy.DispatchResult{}, ErrRuntimeDataPlaneDependencyMissing
+	}
+	tunnelAcquirer, acquirerErr := connectorproxy.NewTunnelAcquirer(connectorproxy.TunnelAcquirerOptions{
+		Registry:       runtime.dataPlane.tunnelRegistry,
+		WaitHint:       defaultBridgeAcquireWaitHint,
+		PollInterval:   defaultBridgeAcquirePollInterval,
+		EnableNoIdleWT: true,
+	})
+	if acquirerErr != nil {
+		return connectorproxy.DispatchResult{}, fmt.Errorf("dispatch connector ingress: new tunnel acquirer: %w", acquirerErr)
+	}
+	openHandshake := connectorproxy.NewOpenHandshake(connectorproxy.OpenHandshakeOptions{
+		OpenTimeout:         defaultBridgeTrafficOpenTimeout,
+		LateAckDrainTimeout: defaultBridgeLateAckDrainTimeout,
+	})
+	dispatcher, dispatcherErr := connectorproxy.NewDispatcher(connectorproxy.DispatcherOptions{
+		TunnelAcquirer: tunnelAcquirer,
+		OpenHandshake:  openHandshake,
+		Relay:          relay,
+		TunnelRegistry: runtime.dataPlane.tunnelRegistry,
+		MaxReuseCount:  runtime.cfg.TunnelReuse.MaxReuseCount,
+		RecycleTimeout: runtime.cfg.TunnelReuse.RecycleTimeout,
+	})
+	if dispatcherErr != nil {
+		return connectorproxy.DispatchResult{}, fmt.Errorf("dispatch connector ingress: new dispatcher: %w", dispatcherErr)
+	}
+	dispatchResult, dispatchErr := dispatcher.Dispatch(ctx, connectorproxy.DispatchRequest{
+		ConnectorID: normalizedConnectorID,
+		TrafficOpen: trafficOpen,
+	})
+	if dispatchErr != nil {
+		return dispatchResult, fmt.Errorf("dispatch connector ingress: dispatch: %w", dispatchErr)
+	}
+	return dispatchResult, nil
 }
 
 func shouldRetryConnectorIngressRead(request *http.Request, err error) bool {

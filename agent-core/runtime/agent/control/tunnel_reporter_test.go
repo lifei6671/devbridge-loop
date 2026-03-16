@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +103,83 @@ func TestTunnelReporterEventAndPeriodic(testingObject *testing.T) {
 	err = <-reportDone
 	if err == nil {
 		testingObject.Fatalf("expected reporter run return context canceled")
+	}
+}
+
+// TestTunnelReporterEventSnapshotPreservesTransientInUse 验证事件快照可保留短暂 in_use 态。
+func TestTunnelReporterEventSnapshotPreservesTransientInUse(testingObject *testing.T) {
+	testingObject.Parallel()
+	source := &reporterTestSnapshotSource{
+		snapshot: tunnel.Snapshot{
+			IdleCount: 3,
+		},
+	}
+	sender := &reporterTestSender{reportChannel: make(chan TunnelPoolReport, 8)}
+	reporter, err := NewTunnelReporter(source, sender, TunnelReporterConfig{
+		Period:         time.Hour,
+		EventBuffer:    8,
+		TargetIdleHint: 6,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel reporter failed: %v", err)
+	}
+	reporter.SetSession("session-b", 9)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reportDone := make(chan error, 1)
+	go func() {
+		reportDone <- reporter.Run(ctx)
+	}()
+
+	source.mutex.Lock()
+	source.snapshot = tunnel.Snapshot{
+		IdleCount:   2,
+		ActiveCount: 1,
+	}
+	source.mutex.Unlock()
+	reporter.NotifyEvent("tunnel_active")
+
+	source.mutex.Lock()
+	source.snapshot = tunnel.Snapshot{
+		IdleCount: 3,
+	}
+	source.mutex.Unlock()
+	reporter.NotifyEvent("tunnel_recycled")
+
+	firstReport := waitTunnelPoolReport(testingObject, sender.reportChannel, 500*time.Millisecond)
+	secondReport := waitTunnelPoolReport(testingObject, sender.reportChannel, 500*time.Millisecond)
+	reportByTrigger := map[string]TunnelPoolReport{
+		firstReport.Trigger:  firstReport,
+		secondReport.Trigger: secondReport,
+	}
+
+	activeReport, hasActiveReport := reportByTrigger["event:tunnel_active"]
+	if !hasActiveReport {
+		testingObject.Fatalf("missing event:tunnel_active report, got triggers=%v", []string{firstReport.Trigger, secondReport.Trigger})
+	}
+	if activeReport.InUseCount != 1 || activeReport.IdleCount != 2 {
+		testingObject.Fatalf(
+			"unexpected active report snapshot: idle=%d in_use=%d",
+			activeReport.IdleCount,
+			activeReport.InUseCount,
+		)
+	}
+
+	recycledReport, hasRecycledReport := reportByTrigger["event:tunnel_recycled"]
+	if !hasRecycledReport {
+		testingObject.Fatalf("missing event:tunnel_recycled report, got triggers=%v", []string{firstReport.Trigger, secondReport.Trigger})
+	}
+	if recycledReport.InUseCount != 0 || recycledReport.IdleCount != 3 {
+		testingObject.Fatalf(
+			"unexpected recycled report snapshot: idle=%d in_use=%d",
+			recycledReport.IdleCount,
+			recycledReport.InUseCount,
+		)
+	}
+
+	cancel()
+	if runErr := <-reportDone; !errors.Is(runErr, context.Canceled) {
+		testingObject.Fatalf("expected context canceled, got %v", runErr)
 	}
 }
 

@@ -507,6 +507,47 @@ func TestControlMessageDispatcherHandleTunnelDialAnnounce(testingObject *testing
 	}
 }
 
+// TestControlMessageDispatcherTunnelDialAnnounceDeduplicatesTunnelID 验证重复 tunnel_id 宣告不会污染消费队列。
+func TestControlMessageDispatcherTunnelDialAnnounceDeduplicatesTunnelID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{})
+	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
+		SessionID:     "session-a",
+		SessionEpoch:  9,
+		TunnelID:      "tun-77",
+		DialLocalAddr: "127.0.0.1:54321",
+		TimestampUnix: time.Now().UTC().Unix(),
+	})
+	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
+		SessionID:     "session-a",
+		SessionEpoch:  9,
+		TunnelID:      "tun-77",
+		DialLocalAddr: "127.0.0.1:54321",
+		TimestampUnix: time.Now().UTC().Unix(),
+	})
+	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
+		SessionID:     "session-a",
+		SessionEpoch:  9,
+		TunnelID:      "tun-78",
+		DialLocalAddr: "127.0.0.1:54322",
+		TimestampUnix: time.Now().UTC().Unix(),
+	})
+
+	first := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
+	if first != "tun-77" {
+		testingObject.Fatalf("unexpected first consumed tunnel id: got=%s want=tun-77", first)
+	}
+	second := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
+	if second != "tun-78" {
+		testingObject.Fatalf("unexpected second consumed tunnel id: got=%s want=tun-78", second)
+	}
+	third := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
+	if third != "" {
+		testingObject.Fatalf("expected queue drained after dedupe consume, got=%s", third)
+	}
+}
+
 type controlPlaneLifecycleTestTunnel struct {
 	tunnelID string
 	closed   bool
@@ -1107,6 +1148,116 @@ func TestRegisterAcceptedTunnelLifecycleProbeRemoteClose(testingObject *testing.
 	testingObject.Fatalf("expected idle tunnel removed after lifecycle probe close")
 }
 
+// TestRegisterAcceptedTunnelUsesDialAnnounceForGRPC 验证 gRPC tunnel 和 TCP 一样通过 TunnelDialAnnounce 对齐 tunnel_id。
+func TestRegisterAcceptedTunnelUsesDialAnnounceForGRPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	server := &controlPlaneServer{dispatcher: dispatcher}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("grpc-acceptor-generated-id")
+	defer func() {
+		_ = rawTunnel.Close()
+	}()
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
+			SessionID:     "session-grpc-1",
+			SessionEpoch:  11,
+			TunnelID:      "tun-42",
+			TimestampUnix: time.Now().UTC().Unix(),
+		})
+	}()
+
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		now := time.Now().UTC()
+		sessionRegistry.Upsert(now, registry.SessionRuntime{
+			SessionID:     "session-grpc-1",
+			ConnectorID:   "agent-grpc",
+			Epoch:         11,
+			State:         registry.SessionActive,
+			LastHeartbeat: now,
+			UpdatedAt:     now,
+		})
+	}()
+
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeGRPCH2); err != nil {
+		testingObject.Fatalf("register accepted grpc tunnel failed: %v", err)
+	}
+
+	runtimeSnapshot, exists := tunnelRegistry.Get("tun-42")
+	if !exists {
+		testingObject.Fatalf("expected grpc tunnel registered with announced tunnel id")
+	}
+	if runtimeSnapshot.ConnectorID != "agent-grpc" || runtimeSnapshot.SessionID != "session-grpc-1" {
+		testingObject.Fatalf(
+			"unexpected grpc tunnel owner: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+	if rawTunnel.closed() {
+		testingObject.Fatalf("expected grpc tunnel to remain open after successful registration")
+	}
+}
+
+// TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC 验证 gRPC tunnel_id 来源于 stream metadata 时无需等待 dial announce。
+func TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-grpc-meta-1",
+		ConnectorID:   "agent-grpc",
+		Epoch:         12,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	server := &controlPlaneServer{dispatcher: dispatcher}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("tun-64")
+	rawTunnel.meta.Labels = map[string]string{
+		grpcbinding.TunnelMetaLabelTunnelIDSource: grpcbinding.TunnelIDSourceStreamMetadata,
+	}
+	defer func() {
+		_ = rawTunnel.Close()
+	}()
+
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeGRPCH2); err != nil {
+		testingObject.Fatalf("register accepted grpc tunnel failed: %v", err)
+	}
+
+	runtimeSnapshot, exists := tunnelRegistry.Get("tun-64")
+	if !exists {
+		testingObject.Fatalf("expected grpc tunnel registered with metadata tunnel id")
+	}
+	if runtimeSnapshot.ConnectorID != "agent-grpc" || runtimeSnapshot.SessionID != "session-grpc-meta-1" {
+		testingObject.Fatalf(
+			"unexpected grpc tunnel owner: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+	if rawTunnel.closed() {
+		testingObject.Fatalf("expected grpc tunnel to remain open after successful registration")
+	}
+}
+
 // TestRegisterAcceptedTunnelAmbiguousOwner 验证 owner 不唯一时入站 tunnel 不会被登记。
 func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -1151,7 +1302,7 @@ func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
 
 // controlPlaneInboundTestTunnel 是 registerAcceptedTunnel 用的最小 transport.Tunnel 假实现。
 type controlPlaneInboundTestTunnel struct {
-	tunnelID string
+	meta transport.TunnelMeta
 
 	doneOnce sync.Once
 	doneChan chan struct{}
@@ -1165,7 +1316,10 @@ type controlPlaneInboundTestTunnel struct {
 // newControlPlaneInboundTestTunnel 创建可手动关闭的测试 tunnel。
 func newControlPlaneInboundTestTunnel(tunnelID string) *controlPlaneInboundTestTunnel {
 	return &controlPlaneInboundTestTunnel{
-		tunnelID: tunnelID,
+		meta: transport.TunnelMeta{
+			TunnelID:  tunnelID,
+			CreatedAt: time.Now().UTC(),
+		},
 		doneChan: make(chan struct{}),
 	}
 }
@@ -1175,12 +1329,22 @@ func (tunnel *controlPlaneInboundTestTunnel) ID() string {
 	if tunnel == nil {
 		return ""
 	}
-	return tunnel.tunnelID
+	return strings.TrimSpace(tunnel.meta.TunnelID)
 }
 
 // Meta 返回最小 tunnel 元数据。
 func (tunnel *controlPlaneInboundTestTunnel) Meta() transport.TunnelMeta {
-	return transport.TunnelMeta{TunnelID: tunnel.ID(), CreatedAt: time.Now().UTC()}
+	if tunnel == nil {
+		return transport.TunnelMeta{}
+	}
+	meta := tunnel.meta
+	if strings.TrimSpace(meta.TunnelID) == "" {
+		meta.TunnelID = tunnel.ID()
+	}
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = time.Now().UTC()
+	}
+	return meta
 }
 
 // State 返回 idle，占位满足接口约束。

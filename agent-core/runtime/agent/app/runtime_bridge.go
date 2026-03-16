@@ -33,7 +33,7 @@ const (
 	bridgeHeartbeatMissThreshold = 5
 	bridgeHeartbeatWriteTimeout  = 2 * time.Second
 	bridgeBusinessWriteTimeout   = 3 * time.Second
-	bridgeTunnelDialAnnounceTTL  = 250 * time.Millisecond
+	bridgeTunnelDialAnnounceTTL  = 2 * time.Second
 	bridgeAutoRouteIDPrefix      = "agent-auto-route"
 
 	bridgeRetryInitialBackoff = time.Second
@@ -160,7 +160,8 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		if grpcClient == nil {
 			return nil, errors.New("grpc transport client is not initialized")
 		}
-		tunnelStream, err := grpcTransport.OpenTunnelStream(ctx, grpcClient)
+		streamContext := grpcbinding.WithTunnelStreamMetadata(ctx, tunnelID, sessionID, sessionEpoch)
+		tunnelStream, err := grpcTransport.OpenTunnelStream(streamContext, grpcClient)
 		if err != nil {
 			opener.runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
 				Level:        events.EventWarn,
@@ -307,17 +308,17 @@ func (r *Runtime) initTunnelManager() error {
 	}
 	registry := tunnel.NewRegistry()
 	manager, err := tunnel.NewManager(tunnel.ManagerOptions{
-			Config: tunnel.ManagerConfig{
-				MinIdle:           r.cfg.TunnelPool.MinIdle,
-				MaxIdle:           r.cfg.TunnelPool.MaxIdle,
-				IdleTTL:           r.cfg.TunnelPool.TTL,
-				MaxReuseCount:     r.cfg.TunnelPool.MaxReuse,
-				RecycleTimeout:    r.cfg.TunnelPool.RecycleAckTO,
-				MaxInflightOpens:  r.cfg.TunnelPool.MaxInflight,
-				TunnelOpenRate:    r.cfg.TunnelPool.OpenRate,
-				TunnelOpenBurst:   r.cfg.TunnelPool.OpenBurst,
-				ReconcileInterval: r.cfg.TunnelPool.ReconcileGap,
-			},
+		Config: tunnel.ManagerConfig{
+			MinIdle:           r.cfg.TunnelPool.MinIdle,
+			MaxIdle:           r.cfg.TunnelPool.MaxIdle,
+			IdleTTL:           r.cfg.TunnelPool.TTL,
+			MaxReuseCount:     r.cfg.TunnelPool.MaxReuse,
+			RecycleTimeout:    r.cfg.TunnelPool.RecycleAckTO,
+			MaxInflightOpens:  r.cfg.TunnelPool.MaxInflight,
+			TunnelOpenRate:    r.cfg.TunnelPool.OpenRate,
+			TunnelOpenBurst:   r.cfg.TunnelPool.OpenBurst,
+			ReconcileInterval: r.cfg.TunnelPool.ReconcileGap,
+		},
 		Registry: registry,
 		Opener:   &bridgeTunnelOpener{runtime: r},
 		// tunnel manager 事件指标统一写入 runtime 级 metrics 容器。
