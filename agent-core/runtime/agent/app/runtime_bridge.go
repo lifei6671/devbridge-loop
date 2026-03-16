@@ -2037,12 +2037,9 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		return nil, errors.New("port must be greater than 0")
 	}
 	normalizedNamespace := strings.TrimSpace(input.Namespace)
-	if normalizedNamespace == "" {
-		normalizedNamespace = "dev"
-	}
 	normalizedEnvironment := strings.TrimSpace(input.Environment)
-	if normalizedEnvironment == "" {
-		normalizedEnvironment = "demo"
+	if normalizedNamespace == "" && normalizedEnvironment == "" && normalizedSNIName == "" {
+		return nil, errors.New("namespace、environment、sni_name 至少填写一个")
 	}
 	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
 	if normalizedServiceKey == "" {
@@ -2177,12 +2174,6 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 					Environment: strings.TrimSpace(targetRegistration.Environment),
 					Reason:      "service_removed",
 				}
-				if routeRevokePayload.Namespace == "" {
-					routeRevokePayload.Namespace = "dev"
-				}
-				if routeRevokePayload.Environment == "" {
-					routeRevokePayload.Environment = "demo"
-				}
 				envelope, err := r.controlPublisher.Publish(
 					context.Background(),
 					pb.ControlMessageRouteRevoke,
@@ -2271,13 +2262,7 @@ func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.Rou
 		return pb.RouteAssign{}, false
 	}
 	namespace := strings.TrimSpace(registration.Namespace)
-	if namespace == "" {
-		namespace = "dev"
-	}
 	environment := strings.TrimSpace(registration.Environment)
-	if environment == "" {
-		environment = "demo"
-	}
 	pathPrefix := strings.TrimSpace(registration.Exposure.PathPrefix)
 	if pathPrefix == "" {
 		pathPrefix = "/"

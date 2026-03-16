@@ -34,23 +34,15 @@ fn default_diagnose_category_enabled() -> bool {
     true
 }
 
-fn default_service_namespace() -> String {
-    "dev".to_string()
-}
-
-fn default_service_environment() -> String {
-    "demo".to_string()
-}
-
 /// 手动添加服务配置：持久化在宿主配置文件，供 Agent 重启后自动恢复。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualServiceConfig {
     #[serde(default)]
     pub service_id: Option<String>,
-    #[serde(default = "default_service_namespace")]
-    pub namespace: String,
-    #[serde(default = "default_service_environment")]
-    pub environment: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
     pub service_name: String,
     pub protocol: String,
     pub host: String,
@@ -68,38 +60,43 @@ impl ManualServiceConfig {
         if service_name.is_empty() || protocol.is_empty() || host.is_empty() || self.port == 0 {
             return None;
         }
-        let namespace = self.namespace.trim();
-        let environment = self.environment.trim();
+        let normalized_namespace = self
+            .namespace
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let normalized_environment = self
+            .environment
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let normalized_sni_name = self
+            .sni_name
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if normalized_namespace.is_none() && normalized_environment.is_none() && normalized_sni_name.is_none() {
+            return None;
+        }
         Some(Self {
             service_id: self
                 .service_id
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            namespace: if namespace.is_empty() {
-                default_service_namespace()
-            } else {
-                namespace.to_string()
-            },
-            environment: if environment.is_empty() {
-                default_service_environment()
-            } else {
-                environment.to_string()
-            },
+            namespace: normalized_namespace,
+            environment: normalized_environment,
             service_name,
             protocol,
             host,
             port: self.port,
-            sni_name: self
-                .sni_name
-                .as_ref()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            sni_name: normalized_sni_name,
         })
     }
 }
 
 /// 判断两个手动服务配置是否指向同一条逻辑服务记录。
+/// 优先按 service_id，对无 service_id 的配置按 namespace/environment/service_name/sni 组合匹配。
 fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServiceConfig) -> bool {
     match (&left.service_id, &right.service_id) {
         (Some(left_id), Some(right_id)) => left_id == right_id,
@@ -107,6 +104,7 @@ fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServic
             left.namespace == right.namespace
                 && left.environment == right.environment
                 && left.service_name == right.service_name
+                && left.sni_name == right.sni_name
         }
     }
 }
@@ -976,7 +974,7 @@ pub fn update_runtime_config(
     Ok(())
 }
 
-/// 持久化手动服务配置：按 `service_id` 或 `namespace/environment/service_name` 执行 upsert。
+/// 持久化手动服务配置：按 `service_id` 或 `namespace/environment/service_name/sni` 执行 upsert。
 pub fn upsert_manual_service_config(
     state: &Arc<AppRuntimeState>,
     service: ManualServiceConfig,
@@ -999,7 +997,7 @@ pub fn upsert_manual_service_config(
     Ok(persisted_size)
 }
 
-/// 删除手动服务配置：优先按 service_id 匹配；service_id 为空时回落 namespace/environment/service_name。
+/// 删除手动服务配置：优先按 service_id 匹配；其次按 service_key；最后按 service_name + 可选 scope 匹配。
 pub fn remove_manual_service_config(
     state: &Arc<AppRuntimeState>,
     service_id: &str,
@@ -1014,6 +1012,15 @@ pub fn remove_manual_service_config(
     let normalized_environment = environment.unwrap_or_default().trim().to_string();
     let normalized_service_name = service_name.unwrap_or_default().trim().to_string();
 
+    let build_manual_service_key = |item: &ManualServiceConfig| {
+        format!(
+            "{}/{}/{}",
+            item.namespace.as_deref().unwrap_or_default().trim(),
+            item.environment.as_deref().unwrap_or_default().trim(),
+            item.service_name.trim()
+        )
+    };
+
     let mut next_runtime_config = current_runtime_config(state)?;
     next_runtime_config.manual_services.retain(|item| {
         if !normalized_service_id.is_empty()
@@ -1027,23 +1034,23 @@ pub fn remove_manual_service_config(
         }
         if normalized_service_id.is_empty()
             && !normalized_service_key.is_empty()
-            && format!(
-                "{}/{}/{}",
-                item.namespace.trim(),
-                item.environment.trim(),
-                item.service_name.trim()
-            ) == normalized_service_key
+            && build_manual_service_key(item) == normalized_service_key
         {
             return false;
         }
         if normalized_service_id.is_empty()
-            && !normalized_namespace.is_empty()
-            && !normalized_environment.is_empty()
+            && normalized_service_key.is_empty()
             && !normalized_service_name.is_empty()
-            && item.namespace == normalized_namespace
-            && item.environment == normalized_environment
             && item.service_name == normalized_service_name
         {
+            let item_namespace = item.namespace.as_deref().unwrap_or_default().trim();
+            if !normalized_namespace.is_empty() && item_namespace != normalized_namespace {
+                return true;
+            }
+            let item_environment = item.environment.as_deref().unwrap_or_default().trim();
+            if !normalized_environment.is_empty() && item_environment != normalized_environment {
+                return true;
+            }
             return false;
         }
         true

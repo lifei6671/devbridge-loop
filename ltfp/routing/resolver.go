@@ -87,8 +87,16 @@ func (resolver *Resolver) resolveConnector(route pb.Route, target *pb.ConnectorS
 	if !exists {
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "service is not found by serviceKey")
 	}
-	if strings.TrimSpace(service.Namespace) != strings.TrimSpace(route.Namespace) || strings.TrimSpace(service.Environment) != strings.TrimSpace(route.Environment) {
-		// route 与 service scope 不一致时必须拒绝，避免跨 scope 引用。
+	routeNamespace := strings.TrimSpace(route.Namespace)
+	serviceNamespace := strings.TrimSpace(service.Namespace)
+	if routeNamespace != "" && serviceNamespace != "" && routeNamespace != serviceNamespace {
+		// route 与 service 同时声明 namespace 时必须一致，空值视为不约束。
+		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match service scope")
+	}
+	routeEnvironment := strings.TrimSpace(route.Environment)
+	serviceEnvironment := strings.TrimSpace(service.Environment)
+	if routeEnvironment != "" && serviceEnvironment != "" && routeEnvironment != serviceEnvironment {
+		// route 与 service 同时声明 environment 时必须一致，空值视为不约束。
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match service scope")
 	}
 	if service.Status != pb.ServiceStatusActive || service.HealthStatus != pb.HealthStatusHealthy {

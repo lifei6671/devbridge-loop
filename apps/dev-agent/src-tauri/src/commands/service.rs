@@ -187,8 +187,8 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
             ServiceListItem {
                 service_id: normalized_service_id.clone(),
                 service_key: value_str_or(item, &["service_key", "key"], ""),
-                namespace: value_str_or(item, &["namespace"], "dev"),
-                environment: value_str_or(item, &["environment"], "demo"),
+                namespace: value_str_or(item, &["namespace"], ""),
+                environment: value_str_or(item, &["environment"], ""),
                 service_name: value_str_or(
                     item,
                     &["service_name", "name", "display_name", "service_key"],
@@ -218,16 +218,6 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
         .collect()
 }
 
-fn normalize_optional_text(value: Option<String>, default_value: &str) -> String {
-    let normalized = value.unwrap_or_default();
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        default_value.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String> {
     let service_name = input.service_name.trim().to_string();
     if service_name.is_empty() {
@@ -244,18 +234,24 @@ fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String>
     if input.port == 0 {
         return Err("port 必须大于 0".to_string());
     }
+    let normalized_namespace = normalize_optional_trimmed_text(input.namespace);
+    let normalized_environment = normalize_optional_trimmed_text(input.environment);
+    let normalized_sni_name = normalize_optional_trimmed_text(input.sni_name);
+    if normalized_namespace.is_none() && normalized_environment.is_none() && normalized_sni_name.is_none() {
+        return Err("namespace、environment、sni_name 至少填写一个".to_string());
+    }
     Ok(ServiceAddInput {
         service_id: input
             .service_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         service_name,
-        namespace: Some(normalize_optional_text(input.namespace, "dev")),
-        environment: Some(normalize_optional_text(input.environment, "demo")),
+        namespace: normalized_namespace,
+        environment: normalized_environment,
         protocol,
         host,
         port: input.port,
-        sni_name: normalize_optional_trimmed_text(input.sni_name),
+        sni_name: normalized_sni_name,
     })
 }
 
@@ -482,8 +478,8 @@ pub fn service_add(
                 } else {
                     Some(added_item.service_id.clone())
                 },
-                namespace: normalize_optional_text(normalized_input.namespace.clone(), "dev"),
-                environment: normalize_optional_text(normalized_input.environment.clone(), "demo"),
+                namespace: normalized_input.namespace.clone(),
+                environment: normalized_input.environment.clone(),
                 service_name: normalized_input.service_name.clone(),
                 protocol: normalized_input.protocol.clone(),
                 host: normalized_input.host.clone(),

@@ -70,6 +70,19 @@ func TestValidatePublishService(t *testing.T) {
 	}
 }
 
+// TestValidatePublishServiceAcceptsSNIWithoutScope 验证无 namespace/environment 时，只要有 SNI 仍可发布。
+func TestValidatePublishServiceAcceptsSNIWithoutScope(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.Namespace = ""
+	message.Environment = ""
+	message.Exposure.SNIName = "order.dev.example.com"
+	if err := ValidatePublishService(message); err != nil {
+		t.Fatalf("validate publish service with sni-only failed: %v", err)
+	}
+}
+
 // TestValidatePublishServiceRejectMissingEndpoint 验证缺少 endpoint 会被拒绝。
 func TestValidatePublishServiceRejectMissingEndpoint(t *testing.T) {
 	t.Parallel()
@@ -86,12 +99,44 @@ func TestValidatePublishServiceRejectMissingEndpoint(t *testing.T) {
 	}
 }
 
+// TestValidatePublishServiceRejectMissingScopeAndSNI 验证 namespace/environment/sni 全空时会被拒绝。
+func TestValidatePublishServiceRejectMissingScopeAndSNI(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.Namespace = ""
+	message.Environment = ""
+	message.Exposure.SNIName = ""
+	for index := range message.Endpoints {
+		message.Endpoints[index].ServerName = ""
+	}
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestValidateRouteScope 验证 route 与 target scope 一致性校验。
 func TestValidateRouteScope(t *testing.T) {
 	t.Parallel()
 
 	if err := ValidateRouteScope("dev", "alice", "dev", "alice"); err != nil {
 		t.Fatalf("validate route scope failed: %v", err)
+	}
+}
+
+// TestValidateRouteScopeAllowsPartialScope 验证 route/target 一侧 scope 为空时按“不约束”处理。
+func TestValidateRouteScopeAllowsPartialScope(t *testing.T) {
+	t.Parallel()
+
+	if err := ValidateRouteScope("", "alice", "dev", "alice"); err != nil {
+		t.Fatalf("validate partial route scope failed: %v", err)
+	}
+	if err := ValidateRouteScope("dev", "", "dev", "prod"); err != nil {
+		t.Fatalf("validate partial environment scope failed: %v", err)
 	}
 }
 

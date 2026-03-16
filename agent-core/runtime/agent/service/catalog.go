@@ -1,14 +1,21 @@
 package service
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"math/big"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/agent-core/pkg/tsbase62"
 	"github.com/lifei6671/devbridge-loop/ltfp/adapter"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
+
+const ulidEncoding = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 // Record 描述 Agent 本地 service 运行态记录。
 type Record struct {
@@ -53,8 +60,12 @@ func (catalog *Catalog) Upsert(now time.Time, registration adapter.LocalRegistra
 		}
 	}
 	if normalizedServiceID == "" {
-		// 无显式 service_id 时回退到 service_key，保证记录可追踪。
-		normalizedServiceID = normalizedServiceKey
+		// 无显式 service_id 且无历史映射时按规则生成 ID。
+		normalizedServiceID = buildGeneratedServiceID(
+			now,
+			normalizedRegistration.ServiceName,
+			normalizedRegistration.ServiceType,
+		)
 	}
 	normalizedRegistration.ServiceID = normalizedServiceID
 	normalizedRegistration.ServiceKey = normalizedServiceKey
@@ -290,4 +301,81 @@ func cloneStringMap(source map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func buildGeneratedServiceID(now time.Time, serviceName string, serviceType string) string {
+	nameSegment := normalizeServiceIDSegment(serviceName, "service")
+	protocolSegment := normalizeServiceIDSegment(serviceType, "tcp")
+	return fmt.Sprintf("%s-%s-%s", nameSegment, protocolSegment, tsbase62.EncodeUint64(uint64(now.UnixNano())))
+}
+
+func normalizeServiceIDSegment(value string, fallback string) string {
+	normalizedFallback := strings.ToLower(strings.TrimSpace(fallback))
+	if normalizedFallback == "" {
+		normalizedFallback = "x"
+	}
+	raw := strings.ToLower(strings.TrimSpace(value))
+	if raw == "" {
+		return normalizedFallback
+	}
+	builder := strings.Builder{}
+	builder.Grow(len(raw))
+	lastHyphen := false
+	for _, currentRune := range raw {
+		isAlphaNumeric := (currentRune >= 'a' && currentRune <= 'z') || (currentRune >= '0' && currentRune <= '9')
+		if isAlphaNumeric {
+			builder.WriteRune(currentRune)
+			lastHyphen = false
+			continue
+		}
+		if !lastHyphen && builder.Len() > 0 {
+			builder.WriteByte('-')
+			lastHyphen = true
+		}
+	}
+	segment := strings.Trim(builder.String(), "-")
+	if segment == "" {
+		return normalizedFallback
+	}
+	const maxSegmentLength = 48
+	if len(segment) > maxSegmentLength {
+		segment = strings.Trim(segment[:maxSegmentLength], "-")
+		if segment == "" {
+			return normalizedFallback
+		}
+	}
+	return segment
+}
+
+func newULIDString(now time.Time) string {
+	normalizedNow := normalizeUpdatedAt(now)
+	timestampMillis := uint64(normalizedNow.UnixMilli())
+	var raw [16]byte
+	raw[0] = byte(timestampMillis >> 40)
+	raw[1] = byte(timestampMillis >> 32)
+	raw[2] = byte(timestampMillis >> 24)
+	raw[3] = byte(timestampMillis >> 16)
+	raw[4] = byte(timestampMillis >> 8)
+	raw[5] = byte(timestampMillis)
+	if _, err := rand.Read(raw[6:]); err != nil {
+		// 熵源异常时回退到时间戳片段，保证格式可用。
+		fallbackEntropy := uint64(time.Now().UTC().UnixNano())
+		binary.BigEndian.PutUint16(raw[6:8], uint16(fallbackEntropy>>48))
+		binary.BigEndian.PutUint64(raw[8:16], fallbackEntropy)
+	}
+	return encodeULID(raw)
+}
+
+func encodeULID(raw [16]byte) string {
+	var value big.Int
+	value.SetBytes(raw[:])
+	base := big.NewInt(32)
+	var remainder big.Int
+	encoded := make([]byte, 26)
+	for index := len(encoded) - 1; index >= 0; index-- {
+		remainder.Mod(&value, base)
+		encoded[index] = ulidEncoding[remainder.Int64()]
+		value.Div(&value, base)
+	}
+	return string(encoded)
 }

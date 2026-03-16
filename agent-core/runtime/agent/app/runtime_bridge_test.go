@@ -782,6 +782,65 @@ func TestAddOrUpdateServiceUsesDefaultHealthCheckConfig(testingObject *testing.T
 	}
 }
 
+// TestAddOrUpdateServiceRejectsMissingScopeAndSNI 验证 namespace/environment/sni 全空会被拒绝。
+func TestAddOrUpdateServiceRejectsMissingScopeAndSNI(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		serviceCatalog: service.NewCatalog(),
+	}
+	_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		ServiceID:   "svc-missing-scope",
+		ServiceName: "payment-service",
+		Protocol:    "http",
+		Host:        "127.0.0.1",
+		Port:        18090,
+	})
+	if err == nil {
+		testingObject.Fatalf("expected add service to reject empty namespace/environment/sni")
+	}
+	if !strings.Contains(err.Error(), "至少填写一个") {
+		testingObject.Fatalf("unexpected error for missing namespace/environment/sni: %v", err)
+	}
+}
+
+// TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided 验证仅 SNI 注册时不会补齐 namespace/environment 默认值。
+func TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		serviceCatalog: service.NewCatalog(),
+	}
+	addedPayload, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		ServiceID:   "svc-sni-only",
+		ServiceName: "payment-service",
+		Protocol:    "http",
+		Host:        "127.0.0.1",
+		Port:        18091,
+		SNIName:     "pay.demo.example.com",
+	})
+	if err != nil {
+		testingObject.Fatalf("add service with sni-only failed: %v", err)
+	}
+	if addedPayload["namespace"] != "" {
+		testingObject.Fatalf("unexpected namespace defaulted: %+v", addedPayload["namespace"])
+	}
+	if addedPayload["environment"] != "" {
+		testingObject.Fatalf("unexpected environment defaulted: %+v", addedPayload["environment"])
+	}
+	records := runtime.serviceCatalog.List()
+	if len(records) != 1 {
+		testingObject.Fatalf("unexpected service catalog count: got=%d want=1", len(records))
+	}
+	if records[0].Registration.Namespace != "" || records[0].Registration.Environment != "" {
+		testingObject.Fatalf(
+			"unexpected catalog scope defaulted: namespace=%q environment=%q",
+			records[0].Registration.Namespace,
+			records[0].Registration.Environment,
+		)
+	}
+}
+
 // TestAddOrUpdateServiceValidatesHealthCheckMode 验证非法探测模式会被拒绝。
 func TestAddOrUpdateServiceValidatesHealthCheckMode(testingObject *testing.T) {
 	testingObject.Parallel()

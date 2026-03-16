@@ -425,3 +425,66 @@ func TestResolverFilters(testingObject *testing.T) {
 		})
 	}
 }
+
+// TestResolverAllowsScopedRequestWhenRouteScopeIsEmpty 验证 route scope 为空时，请求携带 scope 也可命中。
+func TestResolverAllowsScopedRequestWhenRouteScopeIsEmpty(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	routeRegistry := registry.NewRouteRegistry()
+	serviceRegistry := registry.NewServiceRegistry()
+	sessionRegistry := registry.NewSessionRegistry()
+	routeRegistry.Upsert(now, pb.Route{
+		RouteID:     "route-empty-scope",
+		Namespace:   "",
+		Environment: "",
+		Match: pb.RouteMatch{
+			Protocol: "http",
+			Host:     "api.dev.example.com",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: "dev/alice/order-service",
+			},
+		},
+		Metadata: map[string]string{
+			routeMetadataIngressModeKey: string(pb.IngressModeL7Shared),
+		},
+	})
+	serviceRegistry.Upsert(now, pb.Service{
+		ServiceID:    "svc-empty-scope",
+		ServiceKey:   "dev/alice/order-service",
+		Namespace:    "dev",
+		Environment:  "alice",
+		ConnectorID:  "connector-empty-scope",
+		Status:       pb.ServiceStatusActive,
+		HealthStatus: pb.HealthStatusHealthy,
+	})
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-empty-scope",
+		ConnectorID: "connector-empty-scope",
+		Epoch:       1,
+		State:       registry.SessionActive,
+	})
+	resolver := NewResolver(ResolverOptions{
+		RouteRegistry:   routeRegistry,
+		ServiceRegistry: serviceRegistry,
+		SessionRegistry: sessionRegistry,
+	})
+
+	result, err := resolver.Resolve(ingress.RouteLookupRequest{
+		IngressMode: pb.IngressModeL7Shared,
+		Protocol:    "http",
+		Host:        "api.dev.example.com",
+		Authority:   "api.dev.example.com",
+		Namespace:   "dev",
+		Environment: "alice",
+	})
+	if err != nil {
+		testingObject.Fatalf("resolve with empty route scope failed: %v", err)
+	}
+	if result.TargetKind != pb.RouteTargetTypeConnectorService {
+		testingObject.Fatalf("unexpected target kind: got=%s want=%s", result.TargetKind, pb.RouteTargetTypeConnectorService)
+	}
+}

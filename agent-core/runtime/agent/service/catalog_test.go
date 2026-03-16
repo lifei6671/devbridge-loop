@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -19,12 +20,20 @@ func TestCatalogUpsertAndList(t *testing.T) {
 		Namespace:   "dev",
 		Environment: "demo",
 		ServiceName: "order-service",
+		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
 		},
 	})
 	if record.Registration.ServiceID == "" {
 		t.Fatalf("expected service_id to be resolved")
+	}
+	if !strings.HasPrefix(record.Registration.ServiceID, "order-service-http-") {
+		t.Fatalf("unexpected generated service_id prefix: %s", record.Registration.ServiceID)
+	}
+	suffix := strings.TrimPrefix(record.Registration.ServiceID, "order-service-http-")
+	if len(suffix) != 26 {
+		t.Fatalf("unexpected ulid suffix length: got=%d want=26", len(suffix))
 	}
 	if record.HealthStatus != pb.HealthStatusUnknown {
 		t.Fatalf("expected default health status unknown, got=%s", record.HealthStatus)
@@ -67,6 +76,44 @@ func TestCatalogSetServiceIDByKey(t *testing.T) {
 	}
 	if list[0].Registration.ServiceID != "svc-1001" {
 		t.Fatalf("unexpected rewritten service_id: %s", list[0].Registration.ServiceID)
+	}
+}
+
+// TestCatalogUpsertReuseMappedServiceID 验证同一 service_key 无显式 service_id 时会复用既有映射。
+func TestCatalogUpsertReuseMappedServiceID(t *testing.T) {
+	t.Parallel()
+
+	catalog := NewCatalog()
+	now := time.Unix(1700000000, 0).UTC()
+	firstRecord := catalog.Upsert(now, adapter.LocalRegistration{
+		ServiceKey:  "dev/demo/order-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "order-service",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
+	if firstRecord.Registration.ServiceID == "" {
+		t.Fatalf("expected first generated service_id not empty")
+	}
+	secondRecord := catalog.Upsert(now.Add(time.Second), adapter.LocalRegistration{
+		ServiceKey:  "dev/demo/order-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "order-service",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18081},
+		},
+	})
+	if secondRecord.Registration.ServiceID != firstRecord.Registration.ServiceID {
+		t.Fatalf(
+			"expected service_id mapping reused: got=%s want=%s",
+			secondRecord.Registration.ServiceID,
+			firstRecord.Registration.ServiceID,
+		)
 	}
 }
 

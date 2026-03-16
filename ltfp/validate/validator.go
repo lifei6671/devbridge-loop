@@ -71,12 +71,23 @@ func ValidatePublishService(message pb.PublishService) error {
 	if strings.TrimSpace(message.ServiceKey) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "serviceKey is required")
 	}
-	// namespace 和 environment 是 scope 约束核心字段。
-	if strings.TrimSpace(message.Namespace) == "" {
-		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "namespace is required")
+	// namespace/environment/sni 至少需要一个，避免完全无路由标识的服务进入注册表。
+	hasNamespace := strings.TrimSpace(message.Namespace) != ""
+	hasEnvironment := strings.TrimSpace(message.Environment) != ""
+	hasSNI := strings.TrimSpace(message.Exposure.SNIName) != ""
+	if !hasSNI {
+		for _, endpoint := range message.Endpoints {
+			if strings.TrimSpace(endpoint.ServerName) != "" {
+				hasSNI = true
+				break
+			}
+		}
 	}
-	if strings.TrimSpace(message.Environment) == "" {
-		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "environment is required")
+	if !hasNamespace && !hasEnvironment && !hasSNI {
+		return ltfperrors.New(
+			ltfperrors.CodeMissingRequiredField,
+			"at least one of namespace, environment or sni is required",
+		)
 	}
 	// serviceName 为空会导致无法建立 canonical identity 映射。
 	if strings.TrimSpace(message.ServiceName) == "" {
@@ -133,12 +144,18 @@ func ValidateStreamPayload(payload pb.StreamPayload) error {
 
 // ValidateRouteScope 校验 route 与 target 的 scope 一致性。
 func ValidateRouteScope(routeNamespace, routeEnvironment, targetNamespace, targetEnvironment string) error {
-	// 首版协议不允许跨 scope 引用，因此 namespace 必须一致。
-	if strings.TrimSpace(routeNamespace) != strings.TrimSpace(targetNamespace) {
+	normalizedRouteNamespace := strings.TrimSpace(routeNamespace)
+	normalizedTargetNamespace := strings.TrimSpace(targetNamespace)
+	// route/target 同时声明 namespace 时，必须保持一致；任一侧为空视为不约束。
+	if normalizedRouteNamespace != "" && normalizedTargetNamespace != "" && normalizedRouteNamespace != normalizedTargetNamespace {
 		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route namespace must equal target namespace")
 	}
-	// 首版协议不允许跨 environment fallback，因此 environment 必须一致。
-	if strings.TrimSpace(routeEnvironment) != strings.TrimSpace(targetEnvironment) {
+	normalizedRouteEnvironment := strings.TrimSpace(routeEnvironment)
+	normalizedTargetEnvironment := strings.TrimSpace(targetEnvironment)
+	// route/target 同时声明 environment 时，必须保持一致；任一侧为空视为不约束。
+	if normalizedRouteEnvironment != "" &&
+		normalizedTargetEnvironment != "" &&
+		normalizedRouteEnvironment != normalizedTargetEnvironment {
 		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route environment must equal target environment")
 	}
 	return nil

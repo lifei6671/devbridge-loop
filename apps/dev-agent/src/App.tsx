@@ -240,8 +240,8 @@ interface ServiceCreateDraft {
 const DEFAULT_SERVICE_CREATE_DRAFT: ServiceCreateDraft = {
   serviceId: "",
   serviceName: "",
-  namespace: "dev",
-  environment: "demo",
+  namespace: "",
+  environment: "",
   protocol: "tcp",
   host: "127.0.0.1",
   portText: "8080",
@@ -367,6 +367,41 @@ const SETTINGS_FIELD_HELP: Record<string, SettingsFieldHelp> = {
   reconcileGapMs: {
     usage: "周期性池状态对账间隔（毫秒），用于慢路径纠偏。",
     impact: "间隔过大会延迟异常收敛，间隔过小会增加调度与日志开销。",
+  },
+};
+
+const SERVICE_FORM_FIELD_HELP: Record<string, SettingsFieldHelp> = {
+  serviceName: {
+    usage: "填写业务服务名称，建议与真实服务名一致，例如 order-service。",
+    impact: "用于服务展示与管理识别；后续排障、编辑、删除都会依赖该名称。",
+  },
+  serviceId: {
+    usage: "可选稳定 ID；留空时由运行时根据服务标识自动回填，编辑模式固定不可改。",
+    impact: "用于幂等更新同一服务记录；修改 ID 可能被识别为新的服务实体。",
+  },
+  namespace: {
+    usage: "可选隔离域，例如 dev / stage / prod。",
+    impact: "参与 scope 匹配和路由过滤；需与环境/SNI 至少填写一项。",
+  },
+  environment: {
+    usage: "可选环境标签，例如 demo / alice / prod。",
+    impact: "参与 scope 匹配和路由过滤；需与命名空间/SNI 至少填写一项。",
+  },
+  protocol: {
+    usage: "选择服务协议（tcp / http / https）。",
+    impact: "影响健康检查与自动路由能力；协议选择错误会导致转发行为异常。",
+  },
+  host: {
+    usage: "填写服务监听地址，例如 127.0.0.1 或内网 IP。",
+    impact: "Bridge 会直接连接该地址，错误地址会导致 tunnel 无法建立。",
+  },
+  port: {
+    usage: "填写服务监听端口，范围 1-65535。",
+    impact: "与主机地址共同确定上游目标，配置错误会导致连接失败。",
+  },
+  sniName: {
+    usage: "可选 TLS SNI 域名，例如 order.dev.example.com。",
+    impact: "可作为路由匹配关键条件；namespace/environment 为空时可单独作为注册标识。",
   },
 };
 
@@ -594,7 +629,7 @@ function FieldHelpTooltip(props: {
       >
         <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">用法</span>
         <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.usage}</span>
-        <span className="mt-2 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">影响</span>
+        <span className="mt-2 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">作用</span>
         <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.impact}</span>
       </span>
     </span>
@@ -2009,8 +2044,8 @@ export default function App(): JSX.Element {
     setServiceCreateDraft({
       serviceId: item.service_id,
       serviceName: item.service_name,
-      namespace: item.namespace || "dev",
-      environment: item.environment || "demo",
+      namespace: item.namespace || "",
+      environment: item.environment || "",
       protocol: item.protocol || "tcp",
       host: item.host || "127.0.0.1",
       portText: String(item.port > 0 ? item.port : 8080),
@@ -2027,8 +2062,15 @@ export default function App(): JSX.Element {
 
   const submitServiceForm = useCallback(async () => {
     const serviceName = serviceCreateDraft.serviceName.trim();
+    const namespace = serviceCreateDraft.namespace.trim();
+    const environment = serviceCreateDraft.environment.trim();
+    const sniName = serviceCreateDraft.sniName.trim();
     if (!serviceName) {
       notify("warning", "参数不完整", "请输入服务名称");
+      return;
+    }
+    if (!namespace && !environment && !sniName) {
+      notify("warning", "参数不完整", "命名空间、环境、SNI 至少填写一个");
       return;
     }
     let port: number;
@@ -2052,12 +2094,12 @@ export default function App(): JSX.Element {
     const payload: ServiceAddInput = {
       service_id: normalizedServiceID || undefined,
       service_name: serviceName,
-      namespace: serviceCreateDraft.namespace.trim() || undefined,
-      environment: serviceCreateDraft.environment.trim() || undefined,
+      namespace: namespace || undefined,
+      environment: environment || undefined,
       protocol: serviceCreateDraft.protocol.trim().toLowerCase(),
       host: serviceCreateDraft.host.trim(),
       port,
-      sni_name: serviceCreateDraft.sniName.trim() || undefined,
+      sni_name: sniName || undefined,
     };
     setCreatingService(true);
     try {
@@ -2218,7 +2260,7 @@ export default function App(): JSX.Element {
             void submitServiceForm();
           }}
         >
-          <SettingsField label="服务名称" hint="必填">
+          <SettingsField label="服务名称" hint="必填" help={SERVICE_FORM_FIELD_HELP.serviceName}>
             <Input
               placeholder="例如 order-service"
               value={serviceCreateDraft.serviceName}
@@ -2228,7 +2270,11 @@ export default function App(): JSX.Element {
               className="h-9 rounded-lg bg-white"
             />
           </SettingsField>
-          <SettingsField label="服务 ID" hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}>
+          <SettingsField
+            label="服务 ID"
+            hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}
+            help={SERVICE_FORM_FIELD_HELP.serviceId}
+          >
             <Input
               placeholder="例如 svc-order"
               value={serviceCreateDraft.serviceId}
@@ -2239,7 +2285,7 @@ export default function App(): JSX.Element {
               disabled={serviceFormMode === "edit"}
             />
           </SettingsField>
-          <SettingsField label="命名空间" hint="默认 dev">
+          <SettingsField label="命名空间" hint="可选" help={SERVICE_FORM_FIELD_HELP.namespace}>
             <Input
               placeholder="例如 dev"
               value={serviceCreateDraft.namespace}
@@ -2249,7 +2295,7 @@ export default function App(): JSX.Element {
               className="h-9 rounded-lg bg-white"
             />
           </SettingsField>
-          <SettingsField label="环境" hint="默认 demo">
+          <SettingsField label="环境" hint="可选" help={SERVICE_FORM_FIELD_HELP.environment}>
             <Input
               placeholder="例如 demo"
               value={serviceCreateDraft.environment}
@@ -2259,7 +2305,7 @@ export default function App(): JSX.Element {
               className="h-9 rounded-lg bg-white"
             />
           </SettingsField>
-          <SettingsField label="协议" hint="tcp / http / https">
+          <SettingsField label="协议" hint="tcp / http / https" help={SERVICE_FORM_FIELD_HELP.protocol}>
             <select
               value={serviceCreateDraft.protocol}
               className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
@@ -2272,7 +2318,7 @@ export default function App(): JSX.Element {
               <option value="https">https</option>
             </select>
           </SettingsField>
-          <SettingsField label="主机地址" hint="如 127.0.0.1">
+          <SettingsField label="主机地址" hint="如 127.0.0.1" help={SERVICE_FORM_FIELD_HELP.host}>
             <Input
               placeholder="例如 127.0.0.1"
               value={serviceCreateDraft.host}
@@ -2282,7 +2328,7 @@ export default function App(): JSX.Element {
               className="h-9 rounded-lg bg-white"
             />
           </SettingsField>
-          <SettingsField label="端口" hint="1 - 65535">
+          <SettingsField label="端口" hint="1 - 65535" help={SERVICE_FORM_FIELD_HELP.port}>
             <Input
               placeholder="例如 8080"
               value={serviceCreateDraft.portText}
@@ -2293,7 +2339,11 @@ export default function App(): JSX.Element {
               className="h-9 rounded-lg bg-white"
             />
           </SettingsField>
-          <SettingsField label="SNI (可选)" hint="用于 TLS SNI 转发">
+          <SettingsField
+            label="SNI (可选)"
+            hint="与命名空间/环境三选一至少填一项"
+            help={SERVICE_FORM_FIELD_HELP.sniName}
+          >
             <Input
               placeholder="例如 order.dev.example.com"
               value={serviceCreateDraft.sniName}

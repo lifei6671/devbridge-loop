@@ -166,8 +166,8 @@ fn replay_manual_services_after_connect(
                         format!(
                             "回放手动服务失败 service_name={} namespace={} environment={} host={} port={} err={}",
                             service.service_name,
-                            service.namespace,
-                            service.environment,
+                            service.namespace.as_deref().unwrap_or(""),
+                            service.environment.as_deref().unwrap_or(""),
                             service.host,
                             service.port,
                             err

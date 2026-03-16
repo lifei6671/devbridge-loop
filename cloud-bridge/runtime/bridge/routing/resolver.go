@@ -299,14 +299,16 @@ func resolveExternalTarget(route pb.Route, target *pb.ExternalServiceTarget) (*p
 
 func validateRequestScope(route pb.Route, request ingress.RouteLookupRequest) error {
 	normalizedNamespace := strings.TrimSpace(request.Namespace)
-	if normalizedNamespace != "" && normalizedNamespace != strings.TrimSpace(route.Namespace) {
+	routeNamespace := strings.TrimSpace(route.Namespace)
+	if normalizedNamespace != "" && routeNamespace != "" && normalizedNamespace != routeNamespace {
 		return ltfperrors.New(
 			ltfperrors.CodeInvalidScope,
 			fmt.Sprintf("request namespace=%s mismatches route namespace=%s", normalizedNamespace, route.Namespace),
 		)
 	}
 	normalizedEnvironment := strings.TrimSpace(request.Environment)
-	if normalizedEnvironment != "" && normalizedEnvironment != strings.TrimSpace(route.Environment) {
+	routeEnvironment := strings.TrimSpace(route.Environment)
+	if normalizedEnvironment != "" && routeEnvironment != "" && normalizedEnvironment != routeEnvironment {
 		return ltfperrors.New(
 			ltfperrors.CodeInvalidScope,
 			fmt.Sprintf("request environment=%s mismatches route environment=%s", normalizedEnvironment, route.Environment),
