@@ -2,8 +2,11 @@ package control
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +18,8 @@ import (
 const (
 	// defaultEndpointProbeTimeout 定义 endpoint 探测默认超时。
 	defaultEndpointProbeTimeout = 800 * time.Millisecond
+	// defaultHTTPHealthCheckPath 定义 HTTP/HTTPS 探测默认路径。
+	defaultHTTPHealthCheckPath = "/"
 )
 
 // EndpointHealthProbe 定义 endpoint 健康探测接口。
@@ -39,8 +44,8 @@ type HealthReporter struct {
 func NewHealthReporter(options HealthReporterOptions) *HealthReporter {
 	probe := options.Probe
 	if probe == nil {
-		// 未注入探测器时回落到默认 TCP 拨号探测。
-		probe = &tcpEndpointHealthProbe{}
+		// 未注入探测器时回落到默认多协议探测。
+		probe = &defaultEndpointHealthProbe{}
 	}
 	nowFunc := options.Now
 	if nowFunc == nil {
@@ -73,6 +78,7 @@ func (reporter *HealthReporter) BuildServiceReport(
 	}
 
 	checkTime := reporter.now().UTC()
+	probeMode := resolveServiceProbeMode(normalizedService)
 	return adapter.ToHealthReport(
 		normalizedService.ServiceID,
 		normalizedService.ServiceKey,
@@ -80,7 +86,7 @@ func (reporter *HealthReporter) BuildServiceReport(
 		checkTime,
 		"agent.endpoint_probe",
 		map[string]string{
-			"probe_mode": "tcp_dial",
+			"probe_mode": probeMode,
 		},
 	)
 }
@@ -100,28 +106,38 @@ func (reporter *HealthReporter) BuildReports(
 	return reports
 }
 
-// tcpEndpointHealthProbe 使用 TCP 拨号判断 endpoint 可达性。
-type tcpEndpointHealthProbe struct{}
+// defaultEndpointHealthProbe 按服务探测模式执行健康检查。
+type defaultEndpointHealthProbe struct{}
 
 // Probe 执行单 endpoint 可达性探测。
-func (probe *tcpEndpointHealthProbe) Probe(
+func (probe *defaultEndpointHealthProbe) Probe(
 	ctx context.Context,
 	service adapter.LocalRegistration,
 	endpoint pb.ServiceEndpoint,
 ) (pb.HealthStatus, string) {
 	_ = probe
-	_ = service
+	mode := resolveServiceProbeMode(service)
+	if mode == "http" || mode == "https" {
+		return probe.probeHTTPEndpoint(ctx, service, endpoint, mode)
+	}
+	return probe.probeTCPEndpoint(ctx, service, endpoint)
+}
+
+// probeTCPEndpoint 使用 TCP 拨号判断 endpoint 可达性。
+func (probe *defaultEndpointHealthProbe) probeTCPEndpoint(
+	ctx context.Context,
+	service adapter.LocalRegistration,
+	endpoint pb.ServiceEndpoint,
+) (pb.HealthStatus, string) {
+	_ = probe
 	normalizedContext := ctx
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
-	dialTimeout := defaultEndpointProbeTimeout
-	if endpoint.DialTimeoutMS > 0 {
-		dialTimeout = time.Duration(endpoint.DialTimeoutMS) * time.Millisecond
-	}
-	if _, hasDeadline := normalizedContext.Deadline(); !hasDeadline {
+	probeTimeout := resolveProbeTimeout(service, endpoint)
+	if _, hasDeadline := normalizedContext.Deadline(); !hasDeadline && probeTimeout > 0 {
 		var cancel context.CancelFunc
-		normalizedContext, cancel = context.WithTimeout(normalizedContext, dialTimeout)
+		normalizedContext, cancel = context.WithTimeout(normalizedContext, probeTimeout)
 		defer cancel()
 	}
 	endpointAddress, addressErr := endpointAddress(endpoint)
@@ -134,6 +150,115 @@ func (probe *tcpEndpointHealthProbe) Probe(
 	}
 	_ = connection.Close()
 	return pb.HealthStatusHealthy, "dial ok"
+}
+
+// probeHTTPEndpoint 使用 HEAD 探测 HTTP/HTTPS endpoint。
+func (probe *defaultEndpointHealthProbe) probeHTTPEndpoint(
+	ctx context.Context,
+	service adapter.LocalRegistration,
+	endpoint pb.ServiceEndpoint,
+	scheme string,
+) (pb.HealthStatus, string) {
+	_ = probe
+	normalizedContext := ctx
+	if normalizedContext == nil {
+		normalizedContext = context.Background()
+	}
+	probeTimeout := resolveProbeTimeout(service, endpoint)
+	if _, hasDeadline := normalizedContext.Deadline(); !hasDeadline && probeTimeout > 0 {
+		var cancel context.CancelFunc
+		normalizedContext, cancel = context.WithTimeout(normalizedContext, probeTimeout)
+		defer cancel()
+	}
+	endpointAddress, addressErr := endpointAddress(endpoint)
+	if addressErr != nil {
+		return pb.HealthStatusUnhealthy, addressErr.Error()
+	}
+	probeURL := (&url.URL{
+		Scheme: scheme,
+		Host:   endpointAddress,
+		Path:   normalizeHealthCheckPath(service.HealthCheck.Endpoint),
+	}).String()
+	request, requestErr := http.NewRequestWithContext(normalizedContext, http.MethodHead, probeURL, nil)
+	if requestErr != nil {
+		return pb.HealthStatusUnhealthy, fmt.Sprintf("build head request failed: %v", requestErr)
+	}
+	probeClient := newHTTPProbeClient(scheme, endpoint)
+	if probeTransport, ok := probeClient.Transport.(*http.Transport); ok && probeTransport != nil {
+		defer probeTransport.CloseIdleConnections()
+	}
+	response, requestErr := probeClient.Do(request)
+	if requestErr != nil {
+		return pb.HealthStatusUnhealthy, fmt.Sprintf("head request failed: %v", requestErr)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode >= 200 && response.StatusCode < 500 {
+		return pb.HealthStatusHealthy, fmt.Sprintf("head status=%d", response.StatusCode)
+	}
+	return pb.HealthStatusUnhealthy, fmt.Sprintf("head status=%d", response.StatusCode)
+}
+
+// newHTTPProbeClient 构建 HTTP/HTTPS 探测客户端，并在 HTTPS 时透传 endpoint SNI。
+func newHTTPProbeClient(scheme string, endpoint pb.ServiceEndpoint) *http.Client {
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || defaultTransport == nil {
+		return &http.Client{}
+	}
+	transport := defaultTransport.Clone()
+	if strings.EqualFold(strings.TrimSpace(scheme), "https") {
+		if serverName := strings.TrimSpace(endpoint.ServerName); serverName != "" {
+			tlsConfig := transport.TLSClientConfig
+			if tlsConfig != nil {
+				tlsConfig = tlsConfig.Clone()
+			} else {
+				tlsConfig = &tls.Config{}
+			}
+			tlsConfig.ServerName = serverName
+			transport.TLSClientConfig = tlsConfig
+		}
+	}
+	return &http.Client{Transport: transport}
+}
+
+// resolveServiceProbeMode 解析服务健康探测模式。
+func resolveServiceProbeMode(service adapter.LocalRegistration) string {
+	if mode := strings.ToLower(strings.TrimSpace(service.HealthCheck.Type)); mode != "" {
+		switch mode {
+		case "tcp", "http", "https":
+			return mode
+		}
+	}
+	normalizedServiceType := strings.ToLower(strings.TrimSpace(service.ServiceType))
+	switch normalizedServiceType {
+	case "http", "https":
+		return normalizedServiceType
+	default:
+		return "tcp"
+	}
+}
+
+// normalizeHealthCheckPath 归一化 HTTP/HTTPS 探测路径。
+func normalizeHealthCheckPath(path string) string {
+	normalizedPath := strings.TrimSpace(path)
+	if normalizedPath == "" {
+		return defaultHTTPHealthCheckPath
+	}
+	if !strings.HasPrefix(normalizedPath, "/") {
+		return "/" + normalizedPath
+	}
+	return normalizedPath
+}
+
+// resolveProbeTimeout 解析探测超时时间，优先使用 health_check.timeout_sec。
+func resolveProbeTimeout(service adapter.LocalRegistration, endpoint pb.ServiceEndpoint) time.Duration {
+	if service.HealthCheck.TimeoutSec > 0 {
+		return time.Duration(service.HealthCheck.TimeoutSec) * time.Second
+	}
+	if endpoint.DialTimeoutMS > 0 {
+		return time.Duration(endpoint.DialTimeoutMS) * time.Millisecond
+	}
+	return defaultEndpointProbeTimeout
 }
 
 // endpointAddress 组装 endpoint 探测地址。

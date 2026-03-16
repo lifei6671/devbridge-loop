@@ -93,6 +93,36 @@ func (probe *runtimeBridgeTestHealthProbe) Probe(
 	return probe.result, "stub"
 }
 
+type runtimeBridgeBlockingHealthProbe struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (probe *runtimeBridgeBlockingHealthProbe) Probe(
+	ctx context.Context,
+	_ adapter.LocalRegistration,
+	_ pb.ServiceEndpoint,
+) (pb.HealthStatus, string) {
+	if probe == nil {
+		return pb.HealthStatusUnknown, "probe is nil"
+	}
+	if probe.started != nil {
+		select {
+		case <-probe.started:
+		default:
+			close(probe.started)
+		}
+	}
+	if probe.release != nil {
+		select {
+		case <-probe.release:
+		case <-ctx.Done():
+			return pb.HealthStatusUnknown, "probe canceled"
+		}
+	}
+	return pb.HealthStatusHealthy, "released"
+}
+
 type testRefillScheduler struct {
 	snapshot   tunnel.Snapshot
 	lastTarget int
@@ -700,6 +730,225 @@ func TestAddOrUpdateServiceSyncsDuringSessionWarmup(testingObject *testing.T) {
 			secondEnvelope.MessageType,
 			pb.ControlMessagePublishService,
 		)
+	}
+}
+
+// TestAddOrUpdateServiceUsesDefaultHealthCheckConfig 验证 service.add 默认健康检查参数生效。
+func TestAddOrUpdateServiceUsesDefaultHealthCheckConfig(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		serviceCatalog: service.NewCatalog(),
+	}
+	addedPayload, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		ServiceID:   "svc-default-health",
+		ServiceName: "payment-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		Protocol:    "http",
+		Host:        "127.0.0.1",
+		Port:        18090,
+	})
+	if err != nil {
+		testingObject.Fatalf("add or update service failed: %v", err)
+	}
+	if addedPayload["health_check_mode"] != "http" {
+		testingObject.Fatalf("unexpected default health_check_mode: %+v", addedPayload["health_check_mode"])
+	}
+	if addedPayload["health_check_interval_sec"] != uint32(defaultServiceHealthCheckIntervalSec) {
+		testingObject.Fatalf(
+			"unexpected default health_check_interval_sec: %+v",
+			addedPayload["health_check_interval_sec"],
+		)
+	}
+	if addedPayload["health_check_path"] != "/" {
+		testingObject.Fatalf("unexpected default health_check_path: %+v", addedPayload["health_check_path"])
+	}
+	records := runtime.serviceCatalog.List()
+	if len(records) != 1 {
+		testingObject.Fatalf("unexpected service catalog count: got=%d want=1", len(records))
+	}
+	if records[0].Registration.HealthCheck.Type != "http" {
+		testingObject.Fatalf("unexpected catalog health_check.type: %+v", records[0].Registration.HealthCheck.Type)
+	}
+	if records[0].Registration.HealthCheck.IntervalSec != uint32(defaultServiceHealthCheckIntervalSec) {
+		testingObject.Fatalf(
+			"unexpected catalog health_check.interval_sec: %+v",
+			records[0].Registration.HealthCheck.IntervalSec,
+		)
+	}
+	if records[0].Registration.HealthCheck.Endpoint != "/" {
+		testingObject.Fatalf("unexpected catalog health_check.endpoint: %+v", records[0].Registration.HealthCheck.Endpoint)
+	}
+}
+
+// TestAddOrUpdateServiceValidatesHealthCheckMode 验证非法探测模式会被拒绝。
+func TestAddOrUpdateServiceValidatesHealthCheckMode(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		serviceCatalog: service.NewCatalog(),
+	}
+	_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		ServiceID:              "svc-invalid-mode",
+		ServiceName:            "payment-service",
+		Namespace:              "dev",
+		Environment:            "demo",
+		Protocol:               "http",
+		Host:                   "127.0.0.1",
+		Port:                   18090,
+		HealthCheckMode:        "grpc",
+		HealthCheckPath:        "/healthz",
+		HealthCheckIntervalSec: 10,
+	})
+	if err == nil {
+		testingObject.Fatalf("expected add service to reject invalid health_check_mode")
+	}
+	if !strings.Contains(err.Error(), "invalid health_check_mode") {
+		testingObject.Fatalf("unexpected error for invalid health_check_mode: %v", err)
+	}
+}
+
+// TestReportCatalogHealthByIntervalRespectsServiceInterval 验证仅到期服务会触发健康上报。
+func TestReportCatalogHealthByIntervalRespectsServiceInterval(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	controlChannel := newTestPrioritizedControlChannel()
+	serviceCatalog := service.NewCatalog()
+	now := time.Now().UTC()
+	serviceCatalog.Upsert(now.Add(-40*time.Second), adapter.LocalRegistration{
+		ServiceID:   "svc-due",
+		ServiceKey:  "dev/demo/svc-due",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "svc-due",
+		ServiceType: "tcp",
+		HealthCheck: pb.HealthCheckConfig{
+			Type:        "tcp",
+			IntervalSec: 30,
+		},
+		Endpoints: []pb.ServiceEndpoint{
+			{EndpointID: "ep-due", Protocol: "tcp", Host: "127.0.0.1", Port: 19001},
+		},
+	})
+	serviceCatalog.Upsert(now.Add(-5*time.Second), adapter.LocalRegistration{
+		ServiceID:   "svc-not-due",
+		ServiceKey:  "dev/demo/svc-not-due",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "svc-not-due",
+		ServiceType: "tcp",
+		HealthCheck: pb.HealthCheckConfig{
+			Type:        "tcp",
+			IntervalSec: 30,
+		},
+		Endpoints: []pb.ServiceEndpoint{
+			{EndpointID: "ep-not-due", Protocol: "tcp", Host: "127.0.0.1", Port: 19002},
+		},
+	})
+	runtime := &Runtime{
+		controlChannel:   controlChannel,
+		controlPublisher: control.NewPublisher("session-health-loop", 5, 0),
+		serviceCatalog:   serviceCatalog,
+		healthReporter: control.NewHealthReporter(control.HealthReporterOptions{
+			Probe: &runtimeBridgeTestHealthProbe{result: pb.HealthStatusHealthy},
+		}),
+	}
+
+	if err := runtime.reportCatalogHealthByInterval(context.Background()); err != nil {
+		testingObject.Fatalf("report catalog health by interval failed: %v", err)
+	}
+	frames := controlChannel.Frames()
+	if len(frames) != 1 {
+		testingObject.Fatalf("unexpected health report frame count: got=%d want=1", len(frames))
+	}
+	envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
+	if err != nil {
+		testingObject.Fatalf("decode health report frame failed: %v", err)
+	}
+	var healthReport pb.ServiceHealthReport
+	if err := json.Unmarshal(envelope.Payload, &healthReport); err != nil {
+		testingObject.Fatalf("unmarshal health report payload failed: %v", err)
+	}
+	if healthReport.ServiceID != "svc-due" {
+		testingObject.Fatalf("unexpected due service reported: %+v", healthReport.ServiceID)
+	}
+
+	if err := runtime.reportCatalogHealthByInterval(context.Background()); err != nil {
+		testingObject.Fatalf("second report catalog health by interval failed: %v", err)
+	}
+	frames = controlChannel.Frames()
+	if len(frames) != 1 {
+		testingObject.Fatalf("unexpected frame count after second due scan: got=%d want=1", len(frames))
+	}
+}
+
+// TestWaitForActiveExitKeepsCommandResponsiveDuringHealthScan 验证健康扫描不会阻塞命令处理。
+func TestWaitForActiveExitKeepsCommandResponsiveDuringHealthScan(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	probeStarted := make(chan struct{})
+	probeRelease := make(chan struct{})
+	defer close(probeRelease)
+
+	serviceCatalog := service.NewCatalog()
+	serviceCatalog.Upsert(time.Now().UTC().Add(-2*time.Minute), adapter.LocalRegistration{
+		ServiceID:   "svc-blocking-scan",
+		ServiceKey:  "dev/demo/svc-blocking-scan",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "svc-blocking-scan",
+		ServiceType: "tcp",
+		HealthCheck: pb.HealthCheckConfig{
+			Type:        "tcp",
+			IntervalSec: 1,
+		},
+		Endpoints: []pb.ServiceEndpoint{
+			{EndpointID: "ep-blocking-scan", Protocol: "tcp", Host: "127.0.0.1", Port: 19011},
+		},
+	})
+
+	runtime := &Runtime{
+		cfg:               DefaultConfig(),
+		bridgeCommandChan: make(chan bridgeCommand, 1),
+		controlChannel:    newTestPrioritizedControlChannel(),
+		controlPublisher:  control.NewPublisher("session-active-exit", 6, 0),
+		serviceCatalog:    serviceCatalog,
+		healthReporter: control.NewHealthReporter(control.HealthReporterOptions{
+			Probe: &runtimeBridgeBlockingHealthProbe{
+				started: probeStarted,
+				release: probeRelease,
+			},
+		}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultChan := make(chan activeExitResult, 1)
+	go func() {
+		resultChan <- runtime.waitForActiveExit(ctx)
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		testingObject.Fatalf("health scan did not start in time")
+	}
+
+	runtime.bridgeCommandChan <- bridgeCommand{
+		kind:         bridgeCommandReconnect,
+		resetBackoff: true,
+	}
+	select {
+	case result := <-resultChan:
+		if result.reason != activeExitReconnect {
+			testingObject.Fatalf("unexpected active exit reason: got=%d want=%d", result.reason, activeExitReconnect)
+		}
+		if !result.resetBackoff {
+			testingObject.Fatalf("expected reconnect to reset backoff")
+		}
+	case <-time.After(300 * time.Millisecond):
+		testingObject.Fatalf("reconnect command blocked by health scan")
 	}
 }
 

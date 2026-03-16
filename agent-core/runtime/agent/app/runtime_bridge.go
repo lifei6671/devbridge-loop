@@ -40,6 +40,9 @@ const (
 	bridgeRetryInitialBackoff = time.Second
 	bridgeRetryMaxBackoff     = 8 * time.Second
 	bridgeRetryJitterRatio    = 0.2
+
+	defaultServiceHealthCheckIntervalSec = 30
+	serviceHealthCheckScanInterval       = time.Second
 )
 
 type bridgeCommandKind string
@@ -85,15 +88,18 @@ type runtimeSessionSnapshot struct {
 }
 
 type runtimeServiceAddInput struct {
-	ServiceID   string
-	ServiceKey  string
-	Namespace   string
-	Environment string
-	ServiceName string
-	Protocol    string
-	Host        string
-	Port        uint32
-	SNIName     string
+	ServiceID              string
+	ServiceKey             string
+	Namespace              string
+	Environment            string
+	ServiceName            string
+	Protocol               string
+	Host                   string
+	Port                   uint32
+	SNIName                string
+	HealthCheckIntervalSec uint32
+	HealthCheckMode        string
+	HealthCheckPath        string
 }
 
 type runtimeServiceDeleteInput struct {
@@ -1406,35 +1412,66 @@ func (r *Runtime) reportCatalogHealth(ctx context.Context) error {
 	for _, record := range records {
 		localServices = append(localServices, record.Registration)
 	}
-	healthReports := r.healthReporter.BuildReports(ctx, localServices)
-	now := time.Now().UTC()
-	for _, healthReport := range healthReports {
-		resourceID := strings.TrimSpace(healthReport.ServiceID)
-		if resourceID == "" {
-			resourceID = strings.TrimSpace(healthReport.ServiceKey)
+	for _, localService := range localServices {
+		if err := r.publishServiceHealthReport(ctx, localService); err != nil {
+			return err
 		}
-		envelope, err := r.controlPublisher.Publish(
-			ctx,
-			pb.ControlMessageServiceHealthReport,
-			"service",
-			resourceID,
-			healthReport,
-		)
-		if err != nil {
-			return fmt.Errorf("build service health envelope failed: %w", err)
-		}
-		if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
-			return fmt.Errorf("send service health failed: %w", err)
-		}
-		// 上报成功后回写本地健康快照，供 UI 与诊断直接读取。
-		r.serviceCatalog.UpdateHealth(
-			now,
-			healthReport.ServiceID,
-			healthReport.ServiceKey,
-			healthReport.ServiceHealthStatus,
-			healthReport.EndpointStatuses,
-		)
 	}
+	return nil
+}
+
+// reportCatalogHealthByInterval 仅上报到达周期的服务健康状态。
+func (r *Runtime) reportCatalogHealthByInterval(ctx context.Context) error {
+	if r == nil || r.serviceCatalog == nil || r.controlPublisher == nil || r.healthReporter == nil {
+		return nil
+	}
+	records := r.serviceCatalog.List()
+	if len(records) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	for _, record := range records {
+		interval := serviceHealthCheckInterval(record.Registration)
+		if !record.UpdatedAt.IsZero() && now.Before(record.UpdatedAt.Add(interval)) {
+			continue
+		}
+		if err := r.publishServiceHealthReport(ctx, record.Registration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) publishServiceHealthReport(ctx context.Context, localService adapter.LocalRegistration) error {
+	if r == nil || r.controlPublisher == nil || r.healthReporter == nil {
+		return nil
+	}
+	healthReport := r.healthReporter.BuildServiceReport(ctx, localService)
+	resourceID := strings.TrimSpace(healthReport.ServiceID)
+	if resourceID == "" {
+		resourceID = strings.TrimSpace(healthReport.ServiceKey)
+	}
+	envelope, err := r.controlPublisher.Publish(
+		ctx,
+		pb.ControlMessageServiceHealthReport,
+		"service",
+		resourceID,
+		healthReport,
+	)
+	if err != nil {
+		return fmt.Errorf("build service health envelope failed: %w", err)
+	}
+	if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
+		return fmt.Errorf("send service health failed: %w", err)
+	}
+	// 上报成功后回写本地健康快照，供 UI 与诊断直接读取。
+	r.serviceCatalog.UpdateHealth(
+		time.Now().UTC(),
+		healthReport.ServiceID,
+		healthReport.ServiceKey,
+		healthReport.ServiceHealthStatus,
+		healthReport.EndpointStatuses,
+	)
 	return nil
 }
 
@@ -1691,6 +1728,10 @@ func (r *Runtime) waitForActiveExit(ctx context.Context) activeExitResult {
 	}
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
+	serviceHealthTicker := time.NewTicker(serviceHealthCheckScanInterval)
+	defer serviceHealthTicker.Stop()
+	serviceHealthScanPermit := make(chan struct{}, 1)
+	serviceHealthScanPermit <- struct{}{}
 
 	missedPongCount := uint32(0)
 	awaitingPong := false
@@ -1728,6 +1769,20 @@ func (r *Runtime) waitForActiveExit(ctx context.Context) activeExitResult {
 				return activeExitResult{reason: activeExitLost, err: err}
 			}
 			awaitingPong = true
+		case <-serviceHealthTicker.C:
+			select {
+			case <-serviceHealthScanPermit:
+				// 健康扫描改为异步串行执行，避免阻塞保活帧收发与控制命令处理。
+				go func(scanContext context.Context) {
+					defer func() {
+						serviceHealthScanPermit <- struct{}{}
+					}()
+					// 周期健康检查采用 best-effort，失败由后续周期继续纠偏。
+					_ = r.reportCatalogHealthByInterval(scanContext)
+				}(ctx)
+			default:
+				// 上一轮尚未完成时跳过当前 tick，避免堆积后台扫描。
+			}
 		case frame := <-readFrameChan:
 			r.touchBridgeHeartbeat()
 			switch frame.Type {
@@ -1898,6 +1953,68 @@ func (r *Runtime) sessionSnapshotPayload() map[string]any {
 	}
 }
 
+func resolveDefaultHealthCheckModeByProtocol(protocol string) string {
+	normalizedProtocol := strings.ToLower(strings.TrimSpace(protocol))
+	switch normalizedProtocol {
+	case "http", "https":
+		return normalizedProtocol
+	default:
+		return "tcp"
+	}
+}
+
+func normalizeServiceHealthCheckPath(path string) string {
+	normalizedPath := strings.TrimSpace(path)
+	if normalizedPath == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(normalizedPath, "/") {
+		return "/" + normalizedPath
+	}
+	return normalizedPath
+}
+
+func normalizeServiceHealthCheckConfig(
+	serviceProtocol string,
+	intervalSec uint32,
+	mode string,
+	path string,
+) (pb.HealthCheckConfig, error) {
+	normalizedMode := strings.ToLower(strings.TrimSpace(mode))
+	if normalizedMode == "" {
+		normalizedMode = resolveDefaultHealthCheckModeByProtocol(serviceProtocol)
+	}
+	switch normalizedMode {
+	case "tcp", "http", "https":
+	default:
+		return pb.HealthCheckConfig{}, fmt.Errorf("invalid health_check_mode=%s", strings.TrimSpace(mode))
+	}
+
+	normalizedIntervalSec := intervalSec
+	if normalizedIntervalSec == 0 {
+		normalizedIntervalSec = defaultServiceHealthCheckIntervalSec
+	}
+
+	normalizedPath := ""
+	if normalizedMode == "http" || normalizedMode == "https" {
+		normalizedPath = normalizeServiceHealthCheckPath(path)
+	}
+
+	return pb.HealthCheckConfig{
+		Type:        normalizedMode,
+		Endpoint:    normalizedPath,
+		IntervalSec: normalizedIntervalSec,
+	}, nil
+}
+
+func serviceHealthCheckInterval(registration adapter.LocalRegistration) time.Duration {
+	intervalSec := registration.HealthCheck.IntervalSec
+	if intervalSec == 0 {
+		intervalSec = defaultServiceHealthCheckIntervalSec
+	}
+	return time.Duration(intervalSec) * time.Second
+}
+
 // 新增或更新本地服务目录项，并在会话 ACTIVE 时尽力同步控制面。
 func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]any, error) {
 	if r == nil || r.serviceCatalog == nil {
@@ -1935,6 +2052,15 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 			normalizedServiceName,
 		)
 	}
+	healthCheckConfig, err := normalizeServiceHealthCheckConfig(
+		normalizedProtocol,
+		input.HealthCheckIntervalSec,
+		input.HealthCheckMode,
+		input.HealthCheckPath,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	record := r.serviceCatalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
 		ServiceID:   strings.TrimSpace(input.ServiceID),
@@ -1943,6 +2069,7 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		Environment: normalizedEnvironment,
 		ServiceName: normalizedServiceName,
 		ServiceType: normalizedProtocol,
+		HealthCheck: healthCheckConfig,
 		Endpoints: []pb.ServiceEndpoint{
 			{
 				EndpointID: fmt.Sprintf("%s-%s-%d", normalizedServiceName, normalizedHost, input.Port),
@@ -1973,19 +2100,22 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		updatedAtMS = uint64(record.UpdatedAt.UTC().UnixMilli())
 	}
 	return map[string]any{
-		"accepted":       true,
-		"service_id":     record.Registration.ServiceID,
-		"service_name":   record.Registration.ServiceName,
-		"service_key":    record.Registration.ServiceKey,
-		"namespace":      record.Registration.Namespace,
-		"environment":    record.Registration.Environment,
-		"protocol":       normalizedProtocol,
-		"host":           normalizedHost,
-		"port":           input.Port,
-		"sni_name":       normalizedSNIName,
-		"endpoint_count": len(record.Registration.Endpoints),
-		"updated_at_ms":  updatedAtMS,
-		"source":         "agent.runtime",
+		"accepted":                  true,
+		"service_id":                record.Registration.ServiceID,
+		"service_name":              record.Registration.ServiceName,
+		"service_key":               record.Registration.ServiceKey,
+		"namespace":                 record.Registration.Namespace,
+		"environment":               record.Registration.Environment,
+		"protocol":                  normalizedProtocol,
+		"host":                      normalizedHost,
+		"port":                      input.Port,
+		"sni_name":                  normalizedSNIName,
+		"health_check_mode":         record.Registration.HealthCheck.Type,
+		"health_check_interval_sec": record.Registration.HealthCheck.IntervalSec,
+		"health_check_path":         record.Registration.HealthCheck.Endpoint,
+		"endpoint_count":            len(record.Registration.Endpoints),
+		"updated_at_ms":             updatedAtMS,
+		"source":                    "agent.runtime",
 	}, nil
 }
 
@@ -2262,20 +2392,23 @@ func (r *Runtime) serviceListPayload() map[string]any {
 			})
 		}
 		items = append(items, map[string]any{
-			"service_id":       record.Registration.ServiceID,
-			"service_key":      record.Registration.ServiceKey,
-			"namespace":        record.Registration.Namespace,
-			"environment":      record.Registration.Environment,
-			"service_name":     record.Registration.ServiceName,
-			"service_type":     record.Registration.ServiceType,
-			"protocol":         record.Registration.ServiceType,
-			"status":           string(pb.ServiceStatusActive),
-			"health_status":    string(record.HealthStatus),
-			"endpoints":        endpointsPayload,
-			"sni_name":         primarySNIName,
-			"endpoint_count":   len(record.Registration.Endpoints),
-			"resource_version": uint64(0),
-			"updated_at_ms":    updatedAtMS,
+			"service_id":                record.Registration.ServiceID,
+			"service_key":               record.Registration.ServiceKey,
+			"namespace":                 record.Registration.Namespace,
+			"environment":               record.Registration.Environment,
+			"service_name":              record.Registration.ServiceName,
+			"service_type":              record.Registration.ServiceType,
+			"protocol":                  record.Registration.ServiceType,
+			"health_check_mode":         record.Registration.HealthCheck.Type,
+			"health_check_interval_sec": record.Registration.HealthCheck.IntervalSec,
+			"health_check_path":         record.Registration.HealthCheck.Endpoint,
+			"status":                    string(pb.ServiceStatusActive),
+			"health_status":             string(record.HealthStatus),
+			"endpoints":                 endpointsPayload,
+			"sni_name":                  primarySNIName,
+			"endpoint_count":            len(record.Registration.Endpoints),
+			"resource_version":          uint64(0),
+			"updated_at_ms":             updatedAtMS,
 		})
 	}
 	return map[string]any{

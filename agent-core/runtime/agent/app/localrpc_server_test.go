@@ -137,7 +137,10 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 			"protocol":"http",
 			"host":"127.0.0.1",
 			"port":18080,
-			"sni_name":"order.dev.example.com"
+			"sni_name":"order.dev.example.com",
+			"health_check_interval_sec":15,
+			"health_check_mode":"http",
+			"health_check_path":"healthz"
 		}`),
 	}, &localRPCConnectionAuthState{authenticated: true})
 	if failure != nil {
@@ -167,6 +170,15 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 	}
 	if services[0]["sni_name"] != "order.dev.example.com" {
 		testingObject.Fatalf("unexpected sni_name: %+v", services[0]["sni_name"])
+	}
+	if services[0]["health_check_mode"] != "http" {
+		testingObject.Fatalf("unexpected health_check_mode: %+v", services[0]["health_check_mode"])
+	}
+	if services[0]["health_check_interval_sec"] != uint32(15) {
+		testingObject.Fatalf("unexpected health_check_interval_sec: %+v", services[0]["health_check_interval_sec"])
+	}
+	if services[0]["health_check_path"] != "/healthz" {
+		testingObject.Fatalf("unexpected health_check_path: %+v", services[0]["health_check_path"])
 	}
 }
 

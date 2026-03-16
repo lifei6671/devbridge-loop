@@ -87,15 +87,18 @@ type localRPCAuthCompletePayload struct {
 }
 
 type localRPCServiceAddPayload struct {
-	ServiceID   string `json:"service_id"`
-	ServiceKey  string `json:"service_key"`
-	Namespace   string `json:"namespace"`
-	Environment string `json:"environment"`
-	ServiceName string `json:"service_name"`
-	Protocol    string `json:"protocol"`
-	Host        string `json:"host"`
-	Port        uint32 `json:"port"`
-	SNIName     string `json:"sni_name"`
+	ServiceID              string `json:"service_id"`
+	ServiceKey             string `json:"service_key"`
+	Namespace              string `json:"namespace"`
+	Environment            string `json:"environment"`
+	ServiceName            string `json:"service_name"`
+	Protocol               string `json:"protocol"`
+	Host                   string `json:"host"`
+	Port                   uint32 `json:"port"`
+	SNIName                string `json:"sni_name"`
+	HealthCheckIntervalSec uint32 `json:"health_check_interval_sec"`
+	HealthCheckMode        string `json:"health_check_mode"`
+	HealthCheckPath        string `json:"health_check_path"`
 }
 
 type localRPCServiceDeletePayload struct {
@@ -432,15 +435,18 @@ func (server *localRPCServer) dispatchRequest(
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.add payload"}
 		}
 		addedPayload, addErr := server.runtime.addOrUpdateService(runtimeServiceAddInput{
-			ServiceID:   servicePayload.ServiceID,
-			ServiceKey:  servicePayload.ServiceKey,
-			Namespace:   servicePayload.Namespace,
-			Environment: servicePayload.Environment,
-			ServiceName: servicePayload.ServiceName,
-			Protocol:    servicePayload.Protocol,
-			Host:        servicePayload.Host,
-			Port:        servicePayload.Port,
-			SNIName:     servicePayload.SNIName,
+			ServiceID:              servicePayload.ServiceID,
+			ServiceKey:             servicePayload.ServiceKey,
+			Namespace:              servicePayload.Namespace,
+			Environment:            servicePayload.Environment,
+			ServiceName:            servicePayload.ServiceName,
+			Protocol:               servicePayload.Protocol,
+			Host:                   servicePayload.Host,
+			Port:                   servicePayload.Port,
+			SNIName:                servicePayload.SNIName,
+			HealthCheckIntervalSec: servicePayload.HealthCheckIntervalSec,
+			HealthCheckMode:        servicePayload.HealthCheckMode,
+			HealthCheckPath:        servicePayload.HealthCheckPath,
 		})
 		if addErr != nil {
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: addErr.Error()}
