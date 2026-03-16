@@ -34,6 +34,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Modal } from "@/components/ui/modal";
 import { Toaster } from "@/components/ui/sonner";
 import { useSystemResources } from "@/features/system/use_system_resources";
 import { bytesPerSecToMiB, formatBytesToGiB } from "@/features/traffic/format";
@@ -1119,7 +1120,7 @@ export default function App(): JSX.Element {
   const [tunnelItems, setTunnelItems] = useState<TunnelListItem[]>([]);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const [closeActionLoading, setCloseActionLoading] = useState(false);
-  const [serviceCreateExpanded, setServiceCreateExpanded] = useState(false);
+  const [serviceFormOpen, setServiceFormOpen] = useState(false);
   const [serviceFormMode, setServiceFormMode] = useState<"create" | "edit">("create");
   const [serviceEditingID, setServiceEditingID] = useState<string | null>(null);
   const [creatingService, setCreatingService] = useState(false);
@@ -1989,7 +1990,7 @@ export default function App(): JSX.Element {
   }, [hostConfig, notify, refreshHostLogs, settingsDraft]);
 
   const closeServiceForm = useCallback(() => {
-    setServiceCreateExpanded(false);
+    setServiceFormOpen(false);
     setServiceFormMode("create");
     setServiceEditingID(null);
     setServiceCreateDraft(DEFAULT_SERVICE_CREATE_DRAFT);
@@ -1999,7 +2000,7 @@ export default function App(): JSX.Element {
     setServiceFormMode("create");
     setServiceEditingID(null);
     setServiceCreateDraft(DEFAULT_SERVICE_CREATE_DRAFT);
-    setServiceCreateExpanded(true);
+    setServiceFormOpen(true);
   }, []);
 
   const openEditServiceForm = useCallback((item: ServiceListItem) => {
@@ -2015,8 +2016,14 @@ export default function App(): JSX.Element {
       portText: String(item.port > 0 ? item.port : 8080),
       sniName: item.sni_name || "",
     });
-    setServiceCreateExpanded(true);
+    setServiceFormOpen(true);
   }, []);
+
+  const handleServiceFormOpenChange = useCallback((nextOpen: boolean) => {
+    if (!nextOpen && !creatingService) {
+      closeServiceForm();
+    }
+  }, [closeServiceForm, creatingService]);
 
   const submitServiceForm = useCallback(async () => {
     const serviceName = serviceCreateDraft.serviceName.trim();
@@ -2116,139 +2123,12 @@ export default function App(): JSX.Element {
         </div>
         <Button
           className="h-9 rounded-lg bg-[#1f67e5] px-4 text-sm font-semibold hover:bg-[#1a58c7]"
-          onClick={() => {
-            if (serviceCreateExpanded) {
-              closeServiceForm();
-              return;
-            }
-            openCreateServiceForm();
-          }}
+          onClick={openCreateServiceForm}
         >
-          {serviceCreateExpanded ? "收起表单" : "+ 新增服务"}
+          + 新增服务
         </Button>
       </CardHeader>
       <CardContent className="p-0">
-        {serviceCreateExpanded ? (
-          <div className="border-y border-[#e5eaf4] bg-[#f8fbff] p-4">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <h4 className="text-sm font-semibold text-[#33415e]">
-                {serviceFormMode === "edit" ? "编辑服务" : "新增服务"}
-              </h4>
-              {serviceFormMode === "edit" && serviceEditingID ? (
-                <span className="rounded-md border border-[#d9e2f2] bg-white px-2 py-1 text-[11px] text-[#657391]">
-                  service_id: {serviceEditingID}
-                </span>
-              ) : null}
-            </div>
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <SettingsField label="服务名称" hint="必填">
-                <Input
-                  placeholder="例如 order-service"
-                  value={serviceCreateDraft.serviceName}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <SettingsField label="服务 ID" hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}>
-                <Input
-                  placeholder="例如 svc-order"
-                  value={serviceCreateDraft.serviceId}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                  disabled={serviceFormMode === "edit"}
-                />
-              </SettingsField>
-              <SettingsField label="命名空间" hint="默认 dev">
-                <Input
-                  placeholder="例如 dev"
-                  value={serviceCreateDraft.namespace}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <SettingsField label="环境" hint="默认 demo">
-                <Input
-                  placeholder="例如 demo"
-                  value={serviceCreateDraft.environment}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <SettingsField label="协议" hint="tcp / http / https">
-                <select
-                  value={serviceCreateDraft.protocol}
-                  className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
-                  }
-                >
-                  <option value="tcp">tcp</option>
-                  <option value="http">http</option>
-                  <option value="https">https</option>
-                </select>
-              </SettingsField>
-              <SettingsField label="主机地址" hint="如 127.0.0.1">
-                <Input
-                  placeholder="例如 127.0.0.1"
-                  value={serviceCreateDraft.host}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <SettingsField label="端口" hint="1 - 65535">
-                <Input
-                  placeholder="例如 8080"
-                  value={serviceCreateDraft.portText}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
-                  }
-                  inputMode="numeric"
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <SettingsField label="SNI (可选)" hint="用于 TLS SNI 转发">
-                <Input
-                  placeholder="例如 order.dev.example.com"
-                  value={serviceCreateDraft.sniName}
-                  onChange={(event) =>
-                    setServiceCreateDraft((prev) => ({ ...prev, sniName: event.target.value }))
-                  }
-                  className="h-9 rounded-lg bg-white"
-                />
-              </SettingsField>
-              <div className="flex items-end justify-end gap-2">
-                <Button
-                  variant="outline"
-                  className="h-9 rounded-lg text-xs"
-                  disabled={creatingService}
-                  onClick={closeServiceForm}
-                >
-                  取消
-                </Button>
-                <Button
-                  className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
-                  disabled={creatingService}
-                  onClick={() => void submitServiceForm()}
-                >
-                  {creatingService ? "提交中..." : serviceFormMode === "edit" ? "保存修改" : "提交新增"}
-                </Button>
-              </div>
-            </div>
-            <p className="mt-2 text-[11px] text-[#6b7892]">
-              服务保存后会立即写入本地服务目录，并在 Bridge 会话可用时自动尝试同步。
-            </p>
-          </div>
-        ) : null}
         <div className="overflow-x-auto">
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
@@ -2315,6 +2195,135 @@ export default function App(): JSX.Element {
         </div>
       </CardContent>
     </Card>
+  );
+
+  const renderServiceFormModal = (): JSX.Element => (
+    <Modal
+      open={serviceFormOpen}
+      onOpenChange={handleServiceFormOpenChange}
+      title={serviceFormMode === "edit" ? "编辑服务" : "新增服务"}
+      description="保存后会立即写入本地服务目录，并在 Bridge 会话可用时自动尝试同步。"
+      className="max-w-[860px]"
+    >
+      <div className="space-y-4">
+        {serviceFormMode === "edit" && serviceEditingID ? (
+          <div className="inline-flex rounded-md border border-[#d9e2f2] bg-[#f7faff] px-2.5 py-1 text-[11px] text-[#657391]">
+            service_id: {serviceEditingID}
+          </div>
+        ) : null}
+        <form
+          className="grid grid-cols-1 gap-3 md:grid-cols-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitServiceForm();
+          }}
+        >
+          <SettingsField label="服务名称" hint="必填">
+            <Input
+              placeholder="例如 order-service"
+              value={serviceCreateDraft.serviceName}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <SettingsField label="服务 ID" hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}>
+            <Input
+              placeholder="例如 svc-order"
+              value={serviceCreateDraft.serviceId}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+              disabled={serviceFormMode === "edit"}
+            />
+          </SettingsField>
+          <SettingsField label="命名空间" hint="默认 dev">
+            <Input
+              placeholder="例如 dev"
+              value={serviceCreateDraft.namespace}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <SettingsField label="环境" hint="默认 demo">
+            <Input
+              placeholder="例如 demo"
+              value={serviceCreateDraft.environment}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <SettingsField label="协议" hint="tcp / http / https">
+            <select
+              value={serviceCreateDraft.protocol}
+              className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
+              }
+            >
+              <option value="tcp">tcp</option>
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </SettingsField>
+          <SettingsField label="主机地址" hint="如 127.0.0.1">
+            <Input
+              placeholder="例如 127.0.0.1"
+              value={serviceCreateDraft.host}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <SettingsField label="端口" hint="1 - 65535">
+            <Input
+              placeholder="例如 8080"
+              value={serviceCreateDraft.portText}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
+              }
+              inputMode="numeric"
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <SettingsField label="SNI (可选)" hint="用于 TLS SNI 转发">
+            <Input
+              placeholder="例如 order.dev.example.com"
+              value={serviceCreateDraft.sniName}
+              onChange={(event) =>
+                setServiceCreateDraft((prev) => ({ ...prev, sniName: event.target.value }))
+              }
+              className="h-9 rounded-lg bg-white"
+            />
+          </SettingsField>
+          <div className="md:col-span-2 flex items-end justify-end gap-2 pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              className="h-9 rounded-lg text-xs"
+              disabled={creatingService}
+              onClick={closeServiceForm}
+            >
+              取消
+            </Button>
+            <Button
+              type="submit"
+              className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
+              disabled={creatingService}
+            >
+              {creatingService ? "提交中..." : serviceFormMode === "edit" ? "保存修改" : "提交新增"}
+            </Button>
+          </div>
+        </form>
+      </div>
+    </Modal>
   );
 
   const renderLogsCard = (): JSX.Element => (
@@ -3315,6 +3324,7 @@ export default function App(): JSX.Element {
           </section>
         </main>
       </div>
+      {renderServiceFormModal()}
       <AlertDialog
         open={closeConfirmOpen}
         onOpenChange={setCloseConfirmOpen}
