@@ -428,9 +428,15 @@ func (r *Runtime) handleTunnelRecyclePhase(
 		}
 		recycle := payload.Recycle
 		recycleTunnelID := strings.TrimSpace(recycle.TunnelID)
+		recycleAckTunnelID := normalizedTunnelID
 		if recycleTunnelID != "" && recycleTunnelID != normalizedTunnelID {
-			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "tunnel_mismatch", "recycle tunnel id mismatch")
-			return false, false, fmt.Errorf("recycle tunnel id mismatch: got=%s want=%s", recycleTunnelID, normalizedTunnelID)
+			if !isGRPCTrafficTunnelIO(tunnelIO) {
+				_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "tunnel_mismatch", "recycle tunnel id mismatch")
+				return false, false, fmt.Errorf("recycle tunnel id mismatch: got=%s want=%s", recycleTunnelID, normalizedTunnelID)
+			}
+			// grpc_h2 兼容路径：Bridge 侧可能使用 stream 本地 tunnel_id；
+			// 允许沿用对端 recycle tunnel_id 回 ACK，并仍使用本地 tunnel_id 驱动 Agent 状态机。
+			recycleAckTunnelID = recycleTunnelID
 		}
 		record, exists := r.tunnelManager.Get(normalizedTunnelID)
 		lastRecycleSeq := uint64(0)
@@ -438,14 +444,14 @@ func (r *Runtime) handleTunnelRecyclePhase(
 			lastRecycleSeq = record.LastRecycleSeq
 		}
 		if recycle.RecycleSeq == 0 || recycle.RecycleSeq <= lastRecycleSeq {
-			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "invalid_seq", "recycle seq not monotonic")
+			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, recycleAckTunnelID, recycle.RecycleSeq, false, "invalid_seq", "recycle seq not monotonic")
 			return false, false, fmt.Errorf("invalid recycle seq: got=%d last=%d", recycle.RecycleSeq, lastRecycleSeq)
 		}
 		if !closeAckObserved {
 			// 在部分时序下，close 可能已在 relay 阶段被消费，此处允许直接进入 recycle 以提升复用鲁棒性。
 			closeAckObserved = true
 		}
-		if err := r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, true, "", ""); err != nil {
+		if err := r.writeTunnelRecycleAck(waitContext, tunnelIO, recycleAckTunnelID, recycle.RecycleSeq, true, "", ""); err != nil {
 			return false, false, err
 		}
 		if recycle.IsFinal {
@@ -461,14 +467,21 @@ func (r *Runtime) handleTunnelRecyclePhase(
 }
 
 func shouldUseTrafficRecycleReadTimeout(tunnelIO traffic.TunnelIO) bool {
+	return !isGRPCTrafficTunnelIO(tunnelIO)
+}
+
+func isGRPCTrafficTunnelIO(tunnelIO traffic.TunnelIO) bool {
 	if tunnelIO == nil {
-		return true
+		return false
 	}
-	adapter, ok := tunnelIO.(*runtimeTrafficTunnel)
-	if !ok || adapter == nil || adapter.tunnel == nil {
-		return true
+	type bindingTypeAware interface {
+		BindingType() transport.BindingType
 	}
-	return shouldUseTrafficTunnelPollingDeadline(adapter.tunnel)
+	awareTunnelIO, ok := tunnelIO.(bindingTypeAware)
+	if !ok {
+		return false
+	}
+	return awareTunnelIO.BindingType() == transport.BindingTypeGRPCH2
 }
 
 func (r *Runtime) writeTunnelRecycleAck(
@@ -763,6 +776,14 @@ func (adapter *runtimeTrafficTunnel) ID() string {
 		return ""
 	}
 	return strings.TrimSpace(adapter.tunnel.ID())
+}
+
+// BindingType 返回底层 tunnel 的承载类型。
+func (adapter *runtimeTrafficTunnel) BindingType() transport.BindingType {
+	if adapter == nil || adapter.tunnel == nil {
+		return ""
+	}
+	return adapter.tunnel.BindingInfo().Type
 }
 
 // Close 关闭底层 tunnel。

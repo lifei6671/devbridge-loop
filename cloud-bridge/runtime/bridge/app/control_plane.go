@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
@@ -31,24 +30,15 @@ const (
 	defaultHeartbeatReplyTimeout = 2 * time.Second
 	// tcpConnectionClassifierReadTimeout 定义 TCP 入站连接类型判别的首包读取超时。
 	tcpConnectionClassifierReadTimeout = 2 * time.Second
-	// defaultIncomingTunnelIDPrefixTCP 定义 Bridge 侧 TCP 入站 tunnel_id 前缀。
-	defaultIncomingTunnelIDPrefixTCP = "tcp-bridge-tunnel"
 	// incomingTunnelProbeInterval 定义入站 tunnel 生命周期探测间隔，兜底处理远端静默断开。
 	incomingTunnelProbeInterval = 250 * time.Millisecond
 	// incomingTunnelProbeTimeout 定义单次探测超时时间，避免阻塞生命周期协程。
 	incomingTunnelProbeTimeout = 120 * time.Millisecond
-	// incomingTunnelDialAnnounceWait 定义入站 tunnel 等待 Agent 宣告/会话对账的窗口。
-	// gRPC tunnel 依赖该宣告对齐 tunnel_id；窗口过短会在控制面轻微抖动时误关可用 tunnel。
-	incomingTunnelDialAnnounceWait = 2 * time.Second
-	// incomingTunnelDialAnnounceTTL 定义宣告 tunnel_id 在队列中的最大保留时长。
-	incomingTunnelDialAnnounceTTL = 3 * time.Second
+	// incomingTunnelOwnerResolveWait 定义入站 tunnel 等待 owner 会话对账的窗口。
+	incomingTunnelOwnerResolveWait = 2 * time.Second
+	// incomingTCPTunnelHandshakeTimeout 定义 TCP 入站读取首帧 tunnel 握手超时。
+	incomingTCPTunnelHandshakeTimeout = 2 * time.Second
 )
-
-type announcedTunnelDialRuntime struct {
-	tunnelID      string
-	dialLocalAddr string
-	announcedAt   time.Time
-}
 
 // controlMessageDispatcher 负责把控制面业务帧分发给 Bridge 控制处理器。
 type controlMessageDispatcher struct {
@@ -62,9 +52,6 @@ type controlMessageDispatcher struct {
 	tunnelHandler         *bridgecontrol.TunnelReportHandler
 	routeHandler          *bridgecontrol.RouteHandler
 	sessionHandler        *bridgecontrol.SessionHandler
-
-	tunnelDialAnnounceMutex  sync.Mutex
-	tunnelDialAnnounceQueues map[string][]announcedTunnelDialRuntime
 }
 
 // controlChannelSessionState 保存单条控制连接最近确认的 session 上下文。
@@ -149,8 +136,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 			SessionRegistry: sessionRegistry,
 			RouteRegistry:   routeRegistry,
 		}),
-		sessionHandler:           sessionHandler,
-		tunnelDialAnnounceQueues: make(map[string][]announcedTunnelDialRuntime),
+		sessionHandler: sessionHandler,
 	}
 }
 
@@ -309,27 +295,6 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 			"agent_target_idle_count", parseRefillMetadataInt(refillRequest.Metadata, "target_idle_count"),
 		)
 		return buildTunnelRefillEnvelope(envelope, refillRequest)
-	case pb.ControlMessageTunnelDialAnnounce:
-		var message pb.TunnelDialAnnounce
-		if err := decodeControlPayload(envelope.Payload, &message); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(message.SessionID) == "" {
-			message.SessionID = strings.TrimSpace(envelope.SessionID)
-		}
-		if message.SessionEpoch == 0 {
-			message.SessionEpoch = envelope.SessionEpoch
-		}
-		slog.Info(
-			"bridge receive tunnel dial announce",
-			"connector_id", strings.TrimSpace(envelope.ConnectorID),
-			"session_id", strings.TrimSpace(message.SessionID),
-			"session_epoch", message.SessionEpoch,
-			"tunnel_id", strings.TrimSpace(message.TunnelID),
-			"dial_local_addr", strings.TrimSpace(message.DialLocalAddr),
-		)
-		dispatcher.enqueueTunnelDialAnnounce(message)
-		return nil, nil
 	case pb.ControlMessageRouteAssign:
 		var message pb.RouteAssign
 		if err := decodeControlPayload(envelope.Payload, &message); err != nil {
@@ -351,105 +316,6 @@ func (dispatcher *controlMessageDispatcher) dispatchEnvelope(envelope pb.Control
 	default:
 		// 未接入的消息类型先忽略，避免骨架阶段影响控制链路稳定性。
 		return nil, nil
-	}
-}
-
-func tunnelDialAnnounceQueueKey(sessionID string, sessionEpoch uint64) string {
-	normalizedSessionID := strings.TrimSpace(sessionID)
-	if normalizedSessionID == "" || sessionEpoch == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%s#%d", normalizedSessionID, sessionEpoch)
-}
-
-func (dispatcher *controlMessageDispatcher) enqueueTunnelDialAnnounce(message pb.TunnelDialAnnounce) {
-	if dispatcher == nil {
-		return
-	}
-	queueKey := tunnelDialAnnounceQueueKey(message.SessionID, message.SessionEpoch)
-	normalizedTunnelID := strings.TrimSpace(message.TunnelID)
-	normalizedDialLocalAddr := strings.TrimSpace(message.DialLocalAddr)
-	if queueKey == "" || normalizedTunnelID == "" {
-		return
-	}
-	normalizedNow := time.Now().UTC()
-	dispatcher.tunnelDialAnnounceMutex.Lock()
-	defer dispatcher.tunnelDialAnnounceMutex.Unlock()
-	queue := dispatcher.tunnelDialAnnounceQueues[queueKey]
-	cleanQueue := make([]announcedTunnelDialRuntime, 0, len(queue)+1)
-	for _, item := range queue {
-		if normalizedNow.Sub(item.announcedAt) <= incomingTunnelDialAnnounceTTL {
-			if item.tunnelID == normalizedTunnelID {
-				// 同一 tunnel_id 的重复宣告仅刷新时间戳，避免后续消费错配。
-				continue
-			}
-			cleanQueue = append(cleanQueue, item)
-		}
-	}
-	cleanQueue = append(cleanQueue, announcedTunnelDialRuntime{
-		tunnelID:      normalizedTunnelID,
-		dialLocalAddr: normalizedDialLocalAddr,
-		announcedAt:   normalizedNow,
-	})
-	dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
-}
-
-func (dispatcher *controlMessageDispatcher) consumeTunnelDialAnnounce(
-	sessionID string,
-	sessionEpoch uint64,
-	peerAddr string,
-	wait time.Duration,
-) string {
-	if dispatcher == nil {
-		return ""
-	}
-	queueKey := tunnelDialAnnounceQueueKey(sessionID, sessionEpoch)
-	if queueKey == "" {
-		return ""
-	}
-	normalizedWait := wait
-	if normalizedWait < 0 {
-		normalizedWait = 0
-	}
-	deadline := time.Now().UTC().Add(normalizedWait)
-	normalizedPeerAddr := strings.TrimSpace(peerAddr)
-	for {
-		now := time.Now().UTC()
-		dispatcher.tunnelDialAnnounceMutex.Lock()
-		queue := dispatcher.tunnelDialAnnounceQueues[queueKey]
-		cleanQueue := make([]announcedTunnelDialRuntime, 0, len(queue))
-		nextTunnelID := ""
-		for _, item := range queue {
-			if now.Sub(item.announcedAt) > incomingTunnelDialAnnounceTTL {
-				continue
-			}
-			if nextTunnelID == "" {
-				if normalizedPeerAddr != "" && strings.TrimSpace(item.dialLocalAddr) != normalizedPeerAddr {
-					cleanQueue = append(cleanQueue, item)
-					continue
-				}
-				nextTunnelID = item.tunnelID
-				continue
-			}
-			cleanQueue = append(cleanQueue, item)
-		}
-		if nextTunnelID == "" {
-			if len(cleanQueue) == 0 {
-				delete(dispatcher.tunnelDialAnnounceQueues, queueKey)
-			} else {
-				dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
-			}
-		} else if len(cleanQueue) == 0 {
-			delete(dispatcher.tunnelDialAnnounceQueues, queueKey)
-		} else {
-			dispatcher.tunnelDialAnnounceQueues[queueKey] = cleanQueue
-		}
-		dispatcher.tunnelDialAnnounceMutex.Unlock()
-
-		if nextTunnelID != "" || normalizedWait == 0 || !now.Before(deadline) {
-			return nextTunnelID
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -591,8 +457,13 @@ func (dispatcher *controlMessageDispatcher) upsertActiveSession(
 		if connectorSession, connectorExists := dispatcher.sessionRegistry.GetByConnector(normalizedConnectorID); connectorExists &&
 			strings.TrimSpace(connectorSession.SessionID) != normalizedSessionID {
 			if connectorSession.Epoch > sessionEpoch {
-				// connector 已绑定到更高 epoch 的会话，当前消息视为旧连接噪声。
-				return
+				switch connectorSession.State {
+				case registry.SessionStale, registry.SessionClosed:
+					// Agent 进程重启后可能出现 epoch 回绕；旧会话已终态时允许新会话接管。
+				default:
+					// connector 仍绑定到存活会话（ACTIVE/DRAINING），当前消息视为旧连接噪声。
+					return
+				}
 			}
 			if connectorSession.Epoch < sessionEpoch {
 				// 同 connector 切到新会话时，把旧会话降级为 DRAINING 并立即收敛相关运行态。
@@ -915,8 +786,6 @@ type controlPlaneServer struct {
 	tcpListener  net.Listener
 	grpcListener net.Listener
 	grpcServer   *grpc.Server
-
-	tcpTunnelSequence atomic.Uint64
 }
 
 // controlPlaneDependencies 定义控制面运行时共享依赖。
@@ -1308,40 +1177,75 @@ func (server *controlPlaneServer) handleAcceptedTCPTunnel(rawConn net.Conn) erro
 		return nil
 	}
 	normalizedNow := time.Now().UTC()
-	tunnelID := ""
 	peerAddr := ""
 	if rawConn != nil && rawConn.RemoteAddr() != nil {
 		peerAddr = strings.TrimSpace(rawConn.RemoteAddr().String())
 	}
-	if server.dispatcher != nil {
-		tunnelID = server.dispatcher.consumeTunnelDialAnnounce(
-			sessionID,
-			sessionEpoch,
-			peerAddr,
-			incomingTunnelDialAnnounceWait,
-		)
-	}
-	if strings.TrimSpace(tunnelID) == "" {
-		tunnelID = fmt.Sprintf("%s-%d", defaultIncomingTunnelIDPrefixTCP, server.tcpTunnelSequence.Add(1))
+	handshake, handshakeErr := readIncomingTCPTunnelHandshake(
+		rawConn,
+		incomingTCPTunnelHandshakeTimeout,
+		server.tcpTransport.Config().MaxTunnelFramePayloadSize,
+	)
+	if handshakeErr != nil {
 		slog.Info(
-			"bridge accept tunnel id fallback",
+			"bridge accept tunnel dropped: read tcp handshake failed",
 			"session_id", sessionID,
 			"session_epoch", sessionEpoch,
 			"peer_addr", peerAddr,
-			"tunnel_id", tunnelID,
+			"error", handshakeErr.Error(),
 		)
-	} else {
+		_ = rawConn.Close()
+		return nil
+	}
+	tunnelID := strings.TrimSpace(handshake.TunnelID)
+	if tunnelID == "" {
 		slog.Info(
-			"bridge accept tunnel id matched",
+			"bridge accept tunnel dropped: missing handshake tunnel id",
 			"session_id", sessionID,
 			"session_epoch", sessionEpoch,
 			"peer_addr", peerAddr,
+		)
+		_ = rawConn.Close()
+		return nil
+	}
+	if announcedSessionID := strings.TrimSpace(handshake.SessionID); announcedSessionID != "" && announcedSessionID != sessionID {
+		slog.Info(
+			"bridge accept tunnel dropped: handshake session mismatch",
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"peer_addr", peerAddr,
+			"announced_session_id", announcedSessionID,
 			"tunnel_id", tunnelID,
 		)
+		_ = rawConn.Close()
+		return nil
 	}
-	rawTunnel, err := server.tcpTransport.OpenTunnel(rawConn, transport.TunnelMeta{
-		TunnelID:  tunnelID,
-		CreatedAt: normalizedNow,
+	if handshake.SessionEpoch != 0 && handshake.SessionEpoch != sessionEpoch {
+		slog.Info(
+			"bridge accept tunnel dropped: handshake session epoch mismatch",
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"peer_addr", peerAddr,
+			"announced_session_epoch", handshake.SessionEpoch,
+			"tunnel_id", tunnelID,
+		)
+		_ = rawConn.Close()
+		return nil
+	}
+	slog.Info(
+		"bridge accept tunnel id from tcp handshake",
+		"session_id", sessionID,
+		"session_epoch", sessionEpoch,
+		"peer_addr", peerAddr,
+		"tunnel_id", tunnelID,
+		"dial_local_addr", strings.TrimSpace(handshake.DialLocalAddr),
+	)
+	openConn := connForTransportOpen(rawConn)
+	rawTunnel, err := server.tcpTransport.OpenTunnel(openConn, transport.TunnelMeta{
+		TunnelID:     tunnelID,
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		CreatedAt:    normalizedNow,
 	})
 	if err != nil {
 		return fmt.Errorf("handle accepted tcp tunnel: open tunnel: %w", err)
@@ -1369,31 +1273,25 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	if rawTunnel == nil {
 		return errors.New("register accepted tunnel: nil tunnel")
 	}
-	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(bindingType, incomingTunnelDialAnnounceWait)
+	connectorID, sessionID, sessionEpoch, ok := server.resolveAcceptedTunnelOwner(bindingType, incomingTunnelOwnerResolveWait)
 	if !ok {
 		// owner 不明确时直接回收 tunnel，避免错误归属影响后续流量调度。
 		_ = rawTunnel.Close()
 		return nil
 	}
 	registeredTunnelID := strings.TrimSpace(rawTunnel.ID())
-	tunnelIDSource := "raw_tunnel_id"
 	if bindingType == transport.BindingTypeGRPCH2 {
-		tunnelIDSource = grpcTunnelIDSource(rawTunnel)
-		// 优先使用 stream metadata 对齐后的 tunnel_id，无法判定来源时回退 announce 队列。
-		useDialAnnounceFallback := shouldUseGRPCTunnelDialAnnounce(rawTunnel)
-		if useDialAnnounceFallback {
-			announcedTunnelID := server.dispatcher.consumeTunnelDialAnnounce(
-				sessionID,
-				sessionEpoch,
-				"",
-				incomingTunnelDialAnnounceWait,
+		tunnelIDSource := grpcTunnelIDSource(rawTunnel)
+		if tunnelIDSource != grpcbinding.TunnelIDSourceStreamMetadata {
+			slog.Info(
+				"bridge register grpc tunnel dropped: missing stream metadata tunnel id",
+				"connector_id", connectorID,
+				"session_id", sessionID,
+				"session_epoch", sessionEpoch,
+				"raw_tunnel_id", strings.TrimSpace(rawTunnel.ID()),
 			)
-			if strings.TrimSpace(announcedTunnelID) == "" {
-				_ = rawTunnel.Close()
-				return nil
-			}
-			registeredTunnelID = strings.TrimSpace(announcedTunnelID)
-			tunnelIDSource = "announce_fallback"
+			_ = rawTunnel.Close()
+			return nil
 		}
 		slog.Info(
 			"bridge register grpc tunnel",
@@ -1408,10 +1306,6 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 	return server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID, registeredTunnelID)
 }
 
-func shouldUseGRPCTunnelDialAnnounce(rawTunnel transport.Tunnel) bool {
-	return grpcTunnelIDSource(rawTunnel) != grpcbinding.TunnelIDSourceStreamMetadata
-}
-
 func grpcTunnelIDSource(rawTunnel transport.Tunnel) string {
 	if rawTunnel == nil {
 		return ""
@@ -1421,6 +1315,53 @@ func grpcTunnelIDSource(rawTunnel transport.Tunnel) string {
 		return ""
 	}
 	return strings.TrimSpace(meta.Labels[grpcbinding.TunnelMetaLabelTunnelIDSource])
+}
+
+func readIncomingTCPTunnelHandshake(
+	rawConn net.Conn,
+	timeout time.Duration,
+	maxPayloadBytes int,
+) (pb.TunnelDialAnnounce, error) {
+	if rawConn == nil {
+		return pb.TunnelDialAnnounce{}, errors.New("read incoming tcp tunnel handshake: nil conn")
+	}
+	handshakeTimeout := timeout
+	if handshakeTimeout > 0 {
+		if err := rawConn.SetReadDeadline(time.Now().UTC().Add(handshakeTimeout)); err != nil {
+			return pb.TunnelDialAnnounce{}, fmt.Errorf("read incoming tcp tunnel handshake: set read deadline: %w", err)
+		}
+		defer func() {
+			_ = rawConn.SetReadDeadline(time.Time{})
+		}()
+	}
+	frameHeader := make([]byte, 4)
+	if _, err := io.ReadFull(rawConn, frameHeader); err != nil {
+		return pb.TunnelDialAnnounce{}, fmt.Errorf("read incoming tcp tunnel handshake: read frame header: %w", err)
+	}
+	payloadSize := int(binary.BigEndian.Uint32(frameHeader))
+	if payloadSize <= 0 {
+		return pb.TunnelDialAnnounce{}, errors.New("read incoming tcp tunnel handshake: empty payload")
+	}
+	maxAllowedPayload := maxPayloadBytes
+	if maxAllowedPayload <= 0 {
+		maxAllowedPayload = 64 * 1024
+	}
+	if payloadSize > maxAllowedPayload {
+		return pb.TunnelDialAnnounce{}, fmt.Errorf(
+			"read incoming tcp tunnel handshake: payload too large size=%d max=%d",
+			payloadSize,
+			maxAllowedPayload,
+		)
+	}
+	payload := make([]byte, payloadSize)
+	if _, err := io.ReadFull(rawConn, payload); err != nil {
+		return pb.TunnelDialAnnounce{}, fmt.Errorf("read incoming tcp tunnel handshake: read payload: %w", err)
+	}
+	var handshake pb.TunnelDialAnnounce
+	if err := json.Unmarshal(payload, &handshake); err != nil {
+		return pb.TunnelDialAnnounce{}, fmt.Errorf("read incoming tcp tunnel handshake: decode payload: %w", err)
+	}
+	return handshake, nil
 }
 
 func (server *controlPlaneServer) resolveAcceptedTunnelOwner(
@@ -1684,7 +1625,12 @@ func classifyTCPInboundConnection(rawConn net.Conn) (net.Conn, bool, error) {
 		if isLikelyHTTPPrefix(peekBuffer) {
 			return nil, false, errors.New("classify tcp inbound: non-ltfp protocol on control port (possible http/grpc)")
 		}
-		return nil, false, fmt.Errorf("classify tcp inbound: unknown non-control prefix=0x%02x%02x", peekBuffer[0], peekBuffer[1])
+		// 非控制帧前缀按数据面 tunnel 接入；首包由后续 tunnel 握手解析。
+		classifiedConn := &prefixedNetConn{
+			Conn:   rawConn,
+			prefix: append([]byte(nil), peekBuffer...),
+		}
+		return classifiedConn, false, nil
 	}
 	classifiedConn := &prefixedNetConn{
 		Conn:   rawConn,
@@ -1773,6 +1719,22 @@ func (conn *prefixedNetConn) Read(payload []byte) (int, error) {
 	writtenSize := copy(payload, conn.prefix)
 	conn.prefix = conn.prefix[writtenSize:]
 	return writtenSize, nil
+}
+
+// connForTransportOpen 返回用于 transport.OpenTunnel/OpenControlChannel 的连接。
+// 当前仅在 prefixed 前缀已消费完时解包到底层连接，避免丢失尚未回放的首包字节。
+func connForTransportOpen(rawConn net.Conn) net.Conn {
+	if rawConn == nil {
+		return nil
+	}
+	prefixedConn, ok := rawConn.(*prefixedNetConn)
+	if !ok || prefixedConn == nil {
+		return rawConn
+	}
+	if len(prefixedConn.prefix) != 0 || prefixedConn.Conn == nil {
+		return rawConn
+	}
+	return prefixedConn.Conn
 }
 
 func serveControlChannel(ctx context.Context, controlChannel transport.ControlChannel) error {

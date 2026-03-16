@@ -22,6 +22,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/routing"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 const (
@@ -249,7 +250,16 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 				_ = upstreamResponse.Body.Close()
 
 				postCommitContext := detachedPostCommitContext(relayContext)
-				if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "http_response_complete"); closeErr != nil {
+				if isGRPCBridgeRuntimeTunnel(tunnel) {
+					// grpc_h2 场景优先写 close 帧触发 Agent 侧 relay 退出，避免 recycle 先到达被 relay 阶段吞帧。
+					if closeErr := writeTunnelCloseFrame(postCommitContext, tunnel, trafficID, "http_response_complete"); closeErr != nil {
+						log.Printf(
+							"bridge ingress http close write failed, continue recycle traffic_id=%s err=%v",
+							strings.TrimSpace(trafficID),
+							closeErr,
+						)
+					}
+				} else if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "http_response_complete"); closeErr != nil {
 					// close_ack 等待失败时先不立即返回失败，继续交给 dispatcher 尝试 recycle，尽量保留可复用 tunnel。
 					log.Printf(
 						"bridge ingress http close-ack wait failed, continue recycle traffic_id=%s err=%v",
@@ -736,6 +746,20 @@ func detachedPostCommitContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return context.WithoutCancel(ctx)
+}
+
+func isGRPCBridgeRuntimeTunnel(tunnel registry.RuntimeTunnel) bool {
+	if tunnel == nil {
+		return false
+	}
+	type bindingTypeAware interface {
+		BindingType() transport.BindingType
+	}
+	awareTunnel, ok := tunnel.(bindingTypeAware)
+	if !ok {
+		return false
+	}
+	return awareTunnel.BindingType() == transport.BindingTypeGRPCH2
 }
 
 type tunnelTrafficReader struct {

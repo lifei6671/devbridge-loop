@@ -215,7 +215,7 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
-	if err := dispatcher.recycleTunnelReusable(normalizedContext, acquiredTunnel); err != nil {
+	if err := dispatcher.recycleTunnelReusable(detachedRecycleContext(normalizedContext), acquiredTunnel); err != nil {
 		log.Printf(
 			"bridge connector dispatch failed event=recycle_tunnel_closed_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
@@ -231,6 +231,14 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		return dispatcher.failResult(result, err)
 	}
 	return result, nil
+}
+
+func detachedRecycleContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	// recycle 阶段不依赖上游请求生命周期，避免上游取消导致可复用 tunnel 被误判为 broken。
+	return context.WithoutCancel(ctx)
 }
 
 func (dispatcher *Dispatcher) failResult(result DispatchResult, dispatchError error) (DispatchResult, error) {

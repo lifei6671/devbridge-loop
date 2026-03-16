@@ -119,6 +119,33 @@ func (tunnel *runtimeBridgeTestTunnel) ID() string {
 	return tunnel.tunnelID
 }
 
+// TestNextTunnelIDUsesSessionScopedPrefix 验证 tunnel_id 默认带 session 作用域，避免多 Agent 冲突。
+func TestNextTunnelIDUsesSessionScopedPrefix(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		cfg: Config{
+			AgentID: "agent-local",
+		},
+		bridgeSession: "session-a1:b2/c3",
+	}
+
+	firstTunnelID := runtime.nextTunnelID()
+	secondTunnelID := runtime.nextTunnelID()
+	runtime.bridgeSession = ""
+	thirdTunnelID := runtime.nextTunnelID()
+
+	if firstTunnelID != "tun-a1_b2_c3-1" {
+		testingObject.Fatalf("unexpected first tunnel id: got=%s want=%s", firstTunnelID, "tun-a1_b2_c3-1")
+	}
+	if secondTunnelID != "tun-a1_b2_c3-2" {
+		testingObject.Fatalf("unexpected second tunnel id: got=%s want=%s", secondTunnelID, "tun-a1_b2_c3-2")
+	}
+	if thirdTunnelID != "tun-agent-local-3" {
+		testingObject.Fatalf("unexpected third tunnel id: got=%s want=%s", thirdTunnelID, "tun-agent-local-3")
+	}
+}
+
 func (tunnel *runtimeBridgeTestTunnel) Close() error {
 	_ = tunnel
 	return nil

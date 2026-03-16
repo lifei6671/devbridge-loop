@@ -14,6 +14,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/routing"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 type runtimeDataPlaneReadResult struct {
@@ -24,6 +25,8 @@ type runtimeDataPlaneReadResult struct {
 // runtimeDataPlaneTestTunnel 是 app 层数据面测试使用的 tunnel 假实现。
 type runtimeDataPlaneTestTunnel struct {
 	id string
+
+	bindingType transport.BindingType
 
 	readQueue  chan runtimeDataPlaneReadResult
 	writeMutex sync.Mutex
@@ -42,6 +45,17 @@ func newRuntimeDataPlaneTestTunnel(id string) *runtimeDataPlaneTestTunnel {
 // ID 返回测试 tunnel 的稳定标识。
 func (tunnel *runtimeDataPlaneTestTunnel) ID() string {
 	return tunnel.id
+}
+
+// BindingType 返回测试 tunnel 的承载类型，默认按 tcp_framed 处理。
+func (tunnel *runtimeDataPlaneTestTunnel) BindingType() transport.BindingType {
+	if tunnel == nil {
+		return ""
+	}
+	if tunnel.bindingType == "" {
+		return transport.BindingTypeTCPFramed
+	}
+	return tunnel.bindingType
 }
 
 // ReadPayload 从预置队列读取 payload，模拟数据面输入流。

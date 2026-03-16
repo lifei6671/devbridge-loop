@@ -15,6 +15,7 @@ import (
 
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 // TestBootstrapInitializesIngressHTTPServerWhenHTTPAddrSet 验证配置了 ingress.http_addr 时会初始化监听器。
@@ -333,6 +334,102 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
 	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
 		testingObject.Fatalf("expected one recycled idle tunnel after connector proxy, total=%d idle=%d", snapshot.TotalCount, snapshot.IdleCount)
+	}
+}
+
+// TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle
+// 验证 grpc_h2 tunnel 在回收前会先写 close，避免 recycle 抢先到达 Agent relay 阶段。
+func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID:     "route-http-grpc-tunnel-close-first",
+		Namespace:   "dev",
+		Environment: "demo",
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.grpc-tunnel.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: "dev/demo/order-service",
+			},
+		},
+	})
+
+	testTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-grpc-close-first-1")
+	testTunnel.bindingType = transport.BindingTypeGRPCH2
+	go func() {
+		for {
+			writes := testTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			trafficID := strings.TrimSpace(writes[0].OpenReq.TrafficID)
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				OpenAck: &pb.TrafficOpenAck{
+					TrafficID: trafficID,
+					Success:   true,
+				},
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"),
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				RecycleAck: &pb.TunnelRecycleAck{
+					TunnelID:   "tunnel-http-grpc-close-first-1",
+					RecycleSeq: 1,
+					Accepted:   true,
+				},
+			})
+			return
+		}
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
+	request.Host = "api.grpc-tunnel.local"
+	request.Header.Set("X-Namespace", "dev")
+	request.Header.Set("X-Env", "demo")
+	recorder := httptest.NewRecorder()
+	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status code: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if recorder.Body.String() != "hello" {
+		testingObject.Fatalf("unexpected response body: got=%s want=%s", recorder.Body.String(), "hello")
+	}
+
+	writes := testTunnel.Writes()
+	closeIndex := -1
+	recycleIndex := -1
+	for index, payload := range writes {
+		if closeIndex == -1 && payload.Close != nil {
+			closeIndex = index
+		}
+		if recycleIndex == -1 && payload.Recycle != nil {
+			recycleIndex = index
+		}
+	}
+	if closeIndex == -1 {
+		testingObject.Fatalf("expected close payload written for grpc tunnel")
+	}
+	if recycleIndex == -1 {
+		testingObject.Fatalf("expected recycle payload written for grpc tunnel")
+	}
+	if closeIndex > recycleIndex {
+		testingObject.Fatalf("expected close written before recycle, close_index=%d recycle_index=%d", closeIndex, recycleIndex)
 	}
 }
 

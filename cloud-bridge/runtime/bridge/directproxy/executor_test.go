@@ -18,9 +18,7 @@ type directProxyTestDiscoveryProvider struct {
 	calls     int
 }
 
-func (provider *directProxyTestDiscoveryProvider) Discover(ctx context.Context, request DiscoveryRequest) ([]ExternalEndpoint, error) {
-	_ = ctx
-	_ = request
+func (provider *directProxyTestDiscoveryProvider) Discover(_ context.Context, _ DiscoveryRequest) ([]ExternalEndpoint, error) {
 	provider.mutex.Lock()
 	defer provider.mutex.Unlock()
 	provider.calls++

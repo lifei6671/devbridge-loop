@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -33,7 +34,7 @@ const (
 	bridgeHeartbeatMissThreshold = 5
 	bridgeHeartbeatWriteTimeout  = 2 * time.Second
 	bridgeBusinessWriteTimeout   = 3 * time.Second
-	bridgeTunnelDialAnnounceTTL  = 2 * time.Second
+	bridgeTCPTunnelHandshakeTO   = 2 * time.Second
 	bridgeAutoRouteIDPrefix      = "agent-auto-route"
 
 	bridgeRetryInitialBackoff = time.Second
@@ -146,7 +147,10 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		if tunnelLocalAddr := rawTunnel.LocalAddr(); tunnelLocalAddr != nil {
 			dialLocalAddr = strings.TrimSpace(tunnelLocalAddr.String())
 		}
-		opener.runtime.tryAnnounceDialedTunnel(tunnelID, sessionID, sessionEpoch, dialLocalAddr)
+		if handshakeErr := opener.runtime.writeTCPTunnelHandshake(ctx, rawTunnel, tunnelID, sessionID, sessionEpoch, dialLocalAddr); handshakeErr != nil {
+			_ = rawTunnel.Close()
+			return nil, fmt.Errorf("write tcp tunnel handshake failed: %w", handshakeErr)
+		}
 		// 所有新建 tunnel 统一包一层 payload 适配器，供 traffic runtime 直接消费。
 		return newRuntimeTrafficTunnelAdapter(rawTunnel), nil
 	case transport.BindingTypeGRPCH2.String():
@@ -179,7 +183,6 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 			_ = tunnelStream.Close(context.Background())
 			return nil, fmt.Errorf("create grpc tunnel failed: %w", err)
 		}
-		opener.runtime.tryAnnounceDialedTunnel(tunnelID, sessionID, sessionEpoch, "")
 		// grpc tunnel 同样走统一 payload 适配层，避免 runtime 侧分 binding 分支。
 		return newRuntimeTrafficTunnelAdapter(grpcTunnel), nil
 	default:
@@ -262,7 +265,43 @@ func (r *Runtime) nextTunnelID() string {
 	r.bridgeMu.Lock()
 	defer r.bridgeMu.Unlock()
 	r.tunnelIDSequence++
-	return fmt.Sprintf("tun-%d", r.tunnelIDSequence)
+	scope := normalizeTunnelIDScope(strings.TrimSpace(r.bridgeSession))
+	if scope == "" {
+		scope = normalizeTunnelIDScope(strings.TrimSpace(r.cfg.AgentID))
+	}
+	if scope == "" {
+		return fmt.Sprintf("tun-%d", r.tunnelIDSequence)
+	}
+	return fmt.Sprintf("tun-%s-%d", scope, r.tunnelIDSequence)
+}
+
+func normalizeTunnelIDScope(rawScope string) string {
+	normalizedScope := strings.TrimSpace(rawScope)
+	if normalizedScope == "" {
+		return ""
+	}
+	if strings.HasPrefix(normalizedScope, "session-") {
+		normalizedScope = strings.TrimSpace(strings.TrimPrefix(normalizedScope, "session-"))
+	}
+	builder := strings.Builder{}
+	builder.Grow(len(normalizedScope))
+	for _, currentRune := range normalizedScope {
+		if (currentRune >= 'a' && currentRune <= 'z') ||
+			(currentRune >= 'A' && currentRune <= 'Z') ||
+			(currentRune >= '0' && currentRune <= '9') ||
+			currentRune == '-' ||
+			currentRune == '_' {
+			builder.WriteRune(currentRune)
+			continue
+		}
+		builder.WriteByte('_')
+	}
+	sanitizedScope := strings.Trim(builder.String(), "-_")
+	if len(sanitizedScope) > 32 {
+		// 保留后缀，通常包含更高区分度的随机片段。
+		sanitizedScope = sanitizedScope[len(sanitizedScope)-32:]
+	}
+	return sanitizedScope
 }
 
 func (r *Runtime) initTransport() error {
@@ -1383,63 +1422,61 @@ func (r *Runtime) SendTunnelPoolReport(ctx context.Context, report control.Tunne
 	return nil
 }
 
-// tryAnnounceDialedTunnel 在 tunnel 建连成功后向 Bridge 宣告 Agent 侧 tunnel_id。
-func (r *Runtime) tryAnnounceDialedTunnel(tunnelID string, sessionID string, sessionEpoch uint64, dialLocalAddr string) {
-	if r == nil || r.controlPublisher == nil {
-		return
+// writeTCPTunnelHandshake 在 tcp_framed tunnel 建连后写入首帧握手，向 Bridge 对齐 Agent 侧 tunnel_id。
+func (r *Runtime) writeTCPTunnelHandshake(
+	ctx context.Context,
+	rawTunnel transport.Tunnel,
+	tunnelID string,
+	sessionID string,
+	sessionEpoch uint64,
+	dialLocalAddr string,
+) error {
+	if r == nil {
+		return errors.New("write tcp tunnel handshake: runtime is nil")
+	}
+	if rawTunnel == nil {
+		return errors.New("write tcp tunnel handshake: nil tunnel")
 	}
 	normalizedTunnelID := strings.TrimSpace(tunnelID)
 	normalizedSessionID := strings.TrimSpace(sessionID)
-	normalizedDialLocalAddr := strings.TrimSpace(dialLocalAddr)
 	if normalizedTunnelID == "" || normalizedSessionID == "" || sessionEpoch == 0 {
-		return
+		return errors.New("write tcp tunnel handshake: invalid tunnel/session identity")
 	}
-	announcePayload := pb.TunnelDialAnnounce{
+	handshakePayload, marshalErr := json.Marshal(pb.TunnelDialAnnounce{
 		SessionID:     normalizedSessionID,
 		SessionEpoch:  sessionEpoch,
 		TunnelID:      normalizedTunnelID,
-		DialLocalAddr: normalizedDialLocalAddr,
+		DialLocalAddr: strings.TrimSpace(dialLocalAddr),
 		TimestampUnix: time.Now().UTC().Unix(),
-	}
-	announceContext, cancelAnnounce := context.WithTimeout(context.Background(), bridgeTunnelDialAnnounceTTL)
-	defer cancelAnnounce()
-	envelope, buildErr := r.controlPublisher.Publish(
-		announceContext,
-		pb.ControlMessageTunnelDialAnnounce,
-		"tunnel",
-		normalizedTunnelID,
-		announcePayload,
-	)
-	if buildErr != nil {
-		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:   events.EventWarn,
-			Module:  events.ModuleAgentRuntimeTunnel,
-			Code:    events.CodeTunnelDialAnnounceBuildFailed,
-			Message: fmt.Sprintf("build tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, buildErr),
-		})
-		return
-	}
-	if sendErr := r.sendBusinessControlEnvelope(announceContext, envelope); sendErr != nil {
-		r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-			Level:   events.EventWarn,
-			Module:  events.ModuleAgentRuntimeTunnel,
-			Code:    events.CodeTunnelDialAnnounceSendFailed,
-			Message: fmt.Sprintf("send tunnel dial announce failed tunnel_id=%s error=%v", normalizedTunnelID, sendErr),
-		})
-		return
-	}
-	r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-		Level:  events.EventInfo,
-		Module: events.ModuleAgentRuntimeTunnel,
-		Code:   events.CodeTunnelDialAnnounced,
-		Message: fmt.Sprintf(
-			"tunnel dial announce sent tunnel_id=%s session_id=%s session_epoch=%d dial_local_addr=%s",
-			normalizedTunnelID,
-			normalizedSessionID,
-			sessionEpoch,
-			normalizedDialLocalAddr,
-		),
 	})
+	if marshalErr != nil {
+		return fmt.Errorf("write tcp tunnel handshake: marshal payload: %w", marshalErr)
+	}
+	writeContext := ctx
+	if writeContext == nil {
+		writeContext = context.Background()
+	}
+	if _, hasDeadline := writeContext.Deadline(); !hasDeadline && bridgeTCPTunnelHandshakeTO > 0 {
+		var cancel context.CancelFunc
+		writeContext, cancel = context.WithTimeout(writeContext, bridgeTCPTunnelHandshakeTO)
+		defer cancel()
+	}
+	if deadline, hasDeadline := writeContext.Deadline(); hasDeadline {
+		if err := rawTunnel.SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("write tcp tunnel handshake: set write deadline: %w", err)
+		}
+		defer func() {
+			_ = rawTunnel.SetWriteDeadline(time.Time{})
+		}()
+	}
+	writtenSize, writeErr := rawTunnel.Write(handshakePayload)
+	if writeErr != nil {
+		return fmt.Errorf("write tcp tunnel handshake: write payload: %w", writeErr)
+	}
+	if writtenSize != len(handshakePayload) {
+		return fmt.Errorf("write tcp tunnel handshake: %w", io.ErrShortWrite)
+	}
+	return nil
 }
 
 // reportTunnelPoolNow 触发一次立即上报，用于会话激活后的首轮对账。

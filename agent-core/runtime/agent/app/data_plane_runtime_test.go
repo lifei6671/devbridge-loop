@@ -13,6 +13,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
 	"github.com/lifei6671/devbridge-loop/ltfp/adapter"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 type runtimeTrafficTestReadResult struct {
@@ -23,6 +24,8 @@ type runtimeTrafficTestReadResult struct {
 // runtimeTrafficTestTunnel 是 app data-plane 测试使用的 tunnel 假实现。
 type runtimeTrafficTestTunnel struct {
 	id string
+
+	bindingType transport.BindingType
 
 	readQueue  chan runtimeTrafficTestReadResult
 	writeMutex sync.Mutex
@@ -43,6 +46,17 @@ func newRuntimeTrafficTestTunnel(tunnelID string) *runtimeTrafficTestTunnel {
 // ID 返回 tunnel 标识。
 func (tunnel *runtimeTrafficTestTunnel) ID() string {
 	return tunnel.id
+}
+
+// BindingType 返回测试 tunnel 的承载类型（默认按 tcp 处理）。
+func (tunnel *runtimeTrafficTestTunnel) BindingType() transport.BindingType {
+	if tunnel == nil {
+		return ""
+	}
+	if tunnel.bindingType == "" {
+		return transport.BindingTypeTCPFramed
+	}
+	return tunnel.bindingType
 }
 
 // ReadPayload 从预置队列读取 payload，模拟 Agent 侧接流量输入。
@@ -281,6 +295,55 @@ func TestRuntimeHintEndpointSelectorFallsBackToServiceCatalog(testingObject *tes
 	}
 	if selectedEndpoint.Addr != "127.0.0.1:8080" {
 		testingObject.Fatalf("unexpected endpoint addr: got=%s want=%s", selectedEndpoint.Addr, "127.0.0.1:8080")
+	}
+}
+
+// TestHandleTunnelRecyclePhaseAcceptsGRPCTunnelIDMismatch 验证 grpc recycle 阶段允许对端 tunnel_id 与本地不一致。
+func TestHandleTunnelRecyclePhaseAcceptsGRPCTunnelIDMismatch(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime, registry := newRuntimeWithTrafficWorkerDependenciesForTest(testingObject)
+	testTunnel := newRuntimeTrafficTestTunnel("agent-tunnel-1")
+	testTunnel.bindingType = transport.BindingTypeGRPCH2
+
+	added, addErr := registry.TryAddOpenedAsIdle(time.Now().UTC(), testTunnel, 2)
+	if addErr != nil {
+		testingObject.Fatalf("add idle tunnel failed: %v", addErr)
+	}
+	if !added {
+		testingObject.Fatalf("expected idle tunnel added")
+	}
+	if activateErr := runtime.tunnelManager.ActivateIdle(testTunnel.ID()); activateErr != nil {
+		testingObject.Fatalf("activate tunnel failed: %v", activateErr)
+	}
+
+	testTunnel.EnqueueReadPayload(pb.StreamPayload{
+		Recycle: &pb.TunnelRecycle{
+			TunnelID:   "bridge-tunnel-9",
+			RecycleSeq: 1,
+			IsFinal:    false,
+		},
+	})
+
+	recycled, finalClose, recycleErr := runtime.handleTunnelRecyclePhase(
+		context.Background(),
+		testTunnel.ID(),
+		"traffic-1",
+		testTunnel,
+	)
+	if recycleErr != nil {
+		testingObject.Fatalf("handle recycle phase failed: %v", recycleErr)
+	}
+	if !recycled || finalClose {
+		testingObject.Fatalf("unexpected recycle result recycled=%t finalClose=%t", recycled, finalClose)
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) != 1 || writes[0].RecycleAck == nil {
+		testingObject.Fatalf("expected one recycle_ack write, got=%+v", writes)
+	}
+	if writes[0].RecycleAck.TunnelID != "bridge-tunnel-9" || !writes[0].RecycleAck.Accepted {
+		testingObject.Fatalf("unexpected recycle_ack payload: %+v", writes[0].RecycleAck)
 	}
 }
 

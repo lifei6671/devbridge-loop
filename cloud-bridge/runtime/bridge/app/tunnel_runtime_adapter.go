@@ -58,6 +58,14 @@ func (adapter *runtimeBridgeTunnelAdapter) ID() string {
 	return strings.TrimSpace(adapter.tunnel.ID())
 }
 
+// BindingType 返回底层 tunnel 的 binding 类型，供上层做协议特定策略分支。
+func (adapter *runtimeBridgeTunnelAdapter) BindingType() transport.BindingType {
+	if adapter == nil || adapter.tunnel == nil {
+		return ""
+	}
+	return adapter.tunnel.BindingInfo().Type
+}
+
 // Close 关闭底层 tunnel。
 func (adapter *runtimeBridgeTunnelAdapter) Close() error {
 	if adapter == nil || adapter.tunnel == nil {

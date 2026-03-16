@@ -679,6 +679,81 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	}
 }
 
+// TestDispatcherDispatchRecycleSurvivesParentCancel 验证 relay 后上游 ctx 取消不会阻断 recycle 复用。
+func TestDispatcherDispatchRecycleSurvivesParentCancel(testingObject *testing.T) {
+	testingObject.Parallel()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnel := newConnectorProxyTestTunnel("tunnel-parent-cancel")
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID: "traffic-parent-cancel",
+			Success:   true,
+		},
+	})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:   "tunnel-parent-cancel",
+			RecycleSeq: 1,
+			Accepted:   true,
+		},
+	})
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel); err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry: tunnelRegistry,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	dispatchContext, cancelDispatch := context.WithCancel(context.Background())
+	defer cancelDispatch()
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: time.Second}),
+		Relay: RelayFunc(func(context.Context, registry.RuntimeTunnel, string) error {
+			cancelDispatch()
+			return nil
+		}),
+		TunnelRegistry: tunnelRegistry,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	result, err := dispatcher.Dispatch(dispatchContext, DispatchRequest{
+		ConnectorID: "connector-1",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-parent-cancel",
+			ServiceID: "svc-1",
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("dispatch failed: %v", err)
+	}
+	if result.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected status code: %d", result.HTTPStatus)
+	}
+	if result.OpenAck == nil || !result.OpenAck.Success {
+		testingObject.Fatalf("expected successful open ack in result")
+	}
+	runtimeAfterDispatch, exists := tunnelRegistry.Get("tunnel-parent-cancel")
+	if !exists {
+		testingObject.Fatalf("expected tunnel kept in registry after recycle")
+	}
+	if runtimeAfterDispatch.State != registry.TunnelStateIdle || runtimeAfterDispatch.ReuseCount != 1 || runtimeAfterDispatch.RecycleSeq != 1 {
+		testingObject.Fatalf(
+			"expected tunnel recycled to idle (reuse=1,seq=1), got state=%s reuse=%d seq=%d",
+			runtimeAfterDispatch.State,
+			runtimeAfterDispatch.ReuseCount,
+			runtimeAfterDispatch.RecycleSeq,
+		)
+	}
+	if tunnel.CloseCount() != 0 {
+		testingObject.Fatalf("expected tunnel not closed after parent context cancel, got=%d", tunnel.CloseCount())
+	}
+}
+
 // TestDispatcherNoIdleReturns503 验证 no-idle 最终返回 503 语义。
 func TestDispatcherNoIdleReturns503(testingObject *testing.T) {
 	testingObject.Parallel()

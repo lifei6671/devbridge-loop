@@ -297,6 +297,9 @@ function encodeQuery(params: Record<string, string | number | undefined>): strin
  */
 function resolveTone(rawState: string): StateTone {
   const state = rawState.toUpperCase();
+  if (state.includes("UNHEALTHY")) {
+    return "danger";
+  }
   if (state.includes("ACTIVE") || state.includes("HEALTHY") || state.includes("SUCCESS")) {
     return "ok";
   }

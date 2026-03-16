@@ -471,8 +471,8 @@ func TestControlMessageDispatcherHandleTunnelPoolReport(testingObject *testing.T
 	}
 }
 
-// TestControlMessageDispatcherHandleTunnelDialAnnounce 验证 Bridge 可接收并消费 Agent tunnel_id 宣告。
-func TestControlMessageDispatcherHandleTunnelDialAnnounce(testingObject *testing.T) {
+// TestControlMessageDispatcherIgnoresTunnelDialAnnounce 验证硬切换后控制面 TunnelDialAnnounce 会被忽略。
+func TestControlMessageDispatcherIgnoresTunnelDialAnnounce(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{})
@@ -501,51 +501,31 @@ func TestControlMessageDispatcherHandleTunnelDialAnnounce(testingObject *testing
 	if replyEnvelope != nil {
 		testingObject.Fatalf("tunnel dial announce should not produce reply envelope")
 	}
-	consumedTunnelID := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "127.0.0.1:54321", 0)
-	if consumedTunnelID != "tun-77" {
-		testingObject.Fatalf("unexpected consumed tunnel id: got=%s want=tun-77", consumedTunnelID)
-	}
 }
 
-// TestControlMessageDispatcherTunnelDialAnnounceDeduplicatesTunnelID 验证重复 tunnel_id 宣告不会污染消费队列。
-func TestControlMessageDispatcherTunnelDialAnnounceDeduplicatesTunnelID(testingObject *testing.T) {
-	testingObject.Parallel()
-
-	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{})
-	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
-		SessionID:     "session-a",
-		SessionEpoch:  9,
-		TunnelID:      "tun-77",
-		DialLocalAddr: "127.0.0.1:54321",
-		TimestampUnix: time.Now().UTC().Unix(),
-	})
-	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
-		SessionID:     "session-a",
-		SessionEpoch:  9,
-		TunnelID:      "tun-77",
-		DialLocalAddr: "127.0.0.1:54321",
-		TimestampUnix: time.Now().UTC().Unix(),
-	})
-	dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
-		SessionID:     "session-a",
-		SessionEpoch:  9,
-		TunnelID:      "tun-78",
-		DialLocalAddr: "127.0.0.1:54322",
-		TimestampUnix: time.Now().UTC().Unix(),
-	})
-
-	first := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
-	if first != "tun-77" {
-		testingObject.Fatalf("unexpected first consumed tunnel id: got=%s want=tun-77", first)
+func writeTCPTunnelHandshakeFrameForTest(connection net.Conn, handshake pb.TunnelDialAnnounce) error {
+	if connection == nil {
+		return errors.New("write tcp tunnel handshake frame for test: nil conn")
 	}
-	second := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
-	if second != "tun-78" {
-		testingObject.Fatalf("unexpected second consumed tunnel id: got=%s want=tun-78", second)
+	encodedPayload, err := json.Marshal(handshake)
+	if err != nil {
+		return err
 	}
-	third := dispatcher.consumeTunnelDialAnnounce("session-a", 9, "", 0)
-	if third != "" {
-		testingObject.Fatalf("expected queue drained after dedupe consume, got=%s", third)
+	frame := make([]byte, 4+len(encodedPayload))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(encodedPayload)))
+	copy(frame[4:], encodedPayload)
+	writtenSize := 0
+	for writtenSize < len(frame) {
+		nextWrittenSize, writeErr := connection.Write(frame[writtenSize:])
+		if writeErr != nil {
+			return writeErr
+		}
+		if nextWrittenSize == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		writtenSize += nextWrittenSize
 	}
+	return nil
 }
 
 type controlPlaneLifecycleTestTunnel struct {
@@ -644,6 +624,101 @@ func TestControlMessageDispatcherSessionTakeoverLifecycle(testingObject *testing
 	}
 	if !oldTunnel.closed {
 		testingObject.Fatalf("expected old session tunnel closed")
+	}
+}
+
+// TestControlMessageDispatcherEpochResetTakeoverFromStaleSession
+// 验证旧会话已 STALE 时，低 epoch 新会话可在 Agent 重启后接管 connector。
+func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-old",
+		ConnectorID:   "connector-1",
+		Epoch:         9,
+		State:         registry.SessionStale,
+		LastHeartbeat: now.Add(-2 * time.Minute),
+		UpdatedAt:     now.Add(-2 * time.Minute),
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.Upsert(now, pb.Service{
+		ServiceID:       "svc-epoch-reset",
+		ServiceKey:      "dev/demo/order-service",
+		ConnectorID:     "connector-1",
+		Status:          pb.ServiceStatusStale,
+		HealthStatus:    pb.HealthStatusUnknown,
+		ResourceVersion: 10,
+	})
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		serviceRegistry: serviceRegistry,
+	})
+
+	encodedPayload, err := json.Marshal(pb.PublishService{
+		ServiceID:   "svc-epoch-reset",
+		ServiceKey:  "dev/demo/order-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "order-service",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("marshal publish payload failed: %v", err)
+	}
+
+	replyEnvelope, err := dispatcher.dispatchEnvelope(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		RequestID:       "req-epoch-reset",
+		SessionID:       "session-new",
+		SessionEpoch:    1,
+		ConnectorID:     "connector-1",
+		ResourceType:    "service",
+		ResourceID:      "svc-epoch-reset",
+		EventID:         "evt-epoch-reset",
+		ResourceVersion: 11,
+		Payload:         encodedPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("dispatch publish after epoch reset failed: %v", err)
+	}
+	if replyEnvelope == nil {
+		testingObject.Fatalf("expected publish ack envelope")
+	}
+	var publishAck pb.PublishServiceAck
+	if err := json.Unmarshal(replyEnvelope.Payload, &publishAck); err != nil {
+		testingObject.Fatalf("unmarshal publish ack payload failed: %v", err)
+	}
+	if !publishAck.Accepted {
+		testingObject.Fatalf("expected publish ack accepted, got error=%s", publishAck.ErrorCode)
+	}
+
+	newSession, exists := sessionRegistry.GetBySession("session-new")
+	if !exists {
+		testingObject.Fatalf("expected new session exists")
+	}
+	if newSession.State != registry.SessionActive {
+		testingObject.Fatalf("unexpected new session state: got=%s want=%s", newSession.State, registry.SessionActive)
+	}
+	connectorSession, exists := sessionRegistry.GetByConnector("connector-1")
+	if !exists {
+		testingObject.Fatalf("expected connector session exists")
+	}
+	if connectorSession.SessionID != "session-new" {
+		testingObject.Fatalf("unexpected connector session owner: got=%s want=%s", connectorSession.SessionID, "session-new")
+	}
+	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-epoch-reset")
+	if !exists {
+		testingObject.Fatalf("expected service snapshot exists")
+	}
+	if serviceSnapshot.Status != pb.ServiceStatusActive {
+		testingObject.Fatalf("unexpected service status after reconnect publish: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusActive)
 	}
 }
 
@@ -929,7 +1004,7 @@ func TestClassifyTCPInboundConnection(testingObject *testing.T) {
 		}
 	})
 
-	testingObject.Run("unknown_prefix_rejected", func(testingObject *testing.T) {
+	testingObject.Run("unknown_prefix_treated_as_tunnel", func(testingObject *testing.T) {
 		serverConn, clientConn := net.Pipe()
 		defer func() {
 			_ = serverConn.Close()
@@ -943,17 +1018,21 @@ func TestClassifyTCPInboundConnection(testingObject *testing.T) {
 		}()
 
 		classifiedConn, isControl, err := classifyTCPInboundConnection(serverConn)
-		if err == nil {
-			testingObject.Fatalf("expected unknown prefix classify error")
-		}
-		if !strings.Contains(err.Error(), "unknown non-control prefix") {
-			testingObject.Fatalf("unexpected classify error: %v", err)
+		if err != nil {
+			testingObject.Fatalf("classify unknown prefix tunnel connection failed: %v", err)
 		}
 		if isControl {
 			testingObject.Fatalf("expected non-control for unknown prefix")
 		}
-		if classifiedConn != nil {
-			testingObject.Fatalf("expected nil classified connection on unknown prefix")
+		if classifiedConn == nil {
+			testingObject.Fatalf("expected classified tunnel connection on unknown prefix")
+		}
+		replayedPrefix := make([]byte, 2)
+		if _, readErr := io.ReadFull(classifiedConn, replayedPrefix); readErr != nil {
+			testingObject.Fatalf("read classified tunnel prefix failed: %v", readErr)
+		}
+		if replayedPrefix[0] != 0x00 || replayedPrefix[1] != 0x00 {
+			testingObject.Fatalf("unexpected replayed tunnel prefix: 0x%02x%02x", replayedPrefix[0], replayedPrefix[1])
 		}
 	})
 
@@ -1000,6 +1079,42 @@ func TestClassifyTCPInboundConnection(testingObject *testing.T) {
 		}
 		if classifiedConn == nil {
 			testingObject.Fatalf("expected passthrough connection for tunnel classification")
+		}
+	})
+}
+
+// TestConnForTransportOpen 验证 prefixed 连接在前缀消费完成后可回退到底层连接。
+func TestConnForTransportOpen(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testingObject.Run("unwraps_prefixed_conn_when_prefix_drained", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		prefixedConn := &prefixedNetConn{Conn: serverConn}
+		openConn := connForTransportOpen(prefixedConn)
+		if openConn != serverConn {
+			testingObject.Fatalf("expected underlying conn when prefix drained")
+		}
+	})
+
+	testingObject.Run("keeps_prefixed_conn_when_prefix_pending", func(testingObject *testing.T) {
+		serverConn, clientConn := net.Pipe()
+		defer func() {
+			_ = serverConn.Close()
+			_ = clientConn.Close()
+		}()
+
+		prefixedConn := &prefixedNetConn{
+			Conn:   serverConn,
+			prefix: []byte{0x00},
+		}
+		openConn := connForTransportOpen(prefixedConn)
+		if openConn != prefixedConn {
+			testingObject.Fatalf("expected prefixed conn preserved when prefix pending")
 		}
 	})
 }
@@ -1055,6 +1170,81 @@ func TestRegisterAcceptedTunnelSingleActiveSession(testingObject *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	testingObject.Fatalf("expected idle tunnel removed after close")
+}
+
+// TestHandleAcceptedTCPTunnelUsesHandshakeTunnelID 验证 TCP 入站从 tunnel 首帧握手读取 tunnel_id 并登记。
+func TestHandleAcceptedTCPTunnelUsesHandshakeTunnelID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-tcp-handshake-1",
+		ConnectorID:   "agent-local",
+		Epoch:         21,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+
+	tcpTransport, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new tcp transport failed: %v", err)
+	}
+	server := &controlPlaneServer{
+		tcpTransport: tcpTransport,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		_ = clientConn.Close()
+	}()
+	go func() {
+		_ = writeTCPTunnelHandshakeFrameForTest(clientConn, pb.TunnelDialAnnounce{
+			SessionID:     "session-tcp-handshake-1",
+			SessionEpoch:  21,
+			TunnelID:      "tun-agent-21",
+			DialLocalAddr: "127.0.0.1:54321",
+			TimestampUnix: time.Now().UTC().Unix(),
+		})
+	}()
+	if err := server.handleAcceptedTCPTunnel(serverConn); err != nil {
+		testingObject.Fatalf("handle accepted tcp tunnel failed: %v", err)
+	}
+
+	runtimeList := tunnelRegistry.List()
+	if len(runtimeList) != 1 {
+		testingObject.Fatalf("expected one tunnel registered, got=%d", len(runtimeList))
+	}
+	runtimeSnapshot := runtimeList[0]
+	if runtimeSnapshot.ConnectorID != "agent-local" || runtimeSnapshot.SessionID != "session-tcp-handshake-1" {
+		testingObject.Fatalf(
+			"unexpected handshake tunnel owner: connector=%s session=%s",
+			runtimeSnapshot.ConnectorID,
+			runtimeSnapshot.SessionID,
+		)
+	}
+	if runtimeSnapshot.TunnelID != "tun-agent-21" {
+		testingObject.Fatalf("unexpected registered tunnel id: got=%s want=%s", runtimeSnapshot.TunnelID, "tun-agent-21")
+	}
+	if runtimeSnapshot.Tunnel == nil {
+		testingObject.Fatalf("expected runtime tunnel instance")
+	}
+
+	_ = runtimeSnapshot.Tunnel.Close()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if tunnelRegistry.Snapshot().TotalCount == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	testingObject.Fatalf("expected handshake tunnel removed after close")
 }
 
 // TestRegisterAcceptedTunnelDuplicateActiveSameConnector
@@ -1148,67 +1338,7 @@ func TestRegisterAcceptedTunnelLifecycleProbeRemoteClose(testingObject *testing.
 	testingObject.Fatalf("expected idle tunnel removed after lifecycle probe close")
 }
 
-// TestRegisterAcceptedTunnelUsesDialAnnounceForGRPC 验证 gRPC tunnel 和 TCP 一样通过 TunnelDialAnnounce 对齐 tunnel_id。
-func TestRegisterAcceptedTunnelUsesDialAnnounceForGRPC(testingObject *testing.T) {
-	testingObject.Parallel()
-
-	sessionRegistry := registry.NewSessionRegistry()
-	tunnelRegistry := registry.NewTunnelRegistry()
-	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
-		sessionRegistry: sessionRegistry,
-		tunnelRegistry:  tunnelRegistry,
-	})
-	server := &controlPlaneServer{dispatcher: dispatcher}
-
-	rawTunnel := newControlPlaneInboundTestTunnel("grpc-acceptor-generated-id")
-	defer func() {
-		_ = rawTunnel.Close()
-	}()
-
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		dispatcher.enqueueTunnelDialAnnounce(pb.TunnelDialAnnounce{
-			SessionID:     "session-grpc-1",
-			SessionEpoch:  11,
-			TunnelID:      "tun-42",
-			TimestampUnix: time.Now().UTC().Unix(),
-		})
-	}()
-
-	go func() {
-		time.Sleep(40 * time.Millisecond)
-		now := time.Now().UTC()
-		sessionRegistry.Upsert(now, registry.SessionRuntime{
-			SessionID:     "session-grpc-1",
-			ConnectorID:   "agent-grpc",
-			Epoch:         11,
-			State:         registry.SessionActive,
-			LastHeartbeat: now,
-			UpdatedAt:     now,
-		})
-	}()
-
-	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeGRPCH2); err != nil {
-		testingObject.Fatalf("register accepted grpc tunnel failed: %v", err)
-	}
-
-	runtimeSnapshot, exists := tunnelRegistry.Get("tun-42")
-	if !exists {
-		testingObject.Fatalf("expected grpc tunnel registered with announced tunnel id")
-	}
-	if runtimeSnapshot.ConnectorID != "agent-grpc" || runtimeSnapshot.SessionID != "session-grpc-1" {
-		testingObject.Fatalf(
-			"unexpected grpc tunnel owner: connector=%s session=%s",
-			runtimeSnapshot.ConnectorID,
-			runtimeSnapshot.SessionID,
-		)
-	}
-	if rawTunnel.closed() {
-		testingObject.Fatalf("expected grpc tunnel to remain open after successful registration")
-	}
-}
-
-// TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC 验证 gRPC tunnel_id 来源于 stream metadata 时无需等待 dial announce。
+// TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC 验证 gRPC tunnel_id 必须来源于 stream metadata。
 func TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC(testingObject *testing.T) {
 	testingObject.Parallel()
 
@@ -1255,6 +1385,44 @@ func TestRegisterAcceptedTunnelUsesStreamMetadataTunnelIDForGRPC(testingObject *
 	}
 	if rawTunnel.closed() {
 		testingObject.Fatalf("expected grpc tunnel to remain open after successful registration")
+	}
+}
+
+// TestRegisterAcceptedTunnelDropsWhenClientTunnelIDMissingForGRPC 验证 gRPC 缺少客户端 tunnel_id 上报时会拒绝登记。
+func TestRegisterAcceptedTunnelDropsWhenClientTunnelIDMissingForGRPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-grpc-raw-1",
+		ConnectorID:   "agent-grpc",
+		Epoch:         13,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	server := &controlPlaneServer{dispatcher: dispatcher}
+
+	rawTunnel := newControlPlaneInboundTestTunnel("grpc-raw-88")
+	defer func() {
+		_ = rawTunnel.Close()
+	}()
+
+	if err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeGRPCH2); err != nil {
+		testingObject.Fatalf("register accepted grpc tunnel should not hard fail when tunnel id missing: %v", err)
+	}
+	if tunnelRegistry.Snapshot().TotalCount != 0 {
+		testingObject.Fatalf("expected no grpc tunnel registered when client tunnel id is missing")
+	}
+	if !rawTunnel.closed() {
+		testingObject.Fatalf("expected grpc tunnel closed when client tunnel id is missing")
 	}
 }
 
