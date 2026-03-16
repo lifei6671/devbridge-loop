@@ -34,8 +34,10 @@ const (
 
 // Endpoint 描述 Agent 侧最终选中的 upstream endpoint。
 type Endpoint struct {
-	ID   string
-	Addr string
+	ID         string
+	Addr       string
+	Protocol   string
+	ServerName string
 }
 
 // EndpointSelector 定义 service -> endpoint 的本地选择能力。

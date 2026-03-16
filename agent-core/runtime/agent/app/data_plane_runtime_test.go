@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -296,6 +298,9 @@ func TestRuntimeHintEndpointSelectorFallsBackToServiceCatalog(testingObject *tes
 	if selectedEndpoint.Addr != "127.0.0.1:8080" {
 		testingObject.Fatalf("unexpected endpoint addr: got=%s want=%s", selectedEndpoint.Addr, "127.0.0.1:8080")
 	}
+	if selectedEndpoint.Protocol != "http" {
+		testingObject.Fatalf("unexpected endpoint protocol: got=%s want=%s", selectedEndpoint.Protocol, "http")
+	}
 }
 
 // TestHandleTunnelRecyclePhaseAcceptsGRPCTunnelIDMismatch 验证 grpc recycle 阶段允许对端 tunnel_id 与本地不一致。
@@ -382,6 +387,80 @@ func TestRuntimeHintEndpointSelectorPrefersHintOverCatalog(testingObject *testin
 	if selectedEndpoint.Addr != "127.0.0.1:9090" {
 		testingObject.Fatalf("unexpected endpoint addr: got=%s want=%s", selectedEndpoint.Addr, "127.0.0.1:9090")
 	}
+}
+
+// TestRuntimeHintEndpointSelectorReturnsHTTPSMetadata 验证目录回退可保留 endpoint protocol/sni。
+func TestRuntimeHintEndpointSelectorReturnsHTTPSMetadata(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	catalog := service.NewCatalog()
+	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
+		ServiceID:   "svc-https-1",
+		ServiceKey:  "dev/demo/deepin-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "deepin-service",
+		ServiceType: "https",
+		Endpoints: []pb.ServiceEndpoint{
+			{
+				EndpointID: "ep-https-1",
+				Protocol:   "https",
+				Host:       "127.0.0.1",
+				Port:       8443,
+				ServerName: "deepin.disign.me",
+			},
+		},
+	})
+	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
+
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/deepin-service", map[string]string{})
+	if err != nil {
+		testingObject.Fatalf("select https endpoint from catalog failed: %v", err)
+	}
+	if selectedEndpoint.Protocol != "https" {
+		testingObject.Fatalf("unexpected endpoint protocol: got=%s want=%s", selectedEndpoint.Protocol, "https")
+	}
+	if selectedEndpoint.ServerName != "deepin.disign.me" {
+		testingObject.Fatalf("unexpected endpoint server_name: got=%s want=%s", selectedEndpoint.ServerName, "deepin.disign.me")
+	}
+}
+
+// TestRuntimeNetUpstreamDialerUsesTLSForHTTPS 验证 https endpoint 会走 TLS 拨号。
+func TestRuntimeNetUpstreamDialerUsesTLSForHTTPS(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		testingObject.Fatalf("listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = connection.Write([]byte("not-tls"))
+	}()
+
+	dialer := &runtimeNetUpstreamDialer{dialTimeout: 2 * time.Second}
+	_, err = dialer.Dial(context.Background(), traffic.Endpoint{
+		ID:         "ep-https-1",
+		Addr:       listener.Addr().String(),
+		Protocol:   "https",
+		ServerName: "deepin.disign.me",
+	})
+	if err == nil {
+		testingObject.Fatalf("expected tls dial error for non-tls upstream")
+	}
+	normalizedError := strings.ToLower(err.Error())
+	if !strings.Contains(normalizedError, "tls") {
+		testingObject.Fatalf("expected tls dial path error, got: %v", err)
+	}
+	<-serverDone
 }
 
 // TestRunTrafficAcceptorWorkerRejectsNonOpenFirstFrame 验证首帧非 open 时 worker 会回收 tunnel。

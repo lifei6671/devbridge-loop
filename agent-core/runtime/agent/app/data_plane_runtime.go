@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -612,11 +613,11 @@ func (selector *runtimeHintEndpointSelector) SelectEndpoint(
 		resolvedEndpointAddr = strings.TrimSpace(endpointAddr)
 		break
 	}
+	catalogEndpoint, hasCatalogEndpoint := selector.selectEndpointFromCatalog(normalizedServiceID, normalizedHint)
+	if hasCatalogEndpoint {
+		return catalogEndpoint, nil
+	}
 	if resolvedEndpointAddr == "" {
-		catalogEndpoint, hasCatalogEndpoint := selector.selectEndpointFromCatalog(normalizedServiceID, normalizedHint)
-		if hasCatalogEndpoint {
-			return catalogEndpoint, nil
-		}
 		return traffic.Endpoint{}, fmt.Errorf("select endpoint: service=%s missing endpoint hint", normalizedServiceID)
 	}
 	endpointID := strings.TrimSpace(normalizedHint[trafficOpenHintEndpointIDKey])
@@ -625,8 +626,10 @@ func (selector *runtimeHintEndpointSelector) SelectEndpoint(
 		endpointID = resolvedEndpointAddr
 	}
 	return traffic.Endpoint{
-		ID:   endpointID,
-		Addr: resolvedEndpointAddr,
+		ID:         endpointID,
+		Addr:       resolvedEndpointAddr,
+		Protocol:   "",
+		ServerName: "",
 	}, nil
 }
 
@@ -663,8 +666,10 @@ func (selector *runtimeHintEndpointSelector) selectEndpointFromCatalog(
 				}
 				if endpointAddr := resolveEndpointAddress(endpoint); endpointAddr != "" {
 					return traffic.Endpoint{
-						ID:   endpointIDHint,
-						Addr: endpointAddr,
+						ID:         endpointIDHint,
+						Addr:       endpointAddr,
+						Protocol:   strings.ToLower(strings.TrimSpace(endpoint.Protocol)),
+						ServerName: strings.TrimSpace(endpoint.ServerName),
 					}, true
 				}
 			}
@@ -680,10 +685,16 @@ func (selector *runtimeHintEndpointSelector) selectEndpointFromCatalog(
 					endpointID = endpointAddr
 				}
 				return traffic.Endpoint{
-					ID:   endpointID,
-					Addr: endpointAddr,
+					ID:         endpointID,
+					Addr:       endpointAddr,
+					Protocol:   strings.ToLower(strings.TrimSpace(endpoint.Protocol)),
+					ServerName: strings.TrimSpace(endpoint.ServerName),
 				}, true
 			}
+		}
+		// 显式 hint 未命中目录时，由上层按 hint 原样回退，不自动改写为目录首个 endpoint。
+		if endpointIDHint != "" || endpointAddrHint != "" {
+			return traffic.Endpoint{}, false
 		}
 		for _, endpoint := range record.Registration.Endpoints {
 			endpointAddr := resolveEndpointAddress(endpoint)
@@ -695,8 +706,10 @@ func (selector *runtimeHintEndpointSelector) selectEndpointFromCatalog(
 				endpointID = endpointAddr
 			}
 			return traffic.Endpoint{
-				ID:   endpointID,
-				Addr: endpointAddr,
+				ID:         endpointID,
+				Addr:       endpointAddr,
+				Protocol:   strings.ToLower(strings.TrimSpace(endpoint.Protocol)),
+				ServerName: strings.TrimSpace(endpoint.ServerName),
 			}, true
 		}
 	}
@@ -741,6 +754,26 @@ func (dialer *runtimeNetUpstreamDialer) Dial(
 	normalizedAddress := strings.TrimSpace(endpoint.Addr)
 	if normalizedAddress == "" {
 		return nil, fmt.Errorf("dial upstream: empty endpoint address")
+	}
+	normalizedProtocol := strings.ToLower(strings.TrimSpace(endpoint.Protocol))
+	if normalizedProtocol == "https" {
+		tlsConfig := &tls.Config{}
+		if serverName := strings.TrimSpace(endpoint.ServerName); serverName != "" {
+			tlsConfig.ServerName = serverName
+		}
+		connection, err := (&tls.Dialer{
+			NetDialer: &net.Dialer{},
+			Config:    tlsConfig,
+		}).DialContext(normalizedContext, "tcp", normalizedAddress)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"dial upstream tls: endpoint=%s server_name=%s: %w",
+				normalizedAddress,
+				tlsConfig.ServerName,
+				err,
+			)
+		}
+		return connection, nil
 	}
 	connection, err := (&net.Dialer{}).DialContext(normalizedContext, "tcp", normalizedAddress)
 	if err != nil {
