@@ -90,6 +90,21 @@ func (tunnel *mockTunnel) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
+// Flush 测试桩默认无待清理缓存。
+func (tunnel *mockTunnel) Flush() error {
+	return nil
+}
+
+// ReuseCount 测试桩固定返回 0。
+func (tunnel *mockTunnel) ReuseCount() int {
+	return 0
+}
+
+// Recyclable 测试桩仅在非终态时允许回收。
+func (tunnel *mockTunnel) Recyclable() bool {
+	return tunnel.state != transport.TunnelStateBroken && tunnel.state != transport.TunnelStateClosed
+}
+
 // Done 返回生命周期结束通知。
 func (tunnel *mockTunnel) Done() <-chan struct{} {
 	return tunnel.doneChannel

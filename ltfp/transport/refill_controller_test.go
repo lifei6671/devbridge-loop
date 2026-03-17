@@ -123,6 +123,11 @@ func (pool *failingPutIdlePool) Remove(tunnelID string) error {
 	return ErrUnsupported
 }
 
+// Recycle 仅为满足接口。
+func (pool *failingPutIdlePool) Recycle(ctx context.Context, tunnel Tunnel) (RecycleResult, error) {
+	return RecycleResultClosed, ErrUnsupported
+}
+
 // IdleCount 返回空池计数。
 func (pool *failingPutIdlePool) IdleCount() int {
 	return 0
@@ -130,6 +135,16 @@ func (pool *failingPutIdlePool) IdleCount() int {
 
 // InUseCount 返回空池计数。
 func (pool *failingPutIdlePool) InUseCount() int {
+	return 0
+}
+
+// RecycledCount 返回空池计数。
+func (pool *failingPutIdlePool) RecycledCount() int {
+	return 0
+}
+
+// ClosedCount 返回空池计数。
+func (pool *failingPutIdlePool) ClosedCount() int {
 	return 0
 }
 

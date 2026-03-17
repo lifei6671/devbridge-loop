@@ -1,4 +1,4 @@
-# LTFP 传输层规范 v2.1（最终版）
+# LTFP 传输层规范 v2.1（最终版，含单 Tunnel 串行复用补充）
 
 ## 1. 文档说明
 
@@ -16,6 +16,7 @@
 * 后续 QUIC 等 binding 演进
 
 对应执行清单见 [LTFP-TransportExecutionChecklist.md](./LTFP-TransportExecutionChecklist.md)。
+单 Tunnel 串行复用的专项设计已并入本规范，原方案文档见 [LTFP-TunnelMultiplex-Proposal.md](./LTFP-TunnelMultiplex-Proposal.md)。
 
 ---
 
@@ -43,7 +44,7 @@
 * datagram
 * session resume
 * mid-stream failover
-* tunnel 多次复用
+* 单 tunnel 并发多路复用（同一时刻承载多条 traffic）
 
 ---
 
@@ -70,7 +71,7 @@ Agent 与 Server 之间的一次长期传输会话。一个 Session 包含：
 
 由 Agent 主动建立的数据面双向字节通道。Tunnel 创建后先进入空闲池，待 Server 分配给某次实际 traffic 后承载该次 traffic 的数据传输。
 
-Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / TrafficOpenAck / TrafficClose / TrafficReset / TrafficData` 的业务语义。
+Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficCloseAck / TrafficReset / TunnelRecycle / TunnelRecycleAck` 的业务语义。
 
 ---
 
@@ -154,7 +155,7 @@ Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / Tra
 * `service_key` 查找
 * namespace / env 逻辑
 * traffic 协议状态机
-* `TrafficOpen/Ack/Close/Reset/Data` 字段语义
+* `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck` 字段语义
 
 ---
 
@@ -190,20 +191,21 @@ Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / Tra
 4. Server 在 tunnel 上先发送 `TrafficOpen`
 5. Agent 返回 `TrafficOpenAck`
 6. 之后进入数据转发阶段
-7. traffic 结束后 tunnel 关闭，由 Agent 再补新 tunnel
+7. traffic 正常结束后必须先完成 `TrafficClose -> TrafficCloseAck`，再进入回收握手
+8. 回收握手 `TunnelRecycle -> TunnelRecycleAck` 成功后回池；失败或 `is_final=true` 时关闭并补新 tunnel
 
 ---
 
-#### 3.2.4 单 Tunnel 单 Traffic
+#### 3.2.4 单 Tunnel 单并发 Traffic（可串行复用）
 
 这是本方案的强约束。
 
 即：
 
 * tunnel 建立后可以空闲等待
-* tunnel 一旦被某次 traffic 占用，就不得再服务第二次 traffic
-* traffic 结束后 tunnel 必须关闭
-* Agent 负责补充新的空闲 tunnel
+* 同一时刻一条 tunnel 只能承载一条 traffic（禁止并发复用）
+* traffic 正常结束后可通过回收握手重新回池，承载后续轮次 traffic（串行复用）
+* traffic 异常 reset、回收握手失败或达到最大复用次数时，tunnel 必须关闭并由 Agent 补充
 
 ---
 
@@ -218,7 +220,10 @@ Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / Tra
 * `TrafficOpenAck`
 * `TrafficData`
 * `TrafficClose`
+* `TrafficCloseAck`
 * `TrafficReset`
+* `TunnelRecycle`
+* `TunnelRecycleAck`
 
 Transport 不定义这些帧类型，但 runtime/protocol 必须定义并统一编码。
 
@@ -267,7 +272,7 @@ Transport 不定义这些帧类型，但 runtime/protocol 必须定义并统一�
 
 * Agent 侧 tunnel 预建
 * Server 侧 tunnel 分配
-* `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficReset`
+* `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficCloseAck / TrafficReset / TunnelRecycle / TunnelRecycleAck`
 * 数据转发
 * 心跳
 * session 生命周期治理
@@ -528,6 +533,7 @@ Tunnel 是一条由 Agent 主动建立的数据面双向字节通道。
 * `idle`
 * `reserved`
 * `active`
+* `recycling`（逻辑过程态，可由实现折叠为 `active` 子阶段）
 * `closing`
 * `closed`
 * `broken`
@@ -552,6 +558,10 @@ Tunnel 已被 Server 分配，不能再被其他请求抢占，但尚未完成�
 
 Tunnel 正在被本次 traffic 使用。Transport 只知道它已被使用，不区分 `open_sent` 还是 `established`。
 
+#### recycling
+
+本次 traffic 已进入协议性关闭后的回收握手阶段，等待 `TunnelRecycleAck` 决定“回池或终态关闭”。
+
 #### closing
 
 Tunnel 正在关闭过程中。
@@ -574,9 +584,13 @@ idle -> reserved
 reserved -> active
 reserved -> closed
 reserved -> broken
-active -> closing
+active -> recycling
 active -> closed
 active -> broken
+recycling -> idle
+recycling -> closing
+recycling -> closed
+recycling -> broken
 closing -> closed
 idle -> broken
 ```
@@ -588,11 +602,12 @@ idle -> broken
 1. 只有 `idle` tunnel 才能被分配
 2. `reserved` 表示该 tunnel 已被独占，不得再次分配
 3. `active` 仅表示 tunnel 正在被使用，不表示协议层一定已完成 `OpenAck`
-4. `closed` 和 `broken` 的 tunnel 不得重回池中复用
-5. 一条 tunnel 只能承载一次 traffic
-6. 同一条 tunnel 允许“一侧读、一侧写”的并发使用
-7. 同一条 tunnel 上不保证多写方并发安全；若存在多个写入来源，必须由更高层串行化
-8. 同一条 tunnel 上不保证多读方并发安全；调用方应维持单 reader 模型
+4. `closed` 和 `broken` 的 tunnel 不得重回池中
+5. 一条 tunnel 允许串行承载多轮 traffic，但同一时刻只允许一轮 traffic（单并发）
+6. tunnel 回池前必须完成 `TrafficCloseAck` 与 `TunnelRecycleAck(accepted=true)`，且 `recycle_seq` 必须单调递增；未满足时必须降级关闭
+7. 同一条 tunnel 允许“一侧读、一侧写”的并发使用
+8. 同一条 tunnel 上不保证多写方并发安全；若存在多个写入来源，必须由更高层串行化
+9. 同一条 tunnel 上不保证多读方并发安全；调用方应维持单 reader 模型
 
 ---
 
@@ -604,8 +619,9 @@ Agent 负责：
 
 1. 在 session 认证成功后主动创建若干空闲 tunnel
 2. 在 tunnel 被消费或损坏后补充新 tunnel
-3. 定期清理过期 idle tunnel
-4. 通过控制面上报池状态
+3. 在回收握手与本地可回收校验均成功后将 tunnel 放回 idle pool（否则必须关闭）
+4. 定期清理过期 idle tunnel
+5. 通过控制面上报池状态
 
 ---
 
@@ -616,7 +632,8 @@ Server 负责：
 1. 接收 Agent 建好的 idle tunnel
 2. 从池中分配 tunnel 给实际 traffic
 3. 跟踪 tunnel 生命周期
-4. 在 traffic 结束后回收本地状态
+4. 在 traffic 正常结束后发起 `TunnelRecycle` 握手
+5. 在回收失败/超时时将 tunnel 标记终态并触发补池
 
 ---
 
@@ -631,6 +648,8 @@ Server 负责：
 * `max_inflight_tunnel_opens`
 * `tunnel_open_rate_limit`
 * `tunnel_open_burst`
+* `max_reuse_count`
+* `recycle_handshake_timeout`
 
 ---
 
@@ -796,8 +815,9 @@ Tunnel 建立并空闲
 -> Server 发送 TrafficOpen
 -> Agent 返回 TrafficOpenAck
 -> 双向 TrafficData
--> TrafficClose / TrafficReset
--> Tunnel 关闭
+-> 正常路径：TrafficClose -> TrafficCloseAck -> TunnelRecycle -> TunnelRecycleAck
+-> 异常路径：TrafficReset
+-> 正常回收成功回池；异常或回收失败则关闭
 ```
 
 ---
@@ -808,7 +828,11 @@ Tunnel 建立并空闲
 2. 未收到 `TrafficOpenAck(success=true)` 前不得进入业务数据转发
 3. `TrafficOpenAck(success=false)` 后当前 tunnel 必须关闭
 4. 收到 `TrafficReset` 后必须立即终止该 traffic
-5. traffic 结束后 tunnel 关闭，不回池
+5. 正常关闭后必须先完成 `TrafficCloseAck`，再进入 `TunnelRecycle` 握手
+6. `TunnelRecycleAck(accepted=true)` 才允许回池；拒绝、超时或序列不合法必须关闭
+7. `TunnelRecycle.recycle_seq` 必须严格递增，用于防止旧轮次消息污染
+8. Agent 收到 `TunnelRecycle` 时若尚未观察到本轮 `TrafficCloseAck`，必须返回 `TunnelRecycleAck(accepted=false,error_code=close_ack_required)`
+9. 回收拒绝建议使用稳定错误码：`invalid_seq`、`tunnel_unhealthy`、`buffer_dirty`、`close_ack_required`
 
 ---
 
@@ -826,7 +850,10 @@ LTFP 数据面采用 **framed all the way** 模型。
 * `TrafficOpenAck`
 * `TrafficData`
 * `TrafficClose`
+* `TrafficCloseAck`
 * `TrafficReset`
+* `TunnelRecycle`
+* `TunnelRecycleAck`
 
 ---
 
@@ -853,7 +880,7 @@ LTFP 数据面采用 **framed all the way** 模型。
 #### Runtime / Protocol 层
 
 * 定义数据面帧结构
-* 负责 `TrafficOpen/Ack/Data/Close/Reset` 的编码与解码
+* 负责 `TrafficOpen/Ack/Data/Close/CloseAck/Reset/Recycle/RecycleAck` 的编码与解码
 * 负责数据面状态机推进
 * 负责将普通流式 I/O 适配为 framed data plane
 
@@ -867,7 +894,10 @@ LTFP 数据面采用 **framed all the way** 模型。
 * `OpenAck`
 * `Data`
 * `Close`
+* `CloseAck`
 * `Reset`
+* `Recycle`
+* `RecycleAck`
 
 注意：
 
@@ -948,6 +978,8 @@ Runtime 层必须自行封装一个 `TrafficDataStream` Adapter，供代理逻�
 * open 后未 ack 就写业务流
 * 必填字段缺失
 * 非法状态流转
+* recycle 序列非单调递增（`invalid_seq`）
+* 未观测到 close ack 就触发 recycle（`close_ack_required`）
 
 处理规则：
 
@@ -1058,6 +1090,18 @@ Server 发送 `TrafficOpen` 后必须等待 `TrafficOpenAck`。
 
 ---
 
+### 14.6 Recycle Handshake Timeout
+
+在 `TrafficCloseAck` 之后，`TunnelRecycle -> TunnelRecycleAck` 必须受独立超时约束（建议默认 `3s`）。
+
+若超时未收到合法 `TunnelRecycleAck`：
+
+* 当前 tunnel 必须标记为 `broken` 或 `closed`
+* 不得回池
+* Agent 需补充新 tunnel
+
+---
+
 ## 15. 关闭与终止语义
 
 ### 15.1 正常关闭
@@ -1067,10 +1111,11 @@ Server 发送 `TrafficOpen` 后必须等待 `TrafficOpenAck`。
 语义：
 
 1. 一方发送 `TrafficClose`
-2. 对端完成收尾
-3. 双方释放资源
-4. tunnel 关闭
-5. Agent 后续补充新 tunnel
+2. 对端返回 `TrafficCloseAck`
+3. Server 发起 `TunnelRecycle`（可带 `is_final`）
+4. Agent 返回 `TunnelRecycleAck`（`accepted=false` 时必须带错误码）
+5. 若 `accepted=true` 且 `is_final=false`，tunnel 回池进入下一轮
+6. 若 `accepted=false`、握手超时或 `is_final=true`，tunnel 关闭并补新 tunnel（典型拒绝码：`invalid_seq`、`close_ack_required`、`tunnel_unhealthy`、`buffer_dirty`）
 
 ---
 
@@ -1082,7 +1127,7 @@ Server 发送 `TrafficOpen` 后必须等待 `TrafficOpenAck`。
 
 1. 一方发送 `TrafficReset`
 2. 对端立即停止转发
-3. tunnel 标记损坏或直接关闭
+3. tunnel 标记损坏或直接关闭（跳过回收握手）
 4. 当前 traffic 失败
 5. Agent 补新 tunnel
 
@@ -1214,6 +1259,7 @@ const (
 	TunnelStateIdle     TunnelState = "idle"
 	TunnelStateReserved TunnelState = "reserved"
 	TunnelStateActive   TunnelState = "active"
+	TunnelStateRecycling TunnelState = "recycling"
 	TunnelStateClosing  TunnelState = "closing"
 	TunnelStateClosed   TunnelState = "closed"
 	TunnelStateBroken   TunnelState = "broken"
@@ -1326,6 +1372,13 @@ type Tunnel interface {
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 
+	// Flush 在回收前尝试清理本地读缓存；若存在脏数据应返回错误。
+	Flush() error
+	// ReuseCount 返回当前 tunnel 已完成的回收轮次（0-based）。
+	ReuseCount() int
+	// Recyclable 报告当前 tunnel 是否满足回收前提。
+	Recyclable() bool
+
 	Done() <-chan struct{}
 	Err() error
 }
@@ -1340,11 +1393,12 @@ type TunnelHealthProber interface {
 说明：
 
 1. `Read/Write` 不带 context，便于与 `io.Copy` 集成
-2. `Tunnel` 只传输字节，不认 `TrafficOpen/Ack/Close/Reset/Data`
+2. `Tunnel` 只传输字节，不认 `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck`
 3. 数据面 framing 由 runtime/protocol 负责
 4. 可选能力不支持时必须返回 `ErrUnsupported`
-5. 同一条 tunnel 的多 goroutine 并发写入不保证安全；若存在多写方，上层必须自行串行化
-6. `Probe` 作为可选扩展能力：`tcp_framed` 必须实现；`grpc_h2` 可返回 `ErrUnsupported`（连接级 keepalive 已覆盖）
+5. `Flush/Recyclable` 是回收前的数据清洁度与健康校验钩子；校验失败必须降级关闭
+6. 同一条 tunnel 的多 goroutine 并发写入不保证安全；若存在多写方，上层必须自行串行化
+7. `Probe` 作为可选扩展能力：`tcp_framed` 必须实现；`grpc_h2` 可返回 `ErrUnsupported`（连接级 keepalive 已覆盖）
 
 ---
 
@@ -1364,11 +1418,21 @@ type TunnelAcceptor interface {
 type TunnelPool interface {
 	PutIdle(t Tunnel) error
 	Acquire(ctx context.Context) (Tunnel, error)
+	Recycle(ctx context.Context, tunnel Tunnel) (RecycleResult, error)
 	Remove(id string) error
 
 	IdleCount() int
 	InUseCount() int
+	RecycledCount() int
+	ClosedCount() int
 }
+
+type RecycleResult string
+
+const (
+	RecycleResultRecycled RecycleResult = "recycled" // 回收成功并重新入池
+	RecycleResultClosed   RecycleResult = "closed"   // 回收失败或 final close
+)
 ```
 
 #### Tunnel 分配与探活规范（新增）
@@ -1377,6 +1441,8 @@ type TunnelPool interface {
 2. 若 tunnel 实现了 `TunnelHealthProber`，`Acquire` 或其上层分配器必须在真正分配前完成一次探活；探活失败的 tunnel 必须从 idle 集合移除，禁止重新放回 idle 池
 3. 探活失败必须触发补池信号（例如 `TunnelRefillRequest`）或等待 Agent 自治补充，避免容量持续下降
 4. 分配器应支持 `max_acquire_retry`（建议默认 `3`）；连续命中 stale tunnel 且超过重试后必须返回 `ErrNoTunnel`，并保留 `ErrTunnelStale` 语义供上层判因
+5. `Recycle` 负责 transport 侧回收判定（`Recyclable/Flush`）与池内状态迁移；失败时必须返回 `RecycleResultClosed` 且不得把 tunnel 重新放入 idle 池
+6. `recycle_seq` 单调性与 `close_ack_required` 等协议校验属于 runtime/protocol 职责，不应下沉到 `TunnelPool`
 
 ---
 
@@ -1476,7 +1542,10 @@ const (
 	TrafficFrameOpenAck TrafficFrameType = "open_ack"
 	TrafficFrameData    TrafficFrameType = "data"
 	TrafficFrameClose   TrafficFrameType = "close"
+	TrafficFrameCloseAck TrafficFrameType = "close_ack"
 	TrafficFrameReset   TrafficFrameType = "reset"
+	TrafficFrameRecycle TrafficFrameType = "recycle"
+	TrafficFrameRecycleAck TrafficFrameType = "recycle_ack"
 )
 
 type TrafficOpenAck struct {
@@ -1490,9 +1559,29 @@ type TrafficClose struct {
 	Message string
 }
 
+type TrafficCloseAck struct {
+	Accepted bool
+	Code     string
+	Message  string
+}
+
 type TrafficReset struct {
 	Code    string
 	Message string
+}
+
+type TunnelRecycle struct {
+	TunnelID   string
+	RecycleSeq uint64
+	IsFinal    bool
+}
+
+type TunnelRecycleAck struct {
+	TunnelID   string
+	RecycleSeq uint64
+	Accepted   bool
+	Code       string
+	Message    string
 }
 
 type TrafficFrame struct {
@@ -1501,7 +1590,10 @@ type TrafficFrame struct {
 	OpenAck *TrafficOpenAck
 	Data    []byte
 	Close   *TrafficClose
+	CloseAck *TrafficCloseAck
 	Reset   *TrafficReset
+	Recycle *TunnelRecycle
+	RecycleAck *TunnelRecycleAck
 }
 
 type TrafficProtocol interface {
@@ -1555,6 +1647,7 @@ rpc ControlChannel(stream ControlEnvelope) returns (stream ControlEnvelope);
 * Server 接收到后放入 idle pool
 * 实际请求到来时由 Server 从 idle pool 分配 tunnel
 * 在该 tunnel 上发送 `TrafficOpen`
+* traffic 正常结束后通过 `CloseAck + RecycleAck` 决定“回池或终态关闭”
 
 传输层眼中，数据面只有纯字节 payload，不承载业务字段。
 
@@ -1571,7 +1664,7 @@ rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
 规范要求：
 
 1. `TunnelEnvelope` 只能作为 transport 载体
-2. 不得在 `TunnelEnvelope` 中直接定义 `TrafficOpen/OpenAck/Close/Reset/Data` 等业务字段
+2. 不得在 `TunnelEnvelope` 中直接定义 `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck` 等业务字段
 3. 这些业务对象必须由 runtime/protocol 层先编码为二进制，再写入 `payload`
 
 #### keepalive 与 probe 约束（新增）
@@ -1608,7 +1701,7 @@ rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
 
 * 控制面使用长期 framed TCP 连接
 * 数据面 tunnel 仍以一条 TCP 连接对应一条 tunnel 的方式承载
-* 同样遵循 tunnel 一次一用原则
+* 同样遵循“单 tunnel 单并发 traffic，可串行复用”原则
 
 `tcp_framed` binding 规范要求（新增）：
 
@@ -1641,11 +1734,11 @@ rpc TunnelStream(stream TunnelEnvelope) returns (stream TunnelEnvelope);
 1. 必须实现长期 control channel
 2. 必须实现 Agent 主动创建 tunnel
 3. 必须实现 Server 侧 idle tunnel pool
-4. 必须实现 tunnel 一次一用
-5. 必须实现 `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficReset`
+4. 必须实现“单 tunnel 单并发 traffic + 串行复用回收”模型
+5. 必须实现 `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficCloseAck / TrafficReset / TunnelRecycle / TunnelRecycleAck`
 6. 必须实现控制面 heartbeat
 7. 必须实现 tunnel 补充机制
-8. 可以暂不实现 tunnel 多次复用
+8. 可以暂不实现“单 tunnel 并发多路复用”（同一时刻多 traffic）
 9. 可以暂不实现 datagram
 10. 可以暂不实现 session resume
 
@@ -1773,7 +1866,7 @@ ltfp/
 2. 先实现 `grpc_h2` binding
 3. 实现 Agent 侧 tunnel maintainer
 4. 实现 Server 侧 tunnel pool 与 dispatcher
-5. 在 runtime 层完成 `TrafficOpen/Ack/Data/Close/Reset`
+5. 在 runtime 层完成 `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck`
 6. 最后再评估 QUIC binding
 
 ---
@@ -1782,11 +1875,11 @@ ltfp/
 
 本规范的结论如下：
 
-1. LTFP 传输层采用“长期控制通道 + Agent 预建 Tunnel Pool + 单 Tunnel 单 Traffic”的统一模型
+1. LTFP 传输层采用“长期控制通道 + Agent 预建 Tunnel Pool + 单 Tunnel 单并发 Traffic（可串行复用）”的统一模型
 2. Transport 层只负责 session、control channel、tunnel 与字节流生命周期
-3. `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficReset` 属于 protocol/runtime 层，不属于 transport abstraction
+3. `TrafficOpen / TrafficOpenAck / TrafficData / TrafficClose / TrafficCloseAck / TrafficReset / TunnelRecycle / TunnelRecycleAck` 属于 protocol/runtime 层，不属于 transport abstraction
 4. Server 不需要在 gRPC/HTTP2 上主动新建 stream，而是消费 Agent 预先建立的 tunnel
-5. 一条 tunnel 只承载一次 traffic，traffic 结束后关闭并由 Agent 补充新 tunnel
+5. 一条 tunnel 在同一时刻只承载一次 traffic；正常结束后经 `CloseAck + RecycleAck` 可回池复用，失败路径关闭并补新 tunnel
 6. Tunnel 在 transport 层不感知 `open_sent / established` 等业务握手状态
 7. 数据面采用 **framed all the way**，`Data` 也属于 runtime/protocol frame
 8. Transport 数据面不定义 `DataFrame`，所有数据面协议帧由 runtime/protocol 层自行定义与编解码
@@ -1805,3 +1898,4 @@ ltfp/
 21. 同一条 tunnel 允许单读单写并发，但多写方必须串行化，避免 frame 字节交错
 22. 长驻 idle 池的 tunnel 必须结合 keepalive/probe 与 TTL 一起治理僵尸连接，不得仅依赖控制面 heartbeat 推断
 23. binding 必须通过 `BindingInfo.KeepalivePolicy` 暴露 keepalive/probe 治理参数，支持跨 binding 的可配置与可观测一致性
+24. 串行复用必须受 `max_reuse_count`、`recycle_handshake_timeout` 与 `recycle_seq` 单调性共同约束，防止旧轮次消息污染

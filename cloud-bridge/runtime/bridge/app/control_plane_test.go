@@ -1688,6 +1688,26 @@ func (tunnel *controlPlaneInboundTestTunnel) SetWriteDeadline(deadline time.Time
 	return nil
 }
 
+// Flush 测试替身默认无脏缓存。
+func (tunnel *controlPlaneInboundTestTunnel) Flush() error {
+	return nil
+}
+
+// ReuseCount 测试替身固定返回 0。
+func (tunnel *controlPlaneInboundTestTunnel) ReuseCount() int {
+	return 0
+}
+
+// Recyclable 返回当前 tunnel 是否处于可回收状态。
+func (tunnel *controlPlaneInboundTestTunnel) Recyclable() bool {
+	if tunnel == nil {
+		return false
+	}
+	tunnel.mu.Lock()
+	defer tunnel.mu.Unlock()
+	return !tunnel.closedV
+}
+
 // Done 返回 tunnel 关闭信号。
 func (tunnel *controlPlaneInboundTestTunnel) Done() <-chan struct{} {
 	if tunnel == nil {

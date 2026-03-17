@@ -20,6 +20,7 @@ type mockTunnel struct {
 	resetError  error
 	closeCount  int
 	resetCount  int
+	reuseCount  int
 }
 
 // Read 实现 io.Reader。
@@ -100,6 +101,22 @@ func (tunnel *mockTunnel) SetReadDeadline(deadline time.Time) error {
 func (tunnel *mockTunnel) SetWriteDeadline(deadline time.Time) error {
 	// 测试桩不做真实时间控制，直接返回成功。
 	return nil
+}
+
+// Flush 实现回收前缓存清理检查。
+func (tunnel *mockTunnel) Flush() error {
+	// 测试桩默认无脏数据。
+	return nil
+}
+
+// ReuseCount 返回当前复用轮次。
+func (tunnel *mockTunnel) ReuseCount() int {
+	return tunnel.reuseCount
+}
+
+// Recyclable 返回测试桩是否可回收。
+func (tunnel *mockTunnel) Recyclable() bool {
+	return tunnel.state == TunnelStateIdle
 }
 
 // Done 返回 tunnel 生命周期结束通知。

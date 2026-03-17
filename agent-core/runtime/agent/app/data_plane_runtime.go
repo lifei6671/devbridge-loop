@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/agent-core/pkg/events"
@@ -16,6 +17,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/traffic"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
 	"github.com/lifei6671/devbridge-loop/ltfp/codec"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
@@ -375,7 +377,8 @@ func (r *Runtime) handleTunnelRecyclePhase(
 	if preRecycleTimeout < 15*time.Second {
 		preRecycleTimeout = 15 * time.Second
 	}
-	closeAckObserved := false
+	closeAckObserved := hasTunnelIOObservedCloseAck(tunnelIO, normalizedTrafficID)
+	defer clearTunnelIOObservedCloseAck(tunnelIO, normalizedTrafficID)
 	for {
 		readContext := waitContext
 		cancelRead := func() {}
@@ -432,7 +435,15 @@ func (r *Runtime) handleTunnelRecyclePhase(
 		recycleAckTunnelID := normalizedTunnelID
 		if recycleTunnelID != "" && recycleTunnelID != normalizedTunnelID {
 			if !isGRPCTrafficTunnelIO(tunnelIO) {
-				_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, normalizedTunnelID, recycle.RecycleSeq, false, "tunnel_mismatch", "recycle tunnel id mismatch")
+				_ = r.writeTunnelRecycleAck(
+					waitContext,
+					tunnelIO,
+					normalizedTunnelID,
+					recycle.RecycleSeq,
+					false,
+					ltfperrors.CodeTunnelRecycleTunnelMismatch,
+					"recycle tunnel id mismatch",
+				)
 				return false, false, fmt.Errorf("recycle tunnel id mismatch: got=%s want=%s", recycleTunnelID, normalizedTunnelID)
 			}
 			// grpc_h2 兼容路径：Bridge 侧可能使用 stream 本地 tunnel_id；
@@ -445,12 +456,52 @@ func (r *Runtime) handleTunnelRecyclePhase(
 			lastRecycleSeq = record.LastRecycleSeq
 		}
 		if recycle.RecycleSeq == 0 || recycle.RecycleSeq <= lastRecycleSeq {
-			_ = r.writeTunnelRecycleAck(waitContext, tunnelIO, recycleAckTunnelID, recycle.RecycleSeq, false, "invalid_seq", "recycle seq not monotonic")
+			_ = r.writeTunnelRecycleAck(
+				waitContext,
+				tunnelIO,
+				recycleAckTunnelID,
+				recycle.RecycleSeq,
+				false,
+				ltfperrors.CodeTunnelRecycleInvalidSeq,
+				"recycle seq not monotonic",
+			)
 			return false, false, fmt.Errorf("invalid recycle seq: got=%d last=%d", recycle.RecycleSeq, lastRecycleSeq)
 		}
 		if !closeAckObserved {
-			// 在部分时序下，close 可能已在 relay 阶段被消费，此处允许直接进入 recycle 以提升复用鲁棒性。
-			closeAckObserved = true
+			_ = r.writeTunnelRecycleAck(
+				waitContext,
+				tunnelIO,
+				recycleAckTunnelID,
+				recycle.RecycleSeq,
+				false,
+				ltfperrors.CodeTunnelRecycleCloseAckRequired,
+				"close ack must be observed before recycle",
+			)
+			return false, false, fmt.Errorf("recycle requires close ack: traffic_id=%s", normalizedTrafficID)
+		}
+		if !isTunnelIORecyclable(tunnelIO) {
+			_ = r.writeTunnelRecycleAck(
+				waitContext,
+				tunnelIO,
+				recycleAckTunnelID,
+				recycle.RecycleSeq,
+				false,
+				ltfperrors.CodeTunnelRecycleTunnelUnhealthy,
+				"tunnel not recyclable",
+			)
+			return false, false, fmt.Errorf("tunnel not recyclable: tunnel_id=%s", normalizedTunnelID)
+		}
+		if err := flushTunnelIOBeforeRecycle(tunnelIO); err != nil {
+			_ = r.writeTunnelRecycleAck(
+				waitContext,
+				tunnelIO,
+				recycleAckTunnelID,
+				recycle.RecycleSeq,
+				false,
+				ltfperrors.CodeTunnelRecycleBufferDirty,
+				err.Error(),
+			)
+			return false, false, fmt.Errorf("flush tunnel before recycle: %w", err)
 		}
 		if err := r.writeTunnelRecycleAck(waitContext, tunnelIO, recycleAckTunnelID, recycle.RecycleSeq, true, "", ""); err != nil {
 			return false, false, err
@@ -483,6 +534,64 @@ func isGRPCTrafficTunnelIO(tunnelIO traffic.TunnelIO) bool {
 		return false
 	}
 	return awareTunnelIO.BindingType() == transport.BindingTypeGRPCH2
+}
+
+func isTunnelIORecyclable(tunnelIO traffic.TunnelIO) bool {
+	if tunnelIO == nil {
+		return false
+	}
+	type recyclable interface {
+		Recyclable() bool
+	}
+	recyclableTunnelIO, ok := tunnelIO.(recyclable)
+	if !ok {
+		// 未实现可回收判定接口时按兼容路径放行，避免非 runtimeTrafficTunnel 被误拒绝。
+		return true
+	}
+	return recyclableTunnelIO.Recyclable()
+}
+
+func flushTunnelIOBeforeRecycle(tunnelIO traffic.TunnelIO) error {
+	if tunnelIO == nil {
+		return ErrRuntimeTrafficDependencyMissing
+	}
+	type flushable interface {
+		Flush() error
+	}
+	flushableTunnelIO, ok := tunnelIO.(flushable)
+	if !ok {
+		// 未实现 Flush 接口时按兼容路径放行，避免非 runtimeTrafficTunnel 被误拒绝。
+		return nil
+	}
+	return flushableTunnelIO.Flush()
+}
+
+func hasTunnelIOObservedCloseAck(tunnelIO traffic.TunnelIO, trafficID string) bool {
+	if tunnelIO == nil {
+		return false
+	}
+	type closeAckObservedReader interface {
+		HasCloseAckObserved(trafficID string) bool
+	}
+	reader, ok := tunnelIO.(closeAckObservedReader)
+	if !ok {
+		return false
+	}
+	return reader.HasCloseAckObserved(trafficID)
+}
+
+func clearTunnelIOObservedCloseAck(tunnelIO traffic.TunnelIO, trafficID string) {
+	if tunnelIO == nil {
+		return
+	}
+	type closeAckObservedCleaner interface {
+		ClearCloseAckObserved(trafficID string)
+	}
+	cleaner, ok := tunnelIO.(closeAckObservedCleaner)
+	if !ok {
+		return
+	}
+	cleaner.ClearCloseAckObserved(trafficID)
 }
 
 func (r *Runtime) writeTunnelRecycleAck(
@@ -788,6 +897,9 @@ type runtimeTrafficTunnel struct {
 	jsonCodec       *codec.JSONCodec
 	maxPayloadBytes int
 	ioPollInterval  time.Duration
+
+	closeAckMutex        sync.Mutex
+	closeAckObservedByID map[string]struct{}
 }
 
 var _ tunnel.RuntimeTunnel = (*runtimeTrafficTunnel)(nil)
@@ -796,10 +908,11 @@ var _ traffic.TunnelIO = (*runtimeTrafficTunnel)(nil)
 // newRuntimeTrafficTunnelAdapter 创建 Agent data-plane tunnel payload 适配器。
 func newRuntimeTrafficTunnelAdapter(rawTunnel transport.Tunnel) *runtimeTrafficTunnel {
 	return &runtimeTrafficTunnel{
-		tunnel:          rawTunnel,
-		jsonCodec:       codec.NewJSONCodec(),
-		maxPayloadBytes: defaultTrafficTunnelMaxPayloadBytes,
-		ioPollInterval:  defaultTrafficTunnelIOPollInterval,
+		tunnel:               rawTunnel,
+		jsonCodec:            codec.NewJSONCodec(),
+		maxPayloadBytes:      defaultTrafficTunnelMaxPayloadBytes,
+		ioPollInterval:       defaultTrafficTunnelIOPollInterval,
+		closeAckObservedByID: make(map[string]struct{}),
 	}
 }
 
@@ -843,6 +956,68 @@ func (adapter *runtimeTrafficTunnel) Err() error {
 		return ErrRuntimeTrafficDependencyMissing
 	}
 	return adapter.tunnel.Err()
+}
+
+// Flush 透传到底层 transport.Tunnel，用于 recycle 前数据清洁校验。
+func (adapter *runtimeTrafficTunnel) Flush() error {
+	if adapter == nil || adapter.tunnel == nil {
+		return ErrRuntimeTrafficDependencyMissing
+	}
+	return adapter.tunnel.Flush()
+}
+
+// Recyclable 透传到底层 transport.Tunnel 的可回收判定。
+func (adapter *runtimeTrafficTunnel) Recyclable() bool {
+	if adapter == nil || adapter.tunnel == nil {
+		return false
+	}
+	return adapter.tunnel.Recyclable()
+}
+
+// MarkCloseAckObserved 记录某条 traffic 已在 relay 阶段完成 close_ack。
+func (adapter *runtimeTrafficTunnel) MarkCloseAckObserved(trafficID string) {
+	if adapter == nil {
+		return
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return
+	}
+	adapter.closeAckMutex.Lock()
+	defer adapter.closeAckMutex.Unlock()
+	if adapter.closeAckObservedByID == nil {
+		adapter.closeAckObservedByID = make(map[string]struct{})
+	}
+	adapter.closeAckObservedByID[normalizedTrafficID] = struct{}{}
+}
+
+// HasCloseAckObserved 判断某条 traffic 是否已在 relay 阶段观测到 close_ack。
+func (adapter *runtimeTrafficTunnel) HasCloseAckObserved(trafficID string) bool {
+	if adapter == nil {
+		return false
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return false
+	}
+	adapter.closeAckMutex.Lock()
+	defer adapter.closeAckMutex.Unlock()
+	_, observed := adapter.closeAckObservedByID[normalizedTrafficID]
+	return observed
+}
+
+// ClearCloseAckObserved 清理某条 traffic 的 close_ack 观测状态，避免状态累积。
+func (adapter *runtimeTrafficTunnel) ClearCloseAckObserved(trafficID string) {
+	if adapter == nil {
+		return
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return
+	}
+	adapter.closeAckMutex.Lock()
+	defer adapter.closeAckMutex.Unlock()
+	delete(adapter.closeAckObservedByID, normalizedTrafficID)
 }
 
 // ReadPayload 从底层 tunnel 读取并解码一条 StreamPayload。

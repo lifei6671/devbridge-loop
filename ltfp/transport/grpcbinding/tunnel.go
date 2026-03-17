@@ -20,6 +20,7 @@ type GRPCH2Tunnel struct {
 	stateMutex sync.RWMutex
 	state      transport.TunnelState
 	lastError  error
+	reuseCount int
 
 	readMutex         sync.Mutex
 	pendingRead       []byte
@@ -266,6 +267,47 @@ func (tunnel *GRPCH2Tunnel) SetWriteDeadline(deadline time.Time) error {
 	defer tunnel.deadlineMutex.Unlock()
 	tunnel.writeDeadline = deadline
 	return nil
+}
+
+// Flush 校验 tunnel 本地缓存是否已排空。
+func (tunnel *GRPCH2Tunnel) Flush() error {
+	if tunnel == nil {
+		return fmt.Errorf("grpc tunnel flush: %w", transport.ErrInvalidArgument)
+	}
+	tunnel.readMutex.Lock()
+	defer tunnel.readMutex.Unlock()
+	if len(tunnel.pendingRead) > 0 {
+		return fmt.Errorf("grpc tunnel flush: %w: pending_bytes=%d", transport.ErrStateTransition, len(tunnel.pendingRead))
+	}
+	return nil
+}
+
+// ReuseCount 返回当前 tunnel 已完成回收轮次。
+func (tunnel *GRPCH2Tunnel) ReuseCount() int {
+	if tunnel == nil {
+		return 0
+	}
+	tunnel.stateMutex.RLock()
+	defer tunnel.stateMutex.RUnlock()
+	return tunnel.reuseCount
+}
+
+// Recyclable 报告 tunnel 是否满足回收前提。
+func (tunnel *GRPCH2Tunnel) Recyclable() bool {
+	if tunnel == nil {
+		return false
+	}
+	switch tunnel.State() {
+	case transport.TunnelStateBroken, transport.TunnelStateClosed:
+		return false
+	}
+	// 任意错误都应视为不可回收，避免 closed/broken 状态在并发窗口被误放回 idle 池。
+	if err := tunnel.Err(); err != nil {
+		return false
+	}
+	tunnel.readMutex.Lock()
+	defer tunnel.readMutex.Unlock()
+	return len(tunnel.pendingRead) == 0
 }
 
 // Done 返回 tunnel 结束信号。

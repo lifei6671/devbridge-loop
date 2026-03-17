@@ -100,6 +100,18 @@ func (tunnel *blockingMockTunnel) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
+func (tunnel *blockingMockTunnel) Flush() error {
+	return nil
+}
+
+func (tunnel *blockingMockTunnel) ReuseCount() int {
+	return 0
+}
+
+func (tunnel *blockingMockTunnel) Recyclable() bool {
+	return tunnel.state != transport.TunnelStateBroken && tunnel.state != transport.TunnelStateClosed
+}
+
 func (tunnel *blockingMockTunnel) Done() <-chan struct{} {
 	return tunnel.doneChannel
 }

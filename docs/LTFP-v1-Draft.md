@@ -1,9 +1,9 @@
 # DevBridge Loop 统一服务路由与连接器转发协议
 
-## 最终定稿版（v2.1）
+## 最终定稿版（v2.2）
 
 **文档状态**：Final
-**版本**：v2.1
+**版本**：v2.2
 **定位**：中心汇聚式连接器网络、统一服务路由平面、混合来源服务转发层
 **适用场景**：开发环境回流、内网服务暴露、中心化入口接入、第三方服务发现融合转发
 **设计路线**：中期路线，抽象底层传输层，不强绑定 MASQUE
@@ -59,18 +59,18 @@
 
 ---
 
-## 3.2 数据面禁止应用层二次复用
+## 3.2 数据面禁止并发应用层二次复用
 
-**1 个 traffic = 1 个底层 binding 的原生独立流单元。**
+**同一时刻，1 条 tunnel 只能承载 1 条 traffic（单并发）；允许串行复用。**
 
 这意味着：
 
-* 在 `grpc_h2` 下：1 个 traffic = 1 条 gRPC bidi stream
-* 在 `quic_native` 下：1 个 traffic = 1 条 QUIC stream
-* 在 `h3_stream` 下：1 个 traffic = 1 条 H3 stream
-* 在 `tcp_framed` 下：1 个 traffic = 1 条独立数据连接
+* 在 `grpc_h2` 下：1 条 tunnel = 1 条 gRPC bidi stream；traffic 通过帧在该 stream 上串行轮转
+* 在 `quic_native` 下：1 条 tunnel = 1 条 QUIC stream；同一时刻仅承载 1 条 traffic
+* 在 `h3_stream` 下：1 条 tunnel = 1 条 H3 stream；同一时刻仅承载 1 条 traffic
+* 在 `tcp_framed` 下：1 条 tunnel = 1 条独立数据连接；同一时刻仅承载 1 条 traffic
 
-禁止在单个大 stream 里通过 `traffic_id` 手工复用多条流量。
+禁止在单条 tunnel 上通过 `traffic_id` 并发复用多条流量。
 
 ---
 
@@ -1084,7 +1084,7 @@ v2.1 核心数据路径中：
 
 对于 `grpc_h2`：
 
-> 1 个 traffic = 1 条独立的 gRPC bidi stream
+> 1 条 tunnel = 1 条长期 gRPC bidi stream；同一时刻仅承载 1 条 traffic，结束后可串行复用
 
 ---
 
@@ -1105,7 +1105,10 @@ message StreamPayload {
     TrafficOpenAck open_ack = 2;
     bytes data = 3;
     TrafficClose close = 4;
-    TrafficReset reset = 5;
+    TrafficCloseAck close_ack = 5;
+    TrafficReset reset = 6;
+    TunnelRecycle recycle = 7;
+    TunnelRecycleAck recycle_ack = 8;
   }
 }
 ```
@@ -1114,7 +1117,22 @@ message StreamPayload {
 
 * `TrafficOpen` 只用于 connector proxy path
 * 后续 `data` 不再带 `traffic_id`
-* 该 gRPC stream 自身就是该 traffic 的数据通道
+* 正常结束路径必须为 `TrafficClose -> TrafficCloseAck -> TunnelRecycle -> TunnelRecycleAck`
+* `TunnelRecycle` 只能由 Server 发起，`recycle_seq` 必须单调递增
+* `TunnelRecycleAck(accepted=true)` 且 `is_final=false` 才允许回池复用
+* Agent 收到 `TunnelRecycle` 时若尚未观察到本轮 `TrafficCloseAck`，必须返回 `TunnelRecycleAck(accepted=false,error_code=close_ack_required)`
+* `TunnelRecycleAck(accepted=false)` 必须携带稳定错误码，建议至少支持：`invalid_seq`、`close_ack_required`、`tunnel_unhealthy`、`buffer_dirty`
+* `TrafficReset` 路径必须直接终止 traffic 并关闭 tunnel，禁止继续进入 recycle 握手
+* `TunnelRecycle -> TunnelRecycleAck` 必须受独立超时约束（建议默认 `3s`）；超时或拒绝都必须关闭 tunnel 并触发补池
+* 达到 `max_reuse_count` 时，Server 应发送 `is_final=true`，本轮结束后强制关闭并轮换新 tunnel
+
+## 19.4 回收可靠性约束（v2.2 补充）
+
+1. 回收握手前置条件：必须先完成 `TrafficCloseAck`，否则 Agent 必须拒绝回收并返回 `close_ack_required`
+2. 代际与序列：`recycle_seq` 必须对同一 tunnel 严格递增，命中旧序列必须拒绝并返回 `invalid_seq`
+3. 数据清洁度：Agent 在回收 ACK 前必须确认本地 tunnel 可回收（健康、无脏数据、可 flush）；失败必须拒绝
+4. 不确定即销毁：握手超时、序列异常、健康校验失败、显式拒绝都必须降级为物理关闭，不得强行回池
+5. 职责分离：`recycle_seq` 与 `close_ack_required` 属于 runtime/protocol 校验；tunnel pool 只负责 transport 侧健康判定与池状态迁移
 
 ---
 
@@ -1446,10 +1464,35 @@ message TrafficClose {
   string reason = 2;
 }
 
+message TrafficCloseAck {
+  string traffic_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+  string error_message = 4;
+  map<string, string> metadata = 5;
+}
+
 message TrafficReset {
   string traffic_id = 1;
   string error_code = 2;
   string error_message = 3;
+}
+
+message TunnelRecycle {
+  string tunnel_id = 1;
+  uint64 recycle_seq = 2;      // per-tunnel strict monotonic sequence from server
+  bool is_final = 3;           // true means recycle handshake succeeds but tunnel must close after ack
+  int32 completed_traffic_count = 4;
+  map<string, string> metadata = 5;
+}
+
+message TunnelRecycleAck {
+  string tunnel_id = 1;
+  uint64 recycle_seq = 2;
+  bool accepted = 3;
+  string error_code = 4;       // invalid_seq | close_ack_required | tunnel_unhealthy | buffer_dirty
+  string error_message = 5;
+  map<string, string> metadata = 6;
 }
 
 message StreamPayload {
@@ -1458,7 +1501,10 @@ message StreamPayload {
     TrafficOpenAck open_ack = 2;
     bytes data = 3;
     TrafficClose close = 4;
-    TrafficReset reset = 5;
+    TrafficCloseAck close_ack = 5;
+    TrafficReset reset = 6;
+    TunnelRecycle recycle = 7;
+    TunnelRecycleAck recycle_ack = 8;
   }
 }
 
@@ -1548,7 +1594,7 @@ v2.1 核心路径中，Agent 不要求维护 route 表；只有启用可选 edge
 * `grpc_h2`
 * ControlChannel
 * TunnelStream
-* 单 traffic = 单 gRPC stream
+* 1 条 tunnel = 1 条长期 gRPC stream（同一时刻单 traffic，结束后可串行复用）
 * namespace / environment
 * connector service publish
 * connector proxy path

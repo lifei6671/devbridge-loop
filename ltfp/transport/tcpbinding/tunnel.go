@@ -22,6 +22,7 @@ type TCPTunnel struct {
 	stateMutex sync.RWMutex
 	state      transport.TunnelState
 	lastError  error
+	reuseCount int
 
 	readMutex   sync.Mutex
 	readState   framedReadState
@@ -369,6 +370,56 @@ func (tunnel *TCPTunnel) SetWriteDeadline(deadline time.Time) error {
 		return fmt.Errorf("tcp tunnel set write deadline: %w", err)
 	}
 	return nil
+}
+
+// Flush 校验 tunnel 本地缓存是否已排空。
+func (tunnel *TCPTunnel) Flush() error {
+	if tunnel == nil {
+		return fmt.Errorf("tcp tunnel flush: %w", transport.ErrInvalidArgument)
+	}
+	tunnel.readMutex.Lock()
+	defer tunnel.readMutex.Unlock()
+	if len(tunnel.pendingRead) > 0 {
+		return fmt.Errorf("tcp tunnel flush: %w: pending_bytes=%d", transport.ErrStateTransition, len(tunnel.pendingRead))
+	}
+	if tunnel.readState.headerRead > 0 || tunnel.readState.payloadRead > 0 || tunnel.readState.payload != nil {
+		return fmt.Errorf("tcp tunnel flush: %w: framed_state_dirty", transport.ErrStateTransition)
+	}
+	return nil
+}
+
+// ReuseCount 返回当前 tunnel 已完成回收轮次。
+func (tunnel *TCPTunnel) ReuseCount() int {
+	if tunnel == nil {
+		return 0
+	}
+	tunnel.stateMutex.RLock()
+	defer tunnel.stateMutex.RUnlock()
+	return tunnel.reuseCount
+}
+
+// Recyclable 报告 tunnel 是否满足回收前提。
+func (tunnel *TCPTunnel) Recyclable() bool {
+	if tunnel == nil {
+		return false
+	}
+	switch tunnel.State() {
+	case transport.TunnelStateBroken, transport.TunnelStateClosed:
+		return false
+	}
+	// 任意错误都应视为不可回收，避免 closed/broken 状态在并发窗口被误放回 idle 池。
+	if err := tunnel.Err(); err != nil {
+		return false
+	}
+	tunnel.readMutex.Lock()
+	defer tunnel.readMutex.Unlock()
+	if len(tunnel.pendingRead) > 0 {
+		return false
+	}
+	if tunnel.readState.headerRead > 0 || tunnel.readState.payloadRead > 0 || tunnel.readState.payload != nil {
+		return false
+	}
+	return true
 }
 
 // Done 返回 tunnel 终止信号。

@@ -87,3 +87,17 @@ const (
 	// CodeTrafficInvalidServiceID 表示 TrafficOpen 缺少 service_id。
 	CodeTrafficInvalidServiceID = "TRAFFIC_INVALID_SERVICE_ID"
 )
+
+// Tunnel recycle 握手相关错误码定义。
+const (
+	// CodeTunnelRecycleInvalidSeq 表示 recycle_seq 非法（非单调递增或缺失）。
+	CodeTunnelRecycleInvalidSeq = "invalid_seq"
+	// CodeTunnelRecycleCloseAckRequired 表示尚未观测到 TrafficCloseAck，不允许进入 recycle。
+	CodeTunnelRecycleCloseAckRequired = "close_ack_required"
+	// CodeTunnelRecycleTunnelUnhealthy 表示 tunnel 不满足回收健康条件。
+	CodeTunnelRecycleTunnelUnhealthy = "tunnel_unhealthy"
+	// CodeTunnelRecycleBufferDirty 表示 tunnel 仍有脏数据或 flush 失败。
+	CodeTunnelRecycleBufferDirty = "buffer_dirty"
+	// CodeTunnelRecycleTunnelMismatch 表示回收请求的 tunnel_id 与本地上下文不一致。
+	CodeTunnelRecycleTunnelMismatch = "tunnel_mismatch"
+)

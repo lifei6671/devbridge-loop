@@ -261,3 +261,26 @@ func TestTCPTunnelBrokenReadClosesUnderlyingConn(testingObject *testing.T) {
 		testingObject.Fatalf("expected close after broken read not to leak extra close attempts, got %d", conn.CloseCount())
 	}
 }
+
+// TestTCPTunnelRecyclableRejectsClosedErr 验证 ErrClosed 即使状态暂未收敛也不可回收。
+func TestTCPTunnelRecyclableRejectsClosedErr(testingObject *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	tunnel, err := NewTCPTunnel(clientConn, transport.TunnelMeta{TunnelID: "tcp-recyclable-closed-err"}, DefaultTransportConfig())
+	if err != nil {
+		testingObject.Fatalf("create tunnel failed: %v", err)
+	}
+
+	// 模拟 state 与 lastError 读取存在并发窗口时，Err 已暴露 closed。
+	tunnel.stateMutex.Lock()
+	tunnel.lastError = transport.ErrClosed
+	tunnel.stateMutex.Unlock()
+	if state := tunnel.State(); state != transport.TunnelStateIdle {
+		testingObject.Fatalf("expected idle state before recyclable check, got %s", state)
+	}
+	if tunnel.Recyclable() {
+		testingObject.Fatalf("expected tunnel not recyclable when Err returns ErrClosed")
+	}
+}

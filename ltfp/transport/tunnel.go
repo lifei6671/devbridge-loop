@@ -24,6 +24,13 @@ type Tunnel interface {
 	SetReadDeadline(deadline time.Time) error
 	SetWriteDeadline(deadline time.Time) error
 
+	// Flush 在回收前尝试清理本地读缓存；若存在脏数据应返回错误。
+	Flush() error
+	// ReuseCount 返回当前 tunnel 已完成的回收轮次（0-based）。
+	ReuseCount() int
+	// Recyclable 报告当前 tunnel 是否满足回收前提。
+	Recyclable() bool
+
 	Done() <-chan struct{}
 	Err() error
 }

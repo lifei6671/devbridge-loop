@@ -14,10 +14,23 @@ type TunnelPool interface {
 	PutIdle(tunnel Tunnel) error
 	Acquire(ctx context.Context) (Tunnel, error)
 	Remove(tunnelID string) error
+	Recycle(ctx context.Context, tunnel Tunnel) (RecycleResult, error)
 
 	IdleCount() int
 	InUseCount() int
+	RecycledCount() int
+	ClosedCount() int
 }
+
+// RecycleResult 描述一次回收操作的最终结果。
+type RecycleResult string
+
+const (
+	// RecycleResultRecycled 表示回收成功并重新回到 idle 池。
+	RecycleResultRecycled RecycleResult = "recycled"
+	// RecycleResultClosed 表示回收失败并降级关闭。
+	RecycleResultClosed RecycleResult = "closed"
+)
 
 // TunnelPoolConfig 描述 tunnel 池容量和超时参数。
 type TunnelPoolConfig struct {
@@ -124,6 +137,8 @@ type InMemoryTunnelPool struct {
 	idleTunnelOrder  []string
 	idleInsertedAt   map[string]time.Time
 	config           TunnelPoolConfig
+	recycledCount    int
+	closedCount      int
 
 	notifyChannel chan struct{}
 }
@@ -292,6 +307,53 @@ func (pool *InMemoryTunnelPool) Remove(tunnelID string) error {
 	return nil
 }
 
+// Recycle 把 in-use tunnel 回收入 idle 池；不满足条件时降级为关闭。
+func (pool *InMemoryTunnelPool) Recycle(ctx context.Context, tunnel Tunnel) (RecycleResult, error) {
+	if tunnel == nil {
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: %w", ErrInvalidArgument)
+	}
+	normalizedTunnelID := strings.TrimSpace(tunnel.ID())
+	if normalizedTunnelID == "" {
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: %w: empty tunnel id", ErrInvalidArgument)
+	}
+	pool.mutex.Lock()
+	_, existsInUse := pool.inUseTunnelsByID[normalizedTunnelID]
+	if existsInUse {
+		delete(pool.inUseTunnelsByID, normalizedTunnelID)
+	}
+	pool.mutex.Unlock()
+	if !existsInUse {
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: %w: tunnel_id=%s", ErrTunnelNotFound, normalizedTunnelID)
+	}
+
+	normalizeContext := ctx
+	if normalizeContext == nil {
+		normalizeContext = context.Background()
+	}
+	select {
+	case <-normalizeContext.Done():
+		pool.cleanupClosedTunnel(tunnel, normalizeContext.Err())
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: %w", normalizeContext.Err())
+	default:
+	}
+	if !tunnel.Recyclable() {
+		pool.cleanupClosedTunnel(tunnel, ErrTunnelBroken)
+		return RecycleResultClosed, nil
+	}
+	if err := tunnel.Flush(); err != nil {
+		pool.cleanupClosedTunnel(tunnel, err)
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: flush: %w", err)
+	}
+	if err := pool.PutIdle(tunnel); err != nil {
+		pool.cleanupClosedTunnel(tunnel, err)
+		return RecycleResultClosed, fmt.Errorf("recycle tunnel: put idle: %w", err)
+	}
+	pool.mutex.Lock()
+	pool.recycledCount++
+	pool.mutex.Unlock()
+	return RecycleResultRecycled, nil
+}
+
 // EvictExpiredIdle 按 idle_tunnel_ttl 清理过期空闲 tunnel。
 func (pool *InMemoryTunnelPool) EvictExpiredIdle(now time.Time) []string {
 	pool.mutex.Lock()
@@ -429,6 +491,20 @@ func (pool *InMemoryTunnelPool) InUseCount() int {
 	return len(pool.inUseTunnelsByID)
 }
 
+// RecycledCount 返回累计回收成功次数。
+func (pool *InMemoryTunnelPool) RecycledCount() int {
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
+	return pool.recycledCount
+}
+
+// ClosedCount 返回累计降级关闭次数。
+func (pool *InMemoryTunnelPool) ClosedCount() int {
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
+	return pool.closedCount
+}
+
 func classifyIdleTunnelRuntimeState(tunnel Tunnel) (IdleTunnelEvictionReason, error) {
 	if tunnel.State() == TunnelStateBroken {
 		// broken tunnel 不可继续分配，直接剔除。
@@ -527,19 +603,18 @@ func (pool *InMemoryTunnelPool) cleanupEvictedIdleTunnel(
 	reason IdleTunnelEvictionReason,
 	cause error,
 ) {
+	if tunnel == nil {
+		return
+	}
 	switch reason {
 	case IdleTunnelEvictionReasonTTLExpired, IdleTunnelEvictionReasonMissingInsertedAt:
 		// TTL 到期属于正常轮换，优先走关闭流程。
 		_ = tunnel.Close()
+		pool.mutex.Lock()
+		pool.closedCount++
+		pool.mutex.Unlock()
 	default:
-		resetCause := cause
-		if resetCause == nil {
-			resetCause = ErrTunnelBroken
-		}
-		if err := tunnel.Reset(resetCause); err != nil {
-			// reset 不可用或失败时退化为直接关闭，确保资源回收。
-			_ = tunnel.Close()
-		}
+		pool.cleanupClosedTunnel(tunnel, cause)
 	}
 }
 
@@ -598,4 +673,21 @@ func (pool *InMemoryTunnelPool) removeIdleOrderLocked(tunnelID string) {
 func (pool *InMemoryTunnelPool) notifyLocked() {
 	close(pool.notifyChannel)
 	pool.notifyChannel = make(chan struct{})
+}
+
+func (pool *InMemoryTunnelPool) cleanupClosedTunnel(tunnel Tunnel, cause error) {
+	if tunnel == nil {
+		return
+	}
+	resetCause := cause
+	if resetCause == nil {
+		resetCause = ErrTunnelBroken
+	}
+	if err := tunnel.Reset(resetCause); err != nil {
+		// reset 不可用或失败时退化为直接关闭，确保资源回收。
+		_ = tunnel.Close()
+	}
+	pool.mutex.Lock()
+	pool.closedCount++
+	pool.mutex.Unlock()
 }

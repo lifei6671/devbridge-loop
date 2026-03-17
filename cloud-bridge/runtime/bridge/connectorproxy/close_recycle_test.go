@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -74,5 +75,50 @@ func TestWriteTrafficCloseAndAwaitAckReturnsResetError(testingObject *testing.T)
 	writes := testTunnel.Writes()
 	if len(writes) != 1 || writes[0].Close == nil {
 		testingObject.Fatalf("expected only close write before reset, got=%+v", writes)
+	}
+}
+
+// TestExecuteTunnelRecycleHandshakeReturnsRejectError 验证回收被拒绝时返回带错误码的失败信息。
+func TestExecuteTunnelRecycleHandshakeReturnsRejectError(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testTunnel := newConnectorProxyTestTunnel("tunnel-recycle-reject")
+	testTunnel.EnqueueReadPayload(pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:     "tunnel-recycle-reject",
+			RecycleSeq:   7,
+			Accepted:     false,
+			ErrorCode:    ltfperrors.CodeTunnelRecycleCloseAckRequired,
+			ErrorMessage: "close ack must be observed before recycle",
+		},
+	})
+
+	ack, err := ExecuteTunnelRecycleHandshake(
+		context.Background(),
+		testTunnel,
+		"tunnel-recycle-reject",
+		7,
+		false,
+		500*time.Millisecond,
+	)
+	if err == nil {
+		testingObject.Fatalf("expected recycle reject error, got nil")
+	}
+	if ack.Accepted {
+		testingObject.Fatalf("expected rejected recycle ack")
+	}
+	if strings.TrimSpace(ack.ErrorCode) != ltfperrors.CodeTunnelRecycleCloseAckRequired {
+		testingObject.Fatalf("unexpected recycle ack error code: %+v", ack)
+	}
+	if !strings.Contains(err.Error(), ltfperrors.CodeTunnelRecycleCloseAckRequired) {
+		testingObject.Fatalf("expected error contains recycle reject code, got=%v", err)
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) != 1 || writes[0].Recycle == nil {
+		testingObject.Fatalf("expected one recycle write before reject, got=%+v", writes)
+	}
+	if writes[0].Recycle.RecycleSeq != 7 {
+		testingObject.Fatalf("unexpected recycle seq in write: %+v", writes[0].Recycle)
 	}
 }

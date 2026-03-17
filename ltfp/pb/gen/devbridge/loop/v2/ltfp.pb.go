@@ -262,16 +262,19 @@ func (x *ConnectorHello) GetMetadata() map[string]string {
 }
 
 type ConnectorWelcome struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	SelectedBinding      string                 `protobuf:"bytes,1,opt,name=selected_binding,json=selectedBinding,proto3" json:"selected_binding,omitempty"`
-	VersionMajor         uint32                 `protobuf:"varint,2,opt,name=version_major,json=versionMajor,proto3" json:"version_major,omitempty"`
-	VersionMinor         uint32                 `protobuf:"varint,3,opt,name=version_minor,json=versionMinor,proto3" json:"version_minor,omitempty"`
-	HeartbeatIntervalSec uint32                 `protobuf:"varint,4,opt,name=heartbeat_interval_sec,json=heartbeatIntervalSec,proto3" json:"heartbeat_interval_sec,omitempty"`
-	Capabilities         []string               `protobuf:"bytes,5,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	AssignedSessionEpoch uint64                 `protobuf:"varint,6,opt,name=assigned_session_epoch,json=assignedSessionEpoch,proto3" json:"assigned_session_epoch,omitempty"`
-	Metadata             map[string]string      `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	SelectedBinding         string                 `protobuf:"bytes,1,opt,name=selected_binding,json=selectedBinding,proto3" json:"selected_binding,omitempty"`
+	VersionMajor            uint32                 `protobuf:"varint,2,opt,name=version_major,json=versionMajor,proto3" json:"version_major,omitempty"`
+	VersionMinor            uint32                 `protobuf:"varint,3,opt,name=version_minor,json=versionMinor,proto3" json:"version_minor,omitempty"`
+	HeartbeatIntervalSec    uint32                 `protobuf:"varint,4,opt,name=heartbeat_interval_sec,json=heartbeatIntervalSec,proto3" json:"heartbeat_interval_sec,omitempty"`
+	Capabilities            []string               `protobuf:"bytes,5,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	AssignedSessionEpoch    uint64                 `protobuf:"varint,6,opt,name=assigned_session_epoch,json=assignedSessionEpoch,proto3" json:"assigned_session_epoch,omitempty"`
+	Metadata                map[string]string      `protobuf:"bytes,7,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	TunnelMaxReuseCount     int32                  `protobuf:"varint,8,opt,name=tunnel_max_reuse_count,json=tunnelMaxReuseCount,proto3" json:"tunnel_max_reuse_count,omitempty"`
+	TunnelRecycleTimeoutSec uint32                 `protobuf:"varint,9,opt,name=tunnel_recycle_timeout_sec,json=tunnelRecycleTimeoutSec,proto3" json:"tunnel_recycle_timeout_sec,omitempty"`
+	TunnelIdleTtlSec        uint32                 `protobuf:"varint,10,opt,name=tunnel_idle_ttl_sec,json=tunnelIdleTtlSec,proto3" json:"tunnel_idle_ttl_sec,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ConnectorWelcome) Reset() {
@@ -351,6 +354,27 @@ func (x *ConnectorWelcome) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *ConnectorWelcome) GetTunnelMaxReuseCount() int32 {
+	if x != nil {
+		return x.TunnelMaxReuseCount
+	}
+	return 0
+}
+
+func (x *ConnectorWelcome) GetTunnelRecycleTimeoutSec() uint32 {
+	if x != nil {
+		return x.TunnelRecycleTimeoutSec
+	}
+	return 0
+}
+
+func (x *ConnectorWelcome) GetTunnelIdleTtlSec() uint32 {
+	if x != nil {
+		return x.TunnelIdleTtlSec
+	}
+	return 0
 }
 
 type ConnectorAuth struct {
@@ -2957,6 +2981,82 @@ func (x *TrafficClose) GetReason() string {
 	return ""
 }
 
+type TrafficCloseAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TrafficId     string                 `protobuf:"bytes,1,opt,name=traffic_id,json=trafficId,proto3" json:"traffic_id,omitempty"`
+	Accepted      bool                   `protobuf:"varint,2,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	ErrorCode     string                 `protobuf:"bytes,3,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TrafficCloseAck) Reset() {
+	*x = TrafficCloseAck{}
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TrafficCloseAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TrafficCloseAck) ProtoMessage() {}
+
+func (x *TrafficCloseAck) ProtoReflect() protoreflect.Message {
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TrafficCloseAck.ProtoReflect.Descriptor instead.
+func (*TrafficCloseAck) Descriptor() ([]byte, []int) {
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *TrafficCloseAck) GetTrafficId() string {
+	if x != nil {
+		return x.TrafficId
+	}
+	return ""
+}
+
+func (x *TrafficCloseAck) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *TrafficCloseAck) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *TrafficCloseAck) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *TrafficCloseAck) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
 type TrafficReset struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TrafficId     string                 `protobuf:"bytes,1,opt,name=traffic_id,json=trafficId,proto3" json:"traffic_id,omitempty"`
@@ -2968,7 +3068,7 @@ type TrafficReset struct {
 
 func (x *TrafficReset) Reset() {
 	*x = TrafficReset{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2980,7 +3080,7 @@ func (x *TrafficReset) String() string {
 func (*TrafficReset) ProtoMessage() {}
 
 func (x *TrafficReset) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2993,7 +3093,7 @@ func (x *TrafficReset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficReset.ProtoReflect.Descriptor instead.
 func (*TrafficReset) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{34}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *TrafficReset) GetTrafficId() string {
@@ -3017,6 +3117,166 @@ func (x *TrafficReset) GetErrorMessage() string {
 	return ""
 }
 
+type TunnelRecycle struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	TunnelId              string                 `protobuf:"bytes,1,opt,name=tunnel_id,json=tunnelId,proto3" json:"tunnel_id,omitempty"`
+	RecycleSeq            uint64                 `protobuf:"varint,2,opt,name=recycle_seq,json=recycleSeq,proto3" json:"recycle_seq,omitempty"`
+	IsFinal               bool                   `protobuf:"varint,3,opt,name=is_final,json=isFinal,proto3" json:"is_final,omitempty"`
+	CompletedTrafficCount int32                  `protobuf:"varint,4,opt,name=completed_traffic_count,json=completedTrafficCount,proto3" json:"completed_traffic_count,omitempty"`
+	Metadata              map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *TunnelRecycle) Reset() {
+	*x = TunnelRecycle{}
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TunnelRecycle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TunnelRecycle) ProtoMessage() {}
+
+func (x *TunnelRecycle) ProtoReflect() protoreflect.Message {
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TunnelRecycle.ProtoReflect.Descriptor instead.
+func (*TunnelRecycle) Descriptor() ([]byte, []int) {
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *TunnelRecycle) GetTunnelId() string {
+	if x != nil {
+		return x.TunnelId
+	}
+	return ""
+}
+
+func (x *TunnelRecycle) GetRecycleSeq() uint64 {
+	if x != nil {
+		return x.RecycleSeq
+	}
+	return 0
+}
+
+func (x *TunnelRecycle) GetIsFinal() bool {
+	if x != nil {
+		return x.IsFinal
+	}
+	return false
+}
+
+func (x *TunnelRecycle) GetCompletedTrafficCount() int32 {
+	if x != nil {
+		return x.CompletedTrafficCount
+	}
+	return 0
+}
+
+func (x *TunnelRecycle) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
+type TunnelRecycleAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TunnelId      string                 `protobuf:"bytes,1,opt,name=tunnel_id,json=tunnelId,proto3" json:"tunnel_id,omitempty"`
+	RecycleSeq    uint64                 `protobuf:"varint,2,opt,name=recycle_seq,json=recycleSeq,proto3" json:"recycle_seq,omitempty"`
+	Accepted      bool                   `protobuf:"varint,3,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	ErrorCode     string                 `protobuf:"bytes,4,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,5,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	Metadata      map[string]string      `protobuf:"bytes,6,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TunnelRecycleAck) Reset() {
+	*x = TunnelRecycleAck{}
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TunnelRecycleAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TunnelRecycleAck) ProtoMessage() {}
+
+func (x *TunnelRecycleAck) ProtoReflect() protoreflect.Message {
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TunnelRecycleAck.ProtoReflect.Descriptor instead.
+func (*TunnelRecycleAck) Descriptor() ([]byte, []int) {
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *TunnelRecycleAck) GetTunnelId() string {
+	if x != nil {
+		return x.TunnelId
+	}
+	return ""
+}
+
+func (x *TunnelRecycleAck) GetRecycleSeq() uint64 {
+	if x != nil {
+		return x.RecycleSeq
+	}
+	return 0
+}
+
+func (x *TunnelRecycleAck) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *TunnelRecycleAck) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *TunnelRecycleAck) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *TunnelRecycleAck) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
 type StreamPayload struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Payload:
@@ -3025,7 +3285,10 @@ type StreamPayload struct {
 	//	*StreamPayload_OpenAck
 	//	*StreamPayload_Data
 	//	*StreamPayload_Close
+	//	*StreamPayload_CloseAck
 	//	*StreamPayload_Reset_
+	//	*StreamPayload_Recycle
+	//	*StreamPayload_RecycleAck
 	Payload       isStreamPayload_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3033,7 +3296,7 @@ type StreamPayload struct {
 
 func (x *StreamPayload) Reset() {
 	*x = StreamPayload{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3045,7 +3308,7 @@ func (x *StreamPayload) String() string {
 func (*StreamPayload) ProtoMessage() {}
 
 func (x *StreamPayload) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3058,7 +3321,7 @@ func (x *StreamPayload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamPayload.ProtoReflect.Descriptor instead.
 func (*StreamPayload) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{35}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *StreamPayload) GetPayload() isStreamPayload_Payload {
@@ -3104,10 +3367,37 @@ func (x *StreamPayload) GetClose() *TrafficClose {
 	return nil
 }
 
+func (x *StreamPayload) GetCloseAck() *TrafficCloseAck {
+	if x != nil {
+		if x, ok := x.Payload.(*StreamPayload_CloseAck); ok {
+			return x.CloseAck
+		}
+	}
+	return nil
+}
+
 func (x *StreamPayload) GetReset_() *TrafficReset {
 	if x != nil {
 		if x, ok := x.Payload.(*StreamPayload_Reset_); ok {
 			return x.Reset_
+		}
+	}
+	return nil
+}
+
+func (x *StreamPayload) GetRecycle() *TunnelRecycle {
+	if x != nil {
+		if x, ok := x.Payload.(*StreamPayload_Recycle); ok {
+			return x.Recycle
+		}
+	}
+	return nil
+}
+
+func (x *StreamPayload) GetRecycleAck() *TunnelRecycleAck {
+	if x != nil {
+		if x, ok := x.Payload.(*StreamPayload_RecycleAck); ok {
+			return x.RecycleAck
 		}
 	}
 	return nil
@@ -3133,8 +3423,20 @@ type StreamPayload_Close struct {
 	Close *TrafficClose `protobuf:"bytes,4,opt,name=close,proto3,oneof"`
 }
 
+type StreamPayload_CloseAck struct {
+	CloseAck *TrafficCloseAck `protobuf:"bytes,5,opt,name=close_ack,json=closeAck,proto3,oneof"`
+}
+
 type StreamPayload_Reset_ struct {
-	Reset_ *TrafficReset `protobuf:"bytes,5,opt,name=reset,proto3,oneof"`
+	Reset_ *TrafficReset `protobuf:"bytes,6,opt,name=reset,proto3,oneof"`
+}
+
+type StreamPayload_Recycle struct {
+	Recycle *TunnelRecycle `protobuf:"bytes,7,opt,name=recycle,proto3,oneof"`
+}
+
+type StreamPayload_RecycleAck struct {
+	RecycleAck *TunnelRecycleAck `protobuf:"bytes,8,opt,name=recycle_ack,json=recycleAck,proto3,oneof"`
 }
 
 func (*StreamPayload_OpenReq) isStreamPayload_Payload() {}
@@ -3145,7 +3447,13 @@ func (*StreamPayload_Data) isStreamPayload_Payload() {}
 
 func (*StreamPayload_Close) isStreamPayload_Payload() {}
 
+func (*StreamPayload_CloseAck) isStreamPayload_Payload() {}
+
 func (*StreamPayload_Reset_) isStreamPayload_Payload() {}
+
+func (*StreamPayload_Recycle) isStreamPayload_Payload() {}
+
+func (*StreamPayload_RecycleAck) isStreamPayload_Payload() {}
 
 var File_devbridge_loop_v2_ltfp_proto protoreflect.FileDescriptor
 
@@ -3184,7 +3492,7 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa3\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc4\x04\n" +
 	"\x10ConnectorWelcome\x12)\n" +
 	"\x10selected_binding\x18\x01 \x01(\tR\x0fselectedBinding\x12#\n" +
 	"\rversion_major\x18\x02 \x01(\rR\fversionMajor\x12#\n" +
@@ -3192,7 +3500,11 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	"\x16heartbeat_interval_sec\x18\x04 \x01(\rR\x14heartbeatIntervalSec\x12\"\n" +
 	"\fcapabilities\x18\x05 \x03(\tR\fcapabilities\x124\n" +
 	"\x16assigned_session_epoch\x18\x06 \x01(\x04R\x14assignedSessionEpoch\x12M\n" +
-	"\bmetadata\x18\a \x03(\v21.devbridge.loop.v2.ConnectorWelcome.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\a \x03(\v21.devbridge.loop.v2.ConnectorWelcome.MetadataEntryR\bmetadata\x123\n" +
+	"\x16tunnel_max_reuse_count\x18\b \x01(\x05R\x13tunnelMaxReuseCount\x12;\n" +
+	"\x1atunnel_recycle_timeout_sec\x18\t \x01(\rR\x17tunnelRecycleTimeoutSec\x12-\n" +
+	"\x13tunnel_idle_ttl_sec\x18\n" +
+	" \x01(\rR\x10tunnelIdleTtlSec\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x02\n" +
@@ -3519,19 +3831,56 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	"\fTrafficClose\x12\x1d\n" +
 	"\n" +
 	"traffic_id\x18\x01 \x01(\tR\ttrafficId\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"q\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"\x9b\x02\n" +
+	"\x0fTrafficCloseAck\x12\x1d\n" +
+	"\n" +
+	"traffic_id\x18\x01 \x01(\tR\ttrafficId\x12\x1a\n" +
+	"\baccepted\x18\x02 \x01(\bR\baccepted\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x03 \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12L\n" +
+	"\bmetadata\x18\x05 \x03(\v20.devbridge.loop.v2.TrafficCloseAck.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"q\n" +
 	"\fTrafficReset\x12\x1d\n" +
 	"\n" +
 	"traffic_id\x18\x01 \x01(\tR\ttrafficId\x12\x1d\n" +
 	"\n" +
 	"error_code\x18\x02 \x01(\tR\terrorCode\x12#\n" +
-	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\"\x9f\x02\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\"\xa9\x02\n" +
+	"\rTunnelRecycle\x12\x1b\n" +
+	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId\x12\x1f\n" +
+	"\vrecycle_seq\x18\x02 \x01(\x04R\n" +
+	"recycleSeq\x12\x19\n" +
+	"\bis_final\x18\x03 \x01(\bR\aisFinal\x126\n" +
+	"\x17completed_traffic_count\x18\x04 \x01(\x05R\x15completedTrafficCount\x12J\n" +
+	"\bmetadata\x18\x05 \x03(\v2..devbridge.loop.v2.TunnelRecycle.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbc\x02\n" +
+	"\x10TunnelRecycleAck\x12\x1b\n" +
+	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId\x12\x1f\n" +
+	"\vrecycle_seq\x18\x02 \x01(\x04R\n" +
+	"recycleSeq\x12\x1a\n" +
+	"\baccepted\x18\x03 \x01(\bR\baccepted\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x04 \x01(\tR\terrorCode\x12#\n" +
+	"\rerror_message\x18\x05 \x01(\tR\ferrorMessage\x12M\n" +
+	"\bmetadata\x18\x06 \x03(\v21.devbridge.loop.v2.TunnelRecycleAck.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe8\x03\n" +
 	"\rStreamPayload\x12;\n" +
 	"\bopen_req\x18\x01 \x01(\v2\x1e.devbridge.loop.v2.TrafficOpenH\x00R\aopenReq\x12>\n" +
 	"\bopen_ack\x18\x02 \x01(\v2!.devbridge.loop.v2.TrafficOpenAckH\x00R\aopenAck\x12\x14\n" +
 	"\x04data\x18\x03 \x01(\fH\x00R\x04data\x127\n" +
-	"\x05close\x18\x04 \x01(\v2\x1f.devbridge.loop.v2.TrafficCloseH\x00R\x05close\x127\n" +
-	"\x05reset\x18\x05 \x01(\v2\x1f.devbridge.loop.v2.TrafficResetH\x00R\x05resetB\t\n" +
+	"\x05close\x18\x04 \x01(\v2\x1f.devbridge.loop.v2.TrafficCloseH\x00R\x05close\x12A\n" +
+	"\tclose_ack\x18\x05 \x01(\v2\".devbridge.loop.v2.TrafficCloseAckH\x00R\bcloseAck\x127\n" +
+	"\x05reset\x18\x06 \x01(\v2\x1f.devbridge.loop.v2.TrafficResetH\x00R\x05reset\x12<\n" +
+	"\arecycle\x18\a \x01(\v2 .devbridge.loop.v2.TunnelRecycleH\x00R\arecycle\x12F\n" +
+	"\vrecycle_ack\x18\b \x01(\v2#.devbridge.loop.v2.TunnelRecycleAckH\x00R\n" +
+	"recycleAckB\t\n" +
 	"\apayload2w\n" +
 	"\x17DevBridgeControlService\x12\\\n" +
 	"\x0eControlChannel\x12\".devbridge.loop.v2.ControlEnvelope\x1a\".devbridge.loop.v2.ControlEnvelope(\x010\x012p\n" +
@@ -3550,7 +3899,7 @@ func file_devbridge_loop_v2_ltfp_proto_rawDescGZIP() []byte {
 	return file_devbridge_loop_v2_ltfp_proto_rawDescData
 }
 
-var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 60)
+var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
 var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	(*ControlEnvelope)(nil),        // 0: devbridge.loop.v2.ControlEnvelope
 	(*ConnectorHello)(nil),         // 1: devbridge.loop.v2.ConnectorHello
@@ -3586,54 +3935,60 @@ var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	(*TrafficOpen)(nil),            // 31: devbridge.loop.v2.TrafficOpen
 	(*TrafficOpenAck)(nil),         // 32: devbridge.loop.v2.TrafficOpenAck
 	(*TrafficClose)(nil),           // 33: devbridge.loop.v2.TrafficClose
-	(*TrafficReset)(nil),           // 34: devbridge.loop.v2.TrafficReset
-	(*StreamPayload)(nil),          // 35: devbridge.loop.v2.StreamPayload
-	nil,                            // 36: devbridge.loop.v2.ConnectorHello.LabelsEntry
-	nil,                            // 37: devbridge.loop.v2.ConnectorHello.MetadataEntry
-	nil,                            // 38: devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	nil,                            // 39: devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
-	nil,                            // 40: devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	nil,                            // 41: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	nil,                            // 42: devbridge.loop.v2.Heartbeat.MetadataEntry
-	nil,                            // 43: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	nil,                            // 44: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	nil,                            // 45: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
-	nil,                            // 46: devbridge.loop.v2.PublishService.LabelsEntry
-	nil,                            // 47: devbridge.loop.v2.PublishService.MetadataEntry
-	nil,                            // 48: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	nil,                            // 49: devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
-	nil,                            // 50: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
-	nil,                            // 51: devbridge.loop.v2.RouteAssign.MetadataEntry
-	nil,                            // 52: devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	nil,                            // 53: devbridge.loop.v2.NegotiationResult.MetadataEntry
-	nil,                            // 54: devbridge.loop.v2.ForwardIntent.MetadataEntry
-	nil,                            // 55: devbridge.loop.v2.ForwardDecision.MetadataEntry
-	nil,                            // 56: devbridge.loop.v2.ControlError.MetadataEntry
-	nil,                            // 57: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	nil,                            // 58: devbridge.loop.v2.TrafficOpen.MetadataEntry
-	nil,                            // 59: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	(*TrafficCloseAck)(nil),        // 34: devbridge.loop.v2.TrafficCloseAck
+	(*TrafficReset)(nil),           // 35: devbridge.loop.v2.TrafficReset
+	(*TunnelRecycle)(nil),          // 36: devbridge.loop.v2.TunnelRecycle
+	(*TunnelRecycleAck)(nil),       // 37: devbridge.loop.v2.TunnelRecycleAck
+	(*StreamPayload)(nil),          // 38: devbridge.loop.v2.StreamPayload
+	nil,                            // 39: devbridge.loop.v2.ConnectorHello.LabelsEntry
+	nil,                            // 40: devbridge.loop.v2.ConnectorHello.MetadataEntry
+	nil,                            // 41: devbridge.loop.v2.ConnectorWelcome.MetadataEntry
+	nil,                            // 42: devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
+	nil,                            // 43: devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	nil,                            // 44: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	nil,                            // 45: devbridge.loop.v2.Heartbeat.MetadataEntry
+	nil,                            // 46: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	nil,                            // 47: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	nil,                            // 48: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	nil,                            // 49: devbridge.loop.v2.PublishService.LabelsEntry
+	nil,                            // 50: devbridge.loop.v2.PublishService.MetadataEntry
+	nil,                            // 51: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	nil,                            // 52: devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
+	nil,                            // 53: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	nil,                            // 54: devbridge.loop.v2.RouteAssign.MetadataEntry
+	nil,                            // 55: devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	nil,                            // 56: devbridge.loop.v2.NegotiationResult.MetadataEntry
+	nil,                            // 57: devbridge.loop.v2.ForwardIntent.MetadataEntry
+	nil,                            // 58: devbridge.loop.v2.ForwardDecision.MetadataEntry
+	nil,                            // 59: devbridge.loop.v2.ControlError.MetadataEntry
+	nil,                            // 60: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	nil,                            // 61: devbridge.loop.v2.TrafficOpen.MetadataEntry
+	nil,                            // 62: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	nil,                            // 63: devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	nil,                            // 64: devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	nil,                            // 65: devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
 }
 var file_devbridge_loop_v2_ltfp_proto_depIdxs = []int32{
-	36, // 0: devbridge.loop.v2.ConnectorHello.labels:type_name -> devbridge.loop.v2.ConnectorHello.LabelsEntry
-	37, // 1: devbridge.loop.v2.ConnectorHello.metadata:type_name -> devbridge.loop.v2.ConnectorHello.MetadataEntry
-	38, // 2: devbridge.loop.v2.ConnectorWelcome.metadata:type_name -> devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	39, // 3: devbridge.loop.v2.ConnectorAuth.auth_payload:type_name -> devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
-	40, // 4: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	41, // 5: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	42, // 6: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
-	43, // 7: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	44, // 8: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	45, // 9: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	39, // 0: devbridge.loop.v2.ConnectorHello.labels:type_name -> devbridge.loop.v2.ConnectorHello.LabelsEntry
+	40, // 1: devbridge.loop.v2.ConnectorHello.metadata:type_name -> devbridge.loop.v2.ConnectorHello.MetadataEntry
+	41, // 2: devbridge.loop.v2.ConnectorWelcome.metadata:type_name -> devbridge.loop.v2.ConnectorWelcome.MetadataEntry
+	42, // 3: devbridge.loop.v2.ConnectorAuth.auth_payload:type_name -> devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
+	43, // 4: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	44, // 5: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	45, // 6: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
+	46, // 7: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	47, // 8: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	48, // 9: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
 	6,  // 10: devbridge.loop.v2.PublishService.endpoints:type_name -> devbridge.loop.v2.ServiceEndpoint
 	7,  // 11: devbridge.loop.v2.PublishService.exposure:type_name -> devbridge.loop.v2.ServiceExposure
 	8,  // 12: devbridge.loop.v2.PublishService.health_check:type_name -> devbridge.loop.v2.HealthCheckConfig
 	9,  // 13: devbridge.loop.v2.PublishService.discovery_policy:type_name -> devbridge.loop.v2.DiscoveryPolicy
-	46, // 14: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
-	47, // 15: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
+	49, // 14: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
+	50, // 15: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
 	14, // 16: devbridge.loop.v2.ServiceHealthReport.endpoint_statuses:type_name -> devbridge.loop.v2.EndpointHealthStatus
-	48, // 17: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	49, // 18: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
-	50, // 19: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	51, // 17: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	52, // 18: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
+	53, // 19: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
 	16, // 20: devbridge.loop.v2.HybridGroupTarget.primary_connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
 	17, // 21: devbridge.loop.v2.HybridGroupTarget.fallback_external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
 	16, // 22: devbridge.loop.v2.RouteTarget.connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
@@ -3641,30 +3996,36 @@ var file_devbridge_loop_v2_ltfp_proto_depIdxs = []int32{
 	18, // 24: devbridge.loop.v2.RouteTarget.hybrid_group:type_name -> devbridge.loop.v2.HybridGroupTarget
 	20, // 25: devbridge.loop.v2.RouteAssign.match:type_name -> devbridge.loop.v2.RouteMatch
 	19, // 26: devbridge.loop.v2.RouteAssign.target:type_name -> devbridge.loop.v2.RouteTarget
-	51, // 27: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
-	52, // 28: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	53, // 29: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
+	54, // 27: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
+	55, // 28: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	56, // 29: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
 	26, // 30: devbridge.loop.v2.ForwardIntent.negotiation_profile:type_name -> devbridge.loop.v2.NegotiationProfile
-	54, // 31: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
+	57, // 31: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
 	27, // 32: devbridge.loop.v2.ForwardDecision.negotiation_result:type_name -> devbridge.loop.v2.NegotiationResult
-	55, // 33: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
-	56, // 34: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
-	57, // 35: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	58, // 36: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
-	59, // 37: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
-	31, // 38: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
-	32, // 39: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
-	33, // 40: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
-	34, // 41: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
-	0,  // 42: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
-	35, // 43: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
-	0,  // 44: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
-	35, // 45: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
-	44, // [44:46] is the sub-list for method output_type
-	42, // [42:44] is the sub-list for method input_type
-	42, // [42:42] is the sub-list for extension type_name
-	42, // [42:42] is the sub-list for extension extendee
-	0,  // [0:42] is the sub-list for field type_name
+	58, // 33: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
+	59, // 34: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
+	60, // 35: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	61, // 36: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
+	62, // 37: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	63, // 38: devbridge.loop.v2.TrafficCloseAck.metadata:type_name -> devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	64, // 39: devbridge.loop.v2.TunnelRecycle.metadata:type_name -> devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	65, // 40: devbridge.loop.v2.TunnelRecycleAck.metadata:type_name -> devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
+	31, // 41: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
+	32, // 42: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
+	33, // 43: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
+	34, // 44: devbridge.loop.v2.StreamPayload.close_ack:type_name -> devbridge.loop.v2.TrafficCloseAck
+	35, // 45: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
+	36, // 46: devbridge.loop.v2.StreamPayload.recycle:type_name -> devbridge.loop.v2.TunnelRecycle
+	37, // 47: devbridge.loop.v2.StreamPayload.recycle_ack:type_name -> devbridge.loop.v2.TunnelRecycleAck
+	0,  // 48: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
+	38, // 49: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
+	0,  // 50: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
+	38, // 51: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
+	50, // [50:52] is the sub-list for method output_type
+	48, // [48:50] is the sub-list for method input_type
+	48, // [48:48] is the sub-list for extension type_name
+	48, // [48:48] is the sub-list for extension extendee
+	0,  // [0:48] is the sub-list for field type_name
 }
 
 func init() { file_devbridge_loop_v2_ltfp_proto_init() }
@@ -3672,12 +4033,15 @@ func file_devbridge_loop_v2_ltfp_proto_init() {
 	if File_devbridge_loop_v2_ltfp_proto != nil {
 		return
 	}
-	file_devbridge_loop_v2_ltfp_proto_msgTypes[35].OneofWrappers = []any{
+	file_devbridge_loop_v2_ltfp_proto_msgTypes[38].OneofWrappers = []any{
 		(*StreamPayload_OpenReq)(nil),
 		(*StreamPayload_OpenAck)(nil),
 		(*StreamPayload_Data)(nil),
 		(*StreamPayload_Close)(nil),
+		(*StreamPayload_CloseAck)(nil),
 		(*StreamPayload_Reset_)(nil),
+		(*StreamPayload_Recycle)(nil),
+		(*StreamPayload_RecycleAck)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -3685,7 +4049,7 @@ func file_devbridge_loop_v2_ltfp_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_devbridge_loop_v2_ltfp_proto_rawDesc), len(file_devbridge_loop_v2_ltfp_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   60,
+			NumMessages:   66,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

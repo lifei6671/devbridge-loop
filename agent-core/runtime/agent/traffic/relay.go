@@ -56,6 +56,11 @@ func (relay RelayFunc) Relay(ctx context.Context, tunnel TunnelIO, upstream io.R
 	return relay(ctx, tunnel, upstream, trafficID)
 }
 
+// closeAckObserver 由 tunnel 侧可选实现，用于记录 relay 阶段已观测的 close_ack 事实。
+type closeAckObserver interface {
+	MarkCloseAckObserved(trafficID string)
+}
+
 // StreamRelayOptions 描述默认 relay 行为配置。
 type StreamRelayOptions struct {
 	BufferFrames        int
@@ -257,6 +262,10 @@ func (relay *StreamRelay) readTunnelToUpstream(
 			}
 			if writeAckErr := tunnel.WritePayload(ctx, closeAckPayload); writeAckErr != nil {
 				return fmt.Errorf("read tunnel close: write close ack: %w", writeAckErr)
+			}
+			// close_ack 可能在 relay 阶段被消费，后续 recycle 阶段通过该标记继续满足前置条件。
+			if observer, ok := tunnel.(closeAckObserver); ok {
+				observer.MarkCloseAckObserved(trafficID)
 			}
 			return io.EOF
 		}

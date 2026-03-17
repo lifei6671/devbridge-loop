@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -139,13 +140,32 @@ func ExecuteTunnelRecycleHandshake(
 			)
 		}
 		if !ack.Accepted {
+			recycleErrorCode := normalizeRecycleRejectCode(ack.ErrorCode)
 			return ack, fmt.Errorf(
 				"execute tunnel recycle handshake: recycle rejected code=%s message=%s",
-				strings.TrimSpace(ack.ErrorCode),
+				recycleErrorCode,
 				strings.TrimSpace(ack.ErrorMessage),
 			)
 		}
 		return ack, nil
+	}
+}
+
+func normalizeRecycleRejectCode(errorCode string) string {
+	normalizedCode := strings.TrimSpace(errorCode)
+	switch normalizedCode {
+	case ltfperrors.CodeTunnelRecycleInvalidSeq:
+		return ltfperrors.CodeTunnelRecycleInvalidSeq
+	case ltfperrors.CodeTunnelRecycleCloseAckRequired:
+		return ltfperrors.CodeTunnelRecycleCloseAckRequired
+	case ltfperrors.CodeTunnelRecycleTunnelUnhealthy:
+		return ltfperrors.CodeTunnelRecycleTunnelUnhealthy
+	case ltfperrors.CodeTunnelRecycleBufferDirty:
+		return ltfperrors.CodeTunnelRecycleBufferDirty
+	case ltfperrors.CodeTunnelRecycleTunnelMismatch:
+		return ltfperrors.CodeTunnelRecycleTunnelMismatch
+	default:
+		return normalizedCode
 	}
 }
 

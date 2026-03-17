@@ -311,3 +311,28 @@ func TestGRPCH2TunnelResetMarksBroken(testingObject *testing.T) {
 		testingObject.Fatalf("expected reset cause in error, got %v", tunnel.Err())
 	}
 }
+
+// TestGRPCH2TunnelRecyclableRejectsClosedErr 验证 ErrClosed 即使未观测到 closed state 也不可回收。
+func TestGRPCH2TunnelRecyclableRejectsClosedErr(testingObject *testing.T) {
+	tunnelStream, err := newGRPCH2TunnelStream(&fakeTunnelEnvelopeStream{})
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel stream failed: %v", err)
+	}
+	tunnel, err := NewGRPCH2Tunnel(tunnelStream, transport.TunnelMeta{
+		TunnelID: "tunnel-recyclable-closed-err",
+	})
+	if err != nil {
+		testingObject.Fatalf("create grpc tunnel failed: %v", err)
+	}
+
+	// 模拟 stream 已关闭但 watchStreamDone 尚未同步到 tunnel.state 的并发窗口。
+	tunnelStream.stateMutex.Lock()
+	tunnelStream.lastError = transport.ErrClosed
+	tunnelStream.stateMutex.Unlock()
+	if state := tunnel.State(); state != transport.TunnelStateIdle {
+		testingObject.Fatalf("expected idle state before recyclable check, got %s", state)
+	}
+	if tunnel.Recyclable() {
+		testingObject.Fatalf("expected tunnel not recyclable when Err returns ErrClosed")
+	}
+}

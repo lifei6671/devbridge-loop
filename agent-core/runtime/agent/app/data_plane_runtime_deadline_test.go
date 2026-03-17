@@ -66,6 +66,18 @@ func (tunnel *deadlinePolicyTestTunnel) SetWriteDeadline(deadline time.Time) err
 	return nil
 }
 
+func (tunnel *deadlinePolicyTestTunnel) Flush() error {
+	return nil
+}
+
+func (tunnel *deadlinePolicyTestTunnel) ReuseCount() int {
+	return 0
+}
+
+func (tunnel *deadlinePolicyTestTunnel) Recyclable() bool {
+	return true
+}
+
 func (tunnel *deadlinePolicyTestTunnel) Done() <-chan struct{} {
 	doneChannel := make(chan struct{})
 	close(doneChannel)
