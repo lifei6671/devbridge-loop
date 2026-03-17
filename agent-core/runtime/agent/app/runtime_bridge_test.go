@@ -78,6 +78,131 @@ func (channel *testPrioritizedControlChannel) Frames() []transport.PrioritizedCo
 	return cloned
 }
 
+type handshakeControlChannel struct {
+	lastFrame      transport.PrioritizedControlFrame
+	frames         []transport.PrioritizedControlFrame
+	doneChan       chan struct{}
+	readQueue      chan transport.ControlFrame
+	authAckSuccess bool
+
+	lastHelloPayload pb.ConnectorHello
+	lastAuthPayload  pb.ConnectorAuth
+}
+
+func newHandshakeControlChannel(authAckSuccess bool) *handshakeControlChannel {
+	return &handshakeControlChannel{
+		doneChan:       make(chan struct{}),
+		readQueue:      make(chan transport.ControlFrame, 8),
+		authAckSuccess: authAckSuccess,
+	}
+}
+
+func (channel *handshakeControlChannel) WriteControlFrame(
+	ctx context.Context,
+	frame transport.ControlFrame,
+) error {
+	return channel.WritePrioritizedControlFrame(
+		ctx,
+		transport.PrioritizedControlFrame{
+			Priority: transport.ControlMessagePriorityNormal,
+			Frame:    frame,
+		},
+	)
+}
+
+func (channel *handshakeControlChannel) WritePrioritizedControlFrame(
+	_ context.Context,
+	frame transport.PrioritizedControlFrame,
+) error {
+	channel.lastFrame = frame
+	channel.frames = append(channel.frames, frame)
+	envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frame.Frame)
+	if err != nil {
+		// 非业务控制帧（如 ping/pong）不参与握手应答。
+		return nil
+	}
+	switch envelope.MessageType {
+	case pb.ControlMessageConnectorHello:
+		// 记录 hello 载荷，供测试断言发送内容。
+		_ = json.Unmarshal(envelope.Payload, &channel.lastHelloPayload)
+		welcomePayload, marshalErr := json.Marshal(pb.ConnectorWelcome{
+			AssignedSessionEpoch: 42,
+			HeartbeatIntervalSec: 5,
+			SelectedBinding:      "tcp_framed",
+		})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		welcomeFrame, encodeErr := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+			VersionMajor: 2,
+			VersionMinor: 1,
+			MessageType:  pb.ControlMessageConnectorWelcome,
+			ConnectorID:  envelope.ConnectorID,
+			Payload:      welcomePayload,
+		})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		channel.readQueue <- welcomeFrame
+	case pb.ControlMessageConnectorAuth:
+		// 记录 auth 载荷，供测试断言 token/client_cap_version 是否按配置填充。
+		_ = json.Unmarshal(envelope.Payload, &channel.lastAuthPayload)
+		authAckPayload := pb.ConnectorAuthAck{
+			Success:      channel.authAckSuccess,
+			SessionID:    "session-auth-42",
+			SessionEpoch: 42,
+		}
+		if !channel.authAckSuccess {
+			authAckPayload.ErrorCode = "auth_invalid_token"
+			authAckPayload.ErrorMessage = "invalid token"
+		}
+		encodedAuthAck, marshalErr := json.Marshal(authAckPayload)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		authAckFrame, encodeErr := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+			VersionMajor: 2,
+			VersionMinor: 1,
+			MessageType:  pb.ControlMessageConnectorAuthAck,
+			ConnectorID:  envelope.ConnectorID,
+			SessionID:    authAckPayload.SessionID,
+			SessionEpoch: authAckPayload.SessionEpoch,
+			Payload:      encodedAuthAck,
+		})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		channel.readQueue <- authAckFrame
+	}
+	return nil
+}
+
+func (channel *handshakeControlChannel) ReadControlFrame(ctx context.Context) (transport.ControlFrame, error) {
+	select {
+	case <-ctx.Done():
+		return transport.ControlFrame{}, ctx.Err()
+	case frame := <-channel.readQueue:
+		return frame, nil
+	}
+}
+
+func (channel *handshakeControlChannel) Close(_ context.Context) error {
+	select {
+	case <-channel.doneChan:
+	default:
+		close(channel.doneChan)
+	}
+	return nil
+}
+
+func (channel *handshakeControlChannel) Done() <-chan struct{} {
+	return channel.doneChan
+}
+
+func (channel *handshakeControlChannel) Err() error {
+	return nil
+}
+
 type runtimeBridgeTestHealthProbe struct {
 	result pb.HealthStatus
 }
@@ -259,6 +384,60 @@ func TestSendControlHeartbeatPingWritesHighPriorityFrame(testingObject *testing.
 	}
 	if len(controlChannel.lastFrame.Frame.Payload) != 0 {
 		testingObject.Fatalf("expected empty ping payload")
+	}
+}
+
+// TestPerformControlHandshakeBuildsHelloAndAuth 验证握手会发送 Hello/Auth 并回填权威会话。
+func TestPerformControlHandshakeBuildsHelloAndAuth(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		cfg:            DefaultConfig(),
+		controlChannel: newHandshakeControlChannel(true),
+	}
+	if err := runtime.performControlHandshake(context.Background()); err != nil {
+		testingObject.Fatalf("perform control handshake failed: %v", err)
+	}
+	if runtime.bridgeSession != "session-auth-42" || runtime.bridgeEpoch != 42 {
+		testingObject.Fatalf(
+			"unexpected authoritative session: session_id=%s session_epoch=%d",
+			runtime.bridgeSession,
+			runtime.bridgeEpoch,
+		)
+	}
+	handshakeChannel := runtime.controlChannel.(*handshakeControlChannel)
+	if strings.TrimSpace(handshakeChannel.lastHelloPayload.ConnectorID) != strings.TrimSpace(runtime.cfg.AgentID) {
+		testingObject.Fatalf("unexpected connector_id in hello payload: %s", handshakeChannel.lastHelloPayload.ConnectorID)
+	}
+	if strings.TrimSpace(handshakeChannel.lastAuthPayload.AuthMethod) != strings.TrimSpace(runtime.cfg.Session.AuthMethod) {
+		testingObject.Fatalf("unexpected auth_method in auth payload: %s", handshakeChannel.lastAuthPayload.AuthMethod)
+	}
+	if strings.TrimSpace(handshakeChannel.lastAuthPayload.Token) != strings.TrimSpace(runtime.cfg.Session.AuthToken) {
+		testingObject.Fatalf("unexpected token in auth payload")
+	}
+	if strings.TrimSpace(handshakeChannel.lastAuthPayload.ClientCapVersion) != strings.TrimSpace(runtime.cfg.Session.ClientCapVersion) {
+		testingObject.Fatalf(
+			"unexpected client_cap_version in auth payload: got=%s want=%s",
+			handshakeChannel.lastAuthPayload.ClientCapVersion,
+			runtime.cfg.Session.ClientCapVersion,
+		)
+	}
+}
+
+// TestPerformControlHandshakeAuthRejectDoesNotLeakToken 验证认证失败错误不会携带 token 明文。
+func TestPerformControlHandshakeAuthRejectDoesNotLeakToken(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		cfg:            DefaultConfig(),
+		controlChannel: newHandshakeControlChannel(false),
+	}
+	err := runtime.performControlHandshake(context.Background())
+	if err == nil {
+		testingObject.Fatalf("expected handshake error, got nil")
+	}
+	if strings.Contains(err.Error(), runtime.cfg.Session.AuthToken) {
+		testingObject.Fatalf("unexpected token leakage in handshake error: %v", err)
 	}
 }
 

@@ -54,14 +54,8 @@ func ValidateConnectorHello(message pb.ConnectorHello) error {
 	if strings.TrimSpace(message.ConnectorID) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "connectorId is required")
 	}
-	// namespace 是最小隔离边界字段之一，必须显式填写。
-	if strings.TrimSpace(message.Namespace) == "" {
-		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "namespace is required")
-	}
-	// environment 是最小隔离边界字段之一，必须显式填写。
-	if strings.TrimSpace(message.Environment) == "" {
-		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "environment is required")
-	}
+	// namespace/environment 在握手阶段为可选上下文字段，不作为认证成功条件。
+	// 这里不再对 namespace/environment 做必填校验。
 	return nil
 }
 

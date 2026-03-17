@@ -47,9 +47,14 @@ type ConnectorWelcome struct {
 
 // ConnectorAuth 描述连接器认证请求。
 type ConnectorAuth struct {
-	AuthMethod  string            `json:"authMethod"`
-	AuthPayload map[string]string `json:"authPayload,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	// AuthMethod 固定为 token，表示采用 Bearer Token 认证。
+	AuthMethod string `json:"authMethod"`
+	// Token 承载认证凭证明文，由 Agent 在握手阶段发送。
+	Token string `json:"token,omitempty"`
+	// ClientCapVersion 表示客户端能力版本，用于服务端做能力分支判断。
+	ClientCapVersion string `json:"clientCapVersion,omitempty"`
+	// Metadata 仅承载非核心扩展字段，不参与认证主判断。
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ConnectorAuthAck 描述认证结果。
@@ -401,14 +406,14 @@ type TunnelRecycleAck struct {
 
 // StreamPayload 描述数据通道 oneof 负载。
 type StreamPayload struct {
-	OpenReq    *TrafficOpen       `json:"openReq,omitempty"`
-	OpenAck    *TrafficOpenAck    `json:"openAck,omitempty"`
-	Data       []byte             `json:"data,omitempty"`
-	Close      *TrafficClose      `json:"close,omitempty"`
-	CloseAck   *TrafficCloseAck   `json:"closeAck,omitempty"`
-	Reset      *TrafficReset      `json:"reset,omitempty"`
-	Recycle    *TunnelRecycle     `json:"recycle,omitempty"`
-	RecycleAck *TunnelRecycleAck  `json:"recycleAck,omitempty"`
+	OpenReq    *TrafficOpen      `json:"openReq,omitempty"`
+	OpenAck    *TrafficOpenAck   `json:"openAck,omitempty"`
+	Data       []byte            `json:"data,omitempty"`
+	Close      *TrafficClose     `json:"close,omitempty"`
+	CloseAck   *TrafficCloseAck  `json:"closeAck,omitempty"`
+	Reset      *TrafficReset     `json:"reset,omitempty"`
+	Recycle    *TunnelRecycle    `json:"recycle,omitempty"`
+	RecycleAck *TunnelRecycleAck `json:"recycleAck,omitempty"`
 }
 
 // ActivePayloadCount 统计数据面 oneof 实际被设置的字段数量。

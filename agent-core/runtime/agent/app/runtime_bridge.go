@@ -1640,6 +1640,193 @@ func (r *Runtime) sendBusinessControlEnvelope(ctx context.Context, envelope pb.C
 	return nil
 }
 
+// buildConnectorHelloEnvelope 构建握手第一步 ConnectorHello 消息。
+func (r *Runtime) buildConnectorHelloEnvelope() pb.ControlEnvelope {
+	normalizedBinding := strings.TrimSpace(r.cfg.BridgeTransport)
+	helloPayload := pb.ConnectorHello{
+		ConnectorID:       strings.TrimSpace(r.cfg.AgentID),
+		NodeName:          strings.TrimSpace(r.cfg.AgentID),
+		Version:           "agent-core",
+		SupportedBindings: []string{normalizedBinding},
+		Capabilities: []string{
+			"control_handshake_v1",
+			"tunnel_recycle_v1",
+		},
+	}
+	encodedPayload, _ := json.Marshal(helloPayload)
+	// 握手消息不依赖会话元信息；会话权威值由 Bridge 在 AuthAck 返回。
+	return pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  strings.TrimSpace(r.cfg.AgentID),
+		Payload:      encodedPayload,
+	}
+}
+
+// buildConnectorAuthEnvelope 构建握手第二步 ConnectorAuth 消息。
+func (r *Runtime) buildConnectorAuthEnvelope() pb.ControlEnvelope {
+	authPayload := pb.ConnectorAuth{
+		AuthMethod:       strings.TrimSpace(r.cfg.Session.AuthMethod),
+		Token:            strings.TrimSpace(r.cfg.Session.AuthToken),
+		ClientCapVersion: strings.TrimSpace(r.cfg.Session.ClientCapVersion),
+	}
+	encodedPayload, _ := json.Marshal(authPayload)
+	return pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  strings.TrimSpace(r.cfg.AgentID),
+		Payload:      encodedPayload,
+	}
+}
+
+// applyAuthoritativeSession 使用 Bridge 返回的权威 session_id/session_epoch 更新本地上下文。
+func (r *Runtime) applyAuthoritativeSession(sessionID string, sessionEpoch uint64) {
+	if r == nil {
+		return
+	}
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if normalizedSessionID == "" || sessionEpoch == 0 {
+		return
+	}
+	r.bridgeMu.Lock()
+	// 覆盖 connect 阶段临时会话值，确保后续控制面消息携带权威代际。
+	r.bridgeSession = normalizedSessionID
+	r.bridgeEpoch = sessionEpoch
+	r.updatedAt = time.Now().UTC()
+	r.bridgeMu.Unlock()
+
+	// 同步各组件会话上下文，避免跨代际污染。
+	if r.refillHandler != nil {
+		r.refillHandler.SetSession(normalizedSessionID, sessionEpoch)
+	}
+	if r.controlPublisher != nil {
+		r.controlPublisher.SetSession(normalizedSessionID, sessionEpoch)
+	}
+	if r.tunnelReporter != nil {
+		r.tunnelReporter.SetSession(normalizedSessionID, sessionEpoch)
+	}
+}
+
+// waitHandshakeBusinessEnvelope 等待并解析握手阶段来自 Bridge 的业务控制消息。
+func (r *Runtime) waitHandshakeBusinessEnvelope(
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+) (pb.ControlEnvelope, error) {
+	for {
+		if ctx.Err() != nil {
+			return pb.ControlEnvelope{}, ctx.Err()
+		}
+		frame, err := controlChannel.ReadControlFrame(ctx)
+		if err != nil {
+			return pb.ControlEnvelope{}, err
+		}
+		switch frame.Type {
+		case transport.ControlFrameTypeHeartbeatPing:
+			// 握手窗口内仍需响应 ping，避免对端将连接误判为超时。
+			if err := r.sendControlHeartbeatPong(ctx, controlChannel); err != nil {
+				return pb.ControlEnvelope{}, err
+			}
+			continue
+		case transport.ControlFrameTypeHeartbeatPong:
+			r.touchBridgeHeartbeat()
+			continue
+		default:
+			// 非业务帧直接忽略，保持对未知扩展帧的兼容性。
+			if _, err := transport.ControlMessageTypeForFrameType(frame.Type); err != nil {
+				continue
+			}
+		}
+		envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frame)
+		if err != nil {
+			return pb.ControlEnvelope{}, fmt.Errorf("decode handshake business control frame failed: %w", err)
+		}
+		return envelope, nil
+	}
+}
+
+// performControlHandshake 执行 Hello->Welcome->Auth->AuthAck 握手闭环。
+func (r *Runtime) performControlHandshake(ctx context.Context) error {
+	if r == nil {
+		return errors.New("runtime is nil")
+	}
+	r.bridgeMu.RLock()
+	controlChannel := r.controlChannel
+	r.bridgeMu.RUnlock()
+	if controlChannel == nil {
+		return errors.New("control channel is nil")
+	}
+
+	normalizedContext := ctx
+	if normalizedContext == nil {
+		normalizedContext = context.Background()
+	}
+	handshakeTimeout := r.cfg.Session.AuthTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 5 * time.Second
+	}
+	handshakeContext, cancelHandshake := context.WithTimeout(normalizedContext, handshakeTimeout)
+	defer cancelHandshake()
+
+	helloEnvelope := r.buildConnectorHelloEnvelope()
+	if err := r.sendBusinessControlEnvelope(handshakeContext, helloEnvelope); err != nil {
+		return fmt.Errorf("send connector hello failed: %w", err)
+	}
+
+	welcomeEnvelope, err := r.waitHandshakeBusinessEnvelope(handshakeContext, controlChannel)
+	if err != nil {
+		return fmt.Errorf("wait connector welcome failed: %w", err)
+	}
+	if welcomeEnvelope.MessageType != pb.ControlMessageConnectorWelcome {
+		return fmt.Errorf("unexpected handshake response before auth: %s", welcomeEnvelope.MessageType)
+	}
+	var welcomePayload pb.ConnectorWelcome
+	if err := json.Unmarshal(welcomeEnvelope.Payload, &welcomePayload); err != nil {
+		return fmt.Errorf("decode connector welcome failed: %w", err)
+	}
+	if welcomePayload.AssignedSessionEpoch == 0 {
+		return errors.New("invalid connector welcome: assigned_session_epoch is empty")
+	}
+
+	authEnvelope := r.buildConnectorAuthEnvelope()
+	if err := r.sendBusinessControlEnvelope(handshakeContext, authEnvelope); err != nil {
+		return fmt.Errorf("send connector auth failed: %w", err)
+	}
+
+	authAckEnvelope, err := r.waitHandshakeBusinessEnvelope(handshakeContext, controlChannel)
+	if err != nil {
+		return fmt.Errorf("wait connector auth ack failed: %w", err)
+	}
+	if authAckEnvelope.MessageType != pb.ControlMessageConnectorAuthAck {
+		return fmt.Errorf("unexpected handshake response after auth: %s", authAckEnvelope.MessageType)
+	}
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(authAckEnvelope.Payload, &authAckPayload); err != nil {
+		return fmt.Errorf("decode connector auth ack failed: %w", err)
+	}
+	if !authAckPayload.Success {
+		// 认证失败错误信息仅透出 code/message，避免输出 token。
+		return fmt.Errorf(
+			"connector auth rejected: code=%s message=%s",
+			strings.TrimSpace(authAckPayload.ErrorCode),
+			strings.TrimSpace(authAckPayload.ErrorMessage),
+		)
+	}
+	if strings.TrimSpace(authAckPayload.SessionID) == "" || authAckPayload.SessionEpoch == 0 {
+		return errors.New("invalid connector auth ack: empty session authority")
+	}
+	if authAckPayload.SessionEpoch != welcomePayload.AssignedSessionEpoch {
+		return fmt.Errorf(
+			"invalid connector auth ack epoch: ack=%d welcome=%d",
+			authAckPayload.SessionEpoch,
+			welcomePayload.AssignedSessionEpoch,
+		)
+	}
+	r.applyAuthoritativeSession(authAckPayload.SessionID, authAckPayload.SessionEpoch)
+	return nil
+}
+
 func (r *Runtime) waitUntilReconnectCommand(ctx context.Context, failStreak *uint32) error {
 	for {
 		select {
@@ -1856,6 +2043,19 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			continue
 		}
 		failStreak = 0
+		if err := r.performControlHandshake(ctx); err != nil {
+			// 握手失败视为连接不可用，按失活链路进入重连退避。
+			r.closeCurrentControlChannel()
+			r.notifyTunnelManagerState(tunnel.SessionStateStale)
+			r.setBridgeLost(err)
+			failStreak++
+			backoff := computeBridgeRetryBackoff(failStreak)
+			r.setBridgeRetrying(err, failStreak, backoff)
+			if waitErr := r.waitRetryWindow(ctx, backoff, &failStreak); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
 		if err := r.syncServiceControlState(ctx); err != nil {
 			// 资源同步失败视为会话不可用，按失活链路进入重连退避。
 			r.closeCurrentControlChannel()

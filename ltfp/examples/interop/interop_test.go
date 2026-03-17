@@ -14,9 +14,19 @@ import (
 // agentSideBuildHello 模拟 agent 侧构建 HELLO 控制面消息。
 func agentSideBuildHello(t *testing.T, transport codec.TransportBinding) []byte {
 	t.Helper()
+	// 默认路径复用 golden hello，用于覆盖标准握手样例。
+	return agentSideBuildHelloWithPayload(t, transport, testkit.GoldenConnectorHello())
+}
+
+// agentSideBuildHelloWithPayload 模拟 agent 侧使用指定 HELLO 载荷构建控制面消息。
+func agentSideBuildHelloWithPayload(
+	t *testing.T,
+	transport codec.TransportBinding,
+	hello pb.ConnectorHello,
+) []byte {
+	t.Helper()
 
 	jsonCodec := codec.NewJSONCodec()
-	hello := testkit.GoldenConnectorHello()
 	rawPayload, err := jsonCodec.EncodePayload(hello)
 	if err != nil {
 		t.Fatalf("agent encode hello payload failed: %v", err)
@@ -106,4 +116,17 @@ func TestAgentBridgeProtocolInterop(t *testing.T) {
 	if session.IsHeartbeatTimeout(lastHeartbeat, time.Now().UTC(), 2, 2) {
 		t.Fatalf("unexpected heartbeat timeout")
 	}
+}
+
+// TestAgentBridgeProtocolInteropAcceptsHelloWithoutScope 验证 Hello 缺失 scope 仍可通过握手校验。
+func TestAgentBridgeProtocolInteropAcceptsHelloWithoutScope(t *testing.T) {
+	t.Parallel()
+
+	transport := codec.TransportBindingHTTP
+	hello := testkit.GoldenConnectorHello()
+	// scope 字段在握手阶段为可选，不应影响 ValidateConnectorHello 结果。
+	hello.Namespace = ""
+	hello.Environment = ""
+	rawHello := agentSideBuildHelloWithPayload(t, transport, hello)
+	_ = bridgeSideDecodeAndValidateHello(t, transport, rawHello)
 }

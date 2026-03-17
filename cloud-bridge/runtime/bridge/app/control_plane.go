@@ -23,11 +23,16 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/validate"
 	"google.golang.org/grpc"
 )
 
 const (
 	defaultHeartbeatReplyTimeout = 2 * time.Second
+	// connectorHeartbeatIntervalSec 定义握手返回给 Agent 的建议 heartbeat 间隔。
+	connectorHeartbeatIntervalSec = 5
+	// defaultWelcomeBinding 作为握手阶段 selected_binding 的默认值。
+	defaultWelcomeBinding = "tcp_framed"
 	// tcpConnectionClassifierReadTimeout 定义 TCP 入站连接类型判别的首包读取超时。
 	tcpConnectionClassifierReadTimeout = 2 * time.Second
 	// incomingTunnelProbeInterval 定义入站 tunnel 生命周期探测间隔，兜底处理远端静默断开。
@@ -46,6 +51,7 @@ type controlMessageDispatcher struct {
 	serviceRegistry       *registry.ServiceRegistry
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
+	authCoordinator       *connectorAuthCoordinator
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 	publishHandler        *bridgecontrol.PublishHandler
 	healthHandler         *bridgecontrol.HealthHandler
@@ -58,6 +64,13 @@ type controlMessageDispatcher struct {
 type controlChannelSessionState struct {
 	sessionID    string
 	sessionEpoch uint64
+	connectorID  string
+	// assignedSessionEpoch 是 Welcome 阶段预分配给本连接的候选 epoch。
+	assignedSessionEpoch uint64
+	// helloAccepted 标记当前连接是否已完成 ConnectorHello 阶段。
+	helloAccepted bool
+	// authenticated 标记当前连接是否已经完成 ConnectorAuthAck(success=true)。
+	authenticated bool
 }
 
 // setSession 更新控制连接会话上下文。
@@ -73,12 +86,28 @@ func (state *controlChannelSessionState) setSession(sessionID string, sessionEpo
 	state.sessionEpoch = sessionEpoch
 }
 
+// setHelloContext 在 ConnectorHello 通过后记录连接上下文。
+func (state *controlChannelSessionState) setHelloContext(connectorID string, assignedSessionEpoch uint64) {
+	if state == nil {
+		return
+	}
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" || assignedSessionEpoch == 0 {
+		return
+	}
+	state.connectorID = normalizedConnectorID
+	state.assignedSessionEpoch = assignedSessionEpoch
+	state.helloAccepted = true
+	state.authenticated = false
+}
+
 // controlMessageDispatcherOptions 定义控制面分发器依赖。
 type controlMessageDispatcherOptions struct {
 	sessionRegistry       *registry.SessionRegistry
 	serviceRegistry       *registry.ServiceRegistry
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
+	authCoordinator       *connectorAuthCoordinator
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 }
 
@@ -104,6 +133,13 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		// 未注入时回落到本地 tunnel 视图。
 		tunnelRegistry = registry.NewTunnelRegistry()
 	}
+	authCoordinator := options.authCoordinator
+	if authCoordinator == nil {
+		// 未注入认证协调器时使用默认实现，保证控制面握手可直接落地。
+		authCoordinator = newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
+			sessionRegistry: sessionRegistry,
+		})
+	}
 	eventGuard := consistency.NewResourceEventGuard(4096)
 	sessionHandler := bridgecontrol.NewSessionHandler(bridgecontrol.SessionHandlerOptions{
 		SessionRegistry: sessionRegistry,
@@ -116,6 +152,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		serviceRegistry:       serviceRegistry,
 		routeRegistry:         routeRegistry,
 		tunnelRegistry:        tunnelRegistry,
+		authCoordinator:       authCoordinator,
 		tunnelPoolReportStore: options.tunnelPoolReportStore,
 		publishHandler: bridgecontrol.NewPublishHandler(bridgecontrol.PublishHandlerOptions{
 			Guard:           eventGuard,
@@ -164,6 +201,29 @@ func (dispatcher *controlMessageDispatcher) handleFrame(
 	if err != nil {
 		return nil, transport.ControlMessagePriorityNormal, fmt.Errorf("decode business control frame failed: %w", err)
 	}
+	if envelope.MessageType == pb.ControlMessageConnectorHello || envelope.MessageType == pb.ControlMessageConnectorAuth {
+		// 握手消息在 frame 层直接处理，避免与资源消息分发逻辑混淆。
+		replyEnvelope, handshakeErr := dispatcher.handleHandshakeEnvelope(envelope, sessionState)
+		if handshakeErr != nil {
+			return nil, transport.ControlMessagePriorityNormal, handshakeErr
+		}
+		replyFrame, encodeErr := transport.EncodeBusinessControlEnvelopeFrame(*replyEnvelope)
+		if encodeErr != nil {
+			return nil, transport.ControlMessagePriorityNormal, fmt.Errorf("encode handshake reply failed: %w", encodeErr)
+		}
+		return &replyFrame, transport.RecommendControlFramePriority(replyFrame.Type), nil
+	}
+	if sessionState != nil && !sessionState.authenticated {
+		// 认证成功前拒绝所有业务控制消息，避免未认证连接污染运行态。
+		// 这里不返回错误，避免 serve 循环直接断链触发无意义重连风暴。
+		slog.Warn(
+			"reject unauthenticated control message",
+			"message_type", envelope.MessageType,
+			"connector_id", strings.TrimSpace(envelope.ConnectorID),
+			"request_id", strings.TrimSpace(envelope.RequestID),
+		)
+		return nil, transport.ControlMessagePriorityNormal, nil
+	}
 	if sessionID, sessionEpoch, ok := resolveEnvelopeSession(envelope); ok {
 		sessionState.setSession(sessionID, sessionEpoch)
 	}
@@ -179,6 +239,219 @@ func (dispatcher *controlMessageDispatcher) handleFrame(
 		return nil, transport.ControlMessagePriorityNormal, fmt.Errorf("encode business control reply failed: %w", err)
 	}
 	return &replyFrame, transport.RecommendControlFramePriority(replyFrame.Type), nil
+}
+
+// handleHandshakeEnvelope 处理 ConnectorHello/ConnectorAuth 握手消息并返回响应。
+func (dispatcher *controlMessageDispatcher) handleHandshakeEnvelope(
+	envelope pb.ControlEnvelope,
+	sessionState *controlChannelSessionState,
+) (*pb.ControlEnvelope, error) {
+	if dispatcher == nil {
+		return nil, errors.New("handshake dispatcher is nil")
+	}
+	switch envelope.MessageType {
+	case pb.ControlMessageConnectorHello:
+		return dispatcher.handleConnectorHelloEnvelope(envelope, sessionState)
+	case pb.ControlMessageConnectorAuth:
+		return dispatcher.handleConnectorAuthEnvelope(envelope, sessionState)
+	default:
+		return nil, fmt.Errorf("unsupported handshake message type: %s", envelope.MessageType)
+	}
+}
+
+// handleConnectorHelloEnvelope 校验并应答 ConnectorHello。
+func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
+	envelope pb.ControlEnvelope,
+	sessionState *controlChannelSessionState,
+) (*pb.ControlEnvelope, error) {
+	var helloPayload pb.ConnectorHello
+	if err := decodeControlPayload(envelope.Payload, &helloPayload); err != nil {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_internal_error",
+			"decode connector hello payload failed",
+		)
+	}
+	if err := validate.ValidateConnectorHello(helloPayload); err != nil {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_internal_error",
+			"invalid connector hello payload",
+		)
+	}
+	normalizedConnectorID := strings.TrimSpace(helloPayload.ConnectorID)
+	if normalizedConnectorID == "" {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_internal_error",
+			"connector_id is required",
+		)
+	}
+	if envelopeConnectorID := strings.TrimSpace(envelope.ConnectorID); envelopeConnectorID != "" && envelopeConnectorID != normalizedConnectorID {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_connector_mismatch",
+			"connector_id mismatch between envelope and hello payload",
+		)
+	}
+
+	assignedSessionEpoch := dispatcher.allocateAssignedSessionEpoch(normalizedConnectorID)
+	if sessionState != nil {
+		// 记录握手上下文，为后续 ConnectorAuth 提交阶段做约束。
+		sessionState.setHelloContext(normalizedConnectorID, assignedSessionEpoch)
+	}
+
+	welcomePayload := pb.ConnectorWelcome{
+		SelectedBinding:      selectWelcomeBinding(helloPayload.SupportedBindings),
+		VersionMajor:         envelope.VersionMajor,
+		VersionMinor:         envelope.VersionMinor,
+		HeartbeatIntervalSec: connectorHeartbeatIntervalSec,
+		AssignedSessionEpoch: assignedSessionEpoch,
+	}
+	return buildConnectorWelcomeEnvelope(envelope, normalizedConnectorID, welcomePayload)
+}
+
+// handleConnectorAuthEnvelope 校验并应答 ConnectorAuth。
+func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
+	envelope pb.ControlEnvelope,
+	sessionState *controlChannelSessionState,
+) (*pb.ControlEnvelope, error) {
+	if sessionState == nil || !sessionState.helloAccepted {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_internal_error",
+			"connector_welcome is required before connector_auth",
+		)
+	}
+	var authPayload pb.ConnectorAuth
+	if err := decodeControlPayload(envelope.Payload, &authPayload); err != nil {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			"auth_internal_error",
+			"decode connector auth payload failed",
+		)
+	}
+	normalizedConnectorID := strings.TrimSpace(sessionState.connectorID)
+	if normalizedConnectorID == "" {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			connectorAuthErrorConnectorMismatch,
+			"connector_id is missing in handshake context",
+		)
+	}
+	if envelopeConnectorID := strings.TrimSpace(envelope.ConnectorID); envelopeConnectorID != "" && envelopeConnectorID != normalizedConnectorID {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			connectorAuthErrorConnectorMismatch,
+			"connector_id mismatch between hello and auth",
+		)
+	}
+	if dispatcher == nil || dispatcher.authCoordinator == nil {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			connectorAuthErrorInternal,
+			"auth coordinator is not initialized",
+		)
+	}
+	authResult := dispatcher.authCoordinator.AuthenticateAndCommit(
+		connectorAuthRequest{
+			connectorID:          normalizedConnectorID,
+			assignedSessionEpoch: sessionState.assignedSessionEpoch,
+			authMethod:           authPayload.AuthMethod,
+			token:                authPayload.Token,
+		},
+		func(sessionID string, sessionEpoch uint64) error {
+			now := time.Now().UTC()
+			dispatcher.upsertActiveSession(
+				now,
+				sessionID,
+				sessionEpoch,
+				normalizedConnectorID,
+				envelope.ResourceVersion,
+			)
+			return nil
+		},
+	)
+	if !authResult.success {
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			authResult.errorCode,
+			authResult.errorMessage,
+		)
+	}
+	// 认证成功后更新连接上下文，供 heartbeat 与后续资源消息复用。
+	sessionState.setSession(authResult.sessionID, authResult.sessionEpoch)
+	sessionState.authenticated = true
+
+	return buildConnectorAuthAckEnvelope(
+		envelope,
+		true,
+		authResult.sessionID,
+		authResult.sessionEpoch,
+		"",
+		"",
+	)
+}
+
+// allocateAssignedSessionEpoch 生成同 connector 的下一候选 epoch。
+func (dispatcher *controlMessageDispatcher) allocateAssignedSessionEpoch(connectorID string) uint64 {
+	normalizedConnectorID := strings.TrimSpace(connectorID)
+	if normalizedConnectorID == "" || dispatcher == nil || dispatcher.sessionRegistry == nil {
+		return 1
+	}
+	if sessionRuntime, exists := dispatcher.sessionRegistry.GetByConnector(normalizedConnectorID); exists {
+		return sessionRuntime.Epoch + 1
+	}
+	return 1
+}
+
+// selectWelcomeBinding 从客户端支持列表中选择握手返回 binding。
+func selectWelcomeBinding(supportedBindings []string) string {
+	if len(supportedBindings) == 0 {
+		return defaultWelcomeBinding
+	}
+	for _, binding := range supportedBindings {
+		normalizedBinding := strings.TrimSpace(binding)
+		if normalizedBinding != "" {
+			return normalizedBinding
+		}
+	}
+	return defaultWelcomeBinding
+}
+
+// newConnectorSessionID 生成握手成功后的会话 ID。
+func newConnectorSessionID() string {
+	return fmt.Sprintf("session-%d", time.Now().UTC().UnixNano())
 }
 
 // dispatchEnvelope 按消息类型分派业务控制消息，并在需要时返回 ACK。
@@ -716,6 +989,74 @@ func buildAckEnvelope(
 		EventID:         requestEnvelope.EventID,
 		ResourceVersion: ackResourceVersion,
 		Payload:         encodedPayload,
+	}, nil
+}
+
+// buildConnectorWelcomeEnvelope 构造 ConnectorWelcome 响应。
+func buildConnectorWelcomeEnvelope(
+	requestEnvelope pb.ControlEnvelope,
+	connectorID string,
+	welcomePayload pb.ConnectorWelcome,
+) (*pb.ControlEnvelope, error) {
+	encodedPayload, err := json.Marshal(welcomePayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal connector welcome payload failed: %w", err)
+	}
+	versionMajor := requestEnvelope.VersionMajor
+	if versionMajor == 0 {
+		versionMajor = 2
+	}
+	versionMinor := requestEnvelope.VersionMinor
+	if versionMinor == 0 {
+		versionMinor = 1
+	}
+	return &pb.ControlEnvelope{
+		VersionMajor: versionMajor,
+		VersionMinor: versionMinor,
+		MessageType:  pb.ControlMessageConnectorWelcome,
+		RequestID:    requestEnvelope.RequestID,
+		ConnectorID:  strings.TrimSpace(connectorID),
+		Payload:      encodedPayload,
+	}, nil
+}
+
+// buildConnectorAuthAckEnvelope 构造 ConnectorAuthAck 响应。
+func buildConnectorAuthAckEnvelope(
+	requestEnvelope pb.ControlEnvelope,
+	success bool,
+	sessionID string,
+	sessionEpoch uint64,
+	errorCode string,
+	errorMessage string,
+) (*pb.ControlEnvelope, error) {
+	authAckPayload := pb.ConnectorAuthAck{
+		Success:      success,
+		SessionID:    strings.TrimSpace(sessionID),
+		SessionEpoch: sessionEpoch,
+		ErrorCode:    strings.TrimSpace(errorCode),
+		ErrorMessage: strings.TrimSpace(errorMessage),
+	}
+	encodedPayload, err := json.Marshal(authAckPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal connector auth ack payload failed: %w", err)
+	}
+	versionMajor := requestEnvelope.VersionMajor
+	if versionMajor == 0 {
+		versionMajor = 2
+	}
+	versionMinor := requestEnvelope.VersionMinor
+	if versionMinor == 0 {
+		versionMinor = 1
+	}
+	return &pb.ControlEnvelope{
+		VersionMajor: versionMajor,
+		VersionMinor: versionMinor,
+		MessageType:  pb.ControlMessageConnectorAuthAck,
+		RequestID:    requestEnvelope.RequestID,
+		SessionID:    strings.TrimSpace(sessionID),
+		SessionEpoch: sessionEpoch,
+		ConnectorID:  strings.TrimSpace(requestEnvelope.ConnectorID),
+		Payload:      encodedPayload,
 	}, nil
 }
 

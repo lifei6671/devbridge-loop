@@ -57,6 +57,26 @@ func TestValidateRejectsUnwiredBridgeTransport(testingObject *testing.T) {
 	}
 }
 
+// TestValidateRejectsUnsupportedAuthMethod 验证仅允许 token 认证方法。
+func TestValidateRejectsUnsupportedAuthMethod(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.Session.AuthMethod = "hmac"
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for unsupported session.auth_method")
+	}
+}
+
+// TestValidateRejectsEmptyAuthToken 验证 session.auth_token 为空会被拒绝。
+func TestValidateRejectsEmptyAuthToken(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.Session.AuthToken = ""
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for empty session.auth_token")
+	}
+}
+
 // TestApplyTunnelPoolOverridePartial 验证外部只传部分字段时其余字段保持默认值。
 func TestApplyTunnelPoolOverridePartial(testingObject *testing.T) {
 	testingObject.Parallel()

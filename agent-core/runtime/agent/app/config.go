@@ -22,6 +22,9 @@ type Config struct {
 type SessionConfig struct {
 	HeartbeatInterval time.Duration
 	AuthTimeout       time.Duration
+	AuthMethod        string
+	AuthToken         string
+	ClientCapVersion  string
 }
 
 type TunnelPoolConfig struct {
@@ -71,6 +74,9 @@ func DefaultConfig() Config {
 		Session: SessionConfig{
 			HeartbeatInterval: 5 * time.Second,
 			AuthTimeout:       5 * time.Second,
+			AuthMethod:        "token",
+			AuthToken:         "dbt_agent-local.agent-dev-secret",
+			ClientCapVersion:  "agent-core/v1",
 		},
 		TunnelPool: TunnelPoolConfig{
 			MinIdle:      8,
@@ -109,6 +115,19 @@ func (c Config) Validate() error {
 		// 当前 agent runtime 仅支持 tcp_framed / grpc_h2。
 	default:
 		return fmt.Errorf("validate config: unsupported bridge_transport=%s", c.BridgeTransport)
+	}
+	normalizedAuthMethod := strings.ToLower(strings.TrimSpace(c.Session.AuthMethod))
+	if normalizedAuthMethod == "" {
+		// 认证方法为空会导致握手阶段无法分支认证策略。
+		return fmt.Errorf("validate config: empty session.auth_method")
+	}
+	if normalizedAuthMethod != "token" {
+		// 当前版本仅支持 token 认证模型。
+		return fmt.Errorf("validate config: unsupported session.auth_method=%s", c.Session.AuthMethod)
+	}
+	if strings.TrimSpace(c.Session.AuthToken) == "" {
+		// token 为空时无法通过握手认证。
+		return fmt.Errorf("validate config: empty session.auth_token")
 	}
 	if c.TunnelPool.MinIdle < 0 {
 		// min_idle 不允许为负值。

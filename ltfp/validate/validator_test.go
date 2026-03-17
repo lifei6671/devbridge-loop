@@ -60,6 +60,35 @@ func TestValidateControlEnvelopeRejectMissingSessionID(t *testing.T) {
 	}
 }
 
+// TestValidateConnectorHelloAcceptsOptionalScope 验证 ConnectorHello 的 namespace/environment 可选。
+func TestValidateConnectorHelloAcceptsOptionalScope(t *testing.T) {
+	t.Parallel()
+
+	hello := testkit.GoldenConnectorHello()
+	// 显式清空 scope 字段，验证握手校验不再将其视为必填。
+	hello.Namespace = ""
+	hello.Environment = ""
+	if err := ValidateConnectorHello(hello); err != nil {
+		t.Fatalf("validate connector hello failed: %v", err)
+	}
+}
+
+// TestValidateConnectorHelloRejectMissingConnectorID 验证 connectorId 缺失仍会被拒绝。
+func TestValidateConnectorHelloRejectMissingConnectorID(t *testing.T) {
+	t.Parallel()
+
+	hello := testkit.GoldenConnectorHello()
+	// connectorId 是接入主身份键，缺失时必须报错。
+	hello.ConnectorID = ""
+	err := ValidateConnectorHello(hello)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestValidatePublishService 验证服务发布消息的关键字段校验。
 func TestValidatePublishService(t *testing.T) {
 	t.Parallel()

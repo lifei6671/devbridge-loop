@@ -378,12 +378,13 @@ func (x *ConnectorWelcome) GetTunnelIdleTtlSec() uint32 {
 }
 
 type ConnectorAuth struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AuthMethod    string                 `protobuf:"bytes,1,opt,name=auth_method,json=authMethod,proto3" json:"auth_method,omitempty"`
-	AuthPayload   map[string]string      `protobuf:"bytes,2,rep,name=auth_payload,json=authPayload,proto3" json:"auth_payload,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Metadata      map[string]string      `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	AuthMethod       string                 `protobuf:"bytes,1,opt,name=auth_method,json=authMethod,proto3" json:"auth_method,omitempty"`
+	Token            string                 `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
+	ClientCapVersion string                 `protobuf:"bytes,3,opt,name=client_cap_version,json=clientCapVersion,proto3" json:"client_cap_version,omitempty"`
+	Metadata         map[string]string      `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ConnectorAuth) Reset() {
@@ -423,11 +424,18 @@ func (x *ConnectorAuth) GetAuthMethod() string {
 	return ""
 }
 
-func (x *ConnectorAuth) GetAuthPayload() map[string]string {
+func (x *ConnectorAuth) GetToken() string {
 	if x != nil {
-		return x.AuthPayload
+		return x.Token
 	}
-	return nil
+	return ""
+}
+
+func (x *ConnectorAuth) GetClientCapVersion() string {
+	if x != nil {
+		return x.ClientCapVersion
+	}
+	return ""
 }
 
 func (x *ConnectorAuth) GetMetadata() map[string]string {
@@ -3507,15 +3515,13 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	" \x01(\rR\x10tunnelIdleTtlSec\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfd\x01\n" +
 	"\rConnectorAuth\x12\x1f\n" +
 	"\vauth_method\x18\x01 \x01(\tR\n" +
-	"authMethod\x12T\n" +
-	"\fauth_payload\x18\x02 \x03(\v21.devbridge.loop.v2.ConnectorAuth.AuthPayloadEntryR\vauthPayload\x12J\n" +
-	"\bmetadata\x18\x03 \x03(\v2..devbridge.loop.v2.ConnectorAuth.MetadataEntryR\bmetadata\x1a>\n" +
-	"\x10AuthPayloadEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
+	"authMethod\x12\x14\n" +
+	"\x05token\x18\x02 \x01(\tR\x05token\x12,\n" +
+	"\x12client_cap_version\x18\x03 \x01(\tR\x10clientCapVersion\x12J\n" +
+	"\bmetadata\x18\x04 \x03(\v2..devbridge.loop.v2.ConnectorAuth.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc0\x02\n" +
@@ -3899,7 +3905,7 @@ func file_devbridge_loop_v2_ltfp_proto_rawDescGZIP() []byte {
 	return file_devbridge_loop_v2_ltfp_proto_rawDescData
 }
 
-var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
+var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 65)
 var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	(*ControlEnvelope)(nil),        // 0: devbridge.loop.v2.ControlEnvelope
 	(*ConnectorHello)(nil),         // 1: devbridge.loop.v2.ConnectorHello
@@ -3943,89 +3949,87 @@ var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	nil,                            // 39: devbridge.loop.v2.ConnectorHello.LabelsEntry
 	nil,                            // 40: devbridge.loop.v2.ConnectorHello.MetadataEntry
 	nil,                            // 41: devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	nil,                            // 42: devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
-	nil,                            // 43: devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	nil,                            // 44: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	nil,                            // 45: devbridge.loop.v2.Heartbeat.MetadataEntry
-	nil,                            // 46: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	nil,                            // 47: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	nil,                            // 48: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
-	nil,                            // 49: devbridge.loop.v2.PublishService.LabelsEntry
-	nil,                            // 50: devbridge.loop.v2.PublishService.MetadataEntry
-	nil,                            // 51: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	nil,                            // 52: devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
-	nil,                            // 53: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
-	nil,                            // 54: devbridge.loop.v2.RouteAssign.MetadataEntry
-	nil,                            // 55: devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	nil,                            // 56: devbridge.loop.v2.NegotiationResult.MetadataEntry
-	nil,                            // 57: devbridge.loop.v2.ForwardIntent.MetadataEntry
-	nil,                            // 58: devbridge.loop.v2.ForwardDecision.MetadataEntry
-	nil,                            // 59: devbridge.loop.v2.ControlError.MetadataEntry
-	nil,                            // 60: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	nil,                            // 61: devbridge.loop.v2.TrafficOpen.MetadataEntry
-	nil,                            // 62: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
-	nil,                            // 63: devbridge.loop.v2.TrafficCloseAck.MetadataEntry
-	nil,                            // 64: devbridge.loop.v2.TunnelRecycle.MetadataEntry
-	nil,                            // 65: devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
+	nil,                            // 42: devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	nil,                            // 43: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	nil,                            // 44: devbridge.loop.v2.Heartbeat.MetadataEntry
+	nil,                            // 45: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	nil,                            // 46: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	nil,                            // 47: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	nil,                            // 48: devbridge.loop.v2.PublishService.LabelsEntry
+	nil,                            // 49: devbridge.loop.v2.PublishService.MetadataEntry
+	nil,                            // 50: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	nil,                            // 51: devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
+	nil,                            // 52: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	nil,                            // 53: devbridge.loop.v2.RouteAssign.MetadataEntry
+	nil,                            // 54: devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	nil,                            // 55: devbridge.loop.v2.NegotiationResult.MetadataEntry
+	nil,                            // 56: devbridge.loop.v2.ForwardIntent.MetadataEntry
+	nil,                            // 57: devbridge.loop.v2.ForwardDecision.MetadataEntry
+	nil,                            // 58: devbridge.loop.v2.ControlError.MetadataEntry
+	nil,                            // 59: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	nil,                            // 60: devbridge.loop.v2.TrafficOpen.MetadataEntry
+	nil,                            // 61: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	nil,                            // 62: devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	nil,                            // 63: devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	nil,                            // 64: devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
 }
 var file_devbridge_loop_v2_ltfp_proto_depIdxs = []int32{
 	39, // 0: devbridge.loop.v2.ConnectorHello.labels:type_name -> devbridge.loop.v2.ConnectorHello.LabelsEntry
 	40, // 1: devbridge.loop.v2.ConnectorHello.metadata:type_name -> devbridge.loop.v2.ConnectorHello.MetadataEntry
 	41, // 2: devbridge.loop.v2.ConnectorWelcome.metadata:type_name -> devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	42, // 3: devbridge.loop.v2.ConnectorAuth.auth_payload:type_name -> devbridge.loop.v2.ConnectorAuth.AuthPayloadEntry
-	43, // 4: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	44, // 5: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	45, // 6: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
-	46, // 7: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	47, // 8: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	48, // 9: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
-	6,  // 10: devbridge.loop.v2.PublishService.endpoints:type_name -> devbridge.loop.v2.ServiceEndpoint
-	7,  // 11: devbridge.loop.v2.PublishService.exposure:type_name -> devbridge.loop.v2.ServiceExposure
-	8,  // 12: devbridge.loop.v2.PublishService.health_check:type_name -> devbridge.loop.v2.HealthCheckConfig
-	9,  // 13: devbridge.loop.v2.PublishService.discovery_policy:type_name -> devbridge.loop.v2.DiscoveryPolicy
-	49, // 14: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
-	50, // 15: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
-	14, // 16: devbridge.loop.v2.ServiceHealthReport.endpoint_statuses:type_name -> devbridge.loop.v2.EndpointHealthStatus
-	51, // 17: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	52, // 18: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
-	53, // 19: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
-	16, // 20: devbridge.loop.v2.HybridGroupTarget.primary_connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
-	17, // 21: devbridge.loop.v2.HybridGroupTarget.fallback_external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
-	16, // 22: devbridge.loop.v2.RouteTarget.connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
-	17, // 23: devbridge.loop.v2.RouteTarget.external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
-	18, // 24: devbridge.loop.v2.RouteTarget.hybrid_group:type_name -> devbridge.loop.v2.HybridGroupTarget
-	20, // 25: devbridge.loop.v2.RouteAssign.match:type_name -> devbridge.loop.v2.RouteMatch
-	19, // 26: devbridge.loop.v2.RouteAssign.target:type_name -> devbridge.loop.v2.RouteTarget
-	54, // 27: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
-	55, // 28: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	56, // 29: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
-	26, // 30: devbridge.loop.v2.ForwardIntent.negotiation_profile:type_name -> devbridge.loop.v2.NegotiationProfile
-	57, // 31: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
-	27, // 32: devbridge.loop.v2.ForwardDecision.negotiation_result:type_name -> devbridge.loop.v2.NegotiationResult
-	58, // 33: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
-	59, // 34: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
-	60, // 35: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	61, // 36: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
-	62, // 37: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
-	63, // 38: devbridge.loop.v2.TrafficCloseAck.metadata:type_name -> devbridge.loop.v2.TrafficCloseAck.MetadataEntry
-	64, // 39: devbridge.loop.v2.TunnelRecycle.metadata:type_name -> devbridge.loop.v2.TunnelRecycle.MetadataEntry
-	65, // 40: devbridge.loop.v2.TunnelRecycleAck.metadata:type_name -> devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
-	31, // 41: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
-	32, // 42: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
-	33, // 43: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
-	34, // 44: devbridge.loop.v2.StreamPayload.close_ack:type_name -> devbridge.loop.v2.TrafficCloseAck
-	35, // 45: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
-	36, // 46: devbridge.loop.v2.StreamPayload.recycle:type_name -> devbridge.loop.v2.TunnelRecycle
-	37, // 47: devbridge.loop.v2.StreamPayload.recycle_ack:type_name -> devbridge.loop.v2.TunnelRecycleAck
-	0,  // 48: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
-	38, // 49: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
-	0,  // 50: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
-	38, // 51: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
-	50, // [50:52] is the sub-list for method output_type
-	48, // [48:50] is the sub-list for method input_type
-	48, // [48:48] is the sub-list for extension type_name
-	48, // [48:48] is the sub-list for extension extendee
-	0,  // [0:48] is the sub-list for field type_name
+	42, // 3: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	43, // 4: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	44, // 5: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
+	45, // 6: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	46, // 7: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	47, // 8: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	6,  // 9: devbridge.loop.v2.PublishService.endpoints:type_name -> devbridge.loop.v2.ServiceEndpoint
+	7,  // 10: devbridge.loop.v2.PublishService.exposure:type_name -> devbridge.loop.v2.ServiceExposure
+	8,  // 11: devbridge.loop.v2.PublishService.health_check:type_name -> devbridge.loop.v2.HealthCheckConfig
+	9,  // 12: devbridge.loop.v2.PublishService.discovery_policy:type_name -> devbridge.loop.v2.DiscoveryPolicy
+	48, // 13: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
+	49, // 14: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
+	14, // 15: devbridge.loop.v2.ServiceHealthReport.endpoint_statuses:type_name -> devbridge.loop.v2.EndpointHealthStatus
+	50, // 16: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	51, // 17: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.SelectorEntry
+	52, // 18: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	16, // 19: devbridge.loop.v2.HybridGroupTarget.primary_connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
+	17, // 20: devbridge.loop.v2.HybridGroupTarget.fallback_external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
+	16, // 21: devbridge.loop.v2.RouteTarget.connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
+	17, // 22: devbridge.loop.v2.RouteTarget.external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
+	18, // 23: devbridge.loop.v2.RouteTarget.hybrid_group:type_name -> devbridge.loop.v2.HybridGroupTarget
+	20, // 24: devbridge.loop.v2.RouteAssign.match:type_name -> devbridge.loop.v2.RouteMatch
+	19, // 25: devbridge.loop.v2.RouteAssign.target:type_name -> devbridge.loop.v2.RouteTarget
+	53, // 26: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
+	54, // 27: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	55, // 28: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
+	26, // 29: devbridge.loop.v2.ForwardIntent.negotiation_profile:type_name -> devbridge.loop.v2.NegotiationProfile
+	56, // 30: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
+	27, // 31: devbridge.loop.v2.ForwardDecision.negotiation_result:type_name -> devbridge.loop.v2.NegotiationResult
+	57, // 32: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
+	58, // 33: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
+	59, // 34: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	60, // 35: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
+	61, // 36: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	62, // 37: devbridge.loop.v2.TrafficCloseAck.metadata:type_name -> devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	63, // 38: devbridge.loop.v2.TunnelRecycle.metadata:type_name -> devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	64, // 39: devbridge.loop.v2.TunnelRecycleAck.metadata:type_name -> devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
+	31, // 40: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
+	32, // 41: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
+	33, // 42: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
+	34, // 43: devbridge.loop.v2.StreamPayload.close_ack:type_name -> devbridge.loop.v2.TrafficCloseAck
+	35, // 44: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
+	36, // 45: devbridge.loop.v2.StreamPayload.recycle:type_name -> devbridge.loop.v2.TunnelRecycle
+	37, // 46: devbridge.loop.v2.StreamPayload.recycle_ack:type_name -> devbridge.loop.v2.TunnelRecycleAck
+	0,  // 47: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
+	38, // 48: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
+	0,  // 49: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
+	38, // 50: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
+	49, // [49:51] is the sub-list for method output_type
+	47, // [47:49] is the sub-list for method input_type
+	47, // [47:47] is the sub-list for extension type_name
+	47, // [47:47] is the sub-list for extension extendee
+	0,  // [0:47] is the sub-list for field type_name
 }
 
 func init() { file_devbridge_loop_v2_ltfp_proto_init() }
@@ -4049,7 +4053,7 @@ func file_devbridge_loop_v2_ltfp_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_devbridge_loop_v2_ltfp_proto_rawDesc), len(file_devbridge_loop_v2_ltfp_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   66,
+			NumMessages:   65,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

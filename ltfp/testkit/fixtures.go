@@ -10,6 +10,7 @@ import (
 // GoldenConnectorHello 返回可复用的握手测试样例。
 func GoldenConnectorHello() pb.ConnectorHello {
 	// 固定样例值，保证不同模块测试输入一致。
+	// namespace/environment 在协议中已是可选字段，此处仍保留默认值用于覆盖常规场景。
 	return pb.ConnectorHello{
 		ConnectorID:       "connector-dev-01",
 		Namespace:         "dev",

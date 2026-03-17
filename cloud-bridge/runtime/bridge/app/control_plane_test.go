@@ -23,6 +23,105 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
+// performConnectorHandshakeForTest 发送 Hello/Auth 并返回握手响应载荷。
+func performConnectorHandshakeForTest(
+	testingObject *testing.T,
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+	connectorID string,
+	token string,
+) (pb.ConnectorWelcome, pb.ConnectorAuthAck) {
+	testingObject.Helper()
+
+	helloPayload := pb.ConnectorHello{
+		ConnectorID:       connectorID,
+		NodeName:          "node-test",
+		Version:           "agent-core",
+		SupportedBindings: []string{"tcp_framed"},
+	}
+	encodedHelloPayload, err := json.Marshal(helloPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector hello payload failed: %v", err)
+	}
+	helloFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  connectorID,
+		Payload:      encodedHelloPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode connector hello frame failed: %v", err)
+	}
+	if err := controlChannel.WriteControlFrame(ctx, helloFrame); err != nil {
+		testingObject.Fatalf("write connector hello frame failed: %v", err)
+	}
+
+	welcomeFrame, err := controlChannel.ReadControlFrame(ctx)
+	if err != nil {
+		testingObject.Fatalf("read connector welcome frame failed: %v", err)
+	}
+	if welcomeFrame.Type != transport.ControlFrameTypeConnectorWelcome {
+		testingObject.Fatalf(
+			"unexpected connector welcome frame type: got=%d want=%d",
+			welcomeFrame.Type,
+			transport.ControlFrameTypeConnectorWelcome,
+		)
+	}
+	welcomeEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(welcomeFrame)
+	if err != nil {
+		testingObject.Fatalf("decode connector welcome envelope failed: %v", err)
+	}
+	var welcomePayload pb.ConnectorWelcome
+	if err := json.Unmarshal(welcomeEnvelope.Payload, &welcomePayload); err != nil {
+		testingObject.Fatalf("unmarshal connector welcome payload failed: %v", err)
+	}
+
+	authPayload := pb.ConnectorAuth{
+		AuthMethod:       "token",
+		Token:            token,
+		ClientCapVersion: "agent-core/v1",
+	}
+	encodedAuthPayload, err := json.Marshal(authPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector auth payload failed: %v", err)
+	}
+	authFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  connectorID,
+		Payload:      encodedAuthPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode connector auth frame failed: %v", err)
+	}
+	if err := controlChannel.WriteControlFrame(ctx, authFrame); err != nil {
+		testingObject.Fatalf("write connector auth frame failed: %v", err)
+	}
+
+	authAckFrame, err := controlChannel.ReadControlFrame(ctx)
+	if err != nil {
+		testingObject.Fatalf("read connector auth ack frame failed: %v", err)
+	}
+	if authAckFrame.Type != transport.ControlFrameTypeConnectorAuthAck {
+		testingObject.Fatalf(
+			"unexpected connector auth ack frame type: got=%d want=%d",
+			authAckFrame.Type,
+			transport.ControlFrameTypeConnectorAuthAck,
+		)
+	}
+	authAckEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(authAckFrame)
+	if err != nil {
+		testingObject.Fatalf("decode connector auth ack envelope failed: %v", err)
+	}
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(authAckEnvelope.Payload, &authAckPayload); err != nil {
+		testingObject.Fatalf("unmarshal connector auth ack payload failed: %v", err)
+	}
+	return welcomePayload, authAckPayload
+}
+
 // TestServeControlChannelReplyHeartbeatPong 验证 Bridge 在收到 ping 后立即回 pong。
 func TestServeControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -129,6 +228,16 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
 		)
 	}()
+	_, authAckPayload := performConnectorHandshakeForTest(
+		testingObject,
+		ctx,
+		clientControl,
+		"agent-local",
+		"dbt_agent-local.agent-dev-secret",
+	)
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected auth success before publish, got=%s", authAckPayload.ErrorCode)
+	}
 
 	publishPayload := pb.PublishService{
 		ServiceID:   "svc-001",
@@ -149,8 +258,9 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 		VersionMajor:    2,
 		VersionMinor:    1,
 		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-001",
-		SessionEpoch:    1,
+		SessionID:       authAckPayload.SessionID,
+		SessionEpoch:    authAckPayload.SessionEpoch,
+		ConnectorID:     "agent-local",
 		RequestID:       "req-001",
 		EventID:         "evt-001",
 		ResourceType:    "service",
@@ -200,6 +310,285 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 		}
 	case <-time.After(time.Second):
 		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+}
+
+// TestServeControlChannelRejectPublishServiceBeforeAuth 验证未认证业务消息被丢弃且不触发断链。
+func TestServeControlChannelRejectPublishServiceBeforeAuth(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	binding, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new tcp binding failed: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	}()
+
+	serverControl, err := binding.OpenControlChannel(serverConn)
+	if err != nil {
+		testingObject.Fatalf("open server control channel failed: %v", err)
+	}
+	clientControl, err := binding.OpenControlChannel(clientConn)
+	if err != nil {
+		testingObject.Fatalf("open client control channel failed: %v", err)
+	}
+	defer func() {
+		_ = clientControl.Close(context.Background())
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveControlChannelWithDispatcher(
+			ctx,
+			serverControl,
+			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
+		)
+	}()
+
+	publishPayload := pb.PublishService{
+		ServiceID:   "svc-unauth",
+		ServiceKey:  "dev/demo/unauth-service",
+		Namespace:   "dev",
+		Environment: "demo",
+		ServiceName: "unauth-service",
+		ServiceType: "http",
+	}
+	encodedPublishPayload, err := json.Marshal(publishPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal publish payload failed: %v", err)
+	}
+	publishFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-unauth",
+		SessionEpoch:    1,
+		RequestID:       "req-unauth",
+		EventID:         "evt-unauth",
+		ResourceType:    "service",
+		ResourceID:      "svc-unauth",
+		ResourceVersion: 1,
+		Payload:         encodedPublishPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode publish frame failed: %v", err)
+	}
+	if err := clientControl.WriteControlFrame(ctx, publishFrame); err != nil {
+		testingObject.Fatalf("write unauth publish frame failed: %v", err)
+	}
+
+	// 发送未认证业务消息后，连接应保持可用，且后续握手仍可成功。
+	readContext, readCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readCancel()
+	welcomePayload, authAckPayload := performConnectorHandshakeForTest(
+		testingObject,
+		readContext,
+		clientControl,
+		"agent-local",
+		"dbt_agent-local.agent-dev-secret",
+	)
+	if welcomePayload.AssignedSessionEpoch == 0 {
+		testingObject.Fatalf("expected assigned session epoch after unauth publish")
+	}
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected auth success after unauth publish, got=%s", authAckPayload.ErrorCode)
+	}
+
+	cancel()
+	_ = clientControl.Close(context.Background())
+	select {
+	case doneErr := <-serverDone:
+		if doneErr != nil && !errors.Is(doneErr, context.Canceled) && !isControlChannelClosedError(doneErr) {
+			testingObject.Fatalf("serve control channel stopped with error: %v", doneErr)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+}
+
+// TestServeControlChannelHandleConnectorHandshake 验证 Bridge 可完成 Hello/Auth 握手闭环。
+func TestServeControlChannelHandleConnectorHandshake(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	binding, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new tcp binding failed: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	}()
+
+	serverControl, err := binding.OpenControlChannel(serverConn)
+	if err != nil {
+		testingObject.Fatalf("open server control channel failed: %v", err)
+	}
+	clientControl, err := binding.OpenControlChannel(clientConn)
+	if err != nil {
+		testingObject.Fatalf("open client control channel failed: %v", err)
+	}
+	defer func() {
+		_ = clientControl.Close(context.Background())
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveControlChannelWithDispatcher(
+			ctx,
+			serverControl,
+			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
+		)
+	}()
+
+	readContext, readCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readCancel()
+	welcomePayload, authAckPayload := performConnectorHandshakeForTest(
+		testingObject,
+		readContext,
+		clientControl,
+		"agent-local",
+		"dbt_agent-local.agent-dev-secret",
+	)
+	if welcomePayload.AssignedSessionEpoch == 0 {
+		testingObject.Fatalf("expected assigned session epoch from welcome payload")
+	}
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected auth success, got error=%s", authAckPayload.ErrorCode)
+	}
+	if authAckPayload.SessionEpoch != welcomePayload.AssignedSessionEpoch {
+		testingObject.Fatalf(
+			"unexpected auth ack epoch: got=%d want=%d",
+			authAckPayload.SessionEpoch,
+			welcomePayload.AssignedSessionEpoch,
+		)
+	}
+	if strings.TrimSpace(authAckPayload.SessionID) == "" {
+		testingObject.Fatalf("expected non-empty auth ack session id")
+	}
+
+	cancel()
+	_ = clientControl.Close(context.Background())
+	select {
+	case doneErr := <-serverDone:
+		if doneErr != nil && !errors.Is(doneErr, context.Canceled) && !isControlChannelClosedError(doneErr) {
+			testingObject.Fatalf("serve control channel stopped with error: %v", doneErr)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+}
+
+// TestServeControlChannelRejectInvalidConnectorAuthMethod 验证非法 auth_method 会被拒绝。
+func TestServeControlChannelRejectInvalidConnectorAuthMethod(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	binding, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new tcp binding failed: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	}()
+
+	serverControl, err := binding.OpenControlChannel(serverConn)
+	if err != nil {
+		testingObject.Fatalf("open server control channel failed: %v", err)
+	}
+	clientControl, err := binding.OpenControlChannel(clientConn)
+	if err != nil {
+		testingObject.Fatalf("open client control channel failed: %v", err)
+	}
+	defer func() {
+		_ = clientControl.Close(context.Background())
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = serveControlChannelWithDispatcher(
+			ctx,
+			serverControl,
+			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
+		)
+	}()
+
+	helloPayload := pb.ConnectorHello{
+		ConnectorID: "connector-auth-invalid-method",
+		NodeName:    "node-a",
+	}
+	encodedHelloPayload, err := json.Marshal(helloPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector hello payload failed: %v", err)
+	}
+	helloFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  helloPayload.ConnectorID,
+		Payload:      encodedHelloPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode connector hello frame failed: %v", err)
+	}
+	if err := clientControl.WriteControlFrame(ctx, helloFrame); err != nil {
+		testingObject.Fatalf("write connector hello frame failed: %v", err)
+	}
+	if _, err := clientControl.ReadControlFrame(context.Background()); err != nil {
+		testingObject.Fatalf("read connector welcome frame failed: %v", err)
+	}
+
+	authPayload := pb.ConnectorAuth{
+		AuthMethod: "hmac",
+		Token:      "dbt_connector-auth-invalid-method.secret-a",
+	}
+	encodedAuthPayload, err := json.Marshal(authPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector auth payload failed: %v", err)
+	}
+	authFrame, err := transport.EncodeBusinessControlEnvelopeFrame(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  helloPayload.ConnectorID,
+		Payload:      encodedAuthPayload,
+	})
+	if err != nil {
+		testingObject.Fatalf("encode connector auth frame failed: %v", err)
+	}
+	if err := clientControl.WriteControlFrame(ctx, authFrame); err != nil {
+		testingObject.Fatalf("write connector auth frame failed: %v", err)
+	}
+
+	authAckFrame, err := clientControl.ReadControlFrame(context.Background())
+	if err != nil {
+		testingObject.Fatalf("read connector auth ack frame failed: %v", err)
+	}
+	authAckEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(authAckFrame)
+	if err != nil {
+		testingObject.Fatalf("decode connector auth ack envelope failed: %v", err)
+	}
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(authAckEnvelope.Payload, &authAckPayload); err != nil {
+		testingObject.Fatalf("unmarshal connector auth ack payload failed: %v", err)
+	}
+	if authAckPayload.Success {
+		testingObject.Fatalf("expected auth failure for invalid method")
+	}
+	if authAckPayload.ErrorCode != "auth_invalid_method" {
+		testingObject.Fatalf("unexpected auth error code: got=%s want=%s", authAckPayload.ErrorCode, "auth_invalid_method")
 	}
 }
 
@@ -264,6 +653,16 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 			transport.ControlFrameTypeHeartbeatPong,
 		)
 	}
+	_, authAckPayload := performConnectorHandshakeForTest(
+		testingObject,
+		ctx,
+		controlChannel,
+		"agent-local",
+		"dbt_agent-local.agent-dev-secret",
+	)
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected auth success before grpc publish, got=%s", authAckPayload.ErrorCode)
+	}
 
 	publishPayload := pb.PublishService{
 		ServiceID:   "svc-002",
@@ -284,8 +683,9 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 		VersionMajor:    2,
 		VersionMinor:    1,
 		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-002",
-		SessionEpoch:    1,
+		SessionID:       authAckPayload.SessionID,
+		SessionEpoch:    authAckPayload.SessionEpoch,
+		ConnectorID:     "agent-local",
 		RequestID:       "req-002",
 		EventID:         "evt-002",
 		ResourceType:    "service",

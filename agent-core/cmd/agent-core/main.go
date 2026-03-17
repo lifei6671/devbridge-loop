@@ -20,6 +20,9 @@ const (
 	envAgentID                  = "DEV_AGENT_CFG_AGENT_ID"
 	envBridgeAddr               = "DEV_AGENT_CFG_BRIDGE_ADDR"
 	envBridgeTransport          = "DEV_AGENT_CFG_BRIDGE_TRANSPORT"
+	envBridgeAuthMethod         = "DEV_AGENT_CFG_BRIDGE_AUTH_METHOD"
+	envBridgeAuthToken          = "DEV_AGENT_CFG_BRIDGE_AUTH_TOKEN"
+	envBridgeClientCapVersion   = "DEV_AGENT_CFG_BRIDGE_CLIENT_CAP_VERSION"
 	envTunnelPoolMinIdle        = "DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE"
 	envTunnelPoolMaxIdle        = "DEV_AGENT_CFG_TUNNEL_POOL_MAX_IDLE"
 	envTunnelPoolMaxInflight    = "DEV_AGENT_CFG_TUNNEL_POOL_MAX_INFLIGHT"
@@ -59,6 +62,18 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	resolvedConfig.BridgeTransport = stringEnvOrDefault(
 		envBridgeTransport,
 		defaultConfig.BridgeTransport,
+	)
+	resolvedConfig.Session.AuthMethod = stringEnvOrDefault(
+		envBridgeAuthMethod,
+		defaultConfig.Session.AuthMethod,
+	)
+	resolvedConfig.Session.AuthToken = stringEnvOrDefault(
+		envBridgeAuthToken,
+		defaultConfig.Session.AuthToken,
+	)
+	resolvedConfig.Session.ClientCapVersion = stringEnvOrDefault(
+		envBridgeClientCapVersion,
+		defaultConfig.Session.ClientCapVersion,
 	)
 
 	minIdle, err := intEnvOrDefault(envTunnelPoolMinIdle, defaultConfig.TunnelPool.MinIdle)
@@ -102,6 +117,12 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	}
 	if strings.TrimSpace(resolvedConfig.BridgeTransport) == "" {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeTransport)
+	}
+	if strings.TrimSpace(resolvedConfig.Session.AuthMethod) == "" {
+		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAuthMethod)
+	}
+	if strings.TrimSpace(resolvedConfig.Session.AuthToken) == "" {
+		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAuthToken)
 	}
 	if minIdle < 0 {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于等于 0", envTunnelPoolMinIdle)
