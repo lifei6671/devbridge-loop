@@ -1,8 +1,10 @@
 package errors
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
+	"strings"
 )
 
 // ProtocolError 描述带错误码和可选原因链的协议错误。
@@ -66,4 +68,54 @@ func ExtractCode(err error) string {
 		return ""
 	}
 	return protocolErr.Code
+}
+
+// NewTunnelRecycleError 创建带统一 recycle 错误码的协议错误。
+func NewTunnelRecycleError(code string, message string) *ProtocolError {
+	return New(
+		NormalizeTunnelRecycleCodeOrDefault(code, CodeTunnelRecycleTunnelUnhealthy),
+		strings.TrimSpace(message),
+	)
+}
+
+// WrapTunnelRecycleError 包装 recycle 相关错误，并优先保留错误链里已有的 recycle 错误码。
+func WrapTunnelRecycleError(code string, message string, cause error) *ProtocolError {
+	recycleCode := ExtractTunnelRecycleCode(cause)
+	if !IsKnownTunnelRecycleCode(recycleCode) {
+		recycleCode = NormalizeTunnelRecycleCodeOrDefault(code, CodeTunnelRecycleTunnelUnhealthy)
+	}
+	return Wrap(recycleCode, strings.TrimSpace(message), cause)
+}
+
+// IsTunnelRecycleCode 判断错误链中是否包含指定 recycle 错误码。
+func IsTunnelRecycleCode(err error, code string) bool {
+	normalizedCode := NormalizeTunnelRecycleCode(code)
+	if !IsKnownTunnelRecycleCode(normalizedCode) {
+		return false
+	}
+	return IsCode(err, normalizedCode)
+}
+
+// ExtractTunnelRecycleCode 提取错误链中的 recycle 错误码；普通 deadline 超时会映射为 deadline_hit。
+func ExtractTunnelRecycleCode(err error) string {
+	extractedCode := NormalizeTunnelRecycleCode(ExtractCode(err))
+	if IsKnownTunnelRecycleCode(extractedCode) {
+		return extractedCode
+	}
+	if stderrors.Is(err, context.DeadlineExceeded) {
+		return CodeTunnelRecycleDeadlineHit
+	}
+	return ""
+}
+
+// ExtractTunnelRecycleMessage 提取 recycle 错误的人类可读消息。
+func ExtractTunnelRecycleMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var protocolErr *ProtocolError
+	if stderrors.As(err, &protocolErr) && IsKnownTunnelRecycleCode(protocolErr.Code) {
+		return strings.TrimSpace(protocolErr.Message)
+	}
+	return strings.TrimSpace(err.Error())
 }

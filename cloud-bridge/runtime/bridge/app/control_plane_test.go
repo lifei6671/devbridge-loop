@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
@@ -462,6 +463,9 @@ func TestServeControlChannelHandleConnectorHandshake(testingObject *testing.T) {
 	if welcomePayload.AssignedSessionEpoch == 0 {
 		testingObject.Fatalf("expected assigned session epoch from welcome payload")
 	}
+	if welcomePayload.TLSMode != string(controlPlaneTLSModePlaintext) {
+		testingObject.Fatalf("unexpected welcome tls_mode: got=%s want=%s", welcomePayload.TLSMode, controlPlaneTLSModePlaintext)
+	}
 	if !authAckPayload.Success {
 		testingObject.Fatalf("expected auth success, got error=%s", authAckPayload.ErrorCode)
 	}
@@ -587,8 +591,8 @@ func TestServeControlChannelRejectInvalidConnectorAuthMethod(testingObject *test
 	if authAckPayload.Success {
 		testingObject.Fatalf("expected auth failure for invalid method")
 	}
-	if authAckPayload.ErrorCode != "auth_invalid_method" {
-		testingObject.Fatalf("unexpected auth error code: got=%s want=%s", authAckPayload.ErrorCode, "auth_invalid_method")
+	if authAckPayload.ErrorCode != ltfperrors.CodeAuthInvalidMethod {
+		testingObject.Fatalf("unexpected auth error code: got=%s want=%s", authAckPayload.ErrorCode, ltfperrors.CodeAuthInvalidMethod)
 	}
 }
 

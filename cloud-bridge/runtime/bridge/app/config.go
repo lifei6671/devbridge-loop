@@ -71,6 +71,9 @@ type ControlPlaneConfig struct {
 	ListenAddr       string        `yaml:"listen_addr"`
 	GRPCH2ListenAddr string        `yaml:"grpc_h2_listen_addr"`
 	HeartbeatTimeout time.Duration `yaml:"heartbeat_timeout"`
+	TLSMode          string        `yaml:"tls_mode"`
+	TLSCertFile      string        `yaml:"tls_cert_file"`
+	TLSKeyFile       string        `yaml:"tls_key_file"`
 }
 
 type TunnelReuseConfig struct {
@@ -130,6 +133,7 @@ func DefaultConfig() Config {
 			ListenAddr:       ":39080",
 			GRPCH2ListenAddr: ":39082",
 			HeartbeatTimeout: 30 * time.Second,
+			TLSMode:          string(controlPlaneTLSModePlaintext),
 		},
 		TunnelReuse: TunnelReuseConfig{
 			MaxReuseCount:     256,
@@ -209,6 +213,18 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == strings.TrimSpace(c.ControlPlane.ListenAddr) {
 		return fmt.Errorf("validate config: grpc_h2 listen addr must be different from tcp listen addr")
+	}
+	normalizedTLSMode, err := normalizeControlPlaneTLSMode(c.ControlPlane.TLSMode)
+	if err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
+	if normalizedTLSMode != controlPlaneTLSModePlaintext {
+		if strings.TrimSpace(c.ControlPlane.TLSCertFile) == "" {
+			return fmt.Errorf("validate config: empty control_plane.tls_cert_file when tls_mode=%s", normalizedTLSMode)
+		}
+		if strings.TrimSpace(c.ControlPlane.TLSKeyFile) == "" {
+			return fmt.Errorf("validate config: empty control_plane.tls_key_file when tls_mode=%s", normalizedTLSMode)
+		}
 	}
 	if c.TunnelReuse.MaxReuseCount <= 0 {
 		return fmt.Errorf("validate config: invalid tunnel_reuse.max_reuse_count=%d", c.TunnelReuse.MaxReuseCount)

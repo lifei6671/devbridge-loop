@@ -255,10 +255,12 @@ func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
 			}
 			postCommitContext := detachedPostCommitContext(relayContext)
 			if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "grpc_response_complete"); closeErr != nil {
-				// close_ack 等待失败时先不立即返回失败，继续交给 dispatcher 尝试 recycle，尽量保留可复用 tunnel。
+				// close_ack 闭环未完成时把 tunnel 标记为不可安全回收，后续由 dispatcher 直接关闭。
+				recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(closeErr)
 				log.Printf(
-					"bridge ingress grpc close-ack wait failed, continue recycle traffic_id=%s err=%v",
+					"bridge ingress grpc close-ack wait failed, fallback close traffic_id=%s recycle_error_code=%s err=%v",
 					strings.TrimSpace(trafficID),
+					recycleErrorCode,
 					closeErr,
 				)
 			}

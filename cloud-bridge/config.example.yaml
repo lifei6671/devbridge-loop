@@ -83,3 +83,11 @@ control_plane:
   # Session 心跳超时阈值。
   # 到达该时长未收到心跳会触发会话收敛（例如转为 STALE/CLOSED）。
   heartbeat_timeout: "30s"
+  # Agent -> Bridge 控制面 TLS 接入模式：
+  # - required: 仅允许 TLS
+  # - optional: 允许 TLS 和明文
+  # - plaintext: 仅允许明文
+  tls_mode: "plaintext"
+  # 当 tls_mode 为 required/optional 时，必须提供服务端证书和私钥。
+  tls_cert_file: ""
+  tls_key_file: ""

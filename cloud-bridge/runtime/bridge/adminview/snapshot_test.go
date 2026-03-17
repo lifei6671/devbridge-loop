@@ -1,10 +1,13 @@
 package adminview
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -146,5 +149,80 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 	}
 	if overview.Listeners[4].ListenerID != "admin_ui_api" || overview.Listeners[4].Port != "39081" {
 		testingObject.Fatalf("unexpected admin listener: %+v", overview.Listeners[4])
+	}
+}
+
+// TestBuildTrafficSummaryIncludesAuthAndTLSMetrics 验证 traffic 汇总会暴露认证与 TLS 拒绝指标。
+func TestBuildTrafficSummaryIncludesAuthAndTLSMetrics(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_300_000, 0).UTC()
+	metrics := obs.NewMetrics()
+	metrics.IncBridgeAuthSuccessTotal()
+	metrics.IncBridgeAuthSupersedeTotal()
+	metrics.IncBridgeAuthRateLimitTotal()
+	metrics.ObserveBridgeAuthFailure("auth_invalid_token")
+	metrics.IncBridgeTLSRejectPlaintextOnRequiredTotal()
+	metrics.IncBridgeTLSRejectTLSOnPlaintextTotal()
+	metrics.ObserveBridgeTunnelRecycleFailure(ltfperrors.CodeTunnelRecycleCloseAckRequired)
+
+	summary := BuildTrafficSummary(now, metrics)
+	if summary.AuthSuccessTotal != 1 || summary.AuthFailureTotal != 1 {
+		testingObject.Fatalf("unexpected auth summary totals: %+v", summary)
+	}
+	if summary.AuthRateLimitTotal != 1 || summary.AuthSupersedeTotal != 1 {
+		testingObject.Fatalf("unexpected auth takeover totals: %+v", summary)
+	}
+	if summary.TLSRejectPlaintextOnRequiredTotal != 1 || summary.TLSRejectTLSOnPlaintextTotal != 1 {
+		testingObject.Fatalf("unexpected tls reject totals: %+v", summary)
+	}
+	if summary.TunnelRecycleFailureTotal != 1 {
+		testingObject.Fatalf("unexpected recycle failure totals: %+v", summary)
+	}
+	if summary.AuthErrorCodeTotals["auth_invalid_token"] != 1 {
+		testingObject.Fatalf("unexpected auth error code totals: %+v", summary.AuthErrorCodeTotals)
+	}
+	if summary.TunnelRecycleErrorCodeTotals[ltfperrors.CodeTunnelRecycleCloseAckRequired] != 1 {
+		testingObject.Fatalf("unexpected recycle error code totals: %+v", summary.TunnelRecycleErrorCodeTotals)
+	}
+	if summary.UpdatedAtMS != uint64(now.UnixMilli()) {
+		testingObject.Fatalf("unexpected updated_at_ms: got=%d want=%d", summary.UpdatedAtMS, uint64(now.UnixMilli()))
+	}
+}
+
+// TestBuildDiagnoseSummaryFlagsAuthFailure 验证诊断摘要会在出现认证失败时输出安全排查提示。
+func TestBuildDiagnoseSummaryFlagsAuthFailure(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_400_000, 0).UTC()
+	metrics := obs.NewMetrics()
+	metrics.ObserveBridgeAuthFailure("auth_invalid_token")
+
+	diagnose := BuildDiagnoseSummary(now, nil, registry.TunnelSnapshot{}, metrics)
+	if diagnose.Health != "degraded" {
+		testingObject.Fatalf("unexpected diagnose health: got=%s want=%s", diagnose.Health, "degraded")
+	}
+	if len(diagnose.Issues) == 0 {
+		testingObject.Fatalf("expected auth failure diagnose issue")
+	}
+}
+
+// TestBuildDiagnoseSummaryFlagsTunnelRecycleFailure 验证诊断摘要会在 recycle 失败时输出针对性提示。
+func TestBuildDiagnoseSummaryFlagsTunnelRecycleFailure(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1_900_500_000, 0).UTC()
+	metrics := obs.NewMetrics()
+	metrics.ObserveBridgeTunnelRecycleFailure(ltfperrors.CodeTunnelRecycleCloseAckRequired)
+
+	diagnose := BuildDiagnoseSummary(now, nil, registry.TunnelSnapshot{}, metrics)
+	if diagnose.Health != "degraded" {
+		testingObject.Fatalf("unexpected diagnose health: got=%s want=%s", diagnose.Health, "degraded")
+	}
+	if len(diagnose.Issues) == 0 {
+		testingObject.Fatalf("expected recycle failure diagnose issue")
+	}
+	if !strings.Contains(diagnose.Issues[0], "close_ack_required") && !strings.Contains(diagnose.Issues[0], "close_ack") {
+		testingObject.Fatalf("expected recycle diagnose issue mentions close_ack, got=%+v", diagnose.Issues)
 	}
 }

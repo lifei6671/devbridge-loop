@@ -125,6 +125,55 @@ func TestConfigValidateAllowsCookieAuthWithCSRFConfig(testingObject *testing.T) 
 	}
 }
 
+// TestConfigValidateRejectsMissingTLSFilesWhenTLSEnabled
+// 验证控制面启用 TLS 模式后必须显式提供证书和私钥路径。
+func TestConfigValidateRejectsMissingTLSFilesWhenTLSEnabled(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ControlPlane.TLSMode = string(controlPlaneTLSModeRequired)
+	config.ControlPlane.TLSCertFile = ""
+	config.ControlPlane.TLSKeyFile = ""
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("validate config should fail when tls_mode requires cert/key")
+	}
+}
+
+// TestConfigValidateAllowsTLSModeOptionalWithFiles
+// 验证 optional 模式在证书路径齐备时可通过结构化校验。
+func TestConfigValidateAllowsTLSModeOptionalWithFiles(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ControlPlane.TLSMode = string(controlPlaneTLSModeOptional)
+	config.ControlPlane.TLSCertFile = "/tmp/bridge-cert.pem"
+	config.ControlPlane.TLSKeyFile = "/tmp/bridge-key.pem"
+	if err := config.Validate(); err != nil {
+		testingObject.Fatalf("validate config should pass when tls_mode optional has cert/key: %v", err)
+	}
+}
+
+// TestBootstrapIgnoresTLSFilesWhenTLSModePlaintext 验证 plaintext 模式下不会因为残留证书路径阻断启动。
+func TestBootstrapIgnoresTLSFilesWhenTLSModePlaintext(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ControlPlane.TLSMode = string(controlPlaneTLSModePlaintext)
+	config.ControlPlane.TLSCertFile = "/tmp/stale-bridge-cert.pem"
+	config.ControlPlane.TLSKeyFile = "/tmp/stale-bridge-key.pem"
+
+	runtime, err := Bootstrap(context.Background(), config)
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime should ignore tls files in plaintext mode: %v", err)
+	}
+	if runtime.controlServer == nil {
+		testingObject.Fatalf("expected control server initialized")
+	}
+	if runtime.controlServer.serverTLSConfig != nil {
+		testingObject.Fatalf("expected plaintext mode not to load server tls config")
+	}
+}
+
 // TestBootstrapSkipsAdminServerWhenDisabled 验证管理面关闭时不会初始化 admin server。
 func TestBootstrapSkipsAdminServerWhenDisabled(testingObject *testing.T) {
 	testingObject.Parallel()

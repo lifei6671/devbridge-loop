@@ -13,10 +13,18 @@ type Config struct {
 	AgentID         string
 	BridgeAddr      string
 	BridgeTransport string
+	BridgeTLS       BridgeTLSConfig
 	Session         SessionConfig
 	TunnelPool      TunnelPoolConfig
 	Observability   ObservabilityConfig
 	ControlChannel  ControlChannelConfig
+}
+
+// BridgeTLSConfig 描述 Agent 连接 Bridge 时使用的 TLS 参数。
+type BridgeTLSConfig struct {
+	Enabled    bool
+	RootCAFile string
+	ServerName string
 }
 
 type SessionConfig struct {
@@ -71,6 +79,9 @@ func DefaultConfig() Config {
 		AgentID:         "agent-local",
 		BridgeAddr:      "127.0.0.1:39080",
 		BridgeTransport: transport.BindingTypeTCPFramed.String(),
+		BridgeTLS: BridgeTLSConfig{
+			Enabled: false,
+		},
 		Session: SessionConfig{
 			HeartbeatInterval: 5 * time.Second,
 			AuthTimeout:       5 * time.Second,
@@ -108,6 +119,10 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.BridgeAddr) == "" {
 		// bridge 地址缺失时无法建连。
 		return fmt.Errorf("validate config: empty bridge_addr")
+	}
+	if c.BridgeTLS.Enabled && strings.TrimSpace(c.BridgeTLS.RootCAFile) == "" {
+		// TLS 模式下必须显式提供 Root CA，避免无意识退回系统默认证书池。
+		return fmt.Errorf("validate config: empty bridge_tls.root_ca_file when tls is enabled")
 	}
 	switch strings.TrimSpace(c.BridgeTransport) {
 	case transport.BindingTypeTCPFramed.String(),

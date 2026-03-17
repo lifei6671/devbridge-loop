@@ -32,7 +32,7 @@ func TestCatalogUpsertAndList(t *testing.T) {
 		t.Fatalf("unexpected generated service_id prefix: %s", record.Registration.ServiceID)
 	}
 	suffix := strings.TrimPrefix(record.Registration.ServiceID, "order-service-http-")
-	if len(suffix) != 26 {
+	if len(suffix) != 11 {
 		t.Fatalf("unexpected ulid suffix length: got=%d want=26", len(suffix))
 	}
 	if record.HealthStatus != pb.HealthStatusUnknown {

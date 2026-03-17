@@ -92,6 +92,9 @@ func buildAdminConfigSnapshot(
 			"listen_addr":          configCopy.ControlPlane.ListenAddr,
 			"grpc_h2_listen_addr":  configCopy.ControlPlane.GRPCH2ListenAddr,
 			"heartbeat_timeout_ms": uint64(configCopy.ControlPlane.HeartbeatTimeout.Milliseconds()),
+			"tls_mode":             configCopy.ControlPlane.TLSMode,
+			"tls_cert_file":        strings.TrimSpace(configCopy.ControlPlane.TLSCertFile),
+			"tls_key_file":         strings.TrimSpace(configCopy.ControlPlane.TLSKeyFile),
 		},
 		"observability": map[string]any{
 			"log_level":    configCopy.Observability.LogLevel,

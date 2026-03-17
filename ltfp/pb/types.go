@@ -37,6 +37,7 @@ type ConnectorWelcome struct {
 	VersionMajor         uint32            `json:"versionMajor"`
 	VersionMinor         uint32            `json:"versionMinor"`
 	HeartbeatIntervalSec uint32            `json:"heartbeatIntervalSec"`
+	TLSMode              string            `json:"tlsMode,omitempty"`
 	Capabilities         []string          `json:"capabilities,omitempty"`
 	AssignedSessionEpoch uint64            `json:"assignedSessionEpoch"`
 	TunnelMaxReuseCount  int32             `json:"tunnelMaxReuseCount,omitempty"`

@@ -74,10 +74,11 @@ type DispatchRouteLookupResult struct {
 
 // runtimeDataPlane 聚合 Bridge 数据面主路径依赖。
 type runtimeDataPlane struct {
-	sessionRegistry *registry.SessionRegistry
-	serviceRegistry *registry.ServiceRegistry
-	routeRegistry   *registry.RouteRegistry
-	tunnelRegistry  *registry.TunnelRegistry
+	sessionRegistry  *registry.SessionRegistry
+	serviceRegistry  *registry.ServiceRegistry
+	routeRegistry    *registry.RouteRegistry
+	tunnelRegistry   *registry.TunnelRegistry
+	connectorMetrics *obs.Metrics
 
 	resolver     *routing.Resolver
 	pathExecutor *routing.PathExecutor
@@ -128,16 +129,17 @@ func newRuntimeDataPlaneWithDependencies(
 	}
 
 	return &runtimeDataPlane{
-		sessionRegistry: sessionRegistry,
-		serviceRegistry: serviceRegistry,
-		routeRegistry:   routeRegistry,
-		tunnelRegistry:  tunnelRegistry,
-		resolver:        resolver,
-		pathExecutor:    pathExecutor,
-		httpGateway:     ingress.NewHTTPGateway(httpListenPort),
-		grpcGateway:     ingress.NewGRPCGateway(grpcListenPort),
-		tlsSNIGateway:   ingress.NewTLSSNIGateway(tlsSNIPort),
-		tcpGateway:      ingress.NewTCPPortGateway(),
+		sessionRegistry:  sessionRegistry,
+		serviceRegistry:  serviceRegistry,
+		routeRegistry:    routeRegistry,
+		tunnelRegistry:   tunnelRegistry,
+		connectorMetrics: dependencies.connectorMetrics,
+		resolver:         resolver,
+		pathExecutor:     pathExecutor,
+		httpGateway:      ingress.NewHTTPGateway(httpListenPort),
+		grpcGateway:      ingress.NewGRPCGateway(grpcListenPort),
+		tlsSNIGateway:    ingress.NewTLSSNIGateway(tlsSNIPort),
+		tcpGateway:       ingress.NewTCPPortGateway(),
 	}, nil
 }
 

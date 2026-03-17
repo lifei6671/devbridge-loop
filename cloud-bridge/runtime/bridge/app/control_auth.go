@@ -1,13 +1,13 @@
 package app
 
 import (
-	"crypto/subtle"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 )
 
 const (
@@ -18,86 +18,15 @@ const (
 )
 
 const (
-	connectorAuthErrorInvalidMethod     = "auth_invalid_method"
-	connectorAuthErrorInvalidToken      = "auth_invalid_token"
-	connectorAuthErrorTokenExpired      = "auth_token_expired"
-	connectorAuthErrorTokenRevoked      = "auth_token_revoked"
-	connectorAuthErrorConnectorMismatch = "auth_connector_mismatch"
-	connectorAuthErrorSessionSuperseded = "auth_session_superseded"
-	connectorAuthErrorRateLimited       = "auth_rate_limited"
-	connectorAuthErrorInternal          = "auth_internal_error"
+	connectorAuthErrorInvalidMethod     = ltfperrors.CodeAuthInvalidMethod
+	connectorAuthErrorInvalidToken      = ltfperrors.CodeAuthInvalidToken
+	connectorAuthErrorTokenExpired      = ltfperrors.CodeAuthTokenExpired
+	connectorAuthErrorTokenRevoked      = ltfperrors.CodeAuthTokenRevoked
+	connectorAuthErrorConnectorMismatch = ltfperrors.CodeAuthConnectorMismatch
+	connectorAuthErrorSessionSuperseded = ltfperrors.CodeAuthSessionSuperseded
+	connectorAuthErrorRateLimited       = ltfperrors.CodeAuthRateLimited
+	connectorAuthErrorInternal          = ltfperrors.CodeAuthInternalError
 )
-
-// connectorTokenStatus 定义 token 在认证阶段的状态。
-type connectorTokenStatus string
-
-const (
-	connectorTokenStatusActive  connectorTokenStatus = "active"
-	connectorTokenStatusGrace   connectorTokenStatus = "grace"
-	connectorTokenStatusRevoked connectorTokenStatus = "revoked"
-	connectorTokenStatusExpired connectorTokenStatus = "expired"
-)
-
-// connectorTokenRecord 保存 Connector token 校验所需的最小字段。
-type connectorTokenRecord struct {
-	TokenID     string
-	ConnectorID string
-	TokenSecret string
-	Status      connectorTokenStatus
-	ExpiresAt   time.Time
-}
-
-// connectorTokenStore 定义 token 索引查询接口。
-type connectorTokenStore interface {
-	LookupByTokenID(tokenID string) (connectorTokenRecord, bool, error)
-}
-
-// inMemoryConnectorTokenStore 提供开发期可用的内存 token 索引实现。
-type inMemoryConnectorTokenStore struct {
-	mu        sync.RWMutex
-	byTokenID map[string]connectorTokenRecord
-}
-
-// newInMemoryConnectorTokenStore 根据 token 记录构建内存索引。
-func newInMemoryConnectorTokenStore(records []connectorTokenRecord) *inMemoryConnectorTokenStore {
-	store := &inMemoryConnectorTokenStore{
-		byTokenID: make(map[string]connectorTokenRecord, len(records)),
-	}
-	for _, record := range records {
-		normalizedTokenID := strings.TrimSpace(record.TokenID)
-		if normalizedTokenID == "" {
-			// token_id 非法时直接跳过，避免污染索引。
-			continue
-		}
-		normalizedRecord := connectorTokenRecord{
-			TokenID:     normalizedTokenID,
-			ConnectorID: strings.TrimSpace(record.ConnectorID),
-			TokenSecret: strings.TrimSpace(record.TokenSecret),
-			Status:      normalizeConnectorTokenStatus(record.Status),
-			ExpiresAt:   record.ExpiresAt.UTC(),
-		}
-		store.byTokenID[normalizedTokenID] = normalizedRecord
-	}
-	return store
-}
-
-// LookupByTokenID 通过 token_id 查询 token 记录。
-func (store *inMemoryConnectorTokenStore) LookupByTokenID(tokenID string) (connectorTokenRecord, bool, error) {
-	if store == nil {
-		return connectorTokenRecord{}, false, fmt.Errorf("connector token store is nil")
-	}
-	normalizedTokenID := strings.TrimSpace(tokenID)
-	if normalizedTokenID == "" {
-		return connectorTokenRecord{}, false, nil
-	}
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	record, exists := store.byTokenID[normalizedTokenID]
-	if !exists {
-		return connectorTokenRecord{}, false, nil
-	}
-	return record, true, nil
-}
 
 // connectorScopedLocker 提供 connector 粒度互斥，保证认证提交的原子性。
 type connectorScopedLocker struct {
@@ -150,6 +79,7 @@ func (locker *connectorScopedLocker) lock(connectorID string) func() {
 type connectorAuthCoordinatorOptions struct {
 	sessionRegistry     *registry.SessionRegistry
 	tokenStore          connectorTokenStore
+	metrics             *obs.Metrics
 	now                 func() time.Time
 	supersedeRateWindow time.Duration
 	supersedeRateLimit  int
@@ -159,6 +89,7 @@ type connectorAuthCoordinatorOptions struct {
 type connectorAuthCoordinator struct {
 	sessionRegistry     *registry.SessionRegistry
 	tokenStore          connectorTokenStore
+	metrics             *obs.Metrics
 	now                 func() time.Time
 	supersedeRateWindow time.Duration
 	supersedeRateLimit  int
@@ -211,9 +142,14 @@ func newConnectorAuthCoordinator(options connectorAuthCoordinatorOptions) *conne
 	if rateLimit <= 0 {
 		rateLimit = defaultConnectorSupersedeRateLimit
 	}
+	metrics := options.metrics
+	if metrics == nil {
+		metrics = obs.DefaultMetrics
+	}
 	return &connectorAuthCoordinator{
 		sessionRegistry:     sessionRegistry,
 		tokenStore:          tokenStore,
+		metrics:             metrics,
 		now:                 nowFunc,
 		supersedeRateWindow: rateWindow,
 		supersedeRateLimit:  rateLimit,
@@ -225,78 +161,102 @@ func newConnectorAuthCoordinator(options connectorAuthCoordinatorOptions) *conne
 // AuthenticateAndCommit 执行固定顺序认证并在通过后原子提交 session。
 func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 	request connectorAuthRequest,
-	commit func(sessionID string, sessionEpoch uint64) error,
-) connectorAuthResult {
+	commit func(now time.Time, sessionRuntime registry.SessionRuntime) error,
+) (result connectorAuthResult) {
+	supersedeSucceeded := false
+	defer func() {
+		// 认证结果需要在函数真正返回时再采样，避免遗漏成功接管后的 supersede 计数。
+		coordinator.observeAuthResult(&result, supersedeSucceeded)
+	}()
 	if coordinator == nil {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "auth coordinator is nil",
 		}
+		return result
 	}
 	if commit == nil {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "auth commit callback is nil",
 		}
+		return result
 	}
 	normalizedAuthMethod := strings.ToLower(strings.TrimSpace(request.authMethod))
 	if normalizedAuthMethod != "token" {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInvalidMethod,
 			errorMessage: "unsupported auth_method",
 		}
+		return result
 	}
 	normalizedConnectorID := strings.TrimSpace(request.connectorID)
 	if normalizedConnectorID == "" {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorConnectorMismatch,
 			errorMessage: "connector_id is required",
 		}
+		return result
 	}
 	tokenID, tokenSecret, parsed := parseConnectorToken(request.token)
 	if !parsed {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInvalidToken,
 			errorMessage: "invalid token format",
 		}
+		return result
 	}
 	tokenRecord, tokenFound, lookupErr := coordinator.tokenStore.LookupByTokenID(tokenID)
 	if lookupErr != nil {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "token lookup failed",
 		}
+		return result
 	}
 	if !tokenFound {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInvalidToken,
 			errorMessage: "token not found",
 		}
+		return result
 	}
 	if strings.TrimSpace(tokenRecord.ConnectorID) != normalizedConnectorID {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorConnectorMismatch,
 			errorMessage: "token connector_id mismatch",
 		}
+		return result
 	}
-	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(tokenRecord.TokenSecret)), []byte(tokenSecret)) != 1 {
-		return connectorAuthResult{
+	secretMatched, verifyErr := verifyConnectorTokenSecret(tokenSecret, tokenRecord.TokenSecretHash)
+	if verifyErr != nil {
+		result = connectorAuthResult{
+			errorCode:    connectorAuthErrorInternal,
+			errorMessage: "token hash verify failed",
+		}
+		return result
+	}
+	if !secretMatched {
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInvalidToken,
 			errorMessage: "token secret mismatch",
 		}
+		return result
 	}
 	now := coordinator.nowUTC()
 	if errorCode, errorMessage, ok := validateConnectorTokenState(tokenRecord, now); !ok {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    errorCode,
 			errorMessage: errorMessage,
 		}
+		return result
 	}
 	if request.assignedSessionEpoch == 0 {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "assigned_session_epoch is required",
 		}
+		return result
 	}
 
 	// 对同一 connector 的提交阶段加锁，保证读取与写入的一致性。
@@ -305,9 +265,15 @@ func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 
 	currentSession, currentExists := coordinator.sessionRegistry.GetByConnector(normalizedConnectorID)
 	if currentExists && currentSession.Epoch >= request.assignedSessionEpoch {
-		return connectorAuthResult{
-			errorCode:    connectorAuthErrorSessionSuperseded,
-			errorMessage: "session epoch has been superseded",
+		switch currentSession.State {
+		case registry.SessionStale, registry.SessionClosed:
+			// 旧权威已终态时允许新握手重新接管 connector。
+		default:
+			result = connectorAuthResult{
+				errorCode:    connectorAuthErrorSessionSuperseded,
+				errorMessage: "session epoch has been superseded",
+			}
+			return result
 		}
 	}
 	supersedeAttempt := currentExists &&
@@ -315,35 +281,48 @@ func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 		currentSession.Epoch > 0 &&
 		(currentSession.State == registry.SessionActive || currentSession.State == registry.SessionDraining)
 	if supersedeAttempt && coordinator.isSupersedeRateLimited(normalizedConnectorID, now) {
-		return connectorAuthResult{
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorRateLimited,
 			errorMessage: "session supersede rate limited",
 		}
+		return result
 	}
 
 	sessionID := newConnectorSessionID()
-	if commitErr := commit(sessionID, request.assignedSessionEpoch); commitErr != nil {
-		return connectorAuthResult{
+	if commitErr := commit(now, registry.SessionRuntime{
+		SessionID:     sessionID,
+		ConnectorID:   normalizedConnectorID,
+		Epoch:         request.assignedSessionEpoch,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	}); commitErr != nil {
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "auth commit failed",
 		}
+		return result
 	}
 	committedSession, committed := coordinator.sessionRegistry.GetByConnector(normalizedConnectorID)
 	if !committed || strings.TrimSpace(committedSession.SessionID) != sessionID || committedSession.Epoch != request.assignedSessionEpoch {
-		return connectorAuthResult{
+		// commit 回调必须让当前 connector 视图与刚签发的 session 完全一致，否则视为非权威提交。
+		result = connectorAuthResult{
 			errorCode:    connectorAuthErrorInternal,
 			errorMessage: "auth commit is not authoritative",
 		}
+		return result
 	}
 	if supersedeAttempt {
 		// 仅在成功抢占生效后计入限流历史。
 		coordinator.recordSuccessfulSupersede(normalizedConnectorID, now)
+		supersedeSucceeded = true
 	}
-	return connectorAuthResult{
+	result = connectorAuthResult{
 		success:      true,
 		sessionID:    sessionID,
 		sessionEpoch: request.assignedSessionEpoch,
 	}
+	return result
 }
 
 // nowUTC 返回认证流程统一使用的 UTC 时间戳。
@@ -430,69 +409,20 @@ func validateConnectorTokenState(record connectorTokenRecord, now time.Time) (st
 	return "", "", true
 }
 
-// normalizeConnectorTokenStatus 归一化 token 状态文本。
-func normalizeConnectorTokenStatus(status connectorTokenStatus) connectorTokenStatus {
-	switch strings.ToLower(strings.TrimSpace(string(status))) {
-	case string(connectorTokenStatusActive):
-		return connectorTokenStatusActive
-	case string(connectorTokenStatusGrace):
-		return connectorTokenStatusGrace
-	case string(connectorTokenStatusRevoked):
-		return connectorTokenStatusRevoked
-	case string(connectorTokenStatusExpired):
-		return connectorTokenStatusExpired
-	default:
-		return ""
+// observeAuthResult 统一记录认证成功率、错误码分布与接管/限流指标。
+func (coordinator *connectorAuthCoordinator) observeAuthResult(result *connectorAuthResult, supersedeSucceeded bool) {
+	if coordinator == nil || coordinator.metrics == nil || result == nil {
+		return
 	}
-}
-
-// parseConnectorToken 解析 dbt_<token_id>.<token_secret> 结构。
-func parseConnectorToken(rawToken string) (string, string, bool) {
-	normalizedToken := strings.TrimSpace(rawToken)
-	if !strings.HasPrefix(normalizedToken, "dbt_") {
-		return "", "", false
-	}
-	withoutPrefix := strings.TrimPrefix(normalizedToken, "dbt_")
-	tokenID, tokenSecret, found := strings.Cut(withoutPrefix, ".")
-	if !found {
-		return "", "", false
-	}
-	tokenID = strings.TrimSpace(tokenID)
-	tokenSecret = strings.TrimSpace(tokenSecret)
-	if tokenID == "" || tokenSecret == "" {
-		return "", "", false
-	}
-	if !isValidConnectorTokenID(tokenID) {
-		return "", "", false
-	}
-	return tokenID, tokenSecret, true
-}
-
-// isValidConnectorTokenID 校验 token_id 是否满足 [A-Za-z0-9_-]+。
-func isValidConnectorTokenID(tokenID string) bool {
-	if strings.TrimSpace(tokenID) == "" {
-		return false
-	}
-	for _, char := range tokenID {
-		isDigit := char >= '0' && char <= '9'
-		isLowerAlpha := char >= 'a' && char <= 'z'
-		isUpperAlpha := char >= 'A' && char <= 'Z'
-		if isDigit || isLowerAlpha || isUpperAlpha || char == '_' || char == '-' {
-			continue
+	if result.success {
+		coordinator.metrics.IncBridgeAuthSuccessTotal()
+		if supersedeSucceeded {
+			coordinator.metrics.IncBridgeAuthSupersedeTotal()
 		}
-		return false
+		return
 	}
-	return true
-}
-
-// defaultConnectorTokenRecords 返回开发环境默认 token 记录。
-func defaultConnectorTokenRecords() []connectorTokenRecord {
-	return []connectorTokenRecord{
-		{
-			TokenID:     "agent-local",
-			ConnectorID: "agent-local",
-			TokenSecret: "agent-dev-secret",
-			Status:      connectorTokenStatusActive,
-		},
+	coordinator.metrics.ObserveBridgeAuthFailure(result.errorCode)
+	if result.errorCode == connectorAuthErrorRateLimited {
+		coordinator.metrics.IncBridgeAuthRateLimitTotal()
 	}
 }

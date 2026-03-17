@@ -56,6 +56,9 @@ type persistedConfigYAML struct {
 		ListenAddr       string `yaml:"listen_addr"`
 		GRPCH2ListenAddr string `yaml:"grpc_h2_listen_addr"`
 		HeartbeatTimeout string `yaml:"heartbeat_timeout"`
+		TLSMode          string `yaml:"tls_mode"`
+		TLSCertFile      string `yaml:"tls_cert_file"`
+		TLSKeyFile       string `yaml:"tls_key_file"`
 	} `yaml:"control_plane"`
 }
 
@@ -83,6 +86,9 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	persisted.ControlPlane.ListenAddr = configToPersist.ControlPlane.ListenAddr
 	persisted.ControlPlane.GRPCH2ListenAddr = configToPersist.ControlPlane.GRPCH2ListenAddr
 	persisted.ControlPlane.HeartbeatTimeout = configToPersist.ControlPlane.HeartbeatTimeout.String()
+	persisted.ControlPlane.TLSMode = configToPersist.ControlPlane.TLSMode
+	persisted.ControlPlane.TLSCertFile = configToPersist.ControlPlane.TLSCertFile
+	persisted.ControlPlane.TLSKeyFile = configToPersist.ControlPlane.TLSKeyFile
 
 	encoded, err := yaml.Marshal(&persisted)
 	if err != nil {

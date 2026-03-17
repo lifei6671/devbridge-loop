@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/consistency"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -53,6 +55,8 @@ type controlMessageDispatcher struct {
 	tunnelRegistry        *registry.TunnelRegistry
 	authCoordinator       *connectorAuthCoordinator
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	tlsMode               string
+	metrics               *obs.Metrics
 	publishHandler        *bridgecontrol.PublishHandler
 	healthHandler         *bridgecontrol.HealthHandler
 	tunnelHandler         *bridgecontrol.TunnelReportHandler
@@ -109,6 +113,8 @@ type controlMessageDispatcherOptions struct {
 	tunnelRegistry        *registry.TunnelRegistry
 	authCoordinator       *connectorAuthCoordinator
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	tlsMode               string
+	metrics               *obs.Metrics
 }
 
 // newControlMessageDispatcher 创建控制面业务分发器及其共享依赖。
@@ -138,7 +144,12 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		// 未注入认证协调器时使用默认实现，保证控制面握手可直接落地。
 		authCoordinator = newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
 			sessionRegistry: sessionRegistry,
+			metrics:         options.metrics,
 		})
+	}
+	metrics := options.metrics
+	if metrics == nil {
+		metrics = obs.DefaultMetrics
 	}
 	eventGuard := consistency.NewResourceEventGuard(4096)
 	sessionHandler := bridgecontrol.NewSessionHandler(bridgecontrol.SessionHandlerOptions{
@@ -147,6 +158,10 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		RouteRegistry:   routeRegistry,
 		Guard:           eventGuard,
 	})
+	normalizedTLSMode, err := normalizeControlPlaneTLSMode(options.tlsMode)
+	if err != nil {
+		normalizedTLSMode = controlPlaneTLSModePlaintext
+	}
 	return &controlMessageDispatcher{
 		sessionRegistry:       sessionRegistry,
 		serviceRegistry:       serviceRegistry,
@@ -154,6 +169,8 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		tunnelRegistry:        tunnelRegistry,
 		authCoordinator:       authCoordinator,
 		tunnelPoolReportStore: options.tunnelPoolReportStore,
+		tlsMode:               string(normalizedTLSMode),
+		metrics:               metrics,
 		publishHandler: bridgecontrol.NewPublishHandler(bridgecontrol.PublishHandlerOptions{
 			Guard:           eventGuard,
 			SessionRegistry: sessionRegistry,
@@ -271,7 +288,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			"auth_internal_error",
+			connectorAuthErrorInternal,
 			"decode connector hello payload failed",
 		)
 	}
@@ -281,7 +298,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			"auth_internal_error",
+			connectorAuthErrorInternal,
 			"invalid connector hello payload",
 		)
 	}
@@ -292,7 +309,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			"auth_internal_error",
+			connectorAuthErrorInternal,
 			"connector_id is required",
 		)
 	}
@@ -302,7 +319,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			"auth_connector_mismatch",
+			connectorAuthErrorConnectorMismatch,
 			"connector_id mismatch between envelope and hello payload",
 		)
 	}
@@ -319,6 +336,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 		VersionMinor:         envelope.VersionMinor,
 		HeartbeatIntervalSec: connectorHeartbeatIntervalSec,
 		AssignedSessionEpoch: assignedSessionEpoch,
+		TLSMode:              strings.TrimSpace(dispatcher.tlsMode),
 	}
 	return buildConnectorWelcomeEnvelope(envelope, normalizedConnectorID, welcomePayload)
 }
@@ -334,7 +352,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			false,
 			"",
 			0,
-			"auth_internal_error",
+			connectorAuthErrorInternal,
 			"connector_welcome is required before connector_auth",
 		)
 	}
@@ -345,7 +363,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			false,
 			"",
 			0,
-			"auth_internal_error",
+			connectorAuthErrorInternal,
 			"decode connector auth payload failed",
 		)
 	}
@@ -387,19 +405,19 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			authMethod:           authPayload.AuthMethod,
 			token:                authPayload.Token,
 		},
-		func(sessionID string, sessionEpoch uint64) error {
-			now := time.Now().UTC()
-			dispatcher.upsertActiveSession(
-				now,
-				sessionID,
-				sessionEpoch,
-				normalizedConnectorID,
-				envelope.ResourceVersion,
-			)
+		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			dispatcher.commitAuthenticatedSession(now, sessionRuntime, envelope.ResourceVersion)
 			return nil
 		},
 	)
 	if !authResult.success {
+		slog.Warn(
+			"connector auth rejected",
+			"connector_id", normalizedConnectorID,
+			"assigned_session_epoch", sessionState.assignedSessionEpoch,
+			"error_code", authResult.errorCode,
+			"error_message", authResult.errorMessage,
+		)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -412,6 +430,12 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	// 认证成功后更新连接上下文，供 heartbeat 与后续资源消息复用。
 	sessionState.setSession(authResult.sessionID, authResult.sessionEpoch)
 	sessionState.authenticated = true
+	slog.Info(
+		"connector auth committed",
+		"connector_id", normalizedConnectorID,
+		"session_id", authResult.sessionID,
+		"session_epoch", authResult.sessionEpoch,
+	)
 
 	return buildConnectorAuthAckEnvelope(
 		envelope,
@@ -716,50 +740,52 @@ func (dispatcher *controlMessageDispatcher) upsertActiveSession(
 	if normalizedSessionID == "" || sessionEpoch == 0 {
 		return
 	}
-	normalizedConnectorID := strings.TrimSpace(connectorID)
-	existingSession, exists := dispatcher.sessionRegistry.GetBySession(normalizedSessionID)
-	if exists && existingSession.Epoch > sessionEpoch {
-		// 旧连接的低 epoch 消息不允许覆盖。
-		return
-	}
-	if normalizedConnectorID == "" && exists {
-		normalizedConnectorID = strings.TrimSpace(existingSession.ConnectorID)
-	}
-
-	if normalizedConnectorID != "" {
-		if connectorSession, connectorExists := dispatcher.sessionRegistry.GetByConnector(normalizedConnectorID); connectorExists &&
-			strings.TrimSpace(connectorSession.SessionID) != normalizedSessionID {
-			if connectorSession.Epoch > sessionEpoch {
-				switch connectorSession.State {
-				case registry.SessionStale, registry.SessionClosed:
-					// Agent 进程重启后可能出现 epoch 回绕；旧会话已终态时允许新会话接管。
-				default:
-					// connector 仍绑定到存活会话（ACTIVE/DRAINING），当前消息视为旧连接噪声。
-					return
-				}
-			}
-			if connectorSession.Epoch < sessionEpoch {
-				// 同 connector 切到新会话时，把旧会话降级为 DRAINING 并立即收敛相关运行态。
-				dispatcher.transitionSessionState(
-					now,
-					connectorSession.SessionID,
-					connectorSession.Epoch,
-					registry.SessionDraining,
-					"session_epoch_takeover",
-				)
-			}
-		}
-	}
-
-	dispatcher.sessionHandler.UpsertSession(registry.SessionRuntime{
+	dispatcher.commitAuthenticatedSession(now, registry.SessionRuntime{
 		SessionID:     normalizedSessionID,
-		ConnectorID:   normalizedConnectorID,
+		ConnectorID:   strings.TrimSpace(connectorID),
 		Epoch:         sessionEpoch,
 		State:         registry.SessionActive,
 		LastHeartbeat: now,
 		UpdatedAt:     now,
-	})
-	dispatcher.sessionHandler.MarkReconnectBaseline(normalizedSessionID, sessionEpoch, resourceVersion)
+	}, resourceVersion)
+}
+
+// commitAuthenticatedSession 原子提交当前 connector 的权威会话，并收敛旧会话副作用。
+func (dispatcher *controlMessageDispatcher) commitAuthenticatedSession(
+	now time.Time,
+	sessionRuntime registry.SessionRuntime,
+	resourceVersion uint64,
+) {
+	if dispatcher == nil || dispatcher.sessionHandler == nil || dispatcher.sessionRegistry == nil {
+		return
+	}
+	normalizedConnectorID := strings.TrimSpace(sessionRuntime.ConnectorID)
+	sessionRuntime.SessionID = strings.TrimSpace(sessionRuntime.SessionID)
+	if sessionRuntime.SessionID == "" || sessionRuntime.Epoch == 0 {
+		return
+	}
+	if normalizedConnectorID == "" {
+		if existingSession, exists := dispatcher.sessionRegistry.GetBySession(sessionRuntime.SessionID); exists {
+			normalizedConnectorID = strings.TrimSpace(existingSession.ConnectorID)
+		}
+	}
+	sessionRuntime.ConnectorID = normalizedConnectorID
+	sessionRuntime.State = registry.SessionActive
+	if sessionRuntime.LastHeartbeat.IsZero() {
+		sessionRuntime.LastHeartbeat = now
+	}
+	commitResult, committed := dispatcher.sessionRegistry.CommitAuthoritative(now, sessionRuntime)
+	if !committed {
+		return
+	}
+	if commitResult.PreviousStateChanged {
+		dispatcher.applySessionLifecycleEffects(now, commitResult.PreviousSession, "session_epoch_takeover")
+	}
+	dispatcher.sessionHandler.MarkReconnectBaseline(
+		commitResult.CurrentSession.SessionID,
+		commitResult.CurrentSession.Epoch,
+		resourceVersion,
+	)
 }
 
 // transitionSessionState 执行 session 状态迁移，并触发生命周期副作用。
@@ -811,7 +837,10 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 		if dispatcher.tunnelPoolReportStore != nil {
 			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
 		}
-		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
+		shouldMarkConnectorInactive := normalizedReason == "session_epoch_takeover" ||
+			dispatcher.isCurrentConnectorSession(sessionRuntime)
+		if dispatcher.serviceRegistry != nil && shouldMarkConnectorInactive {
+			// takeover 场景下旧 session 已不再是当前权威，但旧 connector 服务仍需立即摘流。
 			// DRAINING 后立即摘流：服务标记 INACTIVE，避免被 resolver 继续命中。
 			dispatcher.serviceRegistry.MarkLifecycleByConnector(
 				now,
@@ -1114,9 +1143,12 @@ func parseRefillMetadataInt(metadata map[string]string, key string) int {
 }
 
 type controlPlaneServer struct {
-	tcpListenAddr  string
-	grpcListenAddr string
-	heartbeatTTL   time.Duration
+	tcpListenAddr   string
+	grpcListenAddr  string
+	heartbeatTTL    time.Duration
+	tlsMode         controlPlaneTLSMode
+	serverTLSConfig *tls.Config
+	metrics         *obs.Metrics
 
 	tcpTransport  *tcpbinding.Transport
 	grpcTransport *grpcbinding.Transport
@@ -1136,6 +1168,7 @@ type controlPlaneDependencies struct {
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	metrics               *obs.Metrics
 }
 
 // newControlPlaneServer 创建控制面服务，并绑定业务分发器依赖。
@@ -1151,19 +1184,39 @@ func newControlPlaneServer(
 	if err != nil {
 		return nil, fmt.Errorf("new control plane grpc transport: %w", err)
 	}
+	normalizedTLSMode, err := normalizeControlPlaneTLSMode(config.TLSMode)
+	if err != nil {
+		return nil, err
+	}
+	var serverTLSConfig *tls.Config
+	if normalizedTLSMode != controlPlaneTLSModePlaintext {
+		serverTLSConfig, err = loadControlPlaneServerTLSConfig(config.TLSCertFile, config.TLSKeyFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	metrics := dependencies.metrics
+	if metrics == nil {
+		metrics = obs.DefaultMetrics
+	}
 	return &controlPlaneServer{
-		tcpListenAddr:  strings.TrimSpace(config.ListenAddr),
-		grpcListenAddr: strings.TrimSpace(config.GRPCH2ListenAddr),
-		heartbeatTTL:   config.HeartbeatTimeout,
-		tcpTransport:   tcpTransport,
-		grpcTransport:  grpcTransport,
-		grpcAcceptor:   grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
+		tcpListenAddr:   strings.TrimSpace(config.ListenAddr),
+		grpcListenAddr:  strings.TrimSpace(config.GRPCH2ListenAddr),
+		heartbeatTTL:    config.HeartbeatTimeout,
+		tlsMode:         normalizedTLSMode,
+		serverTLSConfig: serverTLSConfig,
+		metrics:         metrics,
+		tcpTransport:    tcpTransport,
+		grpcTransport:   grpcTransport,
+		grpcAcceptor:    grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
 		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
 			sessionRegistry:       dependencies.sessionRegistry,
 			serviceRegistry:       dependencies.serviceRegistry,
 			routeRegistry:         dependencies.routeRegistry,
 			tunnelRegistry:        dependencies.tunnelRegistry,
 			tunnelPoolReportStore: dependencies.tunnelPoolReportStore,
+			tlsMode:               string(normalizedTLSMode),
+			metrics:               metrics,
 		}),
 	}, nil
 }
@@ -1308,7 +1361,7 @@ func (server *controlPlaneServer) runGRPC(ctx context.Context) error {
 
 	serveErrChan := make(chan error, 1)
 	go func() {
-		serveErrChan <- grpcServer.Serve(listener)
+		serveErrChan <- grpcServer.Serve(newControlPlaneTLSAwareListener(listener, server.tlsMode, server.serverTLSConfig, server.metrics))
 	}()
 
 	select {
@@ -1482,12 +1535,29 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 	if server == nil || rawConn == nil {
 		return errors.New("serve tcp inbound: invalid argument")
 	}
-	classifiedConn, isControlChannel, err := classifyTCPInboundConnection(rawConn)
-	if err != nil {
+	acceptedConn, tlsEnabled, acceptErr := acceptControlPlaneConnWithTLS(rawConn, server.tlsMode, server.serverTLSConfig, server.metrics)
+	if acceptErr != nil {
+		slog.Warn(
+			"reject tcp inbound connection by tls mode",
+			"tls_mode", string(server.tlsMode),
+			"peer_addr", remoteAddrString(rawConn),
+			"error", acceptErr.Error(),
+		)
 		_ = rawConn.Close()
+		return nil
+	}
+	classifiedConn, isControlChannel, err := classifyTCPInboundConnection(acceptedConn)
+	if err != nil {
+		_ = acceptedConn.Close()
 		return fmt.Errorf("serve tcp inbound: classify connection: %w", err)
 	}
 	if isControlChannel {
+		slog.Debug(
+			"accept tcp control connection",
+			"tls_mode", string(server.tlsMode),
+			"tls_enabled", tlsEnabled,
+			"peer_addr", remoteAddrString(rawConn),
+		)
 		controlChannel, openErr := server.tcpTransport.OpenControlChannel(classifiedConn)
 		if openErr != nil {
 			_ = classifiedConn.Close()
@@ -1499,6 +1569,12 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 		}
 		return nil
 	}
+	slog.Debug(
+		"accept tcp tunnel connection",
+		"tls_mode", string(server.tlsMode),
+		"tls_enabled", tlsEnabled,
+		"peer_addr", remoteAddrString(rawConn),
+	)
 	if registerErr := server.handleAcceptedTCPTunnel(classifiedConn); registerErr != nil {
 		_ = classifiedConn.Close()
 		return registerErr

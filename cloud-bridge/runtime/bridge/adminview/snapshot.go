@@ -9,6 +9,7 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -122,14 +123,23 @@ type TunnelSummarySnapshot struct {
 
 // TrafficSummarySnapshot 定义管理后台 traffic 汇总数据。
 type TrafficSummarySnapshot struct {
-	AcquireWaitCount      uint64 `json:"acquire_wait_count"`
-	AcquireWaitTotalMS    int64  `json:"acquire_wait_total_ms"`
-	OpenTimeoutTotal      uint64 `json:"open_timeout_total"`
-	OpenRejectTotal       uint64 `json:"open_reject_total"`
-	OpenAckLateTotal      uint64 `json:"open_ack_late_total"`
-	HybridFallbackTotal   uint64 `json:"hybrid_fallback_total"`
-	EndpointOverrideTotal uint64 `json:"endpoint_override_total"`
-	UpdatedAtMS           uint64 `json:"updated_at_ms"`
+	AcquireWaitCount                  uint64            `json:"acquire_wait_count"`
+	AcquireWaitTotalMS                int64             `json:"acquire_wait_total_ms"`
+	OpenTimeoutTotal                  uint64            `json:"open_timeout_total"`
+	OpenRejectTotal                   uint64            `json:"open_reject_total"`
+	OpenAckLateTotal                  uint64            `json:"open_ack_late_total"`
+	HybridFallbackTotal               uint64            `json:"hybrid_fallback_total"`
+	EndpointOverrideTotal             uint64            `json:"endpoint_override_total"`
+	AuthSuccessTotal                  uint64            `json:"auth_success_total"`
+	AuthFailureTotal                  uint64            `json:"auth_failure_total"`
+	AuthRateLimitTotal                uint64            `json:"auth_rate_limit_total"`
+	AuthSupersedeTotal                uint64            `json:"auth_supersede_total"`
+	TLSRejectPlaintextOnRequiredTotal uint64            `json:"tls_reject_plaintext_on_required_total"`
+	TLSRejectTLSOnPlaintextTotal      uint64            `json:"tls_reject_tls_on_plaintext_total"`
+	TunnelRecycleFailureTotal         uint64            `json:"tunnel_recycle_failure_total"`
+	AuthErrorCodeTotals               map[string]uint64 `json:"auth_error_code_totals"`
+	TunnelRecycleErrorCodeTotals      map[string]uint64 `json:"tunnel_recycle_error_code_totals"`
+	UpdatedAtMS                       uint64            `json:"updated_at_ms"`
 }
 
 // DiagnoseSummarySnapshot 定义管理后台诊断聚合输出。
@@ -659,14 +669,23 @@ func BuildTrafficSummary(now time.Time, metrics *obs.Metrics) TrafficSummarySnap
 		metrics = obs.DefaultMetrics
 	}
 	return TrafficSummarySnapshot{
-		AcquireWaitCount:      metrics.BridgeTunnelAcquireWaitCount(),
-		AcquireWaitTotalMS:    metrics.BridgeTunnelAcquireWaitTotalMs(),
-		OpenTimeoutTotal:      metrics.BridgeTrafficOpenTimeoutTotal(),
-		OpenRejectTotal:       metrics.BridgeTrafficOpenRejectTotal(),
-		OpenAckLateTotal:      metrics.BridgeTrafficOpenAckLateTotal(),
-		HybridFallbackTotal:   metrics.BridgeHybridFallbackTotal(),
-		EndpointOverrideTotal: metrics.BridgeActualEndpointOverrideTotal(),
-		UpdatedAtMS:           uint64(normalizedNow.UnixMilli()),
+		AcquireWaitCount:                  metrics.BridgeTunnelAcquireWaitCount(),
+		AcquireWaitTotalMS:                metrics.BridgeTunnelAcquireWaitTotalMs(),
+		OpenTimeoutTotal:                  metrics.BridgeTrafficOpenTimeoutTotal(),
+		OpenRejectTotal:                   metrics.BridgeTrafficOpenRejectTotal(),
+		OpenAckLateTotal:                  metrics.BridgeTrafficOpenAckLateTotal(),
+		HybridFallbackTotal:               metrics.BridgeHybridFallbackTotal(),
+		EndpointOverrideTotal:             metrics.BridgeActualEndpointOverrideTotal(),
+		AuthSuccessTotal:                  metrics.BridgeAuthSuccessTotal(),
+		AuthFailureTotal:                  metrics.BridgeAuthFailureTotal(),
+		AuthRateLimitTotal:                metrics.BridgeAuthRateLimitTotal(),
+		AuthSupersedeTotal:                metrics.BridgeAuthSupersedeTotal(),
+		TLSRejectPlaintextOnRequiredTotal: metrics.BridgeTLSRejectPlaintextOnRequiredTotal(),
+		TLSRejectTLSOnPlaintextTotal:      metrics.BridgeTLSRejectTLSOnPlaintextTotal(),
+		TunnelRecycleFailureTotal:         metrics.BridgeTunnelRecycleFailureTotal(),
+		AuthErrorCodeTotals:               metrics.BridgeAuthErrorCodeTotals(),
+		TunnelRecycleErrorCodeTotals:      metrics.BridgeTunnelRecycleErrorCodeTotals(),
+		UpdatedAtMS:                       uint64(normalizedNow.UnixMilli()),
 	}
 }
 
@@ -698,6 +717,12 @@ func BuildDiagnoseSummary(
 	if trafficSummary.OpenTimeoutTotal > 0 {
 		issues = append(issues, "检测到 traffic open timeout，请关注预开池水位与补池节奏")
 	}
+	if trafficSummary.AuthFailureTotal > 0 {
+		issues = append(issues, "检测到 connector 认证失败，请检查 token、TLS 模式与会话抢占行为")
+	}
+	if trafficSummary.TunnelRecycleFailureTotal > 0 {
+		issues = append(issues, buildTunnelRecycleDiagnoseIssue(trafficSummary.TunnelRecycleErrorCodeTotals))
+	}
 	health := "healthy"
 	if len(issues) > 0 {
 		health = "degraded"
@@ -707,6 +732,24 @@ func BuildDiagnoseSummary(
 		Issues:      issues,
 		UpdatedAtMS: uint64(normalizedNow.UnixMilli()),
 	}
+}
+
+// buildTunnelRecycleDiagnoseIssue 按 recycle 错误码分布输出最有诊断价值的提示语。
+func buildTunnelRecycleDiagnoseIssue(errorCodeTotals map[string]uint64) string {
+	if errorCodeTotals[ltfperrors.CodeTunnelRecycleInvalidSeq] > 0 ||
+		errorCodeTotals[ltfperrors.CodeTunnelRecycleTunnelMismatch] > 0 {
+		return "检测到 tunnel recycle 协议状态不一致，请检查 tunnel_id/recycle_seq 收敛与双端状态机"
+	}
+	if errorCodeTotals[ltfperrors.CodeTunnelRecycleCloseAckRequired] > 0 {
+		return "检测到 tunnel recycle 因 close_ack_required 失败，请检查 close_ack 闭环与 simultaneous close 时序"
+	}
+	if errorCodeTotals[ltfperrors.CodeTunnelRecycleBufferDirty] > 0 {
+		return "检测到 tunnel recycle 因 buffer_dirty 失败，请检查 flush 排空与长尾响应"
+	}
+	if errorCodeTotals[ltfperrors.CodeTunnelRecycleDeadlineHit] > 0 {
+		return "检测到 tunnel recycle 超时，请关注 close_ack 等待、flush 时延与池水位"
+	}
+	return "检测到 tunnel recycle 失败，请检查 tunnel 健康度、close_ack 闭环与缓冲排空状态"
 }
 
 func maxUint64(left uint64, right uint64) uint64 {

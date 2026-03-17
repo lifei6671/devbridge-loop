@@ -84,14 +84,16 @@ func (relay *Relay) Relay(ctx context.Context, tunnel registry.RuntimeTunnel, tr
 			return fmt.Errorf("relay: read payload: %w", err)
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == normalizedTrafficID {
-			closeAckPayload := pb.StreamPayload{
-				CloseAck: &pb.TrafficCloseAck{
-					TrafficID: normalizedTrafficID,
-					Accepted:  true,
-				},
-			}
-			if writeAckErr := tunnel.WritePayload(normalizedContext, closeAckPayload); writeAckErr != nil {
-				return fmt.Errorf("relay: write close ack: %w", writeAckErr)
+			if tryMarkBridgeCloseAckSentOnce(tunnel, normalizedTrafficID) {
+				closeAckPayload := pb.StreamPayload{
+					CloseAck: &pb.TrafficCloseAck{
+						TrafficID: normalizedTrafficID,
+						Accepted:  true,
+					},
+				}
+				if writeAckErr := tunnel.WritePayload(normalizedContext, closeAckPayload); writeAckErr != nil {
+					return fmt.Errorf("relay: write close ack: %w", writeAckErr)
+				}
 			}
 			return nil
 		}

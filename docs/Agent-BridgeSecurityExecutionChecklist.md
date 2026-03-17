@@ -96,10 +96,10 @@
 
 ### S3. Token 存储与校验能力
 
-- [ ] 增加 connector token 领域模型（`connector_id/token_id/token_secret_hash/status/issued_at/expires_at/rotated_at/metadata`）
-- [ ] 引入抗暴力破解哈希（优先 `argon2id`）
-- [ ] 支持状态机：`active/grace/revoked/expired`
-- [ ] 实现 token 解析规则 `dbt_<token_id>.<token_secret>`（按第一个 `.` 分割）
+- [x] 增加 connector token 领域模型（`connector_id/token_id/token_secret_hash/status/issued_at/expires_at/rotated_at/metadata`）
+- [x] 引入抗暴力破解哈希（优先 `argon2id`）
+- [x] 支持状态机：`active/grace/revoked/expired`
+- [x] 实现 token 解析规则 `dbt_<token_id>.<token_secret>`（按第一个 `.` 分割）
 
 验收标准：
 
@@ -108,12 +108,12 @@
 
 ### S4. TLS 接入模式落地（required/optional/plaintext）
 
-- [ ] 在 Bridge 配置层新增并校验 `tls_mode`
-- [ ] 在控制面接入层执行模式判定：
-- [ ] `required` 仅允许 TLS
-- [ ] `optional` 同时允许 TLS/明文
-- [ ] `plaintext` 仅允许明文
-- [ ] 为拒绝场景补齐明确日志与指标
+- [x] 在 Bridge 配置层新增并校验 `tls_mode`
+- [x] 在控制面接入层执行模式判定：
+- [x] `required` 仅允许 TLS
+- [x] `optional` 同时允许 TLS/明文
+- [x] `plaintext` 仅允许明文
+- [x] 为拒绝场景补齐明确日志与指标
 
 代码落点建议：
 
@@ -128,9 +128,9 @@
 
 ### S5. Agent TLS 校验与连接配置
 
-- [ ] 为 Agent 增加 Bridge TLS 配置（Root CA、ServerName、开关）
-- [ ] gRPC 通道移除默认 `insecure` 依赖，按配置启用 TLS 凭据
-- [ ] TCP binding 在 TLS 模式下支持证书链、SAN、有效期校验
+- [x] 为 Agent 增加 Bridge TLS 配置（Root CA、ServerName、开关）
+- [x] gRPC 通道移除默认 `insecure` 依赖，按配置启用 TLS 凭据
+- [x] TCP binding 在 TLS 模式下支持证书链、SAN、有效期校验
 - [ ] 显式禁用 TLS 1.3 Early Data（0-RTT）
 
 代码落点建议：
@@ -163,10 +163,10 @@
 
 ### S7. Session Epoch 权威与并发收敛
 
-- [ ] 落地 `assigned_session_epoch`（候选）与 `auth_ack.session_epoch`（最终权威）的一致性约束
-- [ ] 以 `connector_id` 粒度实现原子提交（事务/CAS/锁）
-- [ ] 成功抢占限流（如 60s 内最多 3 次）
-- [ ] 对并发失败握手统一返回 `auth_session_superseded`
+- [x] 落地 `assigned_session_epoch`（候选）与 `auth_ack.session_epoch`（最终权威）的一致性约束
+- [x] 以 `connector_id` 粒度实现原子提交（事务/CAS/锁）
+- [x] 成功抢占限流（如 60s 内最多 3 次）
+- [x] 对并发失败握手统一返回 `auth_session_superseded`
 
 验收标准：
 
@@ -175,10 +175,10 @@
 
 ### S8. 数据面关闭与回收语义对齐
 
-- [ ] 固化 simultaneous close 规则：必要时回 `TrafficCloseAck`，且仅一次
-- [ ] `TunnelRecycle` 发起权保持在 Bridge
-- [ ] Server 无法确认安全回收时直接关闭 tunnel
-- [ ] 双端并发 close 场景补齐时序回归测试
+- [x] 固化 simultaneous close 规则：必要时回 `TrafficCloseAck`，且仅一次
+- [x] `TunnelRecycle` 发起权保持在 Bridge
+- [x] Server 无法确认安全回收时直接关闭 tunnel
+- [x] 双端并发 close 场景补齐时序回归测试
 
 代码落点建议：
 
@@ -193,9 +193,9 @@
 
 ### S9. 回收错误码与告警口径统一
 
-- [ ] 对齐 `ltfp/errors/codes.go` 与协议文档错误码集合
-- [ ] 在 Agent/Bridge 回收拒绝分支统一填充错误码
-- [ ] 同步告警、诊断、日志字段映射
+- [x] 对齐 `ltfp/errors/codes.go` 与协议文档错误码集合
+- [x] 在 Agent/Bridge 回收拒绝分支统一填充错误码
+- [x] 同步告警、诊断、日志字段映射
 
 代码落点建议：
 
@@ -210,8 +210,8 @@
 
 ### S10. 观测与审计增强
 
-- [ ] 新增认证与握手指标：成功率、错误码分布、supersede 次数、rate limit 次数
-- [ ] 新增 TLS 模式拒绝指标：`required` 拒绝明文、`plaintext` 拒绝 TLS
+- [x] 新增认证与握手指标：成功率、错误码分布、supersede 次数、rate limit 次数
+- [x] 新增 TLS 模式拒绝指标：`required` 拒绝明文、`plaintext` 拒绝 TLS
 - [ ] 审计日志保留 `connector_id/token_id(脱敏)/session_id/session_epoch/source_ip/error_code`
 
 验收标准：

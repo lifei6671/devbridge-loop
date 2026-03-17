@@ -12,6 +12,7 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/adminapi"
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/web"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -32,8 +33,11 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	sharedMetrics := obs.NewMetrics()
 	// 先初始化数据面主链路依赖，确保控制面可复用同一份注册表真相源。
-	dataPlane, err := newRuntimeDataPlane(cfg)
+	dataPlane, err := newRuntimeDataPlaneWithDependencies(cfg, runtimeDataPlaneDependencies{
+		connectorMetrics: sharedMetrics,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +114,7 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 				BuildConfigSnapshot: func() map[string]any {
 					return adminConfigStore.snapshot()
 				},
+				Metrics: sharedMetrics,
 				ReloadConfig: func(now time.Time, actor string) (adminapi.ReloadConfigResult, error) {
 					return adminConfigStore.reload(now, actor)
 				},
@@ -162,6 +167,7 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 		routeRegistry:         dataPlane.routeRegistry,
 		tunnelRegistry:        dataPlane.tunnelRegistry,
 		tunnelPoolReportStore: tunnelPoolReportStore,
+		metrics:               sharedMetrics,
 	})
 	if err != nil {
 		return nil, err
@@ -185,11 +191,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 		normalizedContext = context.Background()
 	}
 	log.Printf(
-		"bridge runtime starting ingress_http_addr=%s ingress_grpc_addr=%s control_addr=%s control_grpc_addr=%s admin_enabled=%t admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
+		"bridge runtime starting ingress_http_addr=%s ingress_grpc_addr=%s control_addr=%s control_grpc_addr=%s control_tls_mode=%s admin_enabled=%t admin_addr=%s admin_ui_enabled=%t admin_ui_base_path=%s admin_ui_version=%s",
 		r.cfg.Ingress.HTTPAddr,
 		r.cfg.Ingress.GRPCAddr,
 		r.cfg.ControlPlane.ListenAddr,
 		r.cfg.ControlPlane.GRPCH2ListenAddr,
+		r.cfg.ControlPlane.TLSMode,
 		r.cfg.Admin.Enabled,
 		r.cfg.Admin.ListenAddr,
 		r.cfg.Admin.UIEnabled,

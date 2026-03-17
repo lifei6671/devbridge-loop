@@ -251,10 +251,12 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 
 				postCommitContext := detachedPostCommitContext(relayContext)
 				if closeErr := runtime.writeTunnelCloseAndAwaitAck(postCommitContext, tunnel, trafficID, "http_response_complete"); closeErr != nil {
-					// close_ack 等待失败时先不立即返回失败，继续交给 dispatcher 尝试 recycle，尽量保留可复用 tunnel。
+					// close_ack 闭环未完成时把 tunnel 标记为不可安全回收，后续由 dispatcher 直接关闭。
+					recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(closeErr)
 					log.Printf(
-						"bridge ingress http close-ack wait failed, continue recycle traffic_id=%s err=%v",
+						"bridge ingress http close-ack wait failed, fallback close traffic_id=%s recycle_error_code=%s err=%v",
 						strings.TrimSpace(trafficID),
+						recycleErrorCode,
 						closeErr,
 					)
 				}
@@ -621,6 +623,7 @@ func (runtime *Runtime) dispatchConnectorIngressWithRelay(
 		WaitHint:       defaultBridgeAcquireWaitHint,
 		PollInterval:   defaultBridgeAcquirePollInterval,
 		EnableNoIdleWT: true,
+		Metrics:        runtime.dataPlane.connectorMetrics,
 	})
 	if acquirerErr != nil {
 		return connectorproxy.DispatchResult{}, fmt.Errorf("dispatch connector ingress: new tunnel acquirer: %w", acquirerErr)
@@ -628,12 +631,14 @@ func (runtime *Runtime) dispatchConnectorIngressWithRelay(
 	openHandshake := connectorproxy.NewOpenHandshake(connectorproxy.OpenHandshakeOptions{
 		OpenTimeout:         defaultBridgeTrafficOpenTimeout,
 		LateAckDrainTimeout: defaultBridgeLateAckDrainTimeout,
+		Metrics:             runtime.dataPlane.connectorMetrics,
 	})
 	dispatcher, dispatcherErr := connectorproxy.NewDispatcher(connectorproxy.DispatcherOptions{
 		TunnelAcquirer: tunnelAcquirer,
 		OpenHandshake:  openHandshake,
 		Relay:          relay,
 		TunnelRegistry: runtime.dataPlane.tunnelRegistry,
+		Metrics:        runtime.dataPlane.connectorMetrics,
 		MaxReuseCount:  runtime.cfg.TunnelReuse.MaxReuseCount,
 		RecycleTimeout: runtime.cfg.TunnelReuse.RecycleTimeout,
 	})

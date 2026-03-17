@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 )
 
@@ -13,14 +14,18 @@ func TestConnectorAuthCoordinatorConcurrentCommitSuperseded(testingObject *testi
 	testingObject.Parallel()
 
 	sessionRegistry := registry.NewSessionRegistry()
+	metrics := obs.NewMetrics()
 	coordinator := newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
 		sessionRegistry: sessionRegistry,
+		metrics:         metrics,
 		tokenStore: newInMemoryConnectorTokenStore([]connectorTokenRecord{
 			{
-				TokenID:     "connector-a",
-				ConnectorID: "connector-a",
-				TokenSecret: "secret-a",
-				Status:      connectorTokenStatusActive,
+				TokenID:         "connector-a",
+				ConnectorID:     "connector-a",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-a"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
 			},
 		}),
 	})
@@ -41,15 +46,9 @@ func TestConnectorAuthCoordinatorConcurrentCommitSuperseded(testingObject *testi
 			<-startChannel
 			results[resultIndex] = coordinator.AuthenticateAndCommit(
 				request,
-				func(sessionID string, sessionEpoch uint64) error {
-					// 认证提交成功后把会话写入权威注册表。
-					sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-						SessionID:     sessionID,
-						ConnectorID:   "connector-a",
-						Epoch:         sessionEpoch,
-						State:         registry.SessionActive,
-						LastHeartbeat: time.Now().UTC(),
-					})
+				func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+					// 测试里沿用权威提交路径，确保并发条件与生产代码一致。
+					sessionRegistry.CommitAuthoritative(now, sessionRuntime)
 					return nil
 				},
 			)
@@ -72,6 +71,21 @@ func TestConnectorAuthCoordinatorConcurrentCommitSuperseded(testingObject *testi
 	if successCount != 1 || supersededCount != 1 {
 		testingObject.Fatalf("unexpected concurrent auth results: success=%d superseded=%d", successCount, supersededCount)
 	}
+	if metrics.BridgeAuthSuccessTotal() != 1 {
+		testingObject.Fatalf("unexpected auth success metric: got=%d want=1", metrics.BridgeAuthSuccessTotal())
+	}
+	if metrics.BridgeAuthFailureTotal() != 1 {
+		testingObject.Fatalf("unexpected auth failure metric: got=%d want=1", metrics.BridgeAuthFailureTotal())
+	}
+	if metrics.BridgeAuthErrorCodeTotal(connectorAuthErrorSessionSuperseded) != 1 {
+		testingObject.Fatalf(
+			"unexpected superseded error metric: got=%d want=1",
+			metrics.BridgeAuthErrorCodeTotal(connectorAuthErrorSessionSuperseded),
+		)
+	}
+	if metrics.BridgeAuthSupersedeTotal() != 0 {
+		testingObject.Fatalf("unexpected auth supersede metric: got=%d want=0", metrics.BridgeAuthSupersedeTotal())
+	}
 }
 
 // TestConnectorAuthCoordinatorSupersedeRateLimit 验证成功抢占超过阈值后会被限流拒绝。
@@ -87,14 +101,18 @@ func TestConnectorAuthCoordinatorSupersedeRateLimit(testingObject *testing.T) {
 		State:         registry.SessionActive,
 		LastHeartbeat: currentTime,
 	})
+	metrics := obs.NewMetrics()
 	coordinator := newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
 		sessionRegistry: sessionRegistry,
+		metrics:         metrics,
 		tokenStore: newInMemoryConnectorTokenStore([]connectorTokenRecord{
 			{
-				TokenID:     "connector-rate",
-				ConnectorID: "connector-rate",
-				TokenSecret: "secret-rate",
-				Status:      connectorTokenStatusActive,
+				TokenID:         "connector-rate",
+				ConnectorID:     "connector-rate",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-rate"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
 			},
 		}),
 		now: func() time.Time {
@@ -112,15 +130,9 @@ func TestConnectorAuthCoordinatorSupersedeRateLimit(testingObject *testing.T) {
 				authMethod:           "token",
 				token:                "dbt_connector-rate.secret-rate",
 			},
-			func(sessionID string, sessionEpoch uint64) error {
-				// 每次成功提交都更新当前 connector 的权威 session。
-				sessionRegistry.Upsert(currentTime, registry.SessionRuntime{
-					SessionID:     sessionID,
-					ConnectorID:   "connector-rate",
-					Epoch:         sessionEpoch,
-					State:         registry.SessionActive,
-					LastHeartbeat: currentTime,
-				})
+			func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+				// 每次成功提交都通过统一权威提交入口更新 connector 当前会话。
+				sessionRegistry.CommitAuthoritative(now, sessionRuntime)
 				return nil
 			},
 		)
@@ -137,14 +149,8 @@ func TestConnectorAuthCoordinatorSupersedeRateLimit(testingObject *testing.T) {
 			authMethod:           "token",
 			token:                "dbt_connector-rate.secret-rate",
 		},
-		func(sessionID string, sessionEpoch uint64) error {
-			sessionRegistry.Upsert(currentTime, registry.SessionRuntime{
-				SessionID:     sessionID,
-				ConnectorID:   "connector-rate",
-				Epoch:         sessionEpoch,
-				State:         registry.SessionActive,
-				LastHeartbeat: currentTime,
-			})
+		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			sessionRegistry.CommitAuthoritative(now, sessionRuntime)
 			return nil
 		},
 	)
@@ -153,6 +159,24 @@ func TestConnectorAuthCoordinatorSupersedeRateLimit(testingObject *testing.T) {
 	}
 	if limitedResult.errorCode != connectorAuthErrorRateLimited {
 		testingObject.Fatalf("unexpected rate-limit error code: got=%s want=%s", limitedResult.errorCode, connectorAuthErrorRateLimited)
+	}
+	if metrics.BridgeAuthSuccessTotal() != 3 {
+		testingObject.Fatalf("unexpected auth success metric: got=%d want=3", metrics.BridgeAuthSuccessTotal())
+	}
+	if metrics.BridgeAuthSupersedeTotal() != 3 {
+		testingObject.Fatalf("unexpected auth supersede metric: got=%d want=3", metrics.BridgeAuthSupersedeTotal())
+	}
+	if metrics.BridgeAuthFailureTotal() != 1 {
+		testingObject.Fatalf("unexpected auth failure metric: got=%d want=1", metrics.BridgeAuthFailureTotal())
+	}
+	if metrics.BridgeAuthRateLimitTotal() != 1 {
+		testingObject.Fatalf("unexpected auth rate-limit metric: got=%d want=1", metrics.BridgeAuthRateLimitTotal())
+	}
+	if metrics.BridgeAuthErrorCodeTotal(connectorAuthErrorRateLimited) != 1 {
+		testingObject.Fatalf(
+			"unexpected rate-limit error metric: got=%d want=1",
+			metrics.BridgeAuthErrorCodeTotal(connectorAuthErrorRateLimited),
+		)
 	}
 }
 
@@ -171,10 +195,12 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 		{
 			name: "invalid method",
 			record: connectorTokenRecord{
-				TokenID:     "connector-code",
-				ConnectorID: "connector-code",
-				TokenSecret: "secret-code",
-				Status:      connectorTokenStatusActive,
+				TokenID:         "connector-code",
+				ConnectorID:     "connector-code",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-code"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
 			},
 			request: connectorAuthRequest{
 				connectorID:          "connector-code",
@@ -187,10 +213,12 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 		{
 			name: "unknown token",
 			record: connectorTokenRecord{
-				TokenID:     "connector-code",
-				ConnectorID: "connector-code",
-				TokenSecret: "secret-code",
-				Status:      connectorTokenStatusActive,
+				TokenID:         "connector-code",
+				ConnectorID:     "connector-code",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-code"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
 			},
 			request: connectorAuthRequest{
 				connectorID:          "connector-code",
@@ -203,10 +231,12 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 		{
 			name: "connector mismatch",
 			record: connectorTokenRecord{
-				TokenID:     "connector-code",
-				ConnectorID: "connector-other",
-				TokenSecret: "secret-code",
-				Status:      connectorTokenStatusActive,
+				TokenID:         "connector-code",
+				ConnectorID:     "connector-other",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-code"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
 			},
 			request: connectorAuthRequest{
 				connectorID:          "connector-code",
@@ -219,10 +249,12 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 		{
 			name: "token revoked",
 			record: connectorTokenRecord{
-				TokenID:     "connector-code",
-				ConnectorID: "connector-code",
-				TokenSecret: "secret-code",
-				Status:      connectorTokenStatusRevoked,
+				TokenID:         "connector-code",
+				ConnectorID:     "connector-code",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-code"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusRevoked,
 			},
 			request: connectorAuthRequest{
 				connectorID:          "connector-code",
@@ -235,11 +267,13 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 		{
 			name: "token expired by timestamp",
 			record: connectorTokenRecord{
-				TokenID:     "connector-code",
-				ConnectorID: "connector-code",
-				TokenSecret: "secret-code",
-				Status:      connectorTokenStatusActive,
-				ExpiresAt:   now.Add(-time.Second),
+				TokenID:         "connector-code",
+				ConnectorID:     "connector-code",
+				TokenSecretHash: mustHashConnectorTokenSecretArgon2ID("secret-code"),
+				HashAlgorithm:   connectorTokenHashAlgorithmArgon2ID,
+				HashVersion:     connectorTokenHashVersionV1,
+				Status:          connectorTokenStatusActive,
+				ExpiresAt:       now.Add(-time.Second),
 			},
 			request: connectorAuthRequest{
 				connectorID:          "connector-code",
@@ -257,8 +291,10 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 			testingObject.Parallel()
 
 			commitCalled := false
+			metrics := obs.NewMetrics()
 			coordinator := newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
 				sessionRegistry: registry.NewSessionRegistry(),
+				metrics:         metrics,
 				tokenStore: newInMemoryConnectorTokenStore([]connectorTokenRecord{
 					testCase.record,
 				}),
@@ -268,7 +304,9 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 			})
 			result := coordinator.AuthenticateAndCommit(
 				testCase.request,
-				func(sessionID string, sessionEpoch uint64) error {
+				func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+					_ = now
+					_ = sessionRuntime
 					commitCalled = true
 					return nil
 				},
@@ -282,6 +320,54 @@ func TestConnectorAuthCoordinatorErrorCodeMapping(testingObject *testing.T) {
 			if commitCalled != testCase.wantCommit {
 				testingObject.Fatalf("unexpected commit callback state: got=%t want=%t", commitCalled, testCase.wantCommit)
 			}
+			if metrics.BridgeAuthFailureTotal() != 1 {
+				testingObject.Fatalf("unexpected auth failure metric: got=%d want=1", metrics.BridgeAuthFailureTotal())
+			}
+			if metrics.BridgeAuthErrorCodeTotal(testCase.wantCode) != 1 {
+				testingObject.Fatalf(
+					"unexpected error code metric: got=%d want=1 code=%s",
+					metrics.BridgeAuthErrorCodeTotal(testCase.wantCode),
+					testCase.wantCode,
+				)
+			}
 		})
+	}
+}
+
+// TestVerifyConnectorTokenSecretArgon2ID 验证 token secret 会按 argon2id 哈希校验。
+func TestVerifyConnectorTokenSecretArgon2ID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	encodedHash := mustHashConnectorTokenSecretArgon2ID("secret-hash")
+	matched, err := verifyConnectorTokenSecret("secret-hash", encodedHash)
+	if err != nil {
+		testingObject.Fatalf("verify connector token secret failed: %v", err)
+	}
+	if !matched {
+		testingObject.Fatalf("expected token secret hash matched")
+	}
+
+	mismatched, err := verifyConnectorTokenSecret("secret-other", encodedHash)
+	if err != nil {
+		testingObject.Fatalf("verify mismatched connector token secret failed: %v", err)
+	}
+	if mismatched {
+		testingObject.Fatalf("expected token secret hash mismatch")
+	}
+}
+
+// TestParseConnectorTokenUsesFirstDot 验证 token 按第一个点切分 token_id 与 token_secret。
+func TestParseConnectorTokenUsesFirstDot(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tokenID, tokenSecret, ok := parseConnectorToken("dbt_connector-id.secret.with.dot")
+	if !ok {
+		testingObject.Fatalf("expected connector token parsed")
+	}
+	if tokenID != "connector-id" {
+		testingObject.Fatalf("unexpected token id: got=%s want=%s", tokenID, "connector-id")
+	}
+	if tokenSecret != "secret.with.dot" {
+		testingObject.Fatalf("unexpected token secret: got=%s want=%s", tokenSecret, "secret.with.dot")
 	}
 }

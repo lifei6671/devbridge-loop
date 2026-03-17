@@ -32,6 +32,7 @@ control_plane:
   listen_addr: ":49080"
   grpc_h2_listen_addr: ":49082"
   heartbeat_timeout: 45s
+  tls_mode: plaintext
 observability:
   log_level: debug
 `
@@ -50,6 +51,9 @@ observability:
 	}
 	if config.ControlPlane.HeartbeatTimeout != 45*time.Second {
 		testingObject.Fatalf("unexpected heartbeat timeout: got=%s want=%s", config.ControlPlane.HeartbeatTimeout, 45*time.Second)
+	}
+	if config.ControlPlane.TLSMode != string(controlPlaneTLSModePlaintext) {
+		testingObject.Fatalf("unexpected tls mode: got=%s want=%s", config.ControlPlane.TLSMode, controlPlaneTLSModePlaintext)
 	}
 	// 未在 YAML 中配置的字段应继续沿用默认值。
 	if config.Ingress.HTTPAddr != ":38080" {
@@ -133,6 +137,9 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	config.ControlPlane.ListenAddr = ":19080"
 	config.ControlPlane.GRPCH2ListenAddr = ":19082"
 	config.ControlPlane.HeartbeatTimeout = 45 * time.Second
+	config.ControlPlane.TLSMode = string(controlPlaneTLSModeOptional)
+	config.ControlPlane.TLSCertFile = "/tmp/bridge-cert.pem"
+	config.ControlPlane.TLSKeyFile = "/tmp/bridge-key.pem"
 	config.Admin.BasePath = "/console"
 	config.Observability.LogLevel = "debug"
 
@@ -152,6 +159,9 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 			loadedConfig.ControlPlane.HeartbeatTimeout,
 			config.ControlPlane.HeartbeatTimeout,
 		)
+	}
+	if loadedConfig.ControlPlane.TLSMode != config.ControlPlane.TLSMode {
+		testingObject.Fatalf("unexpected control_plane.tls_mode: got=%s want=%s", loadedConfig.ControlPlane.TLSMode, config.ControlPlane.TLSMode)
 	}
 	if loadedConfig.Admin.BasePath != config.Admin.BasePath {
 		testingObject.Fatalf("unexpected admin.base_path: got=%s want=%s", loadedConfig.Admin.BasePath, config.Admin.BasePath)

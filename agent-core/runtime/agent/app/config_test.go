@@ -77,6 +77,17 @@ func TestValidateRejectsEmptyAuthToken(testingObject *testing.T) {
 	}
 }
 
+// TestValidateRejectsMissingBridgeTLSRootCA 验证启用 Bridge TLS 时必须显式提供 Root CA 文件。
+func TestValidateRejectsMissingBridgeTLSRootCA(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.BridgeTLS.Enabled = true
+	config.BridgeTLS.RootCAFile = ""
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for empty bridge tls root ca")
+	}
+}
+
 // TestApplyTunnelPoolOverridePartial 验证外部只传部分字段时其余字段保持默认值。
 func TestApplyTunnelPoolOverridePartial(testingObject *testing.T) {
 	testingObject.Parallel()

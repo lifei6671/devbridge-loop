@@ -337,6 +337,94 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 	}
 }
 
+// TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose 验证 close_ack 超时后不会继续 recycle，而是直接关闭 tunnel。
+func TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	runtime.cfg.TunnelReuse.CloseAckTimeout = 20 * time.Millisecond
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID:     "route-http-close-timeout-close",
+		Namespace:   "dev",
+		Environment: "demo",
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.close-timeout.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				ServiceKey: "dev/demo/order-service",
+			},
+		},
+	})
+
+	testTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-close-timeout-close")
+	go func() {
+		for {
+			writes := testTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: writes[0].OpenReq.TrafficID,
+				Success:   true,
+			}})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"),
+			})
+			return
+		}
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
+	request.Host = "api.close-timeout.local"
+	request.Header.Set("X-Namespace", "dev")
+	request.Header.Set("X-Env", "demo")
+	recorder := httptest.NewRecorder()
+	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status code: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if recorder.Body.String() != "hello" {
+		testingObject.Fatalf("unexpected response body: got=%s want=%s", recorder.Body.String(), "hello")
+	}
+	if testTunnel.closeCount != 1 {
+		testingObject.Fatalf("expected tunnel closed once after close_ack timeout, got=%d", testTunnel.closeCount)
+	}
+	writes := testTunnel.Writes()
+	closeCount := 0
+	recycleCount := 0
+	for _, payload := range writes {
+		if payload.Close != nil {
+			closeCount++
+		}
+		if payload.Recycle != nil {
+			recycleCount++
+		}
+	}
+	if closeCount != 1 {
+		testingObject.Fatalf("expected one close write before fallback close, got=%d", closeCount)
+	}
+	if recycleCount != 0 {
+		testingObject.Fatalf("expected no recycle write after close_ack timeout, got=%d", recycleCount)
+	}
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 0 {
+		testingObject.Fatalf("expected tunnel removed from registry after fallback close, total=%d", snapshot.TotalCount)
+	}
+}
+
 // TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle
 // 验证 grpc_h2 tunnel 在回收前会先写 close，避免 recycle 抢先到达 Agent relay 阶段。
 func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingObject *testing.T) {
@@ -382,6 +470,12 @@ func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingOb
 			})
 			testTunnel.EnqueueReadPayload(pb.StreamPayload{
 				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"),
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: trafficID,
+					Accepted:  true,
+				},
 			})
 			testTunnel.EnqueueReadPayload(pb.StreamPayload{
 				RecycleAck: &pb.TunnelRecycleAck{

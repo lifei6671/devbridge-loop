@@ -3,6 +3,7 @@ package connectorproxy
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,14 +55,25 @@ type connectorProxyTestTunnel struct {
 	writes     []pb.StreamPayload
 	failReset  bool
 	probeError error
-	probeCount atomic.Int32
-	closeCount atomic.Int32
+	flushError error
+	recyclable bool
+
+	closeAckStateMutex sync.Mutex
+	closeAckSentByID   map[string]struct{}
+
+	unsafeRecycleMutex     sync.Mutex
+	unsafeRecycleErrorCode string
+	unsafeRecycleReason    string
+	probeCount             atomic.Int32
+	closeCount             atomic.Int32
 }
 
 func newConnectorProxyTestTunnel(tunnelID string) *connectorProxyTestTunnel {
 	return &connectorProxyTestTunnel{
-		tunnelID:  tunnelID,
-		readQueue: make(chan connectorProxyReadResult, 16),
+		tunnelID:         tunnelID,
+		readQueue:        make(chan connectorProxyReadResult, 16),
+		recyclable:       true,
+		closeAckSentByID: make(map[string]struct{}),
 	}
 }
 
@@ -98,6 +110,77 @@ func (tunnel *connectorProxyTestTunnel) Close() error {
 	return nil
 }
 
+func (tunnel *connectorProxyTestTunnel) Flush() error {
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	return tunnel.flushError
+}
+
+func (tunnel *connectorProxyTestTunnel) Recyclable() bool {
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	return tunnel.recyclable
+}
+
+func (tunnel *connectorProxyTestTunnel) SetFlushError(err error) {
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	tunnel.flushError = err
+}
+
+func (tunnel *connectorProxyTestTunnel) SetRecyclable(recyclable bool) {
+	tunnel.writeMutex.Lock()
+	defer tunnel.writeMutex.Unlock()
+	tunnel.recyclable = recyclable
+}
+
+func (tunnel *connectorProxyTestTunnel) TryMarkCloseAckSent(trafficID string) bool {
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return false
+	}
+	tunnel.closeAckStateMutex.Lock()
+	defer tunnel.closeAckStateMutex.Unlock()
+	if tunnel.closeAckSentByID == nil {
+		tunnel.closeAckSentByID = make(map[string]struct{})
+	}
+	if _, exists := tunnel.closeAckSentByID[normalizedTrafficID]; exists {
+		return false
+	}
+	tunnel.closeAckSentByID[normalizedTrafficID] = struct{}{}
+	return true
+}
+
+func (tunnel *connectorProxyTestTunnel) ClearCloseAckSent(trafficID string) {
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return
+	}
+	tunnel.closeAckStateMutex.Lock()
+	defer tunnel.closeAckStateMutex.Unlock()
+	delete(tunnel.closeAckSentByID, normalizedTrafficID)
+}
+
+func (tunnel *connectorProxyTestTunnel) MarkUnsafeToRecycle(errorCode string, reason string) {
+	tunnel.unsafeRecycleMutex.Lock()
+	defer tunnel.unsafeRecycleMutex.Unlock()
+	tunnel.unsafeRecycleErrorCode = strings.TrimSpace(errorCode)
+	tunnel.unsafeRecycleReason = strings.TrimSpace(reason)
+}
+
+func (tunnel *connectorProxyTestTunnel) ConsumeUnsafeToRecycle() (string, string, bool) {
+	tunnel.unsafeRecycleMutex.Lock()
+	defer tunnel.unsafeRecycleMutex.Unlock()
+	normalizedErrorCode := strings.TrimSpace(tunnel.unsafeRecycleErrorCode)
+	normalizedReason := strings.TrimSpace(tunnel.unsafeRecycleReason)
+	if normalizedErrorCode == "" && normalizedReason == "" {
+		return "", "", false
+	}
+	tunnel.unsafeRecycleErrorCode = ""
+	tunnel.unsafeRecycleReason = ""
+	return normalizedErrorCode, normalizedReason, true
+}
+
 func (tunnel *connectorProxyTestTunnel) Probe(ctx context.Context) error {
 	tunnel.probeCount.Add(1)
 	select {
@@ -112,6 +195,10 @@ func (tunnel *connectorProxyTestTunnel) Probe(ctx context.Context) error {
 
 func (tunnel *connectorProxyTestTunnel) EnqueueReadPayload(payload pb.StreamPayload) {
 	tunnel.readQueue <- connectorProxyReadResult{payload: payload}
+}
+
+func (tunnel *connectorProxyTestTunnel) EnqueueReadError(err error) {
+	tunnel.readQueue <- connectorProxyReadResult{err: err}
 }
 
 func (tunnel *connectorProxyTestTunnel) Writes() []pb.StreamPayload {
@@ -676,6 +763,145 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	}
 	if writes[1].Recycle == nil || writes[1].Recycle.TunnelID != "tunnel-1" || writes[1].Recycle.RecycleSeq != 1 || writes[1].Recycle.IsFinal {
 		testingObject.Fatalf("expected second write is non-final recycle request")
+	}
+}
+
+// TestDispatcherDispatchFallsBackToCloseWhenTunnelNotRecyclable 验证 Bridge 无法确认安全回收时会直接关闭 tunnel。
+func TestDispatcherDispatchFallsBackToCloseWhenTunnelNotRecyclable(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	metrics := obs.NewMetrics()
+	tunnel := newConnectorProxyTestTunnel("tunnel-no-recycle")
+	tunnel.SetRecyclable(false)
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID: "traffic-no-recycle",
+			Success:   true,
+		},
+	})
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel); err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry: tunnelRegistry,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: time.Second}),
+		Relay: RelayFunc(func(context.Context, registry.RuntimeTunnel, string) error {
+			return nil
+		}),
+		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	result, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
+		ConnectorID: "connector-1",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-no-recycle",
+			ServiceID: "svc-1",
+		},
+	})
+	if dispatchErr != nil {
+		testingObject.Fatalf("dispatch should still succeed when recycle degrades to close: %v", dispatchErr)
+	}
+	if result.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected status code: %d", result.HTTPStatus)
+	}
+	if tunnel.CloseCount() != 1 {
+		testingObject.Fatalf("expected tunnel closed once when recycle is unsafe, got=%d", tunnel.CloseCount())
+	}
+	if metrics.BridgeTunnelRecycleFailureTotal() != 1 {
+		testingObject.Fatalf("expected recycle failure metric increment once, got=%d", metrics.BridgeTunnelRecycleFailureTotal())
+	}
+	if metrics.BridgeTunnelRecycleErrorCodeTotal(ltfperrors.CodeTunnelRecycleTunnelUnhealthy) != 1 {
+		testingObject.Fatalf(
+			"expected tunnel_unhealthy recycle code total increment once, got=%d",
+			metrics.BridgeTunnelRecycleErrorCodeTotal(ltfperrors.CodeTunnelRecycleTunnelUnhealthy),
+		)
+	}
+	if _, exists := tunnelRegistry.Get("tunnel-no-recycle"); exists {
+		testingObject.Fatalf("expected unsafe-to-recycle tunnel removed from registry")
+	}
+	writes := tunnel.Writes()
+	if len(writes) != 1 || writes[0].OpenReq == nil {
+		testingObject.Fatalf("expected only open request write before fallback close, got=%+v", writes)
+	}
+}
+
+// TestDispatcherDispatchRecordsRecycleRejectMetrics 验证 peer recycle reject 会写入统一错误码指标。
+func TestDispatcherDispatchRecordsRecycleRejectMetrics(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	metrics := obs.NewMetrics()
+	tunnel := newConnectorProxyTestTunnel("tunnel-recycle-reject-metrics")
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID: "traffic-recycle-reject",
+			Success:   true,
+		},
+	})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:     "tunnel-recycle-reject-metrics",
+			RecycleSeq:   1,
+			Accepted:     false,
+			ErrorCode:    ltfperrors.CodeTunnelRecycleCloseAckRequired,
+			ErrorMessage: "close ack must be observed before recycle",
+		},
+	})
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-1", "session-1", tunnel); err != nil {
+		testingObject.Fatalf("upsert idle tunnel failed: %v", err)
+	}
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry: tunnelRegistry,
+		Metrics:  metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: time.Second, Metrics: metrics}),
+		Relay: RelayFunc(func(context.Context, registry.RuntimeTunnel, string) error {
+			return nil
+		}),
+		TunnelRegistry: tunnelRegistry,
+		Metrics:        metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	_, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
+		ConnectorID: "connector-1",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-recycle-reject",
+			ServiceID: "svc-1",
+		},
+	})
+	if dispatchErr == nil {
+		testingObject.Fatalf("expected recycle reject dispatch error")
+	}
+	if ltfperrors.ExtractTunnelRecycleCode(dispatchErr) != ltfperrors.CodeTunnelRecycleCloseAckRequired {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(dispatchErr), dispatchErr)
+	}
+	if metrics.BridgeTunnelRecycleFailureTotal() != 1 {
+		testingObject.Fatalf("expected recycle failure metric increment once, got=%d", metrics.BridgeTunnelRecycleFailureTotal())
+	}
+	if metrics.BridgeTunnelRecycleErrorCodeTotal(ltfperrors.CodeTunnelRecycleCloseAckRequired) != 1 {
+		testingObject.Fatalf(
+			"expected close_ack_required recycle code total increment once, got=%d",
+			metrics.BridgeTunnelRecycleErrorCodeTotal(ltfperrors.CodeTunnelRecycleCloseAckRequired),
+		)
 	}
 }
 

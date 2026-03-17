@@ -132,11 +132,7 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		if opener.runtime.tcpTransport == nil {
 			return nil, errors.New("tcp transport is not initialized")
 		}
-		rawTunnel, err := opener.runtime.tcpTransport.DialTunnel(
-			ctx,
-			opener.runtime.cfg.BridgeAddr,
-			tunnelMeta,
-		)
+		rawTunnel, err := opener.runtime.openBridgeTCPTunnel(ctx, tunnelMeta)
 		if err != nil {
 			opener.runtime.appendDiagnoseEvent(runtimeDiagnoseEvent{
 				Level:        events.EventWarn,
@@ -817,8 +813,13 @@ func (r *Runtime) connectBridgeControlTCP(ctx context.Context) error {
 	}
 	dialContext, cancelDial := context.WithTimeout(ctx, dialTimeout)
 	defer cancelDial()
-	controlChannel, err := r.tcpTransport.DialControlChannel(dialContext, r.cfg.BridgeAddr)
+	rawConn, err := dialBridgeTCPConn(dialContext, r.cfg.BridgeAddr, dialTimeout, r.cfg.BridgeTLS)
 	if err != nil {
+		return fmt.Errorf("dial bridge control tcp connection failed: %w", err)
+	}
+	controlChannel, err := r.tcpTransport.OpenControlChannel(rawConn)
+	if err != nil {
+		_ = rawConn.Close()
 		return fmt.Errorf("dial bridge control channel failed: %w", err)
 	}
 
@@ -846,9 +847,16 @@ func (r *Runtime) connectBridgeControlGRPC(ctx context.Context) error {
 	dialContext, cancelDial := context.WithTimeout(ctx, dialTimeout)
 	defer cancelDial()
 	dialOptions := append([]grpc.DialOption{}, r.grpcTransport.DialOptions()...)
+	transportCredentials, err := buildBridgeGRPCTransportCredentials(r.cfg.BridgeTLS, r.cfg.BridgeAddr)
+	if err != nil {
+		return fmt.Errorf("build bridge grpc transport credentials failed: %w", err)
+	}
+	if transportCredentials == nil {
+		transportCredentials = insecure.NewCredentials()
+	}
 	dialOptions = append(
 		dialOptions,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(transportCredentials),
 		grpc.WithBlock(),
 	)
 	clientConn, err := grpc.DialContext(dialContext, r.cfg.BridgeAddr, dialOptions...)
@@ -869,6 +877,35 @@ func (r *Runtime) connectBridgeControlGRPC(ctx context.Context) error {
 	r.bridgeMu.Unlock()
 	r.setBridgeConnected(newRuntimeSessionID())
 	return nil
+}
+
+// openBridgeTCPTunnel 为 tcp_framed binding 建立底层连接，并在需要时启用 TLS。
+func (r *Runtime) openBridgeTCPTunnel(ctx context.Context, tunnelMeta transport.TunnelMeta) (*tcpbinding.TCPTunnel, error) {
+	if r == nil {
+		return nil, errors.New("runtime is nil")
+	}
+	if r.tcpTransport == nil {
+		return nil, errors.New("tcp transport is not initialized")
+	}
+	rawConn, err := dialBridgeTCPConn(ctx, r.cfg.BridgeAddr, r.bridgeTunnelDialTimeout(), r.cfg.BridgeTLS)
+	if err != nil {
+		return nil, fmt.Errorf("open bridge tcp tunnel: dial tcp conn: %w", err)
+	}
+	rawTunnel, err := r.tcpTransport.OpenTunnel(rawConn, tunnelMeta)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("open bridge tcp tunnel: open tcp tunnel: %w", err)
+	}
+	return rawTunnel, nil
+}
+
+// bridgeTunnelDialTimeout 返回数据面 tunnel 建连应使用的拨号超时。
+func (r *Runtime) bridgeTunnelDialTimeout() time.Duration {
+	if r == nil || r.tcpTransport == nil {
+		return 0
+	}
+	// tunnel 建连沿用 tcp transport 自身的超时配置，避免被控制面重连预算误伤。
+	return r.tcpTransport.Config().DialTimeout
 }
 
 func writeControlFrameWithPriority(

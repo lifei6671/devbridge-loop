@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,6 +24,14 @@ type SessionRuntime struct {
 	State         SessionState
 	LastHeartbeat time.Time
 	UpdatedAt     time.Time
+}
+
+// AuthoritativeSessionCommitResult 描述一次 connector 权威会话提交的结果。
+type AuthoritativeSessionCommitResult struct {
+	PreviousSession      SessionRuntime
+	PreviousExists       bool
+	PreviousStateChanged bool
+	CurrentSession       SessionRuntime
 }
 
 // SessionRegistry 跟踪 connector 的 session 视图。
@@ -51,6 +60,77 @@ func (r *SessionRegistry) Upsert(now time.Time, runtime SessionRuntime) {
 	if runtime.ConnectorID != "" {
 		r.byConnector[runtime.ConnectorID] = runtime.SessionID
 	}
+}
+
+// CommitAuthoritative 原子提交 connector 当前权威会话，并在必要时把旧会话降为 DRAINING。
+func (r *SessionRegistry) CommitAuthoritative(
+	now time.Time,
+	runtime SessionRuntime,
+) (AuthoritativeSessionCommitResult, bool) {
+	if r == nil {
+		return AuthoritativeSessionCommitResult{}, false
+	}
+	normalizedSessionID := strings.TrimSpace(runtime.SessionID)
+	normalizedConnectorID := strings.TrimSpace(runtime.ConnectorID)
+	if normalizedSessionID == "" || normalizedConnectorID == "" || runtime.Epoch == 0 {
+		return AuthoritativeSessionCommitResult{}, false
+	}
+	normalizedNow := now.UTC()
+	if normalizedNow.IsZero() {
+		normalizedNow = time.Now().UTC()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result := AuthoritativeSessionCommitResult{}
+	if existingSession, exists := r.bySessionID[normalizedSessionID]; exists && existingSession.Epoch > runtime.Epoch {
+		// 同 session_id 不允许被更低 epoch 事件回退覆盖。
+		return result, false
+	}
+	if currentSessionID, exists := r.byConnector[normalizedConnectorID]; exists {
+		if currentSession, currentExists := r.bySessionID[currentSessionID]; currentExists {
+			result.PreviousSession = *currentSession
+			result.PreviousExists = true
+			if strings.TrimSpace(currentSession.SessionID) != normalizedSessionID {
+				if currentSession.Epoch > runtime.Epoch {
+					switch currentSession.State {
+					case SessionStale, SessionClosed:
+						// 旧权威已终态时，允许 Agent 重启后的低 epoch 连接重新接管。
+					default:
+						return result, false
+					}
+				}
+				if currentSession.Epoch == runtime.Epoch {
+					switch currentSession.State {
+					case SessionStale, SessionClosed:
+						// 同 epoch 但旧权威已终态时允许同代接管。
+					default:
+						return result, false
+					}
+				}
+				if currentSession.State == SessionActive || currentSession.State == SessionDraining {
+					currentSession.State = SessionDraining
+					currentSession.UpdatedAt = normalizedNow
+					result.PreviousSession = *currentSession
+					result.PreviousStateChanged = true
+				}
+			}
+		}
+	}
+
+	runtime.SessionID = normalizedSessionID
+	runtime.ConnectorID = normalizedConnectorID
+	runtime.UpdatedAt = normalizedNow
+	if runtime.State == SessionActive && runtime.LastHeartbeat.IsZero() {
+		// 认证成功瞬间即视为该 session 已存活，便于后续 heartbeat timeout 计算。
+		runtime.LastHeartbeat = normalizedNow
+	}
+	copy := runtime
+	r.bySessionID[normalizedSessionID] = &copy
+	r.byConnector[normalizedConnectorID] = normalizedSessionID
+	result.CurrentSession = copy
+	return result, true
 }
 
 // MarkState 更新 session 状态，返回是否更新成功。

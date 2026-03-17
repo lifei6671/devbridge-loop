@@ -39,6 +39,7 @@ type runtimeTrafficTestTunnel struct {
 
 	closeAckMutex      sync.Mutex
 	closeAckObservedBy map[string]struct{}
+	closeAckSentBy     map[string]struct{}
 }
 
 // newRuntimeTrafficTestTunnel 创建带读写缓冲的测试 tunnel。
@@ -47,6 +48,7 @@ func newRuntimeTrafficTestTunnel(tunnelID string) *runtimeTrafficTestTunnel {
 		id:                 tunnelID,
 		readQueue:          make(chan runtimeTrafficTestReadResult, 8),
 		closeAckObservedBy: make(map[string]struct{}),
+		closeAckSentBy:     make(map[string]struct{}),
 	}
 }
 
@@ -102,6 +104,11 @@ func (tunnel *runtimeTrafficTestTunnel) EnqueueReadPayload(payload pb.StreamPayl
 	tunnel.readQueue <- runtimeTrafficTestReadResult{payload: payload}
 }
 
+// EnqueueReadError 预置下一次 ReadPayload 返回错误。
+func (tunnel *runtimeTrafficTestTunnel) EnqueueReadError(err error) {
+	tunnel.readQueue <- runtimeTrafficTestReadResult{err: err}
+}
+
 // Writes 返回写入 payload 的副本。
 func (tunnel *runtimeTrafficTestTunnel) Writes() []pb.StreamPayload {
 	tunnel.writeMutex.Lock()
@@ -132,6 +139,24 @@ func (tunnel *runtimeTrafficTestTunnel) MarkCloseAckObserved(trafficID string) {
 	tunnel.closeAckObservedBy[normalizedTrafficID] = struct{}{}
 }
 
+// TryMarkCloseAckSent 记录某条 traffic 的 close_ack 是否已发送。
+func (tunnel *runtimeTrafficTestTunnel) TryMarkCloseAckSent(trafficID string) bool {
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return false
+	}
+	tunnel.closeAckMutex.Lock()
+	defer tunnel.closeAckMutex.Unlock()
+	if tunnel.closeAckSentBy == nil {
+		tunnel.closeAckSentBy = make(map[string]struct{})
+	}
+	if _, exists := tunnel.closeAckSentBy[normalizedTrafficID]; exists {
+		return false
+	}
+	tunnel.closeAckSentBy[normalizedTrafficID] = struct{}{}
+	return true
+}
+
 // HasCloseAckObserved 判断某条 traffic 是否已观测到 close_ack。
 func (tunnel *runtimeTrafficTestTunnel) HasCloseAckObserved(trafficID string) bool {
 	normalizedTrafficID := strings.TrimSpace(trafficID)
@@ -153,6 +178,7 @@ func (tunnel *runtimeTrafficTestTunnel) ClearCloseAckObserved(trafficID string) 
 	tunnel.closeAckMutex.Lock()
 	defer tunnel.closeAckMutex.Unlock()
 	delete(tunnel.closeAckObservedBy, normalizedTrafficID)
+	delete(tunnel.closeAckSentBy, normalizedTrafficID)
 }
 
 // runtimeTrafficTestManagerOpener 仅用于满足 NewManager 构造依赖，测试中不会触发真实建连。
@@ -438,6 +464,9 @@ func TestHandleTunnelRecyclePhaseRejectsRecycleWithoutCloseAck(testingObject *te
 	if recycled || finalClose {
 		testingObject.Fatalf("unexpected recycle result recycled=%t finalClose=%t", recycled, finalClose)
 	}
+	if ltfperrors.ExtractTunnelRecycleCode(recycleErr) != ltfperrors.CodeTunnelRecycleCloseAckRequired {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(recycleErr), recycleErr)
+	}
 
 	writes := testTunnel.Writes()
 	if len(writes) != 1 || writes[0].RecycleAck == nil {
@@ -497,6 +526,100 @@ func TestHandleTunnelRecyclePhaseAcceptsRecycleWhenCloseAckObservedInRelay(testi
 	writes := testTunnel.Writes()
 	if len(writes) != 1 || writes[0].RecycleAck == nil || !writes[0].RecycleAck.Accepted {
 		testingObject.Fatalf("expected one accepted recycle_ack write, got=%+v", writes)
+	}
+}
+
+// TestHandleTunnelRecyclePhaseReturnsDeadlineHitCode 验证等待 recycle 载荷超时时会返回统一 deadline_hit 错误码。
+func TestHandleTunnelRecyclePhaseReturnsDeadlineHitCode(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime, registry := newRuntimeWithTrafficWorkerDependenciesForTest(testingObject)
+	testTunnel := newRuntimeTrafficTestTunnel("agent-tunnel-recycle-timeout")
+
+	added, addErr := registry.TryAddOpenedAsIdle(time.Now().UTC(), testTunnel, 2)
+	if addErr != nil {
+		testingObject.Fatalf("add idle tunnel failed: %v", addErr)
+	}
+	if !added {
+		testingObject.Fatalf("expected idle tunnel added")
+	}
+	if activateErr := runtime.tunnelManager.ActivateIdle(testTunnel.ID()); activateErr != nil {
+		testingObject.Fatalf("activate tunnel failed: %v", activateErr)
+	}
+
+	testTunnel.EnqueueReadError(context.DeadlineExceeded)
+
+	recycled, finalClose, recycleErr := runtime.handleTunnelRecyclePhase(
+		context.Background(),
+		testTunnel.ID(),
+		"traffic-timeout",
+		testTunnel,
+	)
+	if recycleErr == nil {
+		testingObject.Fatalf("expected recycle phase timeout error")
+	}
+	if recycled || finalClose {
+		testingObject.Fatalf("unexpected recycle result recycled=%t finalClose=%t", recycled, finalClose)
+	}
+	if ltfperrors.ExtractTunnelRecycleCode(recycleErr) != ltfperrors.CodeTunnelRecycleDeadlineHit {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(recycleErr), recycleErr)
+	}
+	if len(testTunnel.Writes()) != 0 {
+		testingObject.Fatalf("expected no recycle ack writes on read timeout, got=%+v", testTunnel.Writes())
+	}
+}
+
+// TestHandleTunnelRecyclePhaseDoesNotRepeatCloseAck 验证 recycle 阶段再次收到 close 时不会重复回 ACK。
+func TestHandleTunnelRecyclePhaseDoesNotRepeatCloseAck(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime, registry := newRuntimeWithTrafficWorkerDependenciesForTest(testingObject)
+	testTunnel := newRuntimeTrafficTestTunnel("agent-tunnel-close-ack-once")
+
+	added, addErr := registry.TryAddOpenedAsIdle(time.Now().UTC(), testTunnel, 2)
+	if addErr != nil {
+		testingObject.Fatalf("add idle tunnel failed: %v", addErr)
+	}
+	if !added {
+		testingObject.Fatalf("expected idle tunnel added")
+	}
+	if activateErr := runtime.tunnelManager.ActivateIdle(testTunnel.ID()); activateErr != nil {
+		testingObject.Fatalf("activate tunnel failed: %v", activateErr)
+	}
+	if !testTunnel.TryMarkCloseAckSent("traffic-1") {
+		testingObject.Fatalf("expected initial close_ack sent mark success")
+	}
+
+	testTunnel.EnqueueReadPayload(pb.StreamPayload{
+		Close: &pb.TrafficClose{
+			TrafficID: "traffic-1",
+			Reason:    "bridge_close_retry",
+		},
+	})
+	testTunnel.EnqueueReadPayload(pb.StreamPayload{
+		Recycle: &pb.TunnelRecycle{
+			TunnelID:   testTunnel.ID(),
+			RecycleSeq: 1,
+			IsFinal:    false,
+		},
+	})
+
+	recycled, finalClose, recycleErr := runtime.handleTunnelRecyclePhase(
+		context.Background(),
+		testTunnel.ID(),
+		"traffic-1",
+		testTunnel,
+	)
+	if recycleErr != nil {
+		testingObject.Fatalf("expected recycle success after duplicate close, got=%v", recycleErr)
+	}
+	if !recycled || finalClose {
+		testingObject.Fatalf("unexpected recycle result recycled=%t finalClose=%t", recycled, finalClose)
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) != 1 || writes[0].RecycleAck == nil || !writes[0].RecycleAck.Accepted {
+		testingObject.Fatalf("expected only recycle_ack write after duplicate close, got=%+v", writes)
 	}
 }
 

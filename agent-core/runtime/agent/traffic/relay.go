@@ -61,6 +61,10 @@ type closeAckObserver interface {
 	MarkCloseAckObserved(trafficID string)
 }
 
+type closeAckSentTracker interface {
+	TryMarkCloseAckSent(trafficID string) bool
+}
+
 // StreamRelayOptions 描述默认 relay 行为配置。
 type StreamRelayOptions struct {
 	BufferFrames        int
@@ -254,14 +258,16 @@ func (relay *StreamRelay) readTunnelToUpstream(
 			return err
 		}
 		if payload.Close != nil && strings.TrimSpace(payload.Close.TrafficID) == trafficID {
-			closeAckPayload := pb.StreamPayload{
-				CloseAck: &pb.TrafficCloseAck{
-					TrafficID: strings.TrimSpace(payload.Close.TrafficID),
-					Accepted:  true,
-				},
-			}
-			if writeAckErr := tunnel.WritePayload(ctx, closeAckPayload); writeAckErr != nil {
-				return fmt.Errorf("read tunnel close: write close ack: %w", writeAckErr)
+			if shouldWriteCloseAckOnce(tunnel, trafficID) {
+				closeAckPayload := pb.StreamPayload{
+					CloseAck: &pb.TrafficCloseAck{
+						TrafficID: strings.TrimSpace(payload.Close.TrafficID),
+						Accepted:  true,
+					},
+				}
+				if writeAckErr := tunnel.WritePayload(ctx, closeAckPayload); writeAckErr != nil {
+					return fmt.Errorf("read tunnel close: write close ack: %w", writeAckErr)
+				}
 			}
 			// close_ack 可能在 relay 阶段被消费，后续 recycle 阶段通过该标记继续满足前置条件。
 			if observer, ok := tunnel.(closeAckObserver); ok {
@@ -287,6 +293,18 @@ func (relay *StreamRelay) readTunnelToUpstream(
 			return fmt.Errorf("read tunnel data: %w", err)
 		}
 	}
+}
+
+func shouldWriteCloseAckOnce(tunnel TunnelIO, trafficID string) bool {
+	if tunnel == nil {
+		return false
+	}
+	tracker, ok := tunnel.(closeAckSentTracker)
+	if !ok {
+		// 未实现状态跟踪接口时按兼容路径放行一次 ACK。
+		return true
+	}
+	return tracker.TryMarkCloseAckSent(trafficID)
 }
 
 func (relay *StreamRelay) writeTunnelDataToUpstream(

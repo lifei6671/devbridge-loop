@@ -20,6 +20,9 @@ const (
 	envAgentID                  = "DEV_AGENT_CFG_AGENT_ID"
 	envBridgeAddr               = "DEV_AGENT_CFG_BRIDGE_ADDR"
 	envBridgeTransport          = "DEV_AGENT_CFG_BRIDGE_TRANSPORT"
+	envBridgeTLSEnabled         = "DEV_AGENT_CFG_BRIDGE_TLS_ENABLED"
+	envBridgeTLSRootCAFile      = "DEV_AGENT_CFG_BRIDGE_TLS_ROOT_CA_FILE"
+	envBridgeTLSServerName      = "DEV_AGENT_CFG_BRIDGE_TLS_SERVER_NAME"
 	envBridgeAuthMethod         = "DEV_AGENT_CFG_BRIDGE_AUTH_METHOD"
 	envBridgeAuthToken          = "DEV_AGENT_CFG_BRIDGE_AUTH_TOKEN"
 	envBridgeClientCapVersion   = "DEV_AGENT_CFG_BRIDGE_CLIENT_CAP_VERSION"
@@ -62,6 +65,19 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	resolvedConfig.BridgeTransport = stringEnvOrDefault(
 		envBridgeTransport,
 		defaultConfig.BridgeTransport,
+	)
+	bridgeTLSEnabled, err := boolEnvOrDefault(envBridgeTLSEnabled, defaultConfig.BridgeTLS.Enabled)
+	if err != nil {
+		return app.Config{}, app.BootstrapOptions{}, err
+	}
+	resolvedConfig.BridgeTLS.Enabled = bridgeTLSEnabled
+	resolvedConfig.BridgeTLS.RootCAFile = stringEnvOrDefault(
+		envBridgeTLSRootCAFile,
+		defaultConfig.BridgeTLS.RootCAFile,
+	)
+	resolvedConfig.BridgeTLS.ServerName = stringEnvOrDefault(
+		envBridgeTLSServerName,
+		defaultConfig.BridgeTLS.ServerName,
 	)
 	resolvedConfig.Session.AuthMethod = stringEnvOrDefault(
 		envBridgeAuthMethod,
@@ -117,6 +133,9 @@ func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.Bootstr
 	}
 	if strings.TrimSpace(resolvedConfig.BridgeTransport) == "" {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeTransport)
+	}
+	if resolvedConfig.BridgeTLS.Enabled && strings.TrimSpace(resolvedConfig.BridgeTLS.RootCAFile) == "" {
+		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 开启时 %s 不能为空", envBridgeTLSEnabled, envBridgeTLSRootCAFile)
 	}
 	if strings.TrimSpace(resolvedConfig.Session.AuthMethod) == "" {
 		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAuthMethod)
@@ -175,6 +194,20 @@ func stringEnvOrDefault(key string, defaultValue string) string {
 		return defaultValue
 	}
 	return normalizedValue
+}
+
+// boolEnvOrDefault 读取布尔环境变量，空值时回退默认值。
+func boolEnvOrDefault(key string, defaultValue bool) (bool, error) {
+	rawValue := os.Getenv(key)
+	normalizedValue := strings.TrimSpace(rawValue)
+	if normalizedValue == "" {
+		return defaultValue, nil
+	}
+	parsedValue, err := strconv.ParseBool(normalizedValue)
+	if err != nil {
+		return false, fmt.Errorf("解析 %s 失败: %w", key, err)
+	}
+	return parsedValue, nil
 }
 
 // intEnvOrDefault 读取 int 环境变量，空值时回退默认值。

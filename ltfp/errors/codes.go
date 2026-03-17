@@ -1,5 +1,7 @@
 package errors
 
+import "strings"
+
 // 协议通用错误码定义。
 const (
 	// CodeInvalidPayload 表示消息体结构不合法或字段类型不匹配。
@@ -74,6 +76,26 @@ const (
 	CodeNegotiationInvalidProfile = "NEGOTIATION_INVALID_PROFILE"
 )
 
+// 认证相关错误码定义。
+const (
+	// CodeAuthInvalidMethod 表示 auth_method 不在支持集合内。
+	CodeAuthInvalidMethod = "auth_invalid_method"
+	// CodeAuthInvalidToken 表示 token 格式错误、缺失或校验失败。
+	CodeAuthInvalidToken = "auth_invalid_token"
+	// CodeAuthTokenExpired 表示 token 已过期。
+	CodeAuthTokenExpired = "auth_token_expired"
+	// CodeAuthTokenRevoked 表示 token 已吊销。
+	CodeAuthTokenRevoked = "auth_token_revoked"
+	// CodeAuthConnectorMismatch 表示 token 与 connector_id 归属不一致。
+	CodeAuthConnectorMismatch = "auth_connector_mismatch"
+	// CodeAuthSessionSuperseded 表示候选 session_epoch 已被更高权威代际取代。
+	CodeAuthSessionSuperseded = "auth_session_superseded"
+	// CodeAuthRateLimited 表示认证抢占命中限流。
+	CodeAuthRateLimited = "auth_rate_limited"
+	// CodeAuthInternalError 表示认证链路内部错误。
+	CodeAuthInternalError = "auth_internal_error"
+)
+
 // 数据面相关错误码定义。
 const (
 	// CodeTrafficInvalidOneof 表示数据面 oneof 字段设置冲突。
@@ -100,4 +122,56 @@ const (
 	CodeTunnelRecycleBufferDirty = "buffer_dirty"
 	// CodeTunnelRecycleTunnelMismatch 表示回收请求的 tunnel_id 与本地上下文不一致。
 	CodeTunnelRecycleTunnelMismatch = "tunnel_mismatch"
+	// CodeTunnelRecycleDeadlineHit 表示回收等待命中 deadline。
+	CodeTunnelRecycleDeadlineHit = "deadline_hit"
 )
+
+// IsKnownTunnelRecycleCode 判断错误码是否属于协议约定的 recycle 错误集合。
+func IsKnownTunnelRecycleCode(errorCode string) bool {
+	switch strings.TrimSpace(errorCode) {
+	case CodeTunnelRecycleInvalidSeq,
+		CodeTunnelRecycleCloseAckRequired,
+		CodeTunnelRecycleTunnelUnhealthy,
+		CodeTunnelRecycleBufferDirty,
+		CodeTunnelRecycleTunnelMismatch,
+		CodeTunnelRecycleDeadlineHit:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeTunnelRecycleCode 归一化回收拒绝错误码，避免双端口径漂移。
+func NormalizeTunnelRecycleCode(errorCode string) string {
+	normalizedCode := strings.TrimSpace(errorCode)
+	switch normalizedCode {
+	case CodeTunnelRecycleInvalidSeq:
+		return CodeTunnelRecycleInvalidSeq
+	case CodeTunnelRecycleCloseAckRequired:
+		return CodeTunnelRecycleCloseAckRequired
+	case CodeTunnelRecycleTunnelUnhealthy:
+		return CodeTunnelRecycleTunnelUnhealthy
+	case CodeTunnelRecycleBufferDirty:
+		return CodeTunnelRecycleBufferDirty
+	case CodeTunnelRecycleTunnelMismatch:
+		return CodeTunnelRecycleTunnelMismatch
+	case CodeTunnelRecycleDeadlineHit:
+		return CodeTunnelRecycleDeadlineHit
+	default:
+		return normalizedCode
+	}
+}
+
+// NormalizeTunnelRecycleCodeOrDefault 归一化 recycle 错误码，未知时回退到指定默认值。
+func NormalizeTunnelRecycleCodeOrDefault(errorCode string, fallbackCode string) string {
+	normalizedCode := NormalizeTunnelRecycleCode(errorCode)
+	if IsKnownTunnelRecycleCode(normalizedCode) {
+		return normalizedCode
+	}
+	normalizedFallbackCode := NormalizeTunnelRecycleCode(fallbackCode)
+	if IsKnownTunnelRecycleCode(normalizedFallbackCode) {
+		return normalizedFallbackCode
+	}
+	// fallback 也非法时退回协议文档中的通用健康失败码，避免留下空错误码。
+	return CodeTunnelRecycleTunnelUnhealthy
+}

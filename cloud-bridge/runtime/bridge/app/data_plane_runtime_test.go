@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,13 +33,24 @@ type runtimeDataPlaneTestTunnel struct {
 	writeMutex sync.Mutex
 	writes     []pb.StreamPayload
 	closeCount int
+	flushError error
+	recyclable bool
+
+	closeAckStateMutex sync.Mutex
+	closeAckSentByID   map[string]struct{}
+
+	unsafeRecycleMutex     sync.Mutex
+	unsafeRecycleErrorCode string
+	unsafeRecycleReason    string
 }
 
 // newRuntimeDataPlaneTestTunnel 创建带读写缓冲的测试 tunnel。
 func newRuntimeDataPlaneTestTunnel(id string) *runtimeDataPlaneTestTunnel {
 	return &runtimeDataPlaneTestTunnel{
-		id:        id,
-		readQueue: make(chan runtimeDataPlaneReadResult, 8),
+		id:               id,
+		readQueue:        make(chan runtimeDataPlaneReadResult, 8),
+		recyclable:       true,
+		closeAckSentByID: make(map[string]struct{}),
 	}
 }
 
@@ -85,6 +97,77 @@ func (tunnel *runtimeDataPlaneTestTunnel) WritePayload(ctx context.Context, payl
 func (tunnel *runtimeDataPlaneTestTunnel) Close() error {
 	tunnel.closeCount++
 	return nil
+}
+
+// Flush 模拟 recycle 前的本地缓冲刷空检查。
+func (tunnel *runtimeDataPlaneTestTunnel) Flush() error {
+	return tunnel.flushError
+}
+
+// Recyclable 返回测试 tunnel 是否允许继续回收入池。
+func (tunnel *runtimeDataPlaneTestTunnel) Recyclable() bool {
+	return tunnel.recyclable
+}
+
+// SetFlushError 配置 flush 阶段返回的错误。
+func (tunnel *runtimeDataPlaneTestTunnel) SetFlushError(err error) {
+	tunnel.flushError = err
+}
+
+// SetRecyclable 配置当前 tunnel 是否允许 recycle。
+func (tunnel *runtimeDataPlaneTestTunnel) SetRecyclable(recyclable bool) {
+	tunnel.recyclable = recyclable
+}
+
+// TryMarkCloseAckSent 记录某条 traffic 的 close_ack 是否已发送。
+func (tunnel *runtimeDataPlaneTestTunnel) TryMarkCloseAckSent(trafficID string) bool {
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return false
+	}
+	tunnel.closeAckStateMutex.Lock()
+	defer tunnel.closeAckStateMutex.Unlock()
+	if tunnel.closeAckSentByID == nil {
+		tunnel.closeAckSentByID = make(map[string]struct{})
+	}
+	if _, exists := tunnel.closeAckSentByID[normalizedTrafficID]; exists {
+		return false
+	}
+	tunnel.closeAckSentByID[normalizedTrafficID] = struct{}{}
+	return true
+}
+
+// ClearCloseAckSent 清理某条 traffic 的 close_ack 发送状态。
+func (tunnel *runtimeDataPlaneTestTunnel) ClearCloseAckSent(trafficID string) {
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return
+	}
+	tunnel.closeAckStateMutex.Lock()
+	defer tunnel.closeAckStateMutex.Unlock()
+	delete(tunnel.closeAckSentByID, normalizedTrafficID)
+}
+
+// MarkUnsafeToRecycle 标记 tunnel 本轮 traffic 后不得再进入 recycle，并记录统一错误码。
+func (tunnel *runtimeDataPlaneTestTunnel) MarkUnsafeToRecycle(errorCode string, reason string) {
+	tunnel.unsafeRecycleMutex.Lock()
+	defer tunnel.unsafeRecycleMutex.Unlock()
+	tunnel.unsafeRecycleErrorCode = strings.TrimSpace(errorCode)
+	tunnel.unsafeRecycleReason = strings.TrimSpace(reason)
+}
+
+// ConsumeUnsafeToRecycle 读取并清空 unsafe recycle 标记。
+func (tunnel *runtimeDataPlaneTestTunnel) ConsumeUnsafeToRecycle() (string, string, bool) {
+	tunnel.unsafeRecycleMutex.Lock()
+	defer tunnel.unsafeRecycleMutex.Unlock()
+	normalizedErrorCode := strings.TrimSpace(tunnel.unsafeRecycleErrorCode)
+	normalizedReason := strings.TrimSpace(tunnel.unsafeRecycleReason)
+	if normalizedErrorCode == "" && normalizedReason == "" {
+		return "", "", false
+	}
+	tunnel.unsafeRecycleErrorCode = ""
+	tunnel.unsafeRecycleReason = ""
+	return normalizedErrorCode, normalizedReason, true
 }
 
 // EnqueueReadPayload 预置下一次读取结果。

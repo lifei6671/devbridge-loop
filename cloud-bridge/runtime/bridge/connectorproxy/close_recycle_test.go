@@ -78,6 +78,41 @@ func TestWriteTrafficCloseAndAwaitAckReturnsResetError(testingObject *testing.T)
 	}
 }
 
+// TestWriteTrafficCloseAndAwaitAckDoesNotRepeatCloseAck 验证 simultaneous close 场景不会重复回 ACK。
+func TestWriteTrafficCloseAndAwaitAckDoesNotRepeatCloseAck(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testTunnel := newConnectorProxyTestTunnel("tunnel-close-ack-once")
+	if !testTunnel.TryMarkCloseAckSent("traffic-ack-once") {
+		testingObject.Fatalf("expected initial close_ack sent mark success")
+	}
+	testTunnel.EnqueueReadPayload(pb.StreamPayload{
+		Close: &pb.TrafficClose{
+			TrafficID: "traffic-ack-once",
+			Reason:    "peer_close_retry",
+		},
+	})
+
+	err := WriteTrafficCloseAndAwaitAck(
+		context.Background(),
+		testTunnel,
+		"traffic-ack-once",
+		"bridge_close_after_body",
+		500*time.Millisecond,
+	)
+	if err != nil {
+		testingObject.Fatalf("write traffic close and await ack failed: %v", err)
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) != 1 {
+		testingObject.Fatalf("expected only close write when close_ack already sent, got=%d", len(writes))
+	}
+	if writes[0].Close == nil || strings.TrimSpace(writes[0].Close.TrafficID) != "traffic-ack-once" {
+		testingObject.Fatalf("expected single close write for traffic-ack-once")
+	}
+}
+
 // TestExecuteTunnelRecycleHandshakeReturnsRejectError 验证回收被拒绝时返回带错误码的失败信息。
 func TestExecuteTunnelRecycleHandshakeReturnsRejectError(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -110,8 +145,8 @@ func TestExecuteTunnelRecycleHandshakeReturnsRejectError(testingObject *testing.
 	if strings.TrimSpace(ack.ErrorCode) != ltfperrors.CodeTunnelRecycleCloseAckRequired {
 		testingObject.Fatalf("unexpected recycle ack error code: %+v", ack)
 	}
-	if !strings.Contains(err.Error(), ltfperrors.CodeTunnelRecycleCloseAckRequired) {
-		testingObject.Fatalf("expected error contains recycle reject code, got=%v", err)
+	if ltfperrors.ExtractTunnelRecycleCode(err) != ltfperrors.CodeTunnelRecycleCloseAckRequired {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(err), err)
 	}
 
 	writes := testTunnel.Writes()
@@ -120,5 +155,60 @@ func TestExecuteTunnelRecycleHandshakeReturnsRejectError(testingObject *testing.
 	}
 	if writes[0].Recycle.RecycleSeq != 7 {
 		testingObject.Fatalf("unexpected recycle seq in write: %+v", writes[0].Recycle)
+	}
+}
+
+// TestWriteTrafficCloseAndAwaitAckMarksUnsafeRecycleCode 验证 close_ack 超时会留下统一 recycle_error_code 供后续关闭分支消费。
+func TestWriteTrafficCloseAndAwaitAckMarksUnsafeRecycleCode(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testTunnel := newConnectorProxyTestTunnel("tunnel-close-timeout")
+	testTunnel.EnqueueReadError(context.DeadlineExceeded)
+
+	err := WriteTrafficCloseAndAwaitAck(
+		context.Background(),
+		testTunnel,
+		"traffic-timeout",
+		"bridge_close_after_body",
+		500*time.Millisecond,
+	)
+	if err == nil {
+		testingObject.Fatalf("expected close_ack timeout error")
+	}
+	if ltfperrors.ExtractTunnelRecycleCode(err) != ltfperrors.CodeTunnelRecycleDeadlineHit {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(err), err)
+	}
+	recycleErrorCode, reason, markedUnsafe := testTunnel.ConsumeUnsafeToRecycle()
+	if !markedUnsafe {
+		testingObject.Fatalf("expected unsafe recycle marker after close_ack timeout")
+	}
+	if recycleErrorCode != ltfperrors.CodeTunnelRecycleDeadlineHit {
+		testingObject.Fatalf("unexpected unsafe recycle error code: got=%s want=%s", recycleErrorCode, ltfperrors.CodeTunnelRecycleDeadlineHit)
+	}
+	if strings.TrimSpace(reason) == "" {
+		testingObject.Fatalf("expected unsafe recycle reason recorded")
+	}
+}
+
+// TestExecuteTunnelRecycleHandshakeReturnsDeadlineHitError 验证等待 recycle_ack 超时时会返回统一 deadline_hit 错误码。
+func TestExecuteTunnelRecycleHandshakeReturnsDeadlineHitError(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testTunnel := newConnectorProxyTestTunnel("tunnel-recycle-timeout")
+	testTunnel.EnqueueReadError(context.DeadlineExceeded)
+
+	_, err := ExecuteTunnelRecycleHandshake(
+		context.Background(),
+		testTunnel,
+		"tunnel-recycle-timeout",
+		9,
+		false,
+		500*time.Millisecond,
+	)
+	if err == nil {
+		testingObject.Fatalf("expected recycle timeout error")
+	}
+	if ltfperrors.ExtractTunnelRecycleCode(err) != ltfperrors.CodeTunnelRecycleDeadlineHit {
+		testingObject.Fatalf("unexpected recycle error code: got=%s err=%v", ltfperrors.ExtractTunnelRecycleCode(err), err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
@@ -28,6 +29,13 @@ type runtimeBridgeTunnelAdapter struct {
 	jsonCodec       *codec.JSONCodec
 	maxPayloadBytes int
 	ioPollInterval  time.Duration
+
+	closeAckStateMutex sync.Mutex
+	closeAckSentByID   map[string]struct{}
+
+	unsafeRecycleMutex     sync.Mutex
+	unsafeRecycleErrorCode string
+	unsafeRecycleReason    string
 }
 
 var _ registry.RuntimeTunnel = (*runtimeBridgeTunnelAdapter)(nil)
@@ -36,11 +44,12 @@ var _ registry.RuntimeTunnelHealthProber = (*runtimeBridgeTunnelAdapter)(nil)
 // newRuntimeBridgeTunnelAdapter 创建 Bridge data-plane tunnel payload 适配器。
 func newRuntimeBridgeTunnelAdapter(rawTunnel transport.Tunnel, tunnelID string) *runtimeBridgeTunnelAdapter {
 	return &runtimeBridgeTunnelAdapter{
-		tunnel:          rawTunnel,
-		tunnelID:        strings.TrimSpace(tunnelID),
-		jsonCodec:       codec.NewJSONCodec(),
-		maxPayloadBytes: defaultBridgeTunnelMaxPayloadBytes,
-		ioPollInterval:  defaultBridgeTunnelIOPollInterval,
+		tunnel:           rawTunnel,
+		tunnelID:         strings.TrimSpace(tunnelID),
+		jsonCodec:        codec.NewJSONCodec(),
+		maxPayloadBytes:  defaultBridgeTunnelMaxPayloadBytes,
+		ioPollInterval:   defaultBridgeTunnelIOPollInterval,
+		closeAckSentByID: make(map[string]struct{}),
 	}
 }
 
@@ -72,6 +81,85 @@ func (adapter *runtimeBridgeTunnelAdapter) Close() error {
 		return nil
 	}
 	return adapter.tunnel.Close()
+}
+
+// Flush 透传到底层 transport.Tunnel，用于 recycle 前确认本地缓冲已排空。
+func (adapter *runtimeBridgeTunnelAdapter) Flush() error {
+	if adapter == nil || adapter.tunnel == nil {
+		return registry.ErrTunnelRegistryDependencyMissing
+	}
+	return adapter.tunnel.Flush()
+}
+
+// Recyclable 透传到底层 transport.Tunnel 的可回收判定。
+func (adapter *runtimeBridgeTunnelAdapter) Recyclable() bool {
+	if adapter == nil || adapter.tunnel == nil {
+		return false
+	}
+	return adapter.tunnel.Recyclable()
+}
+
+// TryMarkCloseAckSent 记录某条 traffic 的 close_ack 是否已发送，用于避免重复回 ACK。
+func (adapter *runtimeBridgeTunnelAdapter) TryMarkCloseAckSent(trafficID string) bool {
+	if adapter == nil {
+		return false
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return false
+	}
+	adapter.closeAckStateMutex.Lock()
+	defer adapter.closeAckStateMutex.Unlock()
+	if adapter.closeAckSentByID == nil {
+		adapter.closeAckSentByID = make(map[string]struct{})
+	}
+	if _, exists := adapter.closeAckSentByID[normalizedTrafficID]; exists {
+		return false
+	}
+	adapter.closeAckSentByID[normalizedTrafficID] = struct{}{}
+	return true
+}
+
+// ClearCloseAckSent 清理某条 traffic 的 close_ack 发送状态，避免复用 tunnel 时状态残留。
+func (adapter *runtimeBridgeTunnelAdapter) ClearCloseAckSent(trafficID string) {
+	if adapter == nil {
+		return
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID == "" {
+		return
+	}
+	adapter.closeAckStateMutex.Lock()
+	defer adapter.closeAckStateMutex.Unlock()
+	delete(adapter.closeAckSentByID, normalizedTrafficID)
+}
+
+// MarkUnsafeToRecycle 标记当前 tunnel 在本轮 traffic 后不得进入 recycle，并记录统一错误码。
+func (adapter *runtimeBridgeTunnelAdapter) MarkUnsafeToRecycle(errorCode string, reason string) {
+	if adapter == nil {
+		return
+	}
+	adapter.unsafeRecycleMutex.Lock()
+	defer adapter.unsafeRecycleMutex.Unlock()
+	adapter.unsafeRecycleErrorCode = strings.TrimSpace(errorCode)
+	adapter.unsafeRecycleReason = strings.TrimSpace(reason)
+}
+
+// ConsumeUnsafeToRecycle 读取并清空本轮 traffic 的 unsafe recycle 标记。
+func (adapter *runtimeBridgeTunnelAdapter) ConsumeUnsafeToRecycle() (string, string, bool) {
+	if adapter == nil {
+		return "", "", false
+	}
+	adapter.unsafeRecycleMutex.Lock()
+	defer adapter.unsafeRecycleMutex.Unlock()
+	normalizedErrorCode := strings.TrimSpace(adapter.unsafeRecycleErrorCode)
+	normalizedReason := strings.TrimSpace(adapter.unsafeRecycleReason)
+	if normalizedErrorCode == "" && normalizedReason == "" {
+		return "", "", false
+	}
+	adapter.unsafeRecycleErrorCode = ""
+	adapter.unsafeRecycleReason = ""
+	return normalizedErrorCode, normalizedReason, true
 }
 
 // Probe 透传底层 tunnel 的可选探活能力，不支持时按无探活能力处理。

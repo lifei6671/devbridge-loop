@@ -10,6 +10,7 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -215,9 +216,11 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		recycleErr := dispatcher.recycleTunnelBroken(acquiredTunnel, err.Error())
 		return dispatcher.failResult(result, errors.Join(err, recycleErr))
 	}
-	if err := dispatcher.recycleTunnelReusable(detachedRecycleContext(normalizedContext), acquiredTunnel); err != nil {
+	if err := dispatcher.recycleTunnelReusable(detachedRecycleContext(normalizedContext), acquiredTunnel, trafficID); err != nil {
+		recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(err)
 		log.Printf(
-			"bridge connector dispatch failed event=recycle_tunnel_closed_failed %s err=%v",
+			"bridge connector dispatch failed event=recycle_tunnel_closed_failed recycle_error_code=%s %s err=%v",
+			recycleErrorCode,
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          trafficID,
 				ServiceID:          strings.TrimSpace(request.TrafficOpen.ServiceID),
@@ -248,9 +251,37 @@ func (dispatcher *Dispatcher) failResult(result DispatchResult, dispatchError er
 	return result, dispatchError
 }
 
-func (dispatcher *Dispatcher) recycleTunnelReusable(ctx context.Context, runtime registry.TunnelRuntime) error {
+func (dispatcher *Dispatcher) recycleTunnelReusable(
+	ctx context.Context,
+	runtime registry.TunnelRuntime,
+	trafficID string,
+) error {
 	if runtime.Tunnel == nil {
 		return ErrDispatcherDependencyMissing
+	}
+	normalizedTrafficID := strings.TrimSpace(trafficID)
+	if normalizedTrafficID != "" {
+		// tunnel 完成一轮 traffic 后清理 close_ack 发送状态，避免复用时误判重复 ACK。
+		defer clearBridgeCloseAckSentState(runtime.Tunnel, normalizedTrafficID)
+	}
+	if unsafeErrorCode, unsafeReason, markedUnsafe := consumeBridgeTunnelUnsafeToRecycle(runtime.Tunnel); markedUnsafe {
+		return dispatcher.downgradeTunnelRecycleToClose(runtime, unsafeErrorCode, unsafeReason, nil)
+	}
+	if !isBridgeTunnelReusable(runtime.Tunnel) {
+		return dispatcher.downgradeTunnelRecycleToClose(
+			runtime,
+			ltfperrors.CodeTunnelRecycleTunnelUnhealthy,
+			"tunnel not recyclable",
+			nil,
+		)
+	}
+	if flushErr := flushBridgeTunnelBeforeRecycle(runtime.Tunnel); flushErr != nil {
+		return dispatcher.downgradeTunnelRecycleToClose(
+			runtime,
+			ltfperrors.CodeTunnelRecycleBufferDirty,
+			"flush before recycle failed",
+			flushErr,
+		)
 	}
 	nextRecycleSeq := runtime.RecycleSeq + 1
 	if nextRecycleSeq == 0 {
@@ -265,6 +296,7 @@ func (dispatcher *Dispatcher) recycleTunnelReusable(ctx context.Context, runtime
 		isFinal,
 		dispatcher.recycleTimeout,
 	); err != nil {
+		dispatcher.observeTunnelRecycleFailure(err)
 		recycleErr := dispatcher.recycleTunnelBroken(runtime, err.Error())
 		if recycleErr != nil {
 			return errors.Join(err, recycleErr)
@@ -275,6 +307,76 @@ func (dispatcher *Dispatcher) recycleTunnelReusable(ctx context.Context, runtime
 		return dispatcher.recycleTunnelClosed(runtime)
 	}
 	return dispatcher.tunnelRegistry.MarkIdleAfterRecycle(dispatcher.now(), runtime.TunnelID, nextRecycleSeq)
+}
+
+// downgradeTunnelRecycleToClose 统一处理“本地判定不可回收 -> 直接关闭”的收敛逻辑。
+func (dispatcher *Dispatcher) downgradeTunnelRecycleToClose(
+	runtime registry.TunnelRuntime,
+	errorCode string,
+	reason string,
+	cause error,
+) error {
+	normalizedErrorCode := ltfperrors.NormalizeTunnelRecycleCodeOrDefault(
+		errorCode,
+		ltfperrors.CodeTunnelRecycleTunnelUnhealthy,
+	)
+	normalizedReason := strings.TrimSpace(reason)
+	dispatcher.observeTunnelRecycleFailureCode(normalizedErrorCode)
+	if cause != nil {
+		log.Printf(
+			"bridge connector recycle downgraded to close recycle_error_code=%s connector_id=%s tunnel_id=%s reason=%s err=%v",
+			normalizedErrorCode,
+			strings.TrimSpace(runtime.ConnectorID),
+			strings.TrimSpace(runtime.TunnelID),
+			normalizedReason,
+			cause,
+		)
+	} else {
+		log.Printf(
+			"bridge connector recycle downgraded to close recycle_error_code=%s connector_id=%s tunnel_id=%s reason=%s",
+			normalizedErrorCode,
+			strings.TrimSpace(runtime.ConnectorID),
+			strings.TrimSpace(runtime.TunnelID),
+			normalizedReason,
+		)
+	}
+	if closeErr := dispatcher.recycleTunnelClosed(runtime); closeErr != nil {
+		return errors.Join(
+			ltfperrors.NewTunnelRecycleError(normalizedErrorCode, normalizedReason),
+			closeErr,
+		)
+	}
+	return nil
+}
+
+func isBridgeTunnelReusable(tunnel registry.RuntimeTunnel) bool {
+	if tunnel == nil {
+		return false
+	}
+	type recyclable interface {
+		Recyclable() bool
+	}
+	recyclableTunnel, ok := tunnel.(recyclable)
+	if !ok {
+		// Bridge 若拿不到可回收判定，就不能确认安全回收，必须降级为直接关闭。
+		return false
+	}
+	return recyclableTunnel.Recyclable()
+}
+
+func flushBridgeTunnelBeforeRecycle(tunnel registry.RuntimeTunnel) error {
+	if tunnel == nil {
+		return ErrDispatcherDependencyMissing
+	}
+	type flushable interface {
+		Flush() error
+	}
+	flushableTunnel, ok := tunnel.(flushable)
+	if !ok {
+		// 无法确认本地缓冲已排空时，不允许继续发起 recycle。
+		return fmt.Errorf("bridge tunnel flush capability missing")
+	}
+	return flushableTunnel.Flush()
 }
 
 func (dispatcher *Dispatcher) recycleTunnelClosed(runtime registry.TunnelRuntime) error {
@@ -322,6 +424,22 @@ func (dispatcher *Dispatcher) observeOpenHandshakeFailure(dispatchErr error) {
 		// open_ack reject 用于统计 agent 显式拒绝比例。
 		dispatcher.metrics.IncBridgeTrafficOpenRejectTotal()
 	}
+}
+
+// observeTunnelRecycleFailure 记录一次 recycle 失败及错误码分布。
+func (dispatcher *Dispatcher) observeTunnelRecycleFailure(recycleErr error) {
+	if dispatcher == nil {
+		return
+	}
+	dispatcher.observeTunnelRecycleFailureCode(ltfperrors.ExtractTunnelRecycleCode(recycleErr))
+}
+
+// observeTunnelRecycleFailureCode 记录一次 recycle 错误码分布，未知值会回退到统一默认码。
+func (dispatcher *Dispatcher) observeTunnelRecycleFailureCode(errorCode string) {
+	if dispatcher == nil || dispatcher.metrics == nil {
+		return
+	}
+	dispatcher.metrics.ObserveBridgeTunnelRecycleFailure(errorCode)
 }
 
 // isActualEndpointOverride 判断 open_ack 回传 endpoint 是否覆盖了请求 hint。

@@ -13,8 +13,10 @@ import (
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/service"
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/tunnel"
 	"github.com/lifei6671/devbridge-loop/ltfp/adapter"
+	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 )
 
 type testPrioritizedControlChannel struct {
@@ -153,7 +155,7 @@ func (channel *handshakeControlChannel) WritePrioritizedControlFrame(
 			SessionEpoch: 42,
 		}
 		if !channel.authAckSuccess {
-			authAckPayload.ErrorCode = "auth_invalid_token"
+			authAckPayload.ErrorCode = ltfperrors.CodeAuthInvalidToken
 			authAckPayload.ErrorMessage = "invalid token"
 		}
 		encodedAuthAck, marshalErr := json.Marshal(authAckPayload)
@@ -721,6 +723,30 @@ func TestInitTransportSupportsGRPCH2(testingObject *testing.T) {
 	}
 	if runtime.grpcTransport == nil {
 		testingObject.Fatalf("expected grpc transport initialized")
+	}
+}
+
+// TestBridgeTunnelDialTimeoutUsesTCPTransportConfig 验证数据面 tunnel 拨号超时不再跟随控制面超时。
+func TestBridgeTunnelDialTimeoutUsesTCPTransportConfig(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tcpTransport, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{
+		DialTimeout: 17 * time.Second,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tcp transport failed: %v", err)
+	}
+	runtime := &Runtime{
+		cfg: Config{
+			ControlChannel: ControlChannelConfig{
+				DialTimeout: 25 * time.Millisecond,
+			},
+		},
+		tcpTransport: tcpTransport,
+	}
+
+	if got, want := runtime.bridgeTunnelDialTimeout(), 17*time.Second; got != want {
+		testingObject.Fatalf("unexpected tunnel dial timeout: got=%s want=%s", got, want)
 	}
 }
 
