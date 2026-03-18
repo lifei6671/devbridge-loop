@@ -82,7 +82,11 @@ TLS 1.3 Early Data（0-RTT）在所有 binding 实现中必须显式禁用。`Co
 
 ### 4.2 service_key 与 service_id
 
-`service_key` 是稳定作用域引用键，格式固定为 `<namespace>/<environment>/<service_name>`；`service_id` 是 server 分配的全局唯一 opaque identity。`service_key` 是 canonical lookup key，`service_id` 是 canonical identity key。route target 使用 `service_key`；runtime / traffic / ACK / audit 使用 `service_id`。当 `PublishService.service_id` 为空时，若 `service_key` 已存在，server 必须复用既有 `service_id`；仅当 `service_key` 首次出现时，server 才分配新的 `service_id`。
+`service_key` 是稳定服务引用键，格式固定为 `<service_name>/<protocol>`。其中 `service_name` 必填，`protocol` 来自 `PublishService.endpoints[*].protocol`，并按 `trim + lower-case` 规范化。同一条 `PublishService` 中所有 endpoint 的 `protocol` 必须一致；若需要多协议暴露，必须拆分为多条 service 发布。为避免键歧义，`service_name` 不允许包含 `/`。`namespace / environment` 仍保留为可选 scope 字段，但不再参与 `service_key` 拼接。
+
+`service_id` 是 server 分配的全局唯一 opaque identity，用于标识逻辑服务池。`service_key` 是 canonical lookup key，`service_id` 是 canonical identity key。route target 使用 `service_key`；runtime / traffic / ACK / audit 使用 `service_id`。当 `PublishService.service_id` 为空时，若 `service_key` 已存在，server 必须复用既有 `service_id`；仅当 `service_key` 首次出现时，server 才分配新的 `service_id`。
+
+同一 `service_key` 允许由多个 connector 并发发布，统一视为同一个逻辑服务池。Server 侧必须维护内部实例标识 `service_instance_id`（运行时字段，不要求进入协议 schema），用于区分池内不同 connector/session 的可用实例。
 
 ### 4.3 scope
 
@@ -102,21 +106,33 @@ TLS 1.3 Early Data（0-RTT）在所有 binding 实现中必须显式禁用。`Co
 
 ### 5.1 证书模型
 
-链路统一采用 TLS 1.3。Bridge 采用自建 CA 模型：初始化时生成 Root CA 私钥与证书，再由 Root CA 签发 Bridge 服务端证书。Agent 侧预置信任 Root CA，并在 TLS 握手阶段校验服务端证书链、SAN 与有效期。Transport Binding Layer 负责安全连接，因此 TLS 证书体系属于 transport 层能力，而不是控制面业务协议的一部分。
+链路统一采用 TLS 1.3。Bridge 启动时必须支持两种服务端证书来源模式，并通过配置显式选择：
+
+* 外部证书模式：运维侧提供 `tls_cert_file/tls_key_file`，Bridge 直接加载既有服务端证书与私钥；
+* 自建 CA 模式：Bridge 初始化时生成或加载 Root CA 私钥与证书，再由 Root CA 签发 Bridge 服务端证书。
+
+Agent 侧必须预置信任与所选模式对应的 trust anchor，并在 TLS 握手阶段校验服务端证书链、SAN 与有效期。Transport Binding Layer 负责安全连接，因此 TLS 证书体系属于 transport 层能力，而不是控制面业务协议的一部分。
+
+证书来源配置必须同时支持**配置文件加载**与**环境变量覆盖**。环境变量优先级高于配置文件，便于在不同部署环境下切换“外部证书模式 / 自建 CA 模式”而不修改基础镜像或静态配置文件。
 
 ### 5.2 证书分层
 
-证书分层固定如下：
+证书分层按模式划分如下：
 
-* Root CA：长期证书，低频轮换；
-* Bridge Server Certificate：短周期证书，定期自动续签；
-* Agent Trust Anchor：仅保存 Root CA 证书。
+* 自建 CA 模式：`Root CA -> Bridge Server Certificate -> Agent Trust Anchor`
+* 外部证书模式：`External CA / Intermediate CA -> Bridge Server Certificate -> Agent Trust Anchor`
+
+其中：
+
+* Root CA：仅在自建 CA 模式下存在，作为长期证书低频轮换；
+* Bridge Server Certificate：两种模式下都存在，作为 Bridge 对外提供的服务端证书；
+* Agent Trust Anchor：保存与当前模式对应的根证书或 CA 链信任锚。
 
 ### 5.3 Agent 校验要求
 
 Agent 必须校验：
 
-* 证书链由预置信任 Root CA 签发；
+* 证书链可回溯到预置信任锚（自建 CA 的 Root CA 或外部 CA 链）；
 * SAN 与访问地址一致；
 * 证书未过期；
 * 当前时间位于有效期内。
@@ -125,12 +141,12 @@ Agent 必须校验：
 
 ### 5.4 Root CA 轮换
 
-Root CA 的分发与更新固定依赖**带外运维配置管理系统**完成，不通过本协议带内分发。Bridge Server Certificate 的常规轮换由 Bridge 自身处理；Root CA 的更新由外部配置工具、镜像更新、配置中心或 Secret 管理系统完成。协议层不提供 Root CA 的 in-band 自动轮换。
+自建 CA 模式下，Root CA 的分发与更新固定依赖**带外运维配置管理系统**完成，不通过本协议带内分发；Bridge Server Certificate 的常规轮换可由 Bridge 自身处理。外部证书模式下，服务端证书与对应 trust anchor 的更新由外部 PKI、配置中心、镜像更新或 Secret 管理系统完成。协议层不提供 trust anchor 的 in-band 自动轮换。
 
 ### 5.5 证书撤销问题说明
 
 当前版本不要求实现 OCSP、CRL 或 OCSP Stapling，也不将证书撤销能力列为协议必须项。
-但证书撤销问题被明确记录为安全边界问题：若 Bridge 服务端私钥泄露，仅依赖“证书链合法、SAN 匹配、未过期”的校验仍不足以完成受损证书的快速收敛。该场景下的处置方式固定为**带外紧急轮换**：停用受损证书、重新签发新的 Bridge Server Certificate，必要时重新签发 Root CA，并通过带外运维渠道更新 Agent 信任锚。
+但证书撤销问题被明确记录为安全边界问题：若 Bridge 服务端私钥泄露，仅依赖“证书链合法、SAN 匹配、未过期”的校验仍不足以完成受损证书的快速收敛。该场景下的处置方式固定为**带外紧急轮换**：停用受损证书、重新签发新的 Bridge Server Certificate；若启用自建 CA 且 CA 同步受损，则再重新签发 Root CA，并通过带外运维渠道更新 Agent 信任锚。
 
 ### 5.6 Bridge TLS 接入模式
 
@@ -141,6 +157,91 @@ Bridge 必须通过配置声明 Agent 接入模式（控制面与数据面统一
 * `plaintext`（明文）：仅允许明文连接；发起 TLS 握手的连接必须被拒绝。
 
 生产环境默认应使用 `required`。`optional` 与 `plaintext` 仅用于开发、联调或受控内网场景。
+
+### 5.7 证书来源配置命名冻结
+
+Bridge 侧 TLS 证书来源配置命名固定如下。
+
+YAML 配置键：
+
+```yaml
+control_plane:
+  tls_mode: true # 是否启用强制 TLS 模式
+  tls_cert_source: "external" # external | managed_ca
+
+  # external 模式，支持自定义公钥和私钥证书
+  tls_cert_file: ""
+  tls_key_file: ""
+
+  # managed_ca 模式，使用内置 CA 签发证书
+  tls_ca_cert_file: ""
+  tls_ca_key_file: ""
+  tls_server_common_name: ""
+  tls_server_san_dns: []
+  tls_server_san_ips: []
+  tls_server_cert_ttl: "168h"
+  tls_server_cert_renew_before: "24h"
+```
+
+环境变量命名：
+
+```text
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_MODE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_SOURCE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_FILE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_KEY_FILE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_CERT_FILE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_KEY_FILE
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_COMMON_NAME
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_DNS
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_IPS
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_TTL
+DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_RENEW_BEFORE
+```
+
+约束固定如下：
+
+* `tls_cert_source` 仅允许 `external` 或 `managed_ca`；
+* `external` 模式下必须提供 `tls_cert_file/tls_key_file`；
+* `managed_ca` 模式下必须提供 `tls_ca_cert_file/tls_ca_key_file`，并至少提供一项 `tls_server_san_dns` 或 `tls_server_san_ips`；
+* `tls_server_san_dns` 与 `tls_server_san_ips` 在环境变量中使用逗号分隔；
+* 环境变量优先级高于 YAML 配置文件；
+* 未显式指定 `tls_cert_source` 时，默认值固定为 `external`，以保持对现有外部证书路径的兼容。
+
+### 5.8 证书续签、替换与热加载
+
+Bridge 在 TLS 启用时必须维护证书热加载循环，运行策略固定如下：
+
+* `external` 模式：周期轮询 `tls_cert_file/tls_key_file`，检测到证书替换后热加载到新连接握手路径；
+* `managed_ca` 模式：按 `tls_server_cert_renew_before` 判断是否进入续签窗口，进入窗口后自动重新签发并热加载；
+* 证书刷新失败时保留上一版可用证书继续服务，并记录错误日志。
+
+### 5.9 模式切换与回滚路径
+
+Bridge 证书来源模式切换与回滚通过同一组配置入口完成，操作顺序固定如下：
+
+1. 准备目标模式所需证书材料（`external` 准备 cert/key；`managed_ca` 准备或规划 CA cert/key）。
+2. 更新 `control_plane.tls_cert_source` 与对应字段（可通过 YAML 或环境变量覆盖）。
+3. 重启 Bridge，使新模式在启动阶段完成校验与首轮证书加载。
+4. 验证 Agent 握手与业务连通性后再放量。
+5. 如出现异常，恢复上一版 `tls_cert_source` 及相关证书参数并重启，回退到前一已知可用模式。
+
+### 5.10 Root CA 带外分发与紧急替换 Runbook
+
+自建 CA 模式下，Root CA 运维固定走带外流程，不通过控制面协议分发：
+
+1. Root CA 分发：通过配置中心/Secret 系统把 trust anchor 下发到 Agent 运行环境。
+2. 常规轮换：预先分发新 trust anchor，确认 Agent 覆盖率后切换 Bridge 使用的新 Root CA。
+3. 紧急替换：私钥泄露或证书受损时，立即停用旧 Root CA，重新签发 Bridge 服务端证书并强制更新 Agent 信任锚。
+4. 回收旧证书：轮换完成后清理旧 Root CA 与旧服务端证书文件，避免误用。
+
+### 5.11 密钥存储约束
+
+密钥存储与权限约束固定如下：
+
+* `managed_ca` 模式下，Root CA 私钥文件与 Bridge 服务端私钥必须分离；服务端私钥按短周期签发使用，不与 Root CA 共用文件。
+* `external` 模式下，服务端私钥文件权限必须满足最小权限（不允许 group/other 读写执行）。
+* 两种模式下，私钥不得出现在普通日志和通用备份快照中。
 
 ---
 
@@ -276,6 +377,12 @@ Agent 侧必须将 token 视为高敏感凭证。
 * 未认证连接总数
 
 对于未知 `connector_id`、已注册 `connector_id`、后续 token 错误等场景，Bridge 对外返回的错误响应不得暴露高可区分度的枚举信息。日志中可保留精细诊断信息，但对协议外显行为必须做适度模糊化处理。
+
+当前实现补充约束如下：
+
+* Hello 阶段限流维度固定为 `source_ip + connector_id`，并附带未认证连接预算与认证并发预算；
+* 认证失败封禁维度固定为 `source_ip + connector_id`，超过阈值后执行短时封禁；
+* 未知 `connector_id`、无效 token、吊销 token 对外统一返回 `auth_invalid_token` 与统一拒绝文案，降低可枚举性。
 
 ### 7.4 ConnectorWelcome
 
@@ -473,6 +580,10 @@ Agent 收到 `auth_session_superseded` 或 `auth_rate_limited` 后，必须进�
 
 接入层通过 token 判定 connector 是否允许建立 session；资源层通过 publish policy 判定当前 session 是否允许发布特定 service；路由层通过 route policy 与 scope 规则判定这些 service 是否可被对应 route 选中。三层职责固定，不交叉。
 
+对于 L7 入口，`RouteMatch` 必须支持可选 `header_matches` 条件，用于在同一 host/path 下按请求头把流量分流到不同 target service。该能力只属于路由决策层，不影响 `service_key/service_id` 身份模型。
+
+路由命中后，`connector_service.service_key` 解析到逻辑服务池，再从池内 `ACTIVE + HEALTHY` 实例集合中选择具体实例。首版策略固定为“随机或等价无状态均衡（如 P2C）”，并要求单条 traffic 生命周期内绑定同一实例，不做 mid-stream failover。该策略与 Cloudflare Tunnel 的 replica 高可用思路一致：优先提供副本冗余与故障收敛，不承诺固定命中某一副本。
+
 ---
 
 ## 11. Tunnel 串行复用场景下的数据面安全边界
@@ -604,11 +715,11 @@ Bridge 必须对未认证的 `ConnectorHello` 阶段实施限流与连接预算�
 * 明文 token
 * `token_secret`
 * Bridge 私钥
-* Root CA 私钥。
+* Root CA 私钥（仅自建 CA 模式）。
 
 ### 14.5 密钥存储
 
-Root CA 私钥与 Bridge 服务端私钥必须单独存储、最小权限访问，不得进入普通日志和通用备份快照。
+若启用自建 CA，Root CA 私钥与 Bridge 服务端私钥必须单独存储、最小权限访问，不得进入普通日志和通用备份快照；外部证书模式下，Bridge 至少必须保证服务端私钥满足相同的最小权限与备份隔离要求。
 
 ---
 
@@ -722,7 +833,7 @@ sequenceDiagram
     A->>B: TCP/QUIC Connect
     A->>B: TLS ClientHello
     B-->>A: TLS ServerHello + Server Cert
-    A->>A: Verify Root CA / SAN / validity
+    A->>A: Verify trust anchor / SAN / validity
     Note over A,B: TLS 1.3 0-RTT disabled
 
     A->>B: ConnectorHello(connector_id, capabilities, metadata)
@@ -750,9 +861,9 @@ sequenceDiagram
 ## 18. 规范性结论
 
 1. Agent 与 Bridge 的接入认证必须通过既有 `ConnectorAuth / ConnectorAuthAck` 完成，不得另起独立认证确认包。
-2. 链路必须使用 TLS 1.3，证书体系必须采用 Bridge 自建 CA。
+2. 链路必须使用 TLS 1.3；Bridge 服务端证书来源必须同时支持“外部证书模式”和“自建 CA 模式”，并由启动配置显式选择。
 3. TLS 1.3 Early Data（0-RTT）必须在所有 binding 实现中显式禁用。
-4. Agent 必须预置 Bridge Root CA，并校验 Bridge 服务端证书链。
+4. Agent 必须预置与当前模式对应的 trust anchor，并校验 Bridge 服务端证书链。
 5. Bridge 必须按 `connector_id` 维护 token 记录。token 与 `namespace / environment` 解耦。
 6. 认证模型固定为 Bearer Token over TLS 1.3；本协议不包含应用层 nonce/timestamp 防重放。
 7. `token_secret_hash` 必须使用 `argon2id`、`scrypt` 或 `bcrypt` 等抗暴力破解算法，禁止快速哈希直接存储。
@@ -764,7 +875,7 @@ sequenceDiagram
 13. 同一 connector 的高频成功抢占必须被 Bridge 限流，防止控制面风暴。
 14. Tunnel 串行复用不触发重新认证；复用安全边界由 `TrafficCloseAck / TunnelRecycle / TunnelRecycleAck / recycle_seq` 与 tunnel 健康性共同保证。
 15. simultaneous close 必须按统一规则收敛，由 Server 决定是否发起 recycle，否则直接关闭。
-16. Root CA 更新必须通过带外运维机制完成；证书撤销问题在当前版本中被明确记录，但不作为协议必须实现项。
+16. trust anchor 更新必须通过带外运维机制完成；证书撤销问题在当前版本中被明确记录，但不作为协议必须实现项。
 17. grace token 最大持续时间不得超过 24 小时；会话期间 token 过期不主动中断现有 active session。
 18. idle tunnel 探活不得写入业务 payload 缓冲区。
 19. Agent 侧 token 必须按高敏感凭证进行安全存储。

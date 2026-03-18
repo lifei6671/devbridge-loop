@@ -106,3 +106,52 @@ func TestHealthHandlerIgnoreStaleEpoch(t *testing.T) {
 		t.Fatalf("stale epoch should be ignored, got=%s", serviceSnapshot.HealthStatus)
 	}
 }
+
+// TestHealthHandlerIgnoreNonActiveSession 验证 draining 会话健康上报不会覆盖状态。
+func TestHealthHandlerIgnoreNonActiveSession(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-draining",
+		ConnectorID: "connector-1",
+		Epoch:       7,
+		State:       registry.SessionDraining,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
+		ServiceID:       "svc-draining",
+		ServiceKey:      "dev/demo/pay-service",
+		Namespace:       "dev",
+		Environment:     "demo",
+		ServiceName:     "pay-service",
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: 3,
+		HealthStatus:    pb.HealthStatusUnknown,
+	})
+	handler := NewHealthHandler(HealthHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ServiceRegistry: serviceRegistry,
+	})
+
+	handler.HandleReport(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageServiceHealthReport,
+		SessionID:    "session-draining",
+		SessionEpoch: 7,
+	}, pb.ServiceHealthReport{
+		ServiceID:           "svc-draining",
+		ServiceKey:          "dev/demo/pay-service",
+		ServiceHealthStatus: pb.HealthStatusHealthy,
+		CheckTimeUnix:       time.Now().UTC().Unix(),
+	})
+
+	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-draining")
+	if !exists {
+		t.Fatalf("expected service snapshot exists")
+	}
+	if serviceSnapshot.HealthStatus != pb.HealthStatusUnknown {
+		t.Fatalf("draining session should be ignored, got=%s", serviceSnapshot.HealthStatus)
+	}
+}

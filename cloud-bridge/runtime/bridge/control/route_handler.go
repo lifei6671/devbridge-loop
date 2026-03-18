@@ -184,6 +184,10 @@ func (handler *RouteHandler) validateSessionEpoch(envelope pb.ControlEnvelope) e
 		// 代际不一致视为旧事件。
 		return ltfperrors.New(ltfperrors.CodeStaleEpochEvent, "session epoch mismatch for route event")
 	}
+	if sessionRuntime.State != registry.SessionActive {
+		// 只有 ACTIVE 会话允许写入路由，旧会话必须冻结控制面写入。
+		return ltfperrors.New(ltfperrors.CodeInvalidStateTransition, "session state does not allow route mutation")
+	}
 	return nil
 }
 

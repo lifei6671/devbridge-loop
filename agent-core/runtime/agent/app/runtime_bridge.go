@@ -45,6 +45,15 @@ const (
 	serviceHealthCheckScanInterval       = time.Second
 )
 
+type bridgeRetryStage string
+
+const (
+	bridgeRetryStageConnect     bridgeRetryStage = "connect"
+	bridgeRetryStageHandshake   bridgeRetryStage = "handshake"
+	bridgeRetryStageInitialSync bridgeRetryStage = "initial_sync"
+	bridgeRetryStageReady       bridgeRetryStage = "ready"
+)
+
 type bridgeCommandKind string
 
 const (
@@ -234,6 +243,26 @@ func computeBridgeRetryBackoffWithJitter(failStreak uint32, jitter float64) time
 		return bridgeRetryMaxBackoff
 	}
 	return backoff
+}
+
+// nextBridgeRetryFailStreak 根据阶段结果推进 fail streak。
+func nextBridgeRetryFailStreak(
+	currentFailStreak uint32,
+	stage bridgeRetryStage,
+	succeeded bool,
+) uint32 {
+	if succeeded {
+		switch stage {
+		case bridgeRetryStageReady:
+			// 只有控制连接、握手、首次同步全部成功后才重置指数退避。
+			return 0
+		default:
+			// connect/handshake/sync 中间阶段成功不重置，避免认证拒绝持续回到 1s。
+			return currentFailStreak
+		}
+	}
+	// 任一阶段失败都按指数退避累加。
+	return currentFailStreak + 1
 }
 
 func runtimeNowMillis() uint64 {
@@ -2071,7 +2100,7 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 		}
 
 		if err := r.connectBridgeControl(ctx); err != nil {
-			failStreak++
+			failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageConnect, false)
 			backoff := computeBridgeRetryBackoff(failStreak)
 			r.setBridgeRetrying(err, failStreak, backoff)
 			if waitErr := r.waitRetryWindow(ctx, backoff, &failStreak); waitErr != nil {
@@ -2079,13 +2108,13 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			}
 			continue
 		}
-		failStreak = 0
+		failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageConnect, true)
 		if err := r.performControlHandshake(ctx); err != nil {
 			// 握手失败视为连接不可用，按失活链路进入重连退避。
 			r.closeCurrentControlChannel()
 			r.notifyTunnelManagerState(tunnel.SessionStateStale)
 			r.setBridgeLost(err)
-			failStreak++
+			failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageHandshake, false)
 			backoff := computeBridgeRetryBackoff(failStreak)
 			r.setBridgeRetrying(err, failStreak, backoff)
 			if waitErr := r.waitRetryWindow(ctx, backoff, &failStreak); waitErr != nil {
@@ -2093,12 +2122,13 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			}
 			continue
 		}
+		failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageHandshake, true)
 		if err := r.syncServiceControlState(ctx); err != nil {
 			// 资源同步失败视为会话不可用，按失活链路进入重连退避。
 			r.closeCurrentControlChannel()
 			r.notifyTunnelManagerState(tunnel.SessionStateStale)
 			r.setBridgeLost(err)
-			failStreak++
+			failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageInitialSync, false)
 			backoff := computeBridgeRetryBackoff(failStreak)
 			r.setBridgeRetrying(err, failStreak, backoff)
 			if waitErr := r.waitRetryWindow(ctx, backoff, &failStreak); waitErr != nil {
@@ -2106,6 +2136,9 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			}
 			continue
 		}
+		failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageInitialSync, true)
+		// 会话进入 ready 阶段后重置 fail streak，后续新一轮故障重新从 1s 开始退避。
+		failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageReady, true)
 		r.setBridgeSessionReady(true)
 		r.notifyTunnelManagerState(tunnel.SessionStateActive)
 		// 会话建连成功后立即上报一次 tunnel 池快照，触发 Bridge 侧补池判定。
@@ -2126,7 +2159,7 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 			}
 			continue
 		case activeExitLost:
-			failStreak++
+			failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageReady, false)
 			backoff := computeBridgeRetryBackoff(failStreak)
 			r.setBridgeRetrying(activeExit.err, failStreak, backoff)
 			if waitErr := r.waitRetryWindow(ctx, backoff, &failStreak); waitErr != nil {

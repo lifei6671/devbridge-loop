@@ -366,6 +366,38 @@ func TestComputeBridgeRetryBackoffWithJitterClamp(testingObject *testing.T) {
 	}
 }
 
+// TestNextBridgeRetryFailStreak 验证预认证阶段失败会累计退避，ready 后才重置。
+func TestNextBridgeRetryFailStreak(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	failStreak := uint32(0)
+	// connect 成功只表示阶段前进，不应重置失败计数。
+	failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageConnect, true)
+	if failStreak != 0 {
+		testingObject.Fatalf("unexpected fail streak after connect success: got=%d want=0", failStreak)
+	}
+	// 第一次握手失败。
+	failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageHandshake, false)
+	if failStreak != 1 {
+		testingObject.Fatalf("unexpected fail streak after first handshake failure: got=%d want=1", failStreak)
+	}
+	// 下一轮 connect 成功后，失败计数仍需保留，避免持续回退到 1s。
+	failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageConnect, true)
+	if failStreak != 1 {
+		testingObject.Fatalf("unexpected fail streak after reconnect success: got=%d want=1", failStreak)
+	}
+	// 第二次握手失败，指数退避计数继续增加。
+	failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageHandshake, false)
+	if failStreak != 2 {
+		testingObject.Fatalf("unexpected fail streak after second handshake failure: got=%d want=2", failStreak)
+	}
+	// 会话 ready 后才允许重置。
+	failStreak = nextBridgeRetryFailStreak(failStreak, bridgeRetryStageReady, true)
+	if failStreak != 0 {
+		testingObject.Fatalf("unexpected fail streak after ready success: got=%d want=0", failStreak)
+	}
+}
+
 // TestSendControlHeartbeatPingWritesHighPriorityFrame 验证 ping 走高优先级控制帧。
 func TestSendControlHeartbeatPingWritesHighPriorityFrame(testingObject *testing.T) {
 	runtime := &Runtime{}

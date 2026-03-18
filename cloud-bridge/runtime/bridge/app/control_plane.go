@@ -16,9 +16,11 @@ import (
 	"sync"
 	"time"
 
+	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	"github.com/lifei6671/devbridge-loop/ltfp/consistency"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
@@ -48,13 +50,65 @@ const (
 	incomingTCPTunnelHandshakeTimeout = 2 * time.Second
 )
 
+// controlChannelLifecycleState 描述控制连接在 Bridge 侧的运行阶段。
+type controlChannelLifecycleState string
+
+const (
+	// controlChannelStateConnecting 表示连接刚创建，尚未进入控制面可读写阶段。
+	controlChannelStateConnecting controlChannelLifecycleState = "connecting"
+	// controlChannelStateConnected 表示底层连接已建立。
+	controlChannelStateConnected controlChannelLifecycleState = "connected"
+	// controlChannelStateControlReady 表示控制通道已就绪，可处理握手消息。
+	controlChannelStateControlReady controlChannelLifecycleState = "control_ready"
+	// controlChannelStateAuthenticated 表示连接已完成 ConnectorAuthAck(success=true)。
+	controlChannelStateAuthenticated controlChannelLifecycleState = "authenticated"
+	// controlChannelStateDraining 表示连接进入排空阶段，不再接受新业务语义。
+	controlChannelStateDraining controlChannelLifecycleState = "draining"
+	// controlChannelStateClosed 表示连接已关闭并完成收尾。
+	controlChannelStateClosed controlChannelLifecycleState = "closed"
+	// controlChannelStateFailed 表示连接异常失败，需要触发失败收敛。
+	controlChannelStateFailed controlChannelLifecycleState = "failed"
+)
+
+var controlChannelLifecycleTransitions = map[controlChannelLifecycleState]map[controlChannelLifecycleState]struct{}{
+	controlChannelStateConnecting: {
+		controlChannelStateConnected: {},
+		controlChannelStateFailed:    {},
+		controlChannelStateClosed:    {},
+	},
+	controlChannelStateConnected: {
+		controlChannelStateControlReady: {},
+		controlChannelStateFailed:       {},
+		controlChannelStateClosed:       {},
+	},
+	controlChannelStateControlReady: {
+		controlChannelStateAuthenticated: {},
+		controlChannelStateFailed:        {},
+		controlChannelStateClosed:        {},
+	},
+	controlChannelStateAuthenticated: {
+		controlChannelStateDraining: {},
+		controlChannelStateFailed:   {},
+		controlChannelStateClosed:   {},
+	},
+	controlChannelStateDraining: {
+		controlChannelStateClosed: {},
+		controlChannelStateFailed: {},
+	},
+	controlChannelStateFailed: {
+		controlChannelStateClosed: {},
+	},
+	controlChannelStateClosed: {},
+}
+
 // controlMessageDispatcher 负责把控制面业务帧分发给 Bridge 控制处理器。
 type controlMessageDispatcher struct {
 	sessionRegistry       *registry.SessionRegistry
 	serviceRegistry       *registry.ServiceRegistry
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
-	authCoordinator       *connectorAuthCoordinator
+	authCoordinator       appauth.Coordinator
+	handshakeGuard        appauth.HandshakeGuard
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 	tlsMode               string
 	metrics               *obs.Metrics
@@ -70,21 +124,24 @@ type controlChannelSessionState struct {
 	sessionID    string
 	sessionEpoch uint64
 	connectorID  string
+	// lifecycle 显式记录连接生命周期，收敛到 connecting->connected->control_ready->authenticated->draining/closed/failed。
+	lifecycle controlChannelLifecycleState
 	// sourceIP 保存连接建立时提取出的源地址，供认证审计直接复用。
 	sourceIP string
 	// assignedSessionEpoch 是 Welcome 阶段预分配给本连接的候选 epoch。
 	assignedSessionEpoch uint64
 	// helloAccepted 标记当前连接是否已完成 ConnectorHello 阶段。
 	helloAccepted bool
-	// authenticated 标记当前连接是否已经完成 ConnectorAuthAck(success=true)。
-	authenticated bool
+	// unauthConnectionReserved 标记当前连接是否已占用未认证连接预算。
+	unauthConnectionReserved bool
 }
 
 // newControlChannelSessionState 创建控制连接上下文并预先归一化 source_ip。
 func newControlChannelSessionState(peerAddr string) *controlChannelSessionState {
 	return &controlChannelSessionState{
+		lifecycle: controlChannelStateConnecting,
 		// 连接建立时就提取 source_ip，避免后续每次认证重复解析地址。
-		sourceIP: normalizeConnectorAuthSourceIP(peerAddr),
+		sourceIP: appauth.NormalizeSourceIP(peerAddr),
 	}
 }
 
@@ -113,7 +170,95 @@ func (state *controlChannelSessionState) setHelloContext(connectorID string, ass
 	state.connectorID = normalizedConnectorID
 	state.assignedSessionEpoch = assignedSessionEpoch
 	state.helloAccepted = true
-	state.authenticated = false
+	// 进入 hello 阶段前，连接至少已经准备好处理控制面握手消息。
+	state.markControlReady()
+}
+
+// transitionLifecycle 按状态机规则推进连接生命周期。
+func (state *controlChannelSessionState) transitionLifecycle(nextState controlChannelLifecycleState) bool {
+	if state == nil {
+		return false
+	}
+	if state.lifecycle == nextState {
+		return true
+	}
+	allowedTransitions, exists := controlChannelLifecycleTransitions[state.lifecycle]
+	if !exists {
+		return false
+	}
+	if _, allowed := allowedTransitions[nextState]; !allowed {
+		return false
+	}
+	state.lifecycle = nextState
+	return true
+}
+
+// markConnected 把连接状态推进到 connected。
+func (state *controlChannelSessionState) markConnected() {
+	if state == nil {
+		return
+	}
+	_ = state.transitionLifecycle(controlChannelStateConnected)
+}
+
+// markControlReady 把连接状态推进到 control_ready。
+func (state *controlChannelSessionState) markControlReady() {
+	if state == nil {
+		return
+	}
+	state.markConnected()
+	_ = state.transitionLifecycle(controlChannelStateControlReady)
+}
+
+// markAuthenticated 把连接状态推进到 authenticated。
+func (state *controlChannelSessionState) markAuthenticated() {
+	if state == nil {
+		return
+	}
+	state.markControlReady()
+	_ = state.transitionLifecycle(controlChannelStateAuthenticated)
+}
+
+// markDraining 把连接状态推进到 draining。
+func (state *controlChannelSessionState) markDraining() {
+	if state == nil {
+		return
+	}
+	if state.lifecycle == controlChannelStateFailed || state.lifecycle == controlChannelStateClosed {
+		return
+	}
+	if state.lifecycle != controlChannelStateAuthenticated {
+		// 只有认证后的连接才能进入 draining，未认证连接直接保持原状态。
+		return
+	}
+	_ = state.transitionLifecycle(controlChannelStateDraining)
+}
+
+// markFailed 把连接状态推进到 failed。
+func (state *controlChannelSessionState) markFailed() {
+	if state == nil || state.lifecycle == controlChannelStateClosed {
+		return
+	}
+	_ = state.transitionLifecycle(controlChannelStateFailed)
+}
+
+// markClosed 把连接状态推进到 closed。
+func (state *controlChannelSessionState) markClosed() {
+	if state == nil {
+		return
+	}
+	if state.lifecycle == controlChannelStateAuthenticated {
+		_ = state.transitionLifecycle(controlChannelStateDraining)
+	}
+	_ = state.transitionLifecycle(controlChannelStateClosed)
+}
+
+// isAuthenticated 判断连接是否已经完成认证并可处理业务消息。
+func (state *controlChannelSessionState) isAuthenticated() bool {
+	if state == nil {
+		return false
+	}
+	return state.lifecycle == controlChannelStateAuthenticated
 }
 
 // controlMessageDispatcherOptions 定义控制面分发器依赖。
@@ -122,7 +267,8 @@ type controlMessageDispatcherOptions struct {
 	serviceRegistry       *registry.ServiceRegistry
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
-	authCoordinator       *connectorAuthCoordinator
+	authCoordinator       appauth.Coordinator
+	handshakeGuard        appauth.HandshakeGuard
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 	tlsMode               string
 	metrics               *obs.Metrics
@@ -153,14 +299,18 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 	authCoordinator := options.authCoordinator
 	if authCoordinator == nil {
 		// 未注入认证协调器时使用默认实现，保证控制面握手可直接落地。
-		authCoordinator = newConnectorAuthCoordinator(connectorAuthCoordinatorOptions{
-			sessionRegistry: sessionRegistry,
-			metrics:         options.metrics,
+		authCoordinator = appauth.NewCoordinator(appauth.CoordinatorOptions{
+			SessionRegistry: sessionRegistry,
+			Metrics:         options.metrics,
 		})
 	}
 	metrics := options.metrics
 	if metrics == nil {
 		metrics = obs.DefaultMetrics
+	}
+	handshakeGuard := options.handshakeGuard
+	if handshakeGuard == nil {
+		handshakeGuard = appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{})
 	}
 	eventGuard := consistency.NewResourceEventGuard(4096)
 	sessionHandler := bridgecontrol.NewSessionHandler(bridgecontrol.SessionHandlerOptions{
@@ -169,9 +319,9 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		RouteRegistry:   routeRegistry,
 		Guard:           eventGuard,
 	})
-	normalizedTLSMode, err := normalizeControlPlaneTLSMode(options.tlsMode)
+	normalizedTLSMode, err := apptls.NormalizeMode(options.tlsMode)
 	if err != nil {
-		normalizedTLSMode = controlPlaneTLSModePlaintext
+		normalizedTLSMode = apptls.ModePlaintext
 	}
 	return &controlMessageDispatcher{
 		sessionRegistry:       sessionRegistry,
@@ -179,6 +329,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		routeRegistry:         routeRegistry,
 		tunnelRegistry:        tunnelRegistry,
 		authCoordinator:       authCoordinator,
+		handshakeGuard:        handshakeGuard,
 		tunnelPoolReportStore: options.tunnelPoolReportStore,
 		tlsMode:               string(normalizedTLSMode),
 		metrics:               metrics,
@@ -241,7 +392,7 @@ func (dispatcher *controlMessageDispatcher) handleFrame(
 		}
 		return &replyFrame, transport.RecommendControlFramePriority(replyFrame.Type), nil
 	}
-	if sessionState != nil && !sessionState.authenticated {
+	if sessionState != nil && !sessionState.isAuthenticated() {
 		// 认证成功前拒绝所有业务控制消息，避免未认证连接污染运行态。
 		// 这里不返回错误，避免 serve 循环直接断链触发无意义重连风暴。
 		slog.Warn(
@@ -299,7 +450,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"decode connector hello payload failed",
 		)
 	}
@@ -309,7 +460,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"invalid connector hello payload",
 		)
 	}
@@ -320,7 +471,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"connector_id is required",
 		)
 	}
@@ -330,8 +481,28 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 			false,
 			"",
 			0,
-			connectorAuthErrorConnectorMismatch,
+			appauth.AuthErrorConnectorMismatch,
 			"connector_id mismatch between envelope and hello payload",
+		)
+	}
+	peerSourceIP := ""
+	if sessionState != nil {
+		peerSourceIP = strings.TrimSpace(sessionState.sourceIP)
+	}
+	if allowed, dimension := dispatcher.allowConnectorHello(peerSourceIP, normalizedConnectorID); !allowed {
+		slog.Warn(
+			"connector hello rate limited",
+			"connector_id", normalizedConnectorID,
+			"source_ip", peerSourceIP,
+			"dimension", dimension,
+		)
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			appauth.AuthErrorRateLimited,
+			"authentication rejected",
 		)
 	}
 
@@ -369,9 +540,9 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	}
 	var authPayload pb.ConnectorAuth
 	emitAuditReject := func(errorCode string, sessionID string, sessionEpoch uint64) {
-		emitConnectorAuthAuditLog(false, connectorAuthAuditRecord{
+		appauth.EmitAuthAuditLog(false, appauth.AuditRecord{
 			ConnectorID:  auditConnectorID,
-			TokenID:      extractConnectorTokenIDForAudit(authPayload.Token),
+			TokenID:      appauth.ExtractTokenIDForAudit(authPayload.Token),
 			SessionID:    sessionID,
 			SessionEpoch: sessionEpoch,
 			SourceIP:     auditSourceIP,
@@ -379,116 +550,164 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 		})
 	}
 	if sessionState == nil || !sessionState.helloAccepted {
-		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
+		emitAuditReject(appauth.AuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"connector_welcome is required before connector_auth",
 		)
 	}
 	if err := decodeControlPayload(envelope.Payload, &authPayload); err != nil {
-		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
+		emitAuditReject(appauth.AuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"decode connector auth payload failed",
 		)
 	}
 	normalizedConnectorID := strings.TrimSpace(sessionState.connectorID)
 	if normalizedConnectorID == "" {
-		emitAuditReject(connectorAuthErrorConnectorMismatch, "", auditSessionEpoch)
+		emitAuditReject(appauth.AuthErrorConnectorMismatch, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			connectorAuthErrorConnectorMismatch,
+			appauth.AuthErrorConnectorMismatch,
 			"connector_id is missing in handshake context",
 		)
 	}
 	// Hello 阶段已锁定 connector_id，后续审计统一以该权威值输出。
 	auditConnectorID = normalizedConnectorID
 	if envelopeConnectorID := strings.TrimSpace(envelope.ConnectorID); envelopeConnectorID != "" && envelopeConnectorID != normalizedConnectorID {
-		emitAuditReject(connectorAuthErrorConnectorMismatch, "", auditSessionEpoch)
+		emitAuditReject(appauth.AuthErrorConnectorMismatch, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			connectorAuthErrorConnectorMismatch,
+			appauth.AuthErrorConnectorMismatch,
 			"connector_id mismatch between hello and auth",
 		)
 	}
 	if dispatcher == nil || dispatcher.authCoordinator == nil {
-		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
+		emitAuditReject(appauth.AuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			connectorAuthErrorInternal,
+			appauth.AuthErrorInternal,
 			"auth coordinator is not initialized",
 		)
 	}
+	if banned, dimension, banUntil := dispatcher.isConnectorAuthBanned(auditSourceIP, normalizedConnectorID); banned {
+		emitAuditReject(appauth.AuthErrorRateLimited, "", auditSessionEpoch)
+		slog.Warn(
+			"connector auth rejected by short-time ban",
+			"connector_id", normalizedConnectorID,
+			"source_ip", auditSourceIP,
+			"dimension", dimension,
+			"ban_until", banUntil.Format(time.RFC3339),
+		)
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			appauth.AuthErrorRateLimited,
+			"authentication rejected",
+		)
+	}
+	if !dispatcher.acquireAuthConcurrencyBudget() {
+		emitAuditReject(appauth.AuthErrorRateLimited, "", auditSessionEpoch)
+		slog.Warn(
+			"connector auth rejected by concurrency budget",
+			"connector_id", normalizedConnectorID,
+			"source_ip", auditSourceIP,
+		)
+		return buildConnectorAuthAckEnvelope(
+			envelope,
+			false,
+			"",
+			0,
+			appauth.AuthErrorRateLimited,
+			"authentication rejected",
+		)
+	}
+	defer dispatcher.releaseAuthConcurrencyBudget()
 	authResult := dispatcher.authCoordinator.AuthenticateAndCommit(
-		connectorAuthRequest{
-			connectorID:          normalizedConnectorID,
-			assignedSessionEpoch: sessionState.assignedSessionEpoch,
-			authMethod:           authPayload.AuthMethod,
-			token:                authPayload.Token,
+		appauth.Request{
+			ConnectorID:          normalizedConnectorID,
+			AssignedSessionEpoch: sessionState.assignedSessionEpoch,
+			AuthMethod:           authPayload.AuthMethod,
+			Token:                authPayload.Token,
 		},
 		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
 			dispatcher.commitAuthenticatedSession(now, sessionRuntime, envelope.ResourceVersion)
 			return nil
 		},
 	)
-	if !authResult.success {
-		emitAuditReject(authResult.errorCode, "", auditSessionEpoch)
+	if !authResult.Success {
+		if appauth.ShouldCountForAuthFailureBan(authResult.ErrorCode) {
+			if banned, dimension, banUntil := dispatcher.recordConnectorAuthFailure(auditSourceIP, normalizedConnectorID); banned {
+				slog.Warn(
+					"connector auth short-time ban activated",
+					"connector_id", normalizedConnectorID,
+					"source_ip", auditSourceIP,
+					"dimension", dimension,
+					"ban_until", banUntil.Format(time.RFC3339),
+				)
+			}
+		}
+		publicErrorCode, publicErrorMessage := appauth.NormalizePublicAuthReject(authResult.ErrorCode, authResult.ErrorMessage)
+		emitAuditReject(authResult.ErrorCode, "", auditSessionEpoch)
 		slog.Warn(
 			"connector auth rejected",
 			"connector_id", normalizedConnectorID,
 			"assigned_session_epoch", sessionState.assignedSessionEpoch,
-			"error_code", authResult.errorCode,
-			"error_message", authResult.errorMessage,
+			"error_code", authResult.ErrorCode,
+			"error_message", authResult.ErrorMessage,
+			"public_error_code", publicErrorCode,
 		)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
 			"",
 			0,
-			authResult.errorCode,
-			authResult.errorMessage,
+			publicErrorCode,
+			publicErrorMessage,
 		)
 	}
 	// 认证成功后更新连接上下文，供 heartbeat 与后续资源消息复用。
-	sessionState.setSession(authResult.sessionID, authResult.sessionEpoch)
-	sessionState.authenticated = true
-	emitConnectorAuthAuditLog(true, connectorAuthAuditRecord{
+	sessionState.setSession(authResult.SessionID, authResult.SessionEpoch)
+	dispatcher.markSessionAuthenticated(sessionState)
+	appauth.EmitAuthAuditLog(true, appauth.AuditRecord{
 		ConnectorID:  normalizedConnectorID,
-		TokenID:      extractConnectorTokenIDForAudit(authPayload.Token),
-		SessionID:    authResult.sessionID,
-		SessionEpoch: authResult.sessionEpoch,
+		TokenID:      appauth.ExtractTokenIDForAudit(authPayload.Token),
+		SessionID:    authResult.SessionID,
+		SessionEpoch: authResult.SessionEpoch,
 		SourceIP:     auditSourceIP,
 		ErrorCode:    "",
 	})
 	slog.Info(
 		"connector auth committed",
 		"connector_id", normalizedConnectorID,
-		"session_id", authResult.sessionID,
-		"session_epoch", authResult.sessionEpoch,
+		"session_id", authResult.SessionID,
+		"session_epoch", authResult.SessionEpoch,
 	)
 
 	return buildConnectorAuthAckEnvelope(
 		envelope,
 		true,
-		authResult.sessionID,
-		authResult.sessionEpoch,
+		authResult.SessionID,
+		authResult.SessionEpoch,
 		"",
 		"",
 	)
@@ -520,9 +739,149 @@ func selectWelcomeBinding(supportedBindings []string) string {
 	return defaultWelcomeBinding
 }
 
-// newConnectorSessionID 生成握手成功后的会话 ID。
-func newConnectorSessionID() string {
-	return fmt.Sprintf("session-%d", time.Now().UTC().UnixNano())
+// allowConnectorHello 执行 Hello 阶段 source_ip/connector_id 双维限流判定。
+func (dispatcher *controlMessageDispatcher) allowConnectorHello(sourceIP string, connectorID string) (bool, string) {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil {
+		return true, ""
+	}
+	allowed, dimension := dispatcher.handshakeGuard.AllowHello(sourceIP, connectorID)
+	if allowed {
+		return true, ""
+	}
+	dispatcher.observeAuthRateLimit()
+	return false, dimension
+}
+
+// isConnectorAuthBanned 检查认证失败封禁是否命中。
+func (dispatcher *controlMessageDispatcher) isConnectorAuthBanned(
+	sourceIP string,
+	connectorID string,
+) (bool, string, time.Time) {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil {
+		return false, "", time.Time{}
+	}
+	banned, dimension, banUntil := dispatcher.handshakeGuard.IsAuthBanned(sourceIP, connectorID)
+	if banned {
+		dispatcher.observeAuthRateLimit()
+	}
+	return banned, dimension, banUntil
+}
+
+// recordConnectorAuthFailure 记录认证失败并在达到阈值时激活短时封禁。
+func (dispatcher *controlMessageDispatcher) recordConnectorAuthFailure(
+	sourceIP string,
+	connectorID string,
+) (bool, string, time.Time) {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil {
+		return false, "", time.Time{}
+	}
+	return dispatcher.handshakeGuard.RecordAuthFailure(sourceIP, connectorID)
+}
+
+// acquireAuthConcurrencyBudget 尝试占用认证并发预算。
+func (dispatcher *controlMessageDispatcher) acquireAuthConcurrencyBudget() bool {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil {
+		return true
+	}
+	allowed := dispatcher.handshakeGuard.TryAcquireAuthConcurrency()
+	if !allowed {
+		dispatcher.observeAuthRateLimit()
+	}
+	return allowed
+}
+
+// releaseAuthConcurrencyBudget 释放认证并发预算。
+func (dispatcher *controlMessageDispatcher) releaseAuthConcurrencyBudget() {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil {
+		return
+	}
+	dispatcher.handshakeGuard.ReleaseAuthConcurrency()
+}
+
+// reserveUnauthenticatedConnectionBudget 尝试占用未认证连接预算。
+func (dispatcher *controlMessageDispatcher) reserveUnauthenticatedConnectionBudget(sessionState *controlChannelSessionState) bool {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil || sessionState == nil {
+		return true
+	}
+	if sessionState.unauthConnectionReserved || sessionState.isAuthenticated() {
+		return true
+	}
+	allowed := dispatcher.handshakeGuard.TryAcquireUnauthenticatedConnection()
+	if !allowed {
+		dispatcher.observeAuthRateLimit()
+		return false
+	}
+	sessionState.unauthConnectionReserved = true
+	return true
+}
+
+// releaseUnauthenticatedConnectionBudget 释放未认证连接预算。
+func (dispatcher *controlMessageDispatcher) releaseUnauthenticatedConnectionBudget(sessionState *controlChannelSessionState) {
+	if dispatcher == nil || dispatcher.handshakeGuard == nil || sessionState == nil {
+		return
+	}
+	if !sessionState.unauthConnectionReserved {
+		return
+	}
+	dispatcher.handshakeGuard.ReleaseUnauthenticatedConnection()
+	sessionState.unauthConnectionReserved = false
+}
+
+// markSessionAuthenticated 在认证成功时更新连接状态并释放未认证预算占用。
+func (dispatcher *controlMessageDispatcher) markSessionAuthenticated(sessionState *controlChannelSessionState) {
+	if sessionState == nil {
+		return
+	}
+	sessionState.markAuthenticated()
+	dispatcher.releaseUnauthenticatedConnectionBudget(sessionState)
+}
+
+// markSessionFailedFromState 在控制连接异常退出时把会话标记为 FAILED 并触发清理。
+func (dispatcher *controlMessageDispatcher) markSessionFailedFromState(
+	now time.Time,
+	sessionState *controlChannelSessionState,
+	reason string,
+) {
+	if dispatcher == nil || sessionState == nil || !sessionState.isAuthenticated() {
+		return
+	}
+	sessionState.markFailed()
+	dispatcher.transitionSessionState(
+		now,
+		sessionState.sessionID,
+		sessionState.sessionEpoch,
+		registry.SessionFailed,
+		reason,
+	)
+}
+
+// closeSessionFromState 在连接正常收尾时把会话标记为 CLOSED 并触发清理。
+func (dispatcher *controlMessageDispatcher) closeSessionFromState(
+	now time.Time,
+	sessionState *controlChannelSessionState,
+	reason string,
+) {
+	if dispatcher == nil || sessionState == nil || !sessionState.isAuthenticated() {
+		return
+	}
+	sessionState.markDraining()
+	sessionState.markClosed()
+	dispatcher.transitionSessionState(
+		now,
+		sessionState.sessionID,
+		sessionState.sessionEpoch,
+		registry.SessionClosed,
+		reason,
+	)
+}
+
+// observeAuthRateLimit 统一记录限流/预算拒绝指标，便于告警规则复用。
+func (dispatcher *controlMessageDispatcher) observeAuthRateLimit() {
+	if dispatcher == nil || dispatcher.metrics == nil {
+		return
+	}
+	dispatcher.metrics.ObserveBridgeAuthFailure(appauth.AuthErrorRateLimited)
+	dispatcher.metrics.IncBridgeAuthRateLimitTotal()
 }
 
 // dispatchEnvelope 按消息类型分派业务控制消息，并在需要时返回 ACK。
@@ -713,7 +1072,7 @@ func (dispatcher *controlMessageDispatcher) upsertSessionFromEnvelope(envelope p
 	}
 	if exists && sessionRuntime.Epoch == envelope.SessionEpoch {
 		switch sessionRuntime.State {
-		case registry.SessionDraining, registry.SessionStale, registry.SessionClosed:
+		case registry.SessionDraining, registry.SessionStale, registry.SessionFailed, registry.SessionClosed:
 			// 非 heartbeat 资源事件不允许把非 ACTIVE 会话重新提升为 ACTIVE。
 			return
 		}
@@ -899,12 +1258,12 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 		if dispatcher.tunnelRegistry != nil {
 			dispatcher.tunnelRegistry.PurgeBySession(now, sessionRuntime.SessionID, "session_draining:"+normalizedReason)
 		}
-	case registry.SessionStale, registry.SessionClosed:
+	case registry.SessionStale, registry.SessionFailed, registry.SessionClosed:
 		if dispatcher.tunnelPoolReportStore != nil {
 			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
 		}
 		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
-			// STALE/CLOSED 服务仅保留审计价值，不再参与路由解析。
+			// STALE/FAILED/CLOSED 服务仅保留审计价值，不再参与路由解析。
 			dispatcher.serviceRegistry.MarkLifecycleByConnector(
 				now,
 				sessionRuntime.ConnectorID,
@@ -1190,12 +1549,13 @@ func parseRefillMetadataInt(metadata map[string]string, key string) int {
 }
 
 type controlPlaneServer struct {
-	tcpListenAddr   string
-	grpcListenAddr  string
-	heartbeatTTL    time.Duration
-	tlsMode         controlPlaneTLSMode
-	serverTLSConfig *tls.Config
-	metrics         *obs.Metrics
+	tcpListenAddr    string
+	grpcListenAddr   string
+	heartbeatTTL     time.Duration
+	tlsMode          apptls.Mode
+	tlsCertSource    apptls.CertSource
+	tlsConfigManager apptls.ConfigManager
+	metrics          *obs.Metrics
 
 	tcpTransport  *tcpbinding.Transport
 	grpcTransport *grpcbinding.Transport
@@ -1216,6 +1576,7 @@ type controlPlaneDependencies struct {
 	tunnelRegistry        *registry.TunnelRegistry
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 	metrics               *obs.Metrics
+	managedCAIssuer       apptls.ManagedCACertificateIssuer
 }
 
 // newControlPlaneServer 创建控制面服务，并绑定业务分发器依赖。
@@ -1231,14 +1592,42 @@ func newControlPlaneServer(
 	if err != nil {
 		return nil, fmt.Errorf("new control plane grpc transport: %w", err)
 	}
-	normalizedTLSMode, err := normalizeControlPlaneTLSMode(config.TLSMode)
+	normalizedTLSMode, err := apptls.NormalizeMode(config.TLSMode)
 	if err != nil {
 		return nil, err
 	}
-	var serverTLSConfig *tls.Config
-	if normalizedTLSMode != controlPlaneTLSModePlaintext {
-		serverTLSConfig, err = loadControlPlaneServerTLSConfig(config.TLSCertFile, config.TLSKeyFile)
+	normalizedTLSCertSource, err := apptls.NormalizeCertSource(config.TLSCertSource)
+	if err != nil {
+		return nil, err
+	}
+	var tlsConfigManager apptls.ConfigManager
+	if normalizedTLSMode != apptls.ModePlaintext {
+		certificateProvider, providerErr := apptls.NewCertificateProvider(
+			apptls.CertificateProviderConfig{
+				TLSCertSource:            config.TLSCertSource,
+				TLSCertFile:              config.TLSCertFile,
+				TLSKeyFile:               config.TLSKeyFile,
+				TLSCACertFile:            config.TLSCACertFile,
+				TLSCAKeyFile:             config.TLSCAKeyFile,
+				TLSServerCommonName:      config.TLSServerCommonName,
+				TLSServerSANDNS:          append([]string(nil), config.TLSServerSANDNS...),
+				TLSServerSANIPs:          append([]string(nil), config.TLSServerSANIPs...),
+				TLSServerCertTTL:         config.TLSServerCertTTL,
+				TLSServerCertRenewBefore: config.TLSServerCertRenewBefore,
+			},
+			apptls.CertificateProviderOptions{
+				ManagedCAIssuer: dependencies.managedCAIssuer,
+			},
+		)
+		if providerErr != nil {
+			return nil, providerErr
+		}
+		tlsConfigManager, err = apptls.NewConfigManager(certificateProvider, normalizedTLSCertSource)
 		if err != nil {
+			return nil, err
+		}
+		// 启动阶段立即加载证书，失败时直接终止启动，避免服务处于半可用状态。
+		if err := tlsConfigManager.Refresh(context.Background()); err != nil {
 			return nil, err
 		}
 	}
@@ -1247,15 +1636,16 @@ func newControlPlaneServer(
 		metrics = obs.DefaultMetrics
 	}
 	return &controlPlaneServer{
-		tcpListenAddr:   strings.TrimSpace(config.ListenAddr),
-		grpcListenAddr:  strings.TrimSpace(config.GRPCH2ListenAddr),
-		heartbeatTTL:    config.HeartbeatTimeout,
-		tlsMode:         normalizedTLSMode,
-		serverTLSConfig: serverTLSConfig,
-		metrics:         metrics,
-		tcpTransport:    tcpTransport,
-		grpcTransport:   grpcTransport,
-		grpcAcceptor:    grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
+		tcpListenAddr:    strings.TrimSpace(config.ListenAddr),
+		grpcListenAddr:   strings.TrimSpace(config.GRPCH2ListenAddr),
+		heartbeatTTL:     config.HeartbeatTimeout,
+		tlsMode:          normalizedTLSMode,
+		tlsCertSource:    normalizedTLSCertSource,
+		tlsConfigManager: tlsConfigManager,
+		metrics:          metrics,
+		tcpTransport:     tcpTransport,
+		grpcTransport:    grpcTransport,
+		grpcAcceptor:     grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
 		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
 			sessionRegistry:       dependencies.sessionRegistry,
 			serviceRegistry:       dependencies.serviceRegistry,
@@ -1282,6 +1672,10 @@ func (server *controlPlaneServer) run(ctx context.Context) error {
 	runners := []func(context.Context) error{
 		server.runTCP,
 		server.runSessionLifecycleLoop,
+	}
+	if server.tlsConfigManager != nil {
+		// TLS 启用时后台周期刷新证书，实现续签和替换热加载。
+		runners = append(runners, server.runTLSCertificateReloadLoop)
 	}
 	if server.grpcListenAddr != "" {
 		runners = append(runners, server.runGRPC)
@@ -1337,6 +1731,54 @@ func (server *controlPlaneServer) runSessionLifecycleLoop(ctx context.Context) e
 		case <-ticker.C:
 		}
 	}
+}
+
+// runTLSCertificateReloadLoop 周期刷新控制面服务端证书，实现续签与热加载。
+func (server *controlPlaneServer) runTLSCertificateReloadLoop(ctx context.Context) error {
+	if server == nil || server.tlsConfigManager == nil {
+		return nil
+	}
+	for {
+		reloadInterval := server.tlsConfigManager.NextReloadInterval()
+		if reloadInterval <= 0 {
+			reloadInterval = apptls.ReloadRetryInterval
+		}
+		reloadTimer := time.NewTimer(reloadInterval)
+		select {
+		case <-ctx.Done():
+			if !reloadTimer.Stop() {
+				select {
+				case <-reloadTimer.C:
+				default:
+				}
+			}
+			return nil
+		case <-reloadTimer.C:
+		}
+		if err := server.tlsConfigManager.Refresh(ctx); err != nil {
+			slog.Warn(
+				"reload control plane tls certificate failed",
+				"tls_mode", string(server.tlsMode),
+				"tls_cert_source", string(server.tlsCertSource),
+				"error", err.Error(),
+			)
+			continue
+		}
+		slog.Info(
+			"reload control plane tls certificate success",
+			"tls_mode", string(server.tlsMode),
+			"tls_cert_source", string(server.tlsCertSource),
+			"cert_not_after", server.tlsConfigManager.CurrentServerCertNotAfter().Format(time.RFC3339),
+		)
+	}
+}
+
+// currentServerTLSConfig 返回当前生效的服务端 TLS 配置。
+func (server *controlPlaneServer) currentServerTLSConfig() *tls.Config {
+	if server == nil || server.tlsConfigManager == nil {
+		return nil
+	}
+	return server.tlsConfigManager.CurrentServerTLSConfig()
 }
 
 func (server *controlPlaneServer) runTCP(ctx context.Context) error {
@@ -1408,7 +1850,9 @@ func (server *controlPlaneServer) runGRPC(ctx context.Context) error {
 
 	serveErrChan := make(chan error, 1)
 	go func() {
-		serveErrChan <- grpcServer.Serve(newControlPlaneTLSAwareListener(listener, server.tlsMode, server.serverTLSConfig, server.metrics))
+		serveErrChan <- grpcServer.Serve(
+			apptls.NewTLSAwareListener(listener, server.tlsMode, server.currentServerTLSConfig, server.metrics),
+		)
 	}()
 
 	select {
@@ -1508,13 +1952,41 @@ func serveGRPCControlChannel(
 func serveGRPCControlChannelWithDispatcher(
 	stream grpc.BidiStreamingServer[transportgen.ControlFrameEnvelope, transportgen.ControlFrameEnvelope],
 	dispatcher *controlMessageDispatcher,
-) error {
+) (serveErr error) {
 	effectiveDispatcher := dispatcher
 	if effectiveDispatcher == nil {
 		// 测试或兼容路径未注入 dispatcher 时按默认实现创建一份。
 		effectiveDispatcher = newControlMessageDispatcher(controlMessageDispatcherOptions{})
 	}
 	sessionState := newControlChannelSessionState(grpcPeerAddrString(stream.Context()))
+	sessionState.markConnected()
+	sessionState.markControlReady()
+	defer func() {
+		effectiveDispatcher.releaseUnauthenticatedConnectionBudget(sessionState)
+		// 认证成功后，连接退出必须显式推进会话终态，避免遗留隧道资源。
+		if serveErr != nil &&
+			!errors.Is(serveErr, context.Canceled) &&
+			!errors.Is(serveErr, context.DeadlineExceeded) {
+			effectiveDispatcher.markSessionFailedFromState(
+				time.Now().UTC(),
+				sessionState,
+				"grpc_control_channel_failed",
+			)
+			return
+		}
+		effectiveDispatcher.closeSessionFromState(
+			time.Now().UTC(),
+			sessionState,
+			"grpc_control_channel_closed",
+		)
+	}()
+	if !effectiveDispatcher.reserveUnauthenticatedConnectionBudget(sessionState) {
+		slog.Warn(
+			"reject grpc control channel by unauthenticated connection budget",
+			"peer_addr", grpcPeerAddrString(stream.Context()),
+		)
+		return nil
+	}
 	for {
 		frameEnvelope, err := stream.Recv()
 		if err != nil {
@@ -1582,12 +2054,17 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 	if server == nil || rawConn == nil {
 		return errors.New("serve tcp inbound: invalid argument")
 	}
-	acceptedConn, tlsEnabled, acceptErr := acceptControlPlaneConnWithTLS(rawConn, server.tlsMode, server.serverTLSConfig, server.metrics)
+	acceptedConn, tlsEnabled, acceptErr := apptls.AcceptConnWithTLS(
+		rawConn,
+		server.tlsMode,
+		server.currentServerTLSConfig(),
+		server.metrics,
+	)
 	if acceptErr != nil {
 		slog.Warn(
 			"reject tcp inbound connection by tls mode",
 			"tls_mode", string(server.tlsMode),
-			"peer_addr", remoteAddrString(rawConn),
+			"peer_addr", apptls.RemoteAddrString(rawConn),
 			"error", acceptErr.Error(),
 		)
 		_ = rawConn.Close()
@@ -1603,7 +2080,7 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 			"accept tcp control connection",
 			"tls_mode", string(server.tlsMode),
 			"tls_enabled", tlsEnabled,
-			"peer_addr", remoteAddrString(rawConn),
+			"peer_addr", apptls.RemoteAddrString(rawConn),
 		)
 		controlChannel, openErr := server.tcpTransport.OpenControlChannel(classifiedConn)
 		if openErr != nil {
@@ -1614,7 +2091,7 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 			ctx,
 			controlChannel,
 			server.dispatcher,
-			remoteAddrString(rawConn),
+			apptls.RemoteAddrString(rawConn),
 		); serveErr != nil && !isControlChannelClosedError(serveErr) {
 			_ = controlChannel.Close(context.Background())
 			return fmt.Errorf("serve tcp inbound: serve control channel: %w", serveErr)
@@ -1625,7 +2102,7 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 		"accept tcp tunnel connection",
 		"tls_mode", string(server.tlsMode),
 		"tls_enabled", tlsEnabled,
-		"peer_addr", remoteAddrString(rawConn),
+		"peer_addr", apptls.RemoteAddrString(rawConn),
 	)
 	if registerErr := server.handleAcceptedTCPTunnel(classifiedConn); registerErr != nil {
 		_ = classifiedConn.Close()
@@ -2303,7 +2780,7 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 	controlChannel transport.ControlChannel,
 	dispatcher *controlMessageDispatcher,
 	peerAddr string,
-) error {
+) (serveErr error) {
 	effectiveDispatcher := dispatcher
 	if effectiveDispatcher == nil {
 		// 测试或兼容路径未注入 dispatcher 时按默认实现创建一份。
@@ -2313,9 +2790,35 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 		return errors.New("control channel is nil")
 	}
 	sessionState := newControlChannelSessionState(peerAddr)
+	sessionState.markConnected()
+	sessionState.markControlReady()
 	defer func() {
+		effectiveDispatcher.releaseUnauthenticatedConnectionBudget(sessionState)
+		// 认证成功后，连接退出必须显式推进会话终态，避免遗留隧道资源。
+		if serveErr != nil &&
+			!errors.Is(serveErr, context.Canceled) &&
+			!errors.Is(serveErr, context.DeadlineExceeded) {
+			effectiveDispatcher.markSessionFailedFromState(
+				time.Now().UTC(),
+				sessionState,
+				"tcp_control_channel_failed",
+			)
+		} else {
+			effectiveDispatcher.closeSessionFromState(
+				time.Now().UTC(),
+				sessionState,
+				"tcp_control_channel_closed",
+			)
+		}
 		_ = controlChannel.Close(context.Background())
 	}()
+	if !effectiveDispatcher.reserveUnauthenticatedConnectionBudget(sessionState) {
+		slog.Warn(
+			"reject control channel by unauthenticated connection budget",
+			"peer_addr", strings.TrimSpace(peerAddr),
+		)
+		return nil
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -2323,6 +2826,9 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 		}
 		frame, err := controlChannel.ReadControlFrame(ctx)
 		if err != nil {
+			if isControlChannelClosedError(err) {
+				return nil
+			}
 			return err
 		}
 		replyFrame, priority, err := effectiveDispatcher.handleFrame(frame, sessionState)
@@ -2341,6 +2847,9 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 		)
 		cancel()
 		if replyErr != nil {
+			if isControlChannelClosedError(replyErr) {
+				return nil
+			}
 			return fmt.Errorf("write control reply frame: %w", replyErr)
 		}
 	}

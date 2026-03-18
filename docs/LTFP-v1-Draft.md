@@ -42,20 +42,21 @@
 
 这是本协议的硬约束。
 
-## 3.1 最小作用域隔离是强制项
+## 3.1 作用域模型能力是强制项
 
 即使不做完整租户系统，也必须有：
 
 * `namespace`
 * `environment`
 
-所有核心资源都必须带作用域：
+系统必须具备基于 `namespace/environment` 的发布与路由治理能力。默认要求如下：
 
 * connector
-* service
 * route
 * discovery query
 * discovery projection
+
+`service` 允许省略 `namespace/environment`（例如仅按服务名接入的场景）；当 service scope 为空时，表示该 service 不声明显式作用域约束。scope 是否参与匹配由 route policy 决定，但不影响 `service_key` 身份计算。
 
 ---
 
@@ -238,18 +239,24 @@ svc_01J8Z6C4X9K7M2P4
 
 ## 6.2 `service_key`
 
-* 稳定作用域引用键
+* 稳定服务引用键
 * 格式固定为：
 
 ```text
-<namespace>/<environment>/<service_name>
+<service_name>/<protocol>
 ```
 
 示例：
 
 ```text
-dev/alice/order-service
+order-service/http
 ```
+
+约束：
+
+* `service_name` 必填，且不允许包含 `/`
+* `protocol` 必填，来自 `PublishService.endpoints[*].protocol` 并按 `trim + lower-case` 规范化
+* 同一条 `PublishService` 的全部 endpoint 必须使用同一 `protocol`；多协议必须拆分为多条 service 发布
 
 ---
 
@@ -257,12 +264,24 @@ dev/alice/order-service
 
 * `service_key` 是 **canonical lookup key**
 * `service_id` 是 **canonical identity key**
-* `service_key -> service_id` 在当前系统中一对一映射
+* `service_key -> service_id` 在逻辑服务池维度是一对一映射
+* 同一 `service_key` 可由多个 connector 并发发布，统一归并到同一 `service_id`
 * route target 使用 `service_key`
 * runtime / traffic / ACK / audit 使用 `service_id`
 * 当 `PublishService.service_id` 为空时：
   * 若 `service_key` 已存在，server **必须复用既有 `service_id`**
   * 仅当 `service_key` 首次出现时，server 才分配新的 `service_id`
+* `service_id` 下可挂接多个运行时实例（见 `6.4`），用于多 connector 高可用与负载分配
+
+---
+
+## 6.4 `service_instance_id`
+
+* 运行时内部实例标识（不要求进入控制面协议 schema）
+* 用于区分同一 `service_id` 下来自不同 connector/session 的可用实例
+* 推荐由 server 内部按 `(connector_id, session_id, service_key)` 组合生成稳定键
+* route resolve 先定位 `service_key -> service_id`，再从实例池中选择一个 `service_instance_id`
+* 单条 traffic 生命周期内固定绑定一个 `service_instance_id`，不做 mid-stream failover
 
 ---
 
@@ -332,6 +351,11 @@ dev/alice/order-service
 * `labels`
 * `metadata`
 
+### 说明
+
+* `service_id` 标识逻辑服务池，允许由多个 connector 同时承载
+* server 运行时会维护该服务池下的实例集合（`service_instance_id` 维度）
+
 ### `status`
 
 `status` 是 **server 维护的派生生命周期状态**，不是 agent 直接声明的配置字段。
@@ -376,6 +400,7 @@ dev/alice/order-service
 
 ### 说明
 
+* 同一条 `PublishService` 的 endpoint 协议必须一致，用于唯一确定 `service_key` 的 `protocol` 片段
 * 首版通常只用一个 endpoint
 * 模型上允许多个 endpoint，为后续扩展留口子
 
@@ -440,6 +465,15 @@ dev/alice/order-service
 * `listen_port`
 * `path_prefix`
 * `sni`
+* `header_matches`
+
+### 匹配规则
+
+* `header_matches` 仅在 `L7 Shared Ingress` 生效；`TLS SNI Shared` 与 `L4 Dedicated` 配置该字段时必须拒绝 route
+* header 名按大小写不敏感匹配，server 侧统一按 lower-case 归一化
+* 首版采用“精确值匹配”语义：请求 header 存在且任一值与期望值完全一致（trim 后）即视为命中
+* `header_matches` 的键全部命中才算 route 命中
+* route `priority` 相同场景下，包含更多 `header_matches` 条目的 route 优先级更高（更具体）
 
 ---
 
@@ -468,6 +502,12 @@ dev/alice/order-service
 
 * `service_key`
 * `selector`
+
+### 解析语义
+
+* `service_key` 固定按 `<service_name>/<protocol>` 匹配逻辑服务池
+* 命中服务池后，从 `ACTIVE + HEALTHY` 的实例集合中选择一个实例（随机或等价无状态均衡算法）
+* 单条 traffic 在生命周期内固定绑定同一实例，不做中途切换
 
 ---
 
@@ -667,6 +707,12 @@ stateDiagram-v2
 * `Host`
 * `:authority`
 * `path_prefix`
+* `header_matches`（可选）
+
+说明：
+
+* 当多个 route 共享同一域名和路径时，可通过 `header_matches` 把请求分流到不同 `connector_service.target.service_key`
+* 该能力用于同入口多服务拆分、灰度流量或按租户 header 分流
 
 ### 可导出方式
 
@@ -1296,7 +1342,7 @@ message DiscoveryPolicy {
 
 message PublishService {
   string service_id = 1;      // may be empty on first publish; server must reuse existing id for known service_key
-  string service_key = 2;     // <namespace>/<environment>/<service_name>
+  string service_key = 2;     // <service_name>/<protocol>
   string namespace = 3;
   string environment = 4;
   string service_name = 5;
@@ -1389,6 +1435,7 @@ message RouteMatch {
   uint32 listen_port = 4;
   string path_prefix = 5;
   string sni = 6;
+  map<string, string> header_matches = 7; // L7 only, exact match
 }
 
 message RouteAssign {

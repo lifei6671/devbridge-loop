@@ -83,3 +83,42 @@ func TestRouteHandlerHandleAssignAndRevoke(t *testing.T) {
 		t.Fatalf("unexpected revoke error code: got=%s want=%s", revokeAck.ErrorCode, ltfperrors.CodeStaleEpochEvent)
 	}
 }
+
+// TestRouteHandlerRejectMutationWhenSessionNotActive 验证非 ACTIVE 会话不能写入路由资源。
+func TestRouteHandlerRejectMutationWhenSessionNotActive(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-draining",
+		ConnectorID: "connector-1",
+		Epoch:       3,
+		State:       registry.SessionDraining,
+	})
+	handler := NewRouteHandler(RouteHandlerOptions{
+		SessionRegistry: sessionRegistry,
+	})
+	assignAck := handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-draining",
+		SessionEpoch:    3,
+		EventID:         "evt-draining-route",
+		ResourceVersion: 1,
+		ResourceID:      "route-draining",
+	}, pb.RouteAssign{
+		RouteID:     "route-draining",
+		Namespace:   "dev",
+		Environment: "alice",
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+		},
+	})
+	if assignAck.Accepted {
+		t.Fatalf("expected draining session route assign rejected")
+	}
+	if assignAck.ErrorCode != ltfperrors.CodeInvalidStateTransition {
+		t.Fatalf("unexpected error code: got=%s want=%s", assignAck.ErrorCode, ltfperrors.CodeInvalidStateTransition)
+	}
+}

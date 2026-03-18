@@ -153,6 +153,7 @@ Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / Tra
 * service 路由
 * 权限判断
 * `service_key` 查找
+* `RouteMatch.header_matches` 匹配
 * namespace / env 逻辑
 * traffic 协议状态机
 * `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck` 字段语义
@@ -357,15 +358,17 @@ Transport `SessionState` 不是协议态，但必须能映射到协议态。
 
 本规范采用以下硬约束：
 
-1. `service_key` 仅用于 Server 侧 route resolve 输入
-2. route resolve 完成后，runtime/traffic 只允许使用 `service_id`
-3. transport 层不得依赖 `service_key`
-4. 数据面 tunnel 分配后，不得重新触发基于 `service_key` 的 lookup 语义
+1. `service_key` 仅用于 Server 侧 route resolve 输入（键格式由协议层定义为 `<service_name>/<protocol>`）
+2. route resolve 必须先完成“`service_key -> service_id -> service_instance_id`”解析，再进入数据面分配
+3. route resolve 完成后，runtime/traffic 主标识只允许使用 `service_id`，可附带 `service_instance_id` 作为实例维度
+4. transport 层不得依赖 `service_key`，也不得参与实例选择算法
+5. 数据面 tunnel 分配后，不得重新触发基于 `service_key` 的 lookup 语义
 
 结论：
 
 * `service_key` 属于控制面 / 路由决策层输入
-* `service_id` 属于 resolve 结果，也是 runtime/traffic 的唯一服务标识
+* `service_id` 属于 resolve 结果，也是 runtime/traffic 的唯一服务主标识
+* `service_instance_id` 属于控制面运行时实例调度结果，不属于 transport 抽象边界
 
 ---
 

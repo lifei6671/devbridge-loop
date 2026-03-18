@@ -1,6 +1,7 @@
-package app
+package auth
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +82,7 @@ type connectorAuthCoordinatorOptions struct {
 	tokenStore          connectorTokenStore
 	metrics             *obs.Metrics
 	now                 func() time.Time
+	sessionIDGenerator  func() string
 	supersedeRateWindow time.Duration
 	supersedeRateLimit  int
 }
@@ -91,6 +93,7 @@ type connectorAuthCoordinator struct {
 	tokenStore          connectorTokenStore
 	metrics             *obs.Metrics
 	now                 func() time.Time
+	sessionIDGenerator  func() string
 	supersedeRateWindow time.Duration
 	supersedeRateLimit  int
 
@@ -134,6 +137,11 @@ func newConnectorAuthCoordinator(options connectorAuthCoordinatorOptions) *conne
 		// 统一使用 UTC 作为认证与限流时间基准。
 		nowFunc = func() time.Time { return time.Now().UTC() }
 	}
+	sessionIDGenerator := options.sessionIDGenerator
+	if sessionIDGenerator == nil {
+		// 未注入时使用默认 session_id 生成器，保持认证链路自洽。
+		sessionIDGenerator = defaultConnectorSessionIDGenerator
+	}
 	rateWindow := options.supersedeRateWindow
 	if rateWindow <= 0 {
 		rateWindow = defaultConnectorSupersedeRateWindow
@@ -151,6 +159,7 @@ func newConnectorAuthCoordinator(options connectorAuthCoordinatorOptions) *conne
 		tokenStore:          tokenStore,
 		metrics:             metrics,
 		now:                 nowFunc,
+		sessionIDGenerator:  sessionIDGenerator,
 		supersedeRateWindow: rateWindow,
 		supersedeRateLimit:  rateLimit,
 		locker:              newConnectorScopedLocker(),
@@ -266,7 +275,7 @@ func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 	currentSession, currentExists := coordinator.sessionRegistry.GetByConnector(normalizedConnectorID)
 	if currentExists && currentSession.Epoch >= request.assignedSessionEpoch {
 		switch currentSession.State {
-		case registry.SessionStale, registry.SessionClosed:
+		case registry.SessionStale, registry.SessionFailed, registry.SessionClosed:
 			// 旧权威已终态时允许新握手重新接管 connector。
 		default:
 			result = connectorAuthResult{
@@ -288,7 +297,7 @@ func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 		return result
 	}
 
-	sessionID := newConnectorSessionID()
+	sessionID := coordinator.sessionIDGenerator()
 	if commitErr := commit(now, registry.SessionRuntime{
 		SessionID:     sessionID,
 		ConnectorID:   normalizedConnectorID,
@@ -323,6 +332,11 @@ func (coordinator *connectorAuthCoordinator) AuthenticateAndCommit(
 		sessionEpoch: request.assignedSessionEpoch,
 	}
 	return result
+}
+
+// defaultConnectorSessionIDGenerator 生成握手成功后的 session_id。
+func defaultConnectorSessionIDGenerator() string {
+	return fmt.Sprintf("session-%d", time.Now().UTC().UnixNano())
 }
 
 // nowUTC 返回认证流程统一使用的 UTC 时间戳。

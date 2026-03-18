@@ -238,3 +238,45 @@ func TestPublishHandlerHandleUnpublish(t *testing.T) {
 		t.Fatalf("unexpected current version: got=%d want=2", dupAck.CurrentResourceVersion)
 	}
 }
+
+// TestPublishHandlerRejectMutationWhenSessionNotActive 验证非 ACTIVE 会话不能写入服务资源。
+func TestPublishHandlerRejectMutationWhenSessionNotActive(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-draining",
+		ConnectorID: "connector-1",
+		Epoch:       3,
+		State:       registry.SessionDraining,
+	})
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+	})
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-draining",
+		SessionEpoch:    3,
+		EventID:         "evt-draining",
+		ResourceVersion: 1,
+		ResourceID:      "svc-draining",
+	}, pb.PublishService{
+		ServiceID:   "svc-draining",
+		ServiceKey:  "dev/alice/draining-service",
+		Namespace:   "dev",
+		Environment: "alice",
+		ServiceName: "draining-service",
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
+	if ack.Accepted {
+		t.Fatalf("expected draining session publish rejected")
+	}
+	if ack.ErrorCode != ltfperrors.CodeInvalidStateTransition {
+		t.Fatalf("unexpected error code: got=%s want=%s", ack.ErrorCode, ltfperrors.CodeInvalidStateTransition)
+	}
+}

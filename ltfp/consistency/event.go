@@ -1,7 +1,6 @@
 package consistency
 
 import (
-	"fmt"
 	"strings"
 
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
@@ -19,24 +18,20 @@ const (
 	VersionRelationNewer VersionRelation = 1
 )
 
-// BuildDedupKey 构造事件去重键。
-func BuildDedupKey(sessionID string, sessionEpoch uint64, eventID string) (string, error) {
+// BuildDedupKey 构造事件去重键，作用域固定为 session_id + event_id。
+func BuildDedupKey(sessionID string, eventID string) (string, error) {
 	normalizedSessionID := strings.TrimSpace(sessionID)
 	normalizedEventID := strings.TrimSpace(eventID)
 	// sessionId 为空会导致不同会话事件互相污染。
 	if normalizedSessionID == "" {
 		return "", ltfperrors.New(ltfperrors.CodeMissingRequiredField, "sessionId is required")
 	}
-	// sessionEpoch 必须为正数以保证代际隔离。
-	if sessionEpoch == 0 {
-		return "", ltfperrors.New(ltfperrors.CodeInvalidSessionEpoch, "sessionEpoch must be greater than 0")
-	}
 	// eventId 为空会破坏幂等语义。
 	if normalizedEventID == "" {
 		return "", ltfperrors.New(ltfperrors.CodeInvalidEventID, "eventId is required")
 	}
-	// key 由 session+epoch+event 三元组构成，满足资源级幂等要求。
-	return fmt.Sprintf("%s:%d:%s", normalizedSessionID, sessionEpoch, normalizedEventID), nil
+	// key 固定为 session_id + event_id，避免跨资源重复投递产生多次副作用。
+	return normalizedSessionID + ":" + normalizedEventID, nil
 }
 
 // CompareResourceVersion 比较资源版本关系。

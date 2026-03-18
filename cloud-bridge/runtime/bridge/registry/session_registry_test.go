@@ -136,3 +136,36 @@ func TestSessionRegistryCommitAuthoritativeRejectsSameEpochActiveTakeover(testin
 		testingObject.Fatalf("unexpected connector authoritative session after rejection: %+v", currentSession)
 	}
 }
+
+// TestSessionRegistryCommitAuthoritativeAllowsFailedEpochReset 验证旧权威已 FAILED 时允许低 epoch 会话接管。
+func TestSessionRegistryCommitAuthoritativeAllowsFailedEpochReset(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	registry := NewSessionRegistry()
+	now := time.Now().UTC()
+	registry.Upsert(now, SessionRuntime{
+		SessionID:     "session-failed",
+		ConnectorID:   "connector-1",
+		Epoch:         9,
+		State:         SessionFailed,
+		LastHeartbeat: now.Add(-time.Minute),
+		UpdatedAt:     now.Add(-time.Minute),
+	})
+
+	_, committed := registry.CommitAuthoritative(now.Add(time.Second), SessionRuntime{
+		SessionID:   "session-reset",
+		ConnectorID: "connector-1",
+		Epoch:       1,
+		State:       SessionActive,
+	})
+	if !committed {
+		testingObject.Fatalf("expected failed epoch reset authoritative commit success")
+	}
+	currentSession, exists := registry.GetByConnector("connector-1")
+	if !exists {
+		testingObject.Fatalf("expected connector authoritative session exists")
+	}
+	if currentSession.SessionID != "session-reset" || currentSession.Epoch != 1 {
+		testingObject.Fatalf("unexpected connector authoritative session after failed reset: %+v", currentSession)
+	}
+}

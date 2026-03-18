@@ -120,6 +120,34 @@ func TestTunnelReportHandlerRejectStaleEpoch(t *testing.T) {
 	}
 }
 
+// TestTunnelReportHandlerRejectNonActiveSession 验证 draining 会话上报不会触发补池。
+func TestTunnelReportHandlerRejectNonActiveSession(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-draining",
+		ConnectorID: "connector-1",
+		Epoch:       10,
+		State:       registry.SessionDraining,
+	})
+	handler := NewTunnelReportHandler(TunnelReportHandlerOptions{
+		SessionRegistry: sessionRegistry,
+	})
+	_, shouldSend := handler.HandleReport(pb.ControlEnvelope{
+		MessageType:  pb.ControlMessageTunnelPoolReport,
+		SessionID:    "session-draining",
+		SessionEpoch: 10,
+	}, pb.TunnelPoolReport{
+		IdleCount:       0,
+		TargetIdleCount: 6,
+		Trigger:         "event:pool_low",
+	})
+	if shouldSend {
+		t.Fatalf("non-active session should not trigger refill request")
+	}
+}
+
 // TestTunnelReportHandlerWritesReportStore 验证有效上报会写入 tunnel 池快照存储。
 func TestTunnelReportHandlerWritesReportStore(t *testing.T) {
 	t.Parallel()

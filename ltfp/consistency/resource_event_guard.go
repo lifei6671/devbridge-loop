@@ -150,7 +150,7 @@ func (guard *ResourceEventGuard) validateAndBuildKeys(meta ResourceEventMeta) (R
 		decision.ErrorMessage = err.Error()
 		return decision, false
 	}
-	dedupKey, err := BuildDedupKey(meta.SessionID, meta.SessionEpoch, meta.EventID)
+	dedupKey, err := BuildDedupKey(meta.SessionID, meta.EventID)
 	if err != nil {
 		// 去重键构造失败同样按 rejected 处理。
 		decision.Status = pb.EventStatusRejected

@@ -278,5 +278,9 @@ func (handler *PublishHandler) validateSessionEpoch(envelope pb.ControlEnvelope)
 		// epoch 不一致时必须拒绝，避免旧会话污染。
 		return ltfperrors.New(ltfperrors.CodeStaleEpochEvent, "session epoch mismatch for resource event")
 	}
+	if sessionRuntime.State != registry.SessionActive {
+		// 只有 ACTIVE 会话允许写入资源，draining/stale/failed/closed 一律冻结写路径。
+		return ltfperrors.New(ltfperrors.CodeInvalidStateTransition, "session state does not allow resource mutation")
+	}
 	return nil
 }

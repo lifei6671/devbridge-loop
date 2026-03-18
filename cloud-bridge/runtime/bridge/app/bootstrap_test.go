@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -131,7 +132,7 @@ func TestConfigValidateRejectsMissingTLSFilesWhenTLSEnabled(testingObject *testi
 	testingObject.Parallel()
 
 	config := DefaultConfig()
-	config.ControlPlane.TLSMode = string(controlPlaneTLSModeRequired)
+	config.ControlPlane.TLSMode = string(apptls.ModeRequired)
 	config.ControlPlane.TLSCertFile = ""
 	config.ControlPlane.TLSKeyFile = ""
 	if err := config.Validate(); err == nil {
@@ -145,11 +146,44 @@ func TestConfigValidateAllowsTLSModeOptionalWithFiles(testingObject *testing.T) 
 	testingObject.Parallel()
 
 	config := DefaultConfig()
-	config.ControlPlane.TLSMode = string(controlPlaneTLSModeOptional)
+	config.ControlPlane.TLSMode = string(apptls.ModeOptional)
 	config.ControlPlane.TLSCertFile = "/tmp/bridge-cert.pem"
 	config.ControlPlane.TLSKeyFile = "/tmp/bridge-key.pem"
 	if err := config.Validate(); err != nil {
 		testingObject.Fatalf("validate config should pass when tls_mode optional has cert/key: %v", err)
+	}
+}
+
+// TestConfigValidateRejectsManagedCAWithoutSAN 验证 managed_ca 模式缺失 SAN 时会被配置校验拒绝。
+func TestConfigValidateRejectsManagedCAWithoutSAN(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ControlPlane.TLSMode = string(apptls.ModeRequired)
+	config.ControlPlane.TLSCertSource = string(apptls.CertSourceManagedCA)
+	config.ControlPlane.TLSCACertFile = "/tmp/managed-root-ca.crt"
+	config.ControlPlane.TLSCAKeyFile = "/tmp/managed-root-ca.key"
+	config.ControlPlane.TLSServerSANDNS = nil
+	config.ControlPlane.TLSServerSANIPs = nil
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("validate config should fail when managed_ca has no san")
+	}
+}
+
+// TestConfigValidateAllowsManagedCAWithSAN 验证 managed_ca 模式在 CA 文件和 SAN 齐备时可通过校验。
+func TestConfigValidateAllowsManagedCAWithSAN(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ControlPlane.TLSMode = string(apptls.ModeRequired)
+	config.ControlPlane.TLSCertSource = string(apptls.CertSourceManagedCA)
+	config.ControlPlane.TLSCACertFile = "/tmp/managed-root-ca.crt"
+	config.ControlPlane.TLSCAKeyFile = "/tmp/managed-root-ca.key"
+	config.ControlPlane.TLSServerSANDNS = []string{"bridge.internal.example"}
+	config.ControlPlane.TLSServerCertTTL = 72 * time.Hour
+	config.ControlPlane.TLSServerCertRenewBefore = 12 * time.Hour
+	if err := config.Validate(); err != nil {
+		testingObject.Fatalf("validate config should pass for managed_ca: %v", err)
 	}
 }
 
@@ -158,7 +192,7 @@ func TestBootstrapIgnoresTLSFilesWhenTLSModePlaintext(testingObject *testing.T) 
 	testingObject.Parallel()
 
 	config := DefaultConfig()
-	config.ControlPlane.TLSMode = string(controlPlaneTLSModePlaintext)
+	config.ControlPlane.TLSMode = string(apptls.ModePlaintext)
 	config.ControlPlane.TLSCertFile = "/tmp/stale-bridge-cert.pem"
 	config.ControlPlane.TLSKeyFile = "/tmp/stale-bridge-key.pem"
 
@@ -169,7 +203,7 @@ func TestBootstrapIgnoresTLSFilesWhenTLSModePlaintext(testingObject *testing.T) 
 	if runtime.controlServer == nil {
 		testingObject.Fatalf("expected control server initialized")
 	}
-	if runtime.controlServer.serverTLSConfig != nil {
+	if runtime.controlServer.currentServerTLSConfig() != nil {
 		testingObject.Fatalf("expected plaintext mode not to load server tls config")
 	}
 }

@@ -1,4 +1,4 @@
-package app
+package config
 
 import (
 	"bytes"
@@ -53,12 +53,20 @@ type persistedConfigYAML struct {
 	Admin         AdminConfig         `yaml:"admin"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	ControlPlane  struct {
-		ListenAddr       string `yaml:"listen_addr"`
-		GRPCH2ListenAddr string `yaml:"grpc_h2_listen_addr"`
-		HeartbeatTimeout string `yaml:"heartbeat_timeout"`
-		TLSMode          string `yaml:"tls_mode"`
-		TLSCertFile      string `yaml:"tls_cert_file"`
-		TLSKeyFile       string `yaml:"tls_key_file"`
+		ListenAddr               string   `yaml:"listen_addr"`
+		GRPCH2ListenAddr         string   `yaml:"grpc_h2_listen_addr"`
+		HeartbeatTimeout         string   `yaml:"heartbeat_timeout"`
+		TLSMode                  string   `yaml:"tls_mode"`
+		TLSCertSource            string   `yaml:"tls_cert_source"`
+		TLSCertFile              string   `yaml:"tls_cert_file"`
+		TLSKeyFile               string   `yaml:"tls_key_file"`
+		TLSCACertFile            string   `yaml:"tls_ca_cert_file"`
+		TLSCAKeyFile             string   `yaml:"tls_ca_key_file"`
+		TLSServerCommonName      string   `yaml:"tls_server_common_name"`
+		TLSServerSANDNS          []string `yaml:"tls_server_san_dns"`
+		TLSServerSANIPs          []string `yaml:"tls_server_san_ips"`
+		TLSServerCertTTL         string   `yaml:"tls_server_cert_ttl"`
+		TLSServerCertRenewBefore string   `yaml:"tls_server_cert_renew_before"`
 	} `yaml:"control_plane"`
 }
 
@@ -87,8 +95,16 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	persisted.ControlPlane.GRPCH2ListenAddr = configToPersist.ControlPlane.GRPCH2ListenAddr
 	persisted.ControlPlane.HeartbeatTimeout = configToPersist.ControlPlane.HeartbeatTimeout.String()
 	persisted.ControlPlane.TLSMode = configToPersist.ControlPlane.TLSMode
+	persisted.ControlPlane.TLSCertSource = configToPersist.ControlPlane.TLSCertSource
 	persisted.ControlPlane.TLSCertFile = configToPersist.ControlPlane.TLSCertFile
 	persisted.ControlPlane.TLSKeyFile = configToPersist.ControlPlane.TLSKeyFile
+	persisted.ControlPlane.TLSCACertFile = configToPersist.ControlPlane.TLSCACertFile
+	persisted.ControlPlane.TLSCAKeyFile = configToPersist.ControlPlane.TLSCAKeyFile
+	persisted.ControlPlane.TLSServerCommonName = configToPersist.ControlPlane.TLSServerCommonName
+	persisted.ControlPlane.TLSServerSANDNS = append([]string(nil), configToPersist.ControlPlane.TLSServerSANDNS...)
+	persisted.ControlPlane.TLSServerSANIPs = append([]string(nil), configToPersist.ControlPlane.TLSServerSANIPs...)
+	persisted.ControlPlane.TLSServerCertTTL = configToPersist.ControlPlane.TLSServerCertTTL.String()
+	persisted.ControlPlane.TLSServerCertRenewBefore = configToPersist.ControlPlane.TLSServerCertRenewBefore.String()
 
 	encoded, err := yaml.Marshal(&persisted)
 	if err != nil {

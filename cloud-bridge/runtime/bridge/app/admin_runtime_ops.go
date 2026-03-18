@@ -89,12 +89,20 @@ func buildAdminConfigSnapshot(
 			"allowed_origins":       append([]string(nil), configCopy.Admin.AllowedOrigins...),
 		},
 		"control_plane": map[string]any{
-			"listen_addr":          configCopy.ControlPlane.ListenAddr,
-			"grpc_h2_listen_addr":  configCopy.ControlPlane.GRPCH2ListenAddr,
-			"heartbeat_timeout_ms": uint64(configCopy.ControlPlane.HeartbeatTimeout.Milliseconds()),
-			"tls_mode":             configCopy.ControlPlane.TLSMode,
-			"tls_cert_file":        strings.TrimSpace(configCopy.ControlPlane.TLSCertFile),
-			"tls_key_file":         strings.TrimSpace(configCopy.ControlPlane.TLSKeyFile),
+			"listen_addr":                     configCopy.ControlPlane.ListenAddr,
+			"grpc_h2_listen_addr":             configCopy.ControlPlane.GRPCH2ListenAddr,
+			"heartbeat_timeout_ms":            uint64(configCopy.ControlPlane.HeartbeatTimeout.Milliseconds()),
+			"tls_mode":                        configCopy.ControlPlane.TLSMode,
+			"tls_cert_source":                 strings.TrimSpace(configCopy.ControlPlane.TLSCertSource),
+			"tls_cert_file":                   strings.TrimSpace(configCopy.ControlPlane.TLSCertFile),
+			"tls_key_file":                    strings.TrimSpace(configCopy.ControlPlane.TLSKeyFile),
+			"tls_ca_cert_file":                strings.TrimSpace(configCopy.ControlPlane.TLSCACertFile),
+			"tls_ca_key_file":                 strings.TrimSpace(configCopy.ControlPlane.TLSCAKeyFile),
+			"tls_server_common_name":          strings.TrimSpace(configCopy.ControlPlane.TLSServerCommonName),
+			"tls_server_san_dns":              append([]string(nil), configCopy.ControlPlane.TLSServerSANDNS...),
+			"tls_server_san_ips":              append([]string(nil), configCopy.ControlPlane.TLSServerSANIPs...),
+			"tls_server_cert_ttl_ms":          uint64(configCopy.ControlPlane.TLSServerCertTTL.Milliseconds()),
+			"tls_server_cert_renew_before_ms": uint64(configCopy.ControlPlane.TLSServerCertRenewBefore.Milliseconds()),
 		},
 		"observability": map[string]any{
 			"log_level":    configCopy.Observability.LogLevel,
@@ -329,7 +337,7 @@ func drainSessionForAdmin(
 	case registry.SessionDraining:
 		currentState = registry.SessionDraining
 		resultLabel = "already_draining"
-	case registry.SessionStale, registry.SessionClosed:
+	case registry.SessionStale, registry.SessionFailed, registry.SessionClosed:
 		currentState = sessionRuntime.State
 		resultLabel = "already_terminal"
 	default:

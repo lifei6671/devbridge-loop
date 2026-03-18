@@ -12,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
@@ -121,6 +124,62 @@ func performConnectorHandshakeForTest(
 		testingObject.Fatalf("unmarshal connector auth ack payload failed: %v", err)
 	}
 	return welcomePayload, authAckPayload
+}
+
+// buildHelloEnvelopeForTest 构造用于握手测试的 ConnectorHello 信封。
+func buildHelloEnvelopeForTest(testingObject *testing.T, connectorID string) pb.ControlEnvelope {
+	testingObject.Helper()
+	helloPayload := pb.ConnectorHello{
+		ConnectorID:       connectorID,
+		NodeName:          "node-test",
+		Version:           "agent-core",
+		SupportedBindings: []string{"tcp_framed"},
+	}
+	encodedHelloPayload, err := json.Marshal(helloPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector hello payload failed: %v", err)
+	}
+	return pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  connectorID,
+		Payload:      encodedHelloPayload,
+	}
+}
+
+// buildAuthEnvelopeForTest 构造用于握手测试的 ConnectorAuth 信封。
+func buildAuthEnvelopeForTest(testingObject *testing.T, connectorID string, token string) pb.ControlEnvelope {
+	testingObject.Helper()
+	authPayload := pb.ConnectorAuth{
+		AuthMethod:       "token",
+		Token:            token,
+		ClientCapVersion: "agent-core/v1",
+	}
+	encodedAuthPayload, err := json.Marshal(authPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector auth payload failed: %v", err)
+	}
+	return pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  connectorID,
+		Payload:      encodedAuthPayload,
+	}
+}
+
+// decodeConnectorAuthAckFromEnvelope 从响应信封中解码 ConnectorAuthAck 载荷。
+func decodeConnectorAuthAckFromEnvelope(testingObject *testing.T, envelope *pb.ControlEnvelope) pb.ConnectorAuthAck {
+	testingObject.Helper()
+	if envelope == nil {
+		testingObject.Fatalf("expected non-nil control envelope")
+	}
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(envelope.Payload, &authAckPayload); err != nil {
+		testingObject.Fatalf("unmarshal connector auth ack payload failed: %v", err)
+	}
+	return authAckPayload
 }
 
 // TestServeControlChannelReplyHeartbeatPong 验证 Bridge 在收到 ping 后立即回 pong。
@@ -463,8 +522,8 @@ func TestServeControlChannelHandleConnectorHandshake(testingObject *testing.T) {
 	if welcomePayload.AssignedSessionEpoch == 0 {
 		testingObject.Fatalf("expected assigned session epoch from welcome payload")
 	}
-	if welcomePayload.TLSMode != string(controlPlaneTLSModePlaintext) {
-		testingObject.Fatalf("unexpected welcome tls_mode: got=%s want=%s", welcomePayload.TLSMode, controlPlaneTLSModePlaintext)
+	if welcomePayload.TLSMode != string(apptls.ModePlaintext) {
+		testingObject.Fatalf("unexpected welcome tls_mode: got=%s want=%s", welcomePayload.TLSMode, apptls.ModePlaintext)
 	}
 	if !authAckPayload.Success {
 		testingObject.Fatalf("expected auth success, got error=%s", authAckPayload.ErrorCode)
@@ -489,6 +548,86 @@ func TestServeControlChannelHandleConnectorHandshake(testingObject *testing.T) {
 		}
 	case <-time.After(time.Second):
 		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+}
+
+// TestServeControlChannelMarksSessionClosedOnPeerClose 验证 TCP 控制流正常断开不会被标记为 FAILED。
+func TestServeControlChannelMarksSessionClosedOnPeerClose(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	binding, err := tcpbinding.NewTransportWithConfig(tcpbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new tcp binding failed: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	}()
+
+	serverControl, err := binding.OpenControlChannel(serverConn)
+	if err != nil {
+		testingObject.Fatalf("open server control channel failed: %v", err)
+	}
+	clientControl, err := binding.OpenControlChannel(clientConn)
+	if err != nil {
+		testingObject.Fatalf("open client control channel failed: %v", err)
+	}
+	defer func() {
+		_ = clientControl.Close(context.Background())
+	}()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- serveControlChannelWithDispatcherAndPeerAddr(
+			ctx,
+			serverControl,
+			dispatcher,
+			"10.20.30.40:39080",
+		)
+	}()
+
+	readContext, readCancel := context.WithTimeout(context.Background(), time.Second)
+	defer readCancel()
+	_, authAckPayload := performConnectorHandshakeForTest(
+		testingObject,
+		readContext,
+		clientControl,
+		"agent-local",
+		"dbt_agent-local.agent-dev-secret",
+	)
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected auth success, got error=%s", authAckPayload.ErrorCode)
+	}
+	if strings.TrimSpace(authAckPayload.SessionID) == "" {
+		testingObject.Fatalf("expected non-empty auth ack session id")
+	}
+
+	_ = clientControl.Close(context.Background())
+	_ = clientConn.Close()
+
+	select {
+	case doneErr := <-serverDone:
+		if doneErr != nil {
+			testingObject.Fatalf("serve control channel stopped with error: %v", doneErr)
+		}
+	case <-time.After(time.Second):
+		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+
+	sessionSnapshot, exists := sessionRegistry.GetBySession(authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected session snapshot exists")
+	}
+	if sessionSnapshot.State != registry.SessionClosed {
+		testingObject.Fatalf("unexpected session state after peer close: got=%s want=%s", sessionSnapshot.State, registry.SessionClosed)
 	}
 }
 
@@ -593,6 +732,265 @@ func TestServeControlChannelRejectInvalidConnectorAuthMethod(testingObject *test
 	}
 	if authAckPayload.ErrorCode != ltfperrors.CodeAuthInvalidMethod {
 		testingObject.Fatalf("unexpected auth error code: got=%s want=%s", authAckPayload.ErrorCode, ltfperrors.CodeAuthInvalidMethod)
+	}
+}
+
+// TestControlMessageDispatcherHelloRateLimitBySourceIP 验证 Hello 在 source_ip 维度可命中限流。
+func TestControlMessageDispatcherHelloRateLimitBySourceIP(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	metrics := obs.NewMetrics()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		metrics: metrics,
+		handshakeGuard: appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{
+			HelloRateLimitBySource:    1,
+			HelloRateLimitByConnector: 100,
+		}),
+	})
+	firstState := newControlChannelSessionState("10.0.0.1:39080")
+	firstReply, err := dispatcher.handleConnectorHelloEnvelope(buildHelloEnvelopeForTest(testingObject, "connector-a"), firstState)
+	if err != nil {
+		testingObject.Fatalf("first hello should pass, got err=%v", err)
+	}
+	if firstReply == nil || firstReply.MessageType != pb.ControlMessageConnectorWelcome {
+		testingObject.Fatalf("expected first hello reply is ConnectorWelcome")
+	}
+
+	secondState := newControlChannelSessionState("10.0.0.1:39081")
+	secondReply, err := dispatcher.handleConnectorHelloEnvelope(buildHelloEnvelopeForTest(testingObject, "connector-b"), secondState)
+	if err != nil {
+		testingObject.Fatalf("second hello should return auth ack payload, got err=%v", err)
+	}
+	authAckPayload := decodeConnectorAuthAckFromEnvelope(testingObject, secondReply)
+	if authAckPayload.Success {
+		testingObject.Fatalf("expected second hello rejected by source_ip rate limit")
+	}
+	if authAckPayload.ErrorCode != appauth.AuthErrorRateLimited {
+		testingObject.Fatalf("unexpected hello rate-limit error code: got=%s", authAckPayload.ErrorCode)
+	}
+	if metrics.BridgeAuthRateLimitTotal() != 1 {
+		testingObject.Fatalf("unexpected hello rate-limit metric: got=%d want=1", metrics.BridgeAuthRateLimitTotal())
+	}
+}
+
+// TestControlMessageDispatcherHelloRateLimitByConnectorID 验证 Hello 在 connector_id 维度可命中限流。
+func TestControlMessageDispatcherHelloRateLimitByConnectorID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		handshakeGuard: appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{
+			HelloRateLimitBySource:    100,
+			HelloRateLimitByConnector: 1,
+		}),
+	})
+	firstState := newControlChannelSessionState("10.0.0.2:39080")
+	firstReply, err := dispatcher.handleConnectorHelloEnvelope(buildHelloEnvelopeForTest(testingObject, "connector-c"), firstState)
+	if err != nil {
+		testingObject.Fatalf("first hello should pass, got err=%v", err)
+	}
+	if firstReply == nil || firstReply.MessageType != pb.ControlMessageConnectorWelcome {
+		testingObject.Fatalf("expected first hello reply is ConnectorWelcome")
+	}
+
+	secondState := newControlChannelSessionState("10.0.0.3:39080")
+	secondReply, err := dispatcher.handleConnectorHelloEnvelope(buildHelloEnvelopeForTest(testingObject, "connector-c"), secondState)
+	if err != nil {
+		testingObject.Fatalf("second hello should return auth ack payload, got err=%v", err)
+	}
+	authAckPayload := decodeConnectorAuthAckFromEnvelope(testingObject, secondReply)
+	if authAckPayload.Success {
+		testingObject.Fatalf("expected second hello rejected by connector_id rate limit")
+	}
+	if authAckPayload.ErrorCode != appauth.AuthErrorRateLimited {
+		testingObject.Fatalf("unexpected hello rate-limit error code: got=%s", authAckPayload.ErrorCode)
+	}
+}
+
+// TestControlMessageDispatcherAuthFailureBanBySourceIP 验证认证失败会在 source_ip 维度触发短时封禁。
+func TestControlMessageDispatcherAuthFailureBanBySourceIP(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	guard := appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{
+		AuthFailureLimitBySource:    1,
+		AuthFailureLimitByConnector: 100,
+		AuthFailureBanDuration:      time.Hour,
+	})
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		handshakeGuard: guard,
+	})
+
+	firstState := newControlChannelSessionState("10.0.1.1:39080")
+	firstState.setHelloContext("connector-ban-a", 1)
+	firstAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-a", "dbt_missing.secret-a"),
+		firstState,
+	)
+	if err != nil {
+		testingObject.Fatalf("first auth should return auth ack payload, got err=%v", err)
+	}
+	firstAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, firstAuthReply)
+	if firstAuthAck.ErrorCode != appauth.AuthErrorInvalidToken {
+		testingObject.Fatalf("unexpected first auth error code: got=%s", firstAuthAck.ErrorCode)
+	}
+
+	secondState := newControlChannelSessionState("10.0.1.1:39081")
+	secondState.setHelloContext("connector-ban-b", 1)
+	secondAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-b", "dbt_missing.secret-b"),
+		secondState,
+	)
+	if err != nil {
+		testingObject.Fatalf("second auth should return auth ack payload, got err=%v", err)
+	}
+	secondAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, secondAuthReply)
+	if secondAuthAck.ErrorCode != appauth.AuthErrorInvalidToken {
+		testingObject.Fatalf("unexpected second auth error code: got=%s", secondAuthAck.ErrorCode)
+	}
+
+	thirdState := newControlChannelSessionState("10.0.1.1:39082")
+	thirdState.setHelloContext("connector-ban-c", 1)
+	thirdAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-c", "dbt_missing.secret-c"),
+		thirdState,
+	)
+	if err != nil {
+		testingObject.Fatalf("third auth should return auth ack payload, got err=%v", err)
+	}
+	thirdAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, thirdAuthReply)
+	if thirdAuthAck.ErrorCode != appauth.AuthErrorRateLimited {
+		testingObject.Fatalf("expected source_ip ban rate limit, got=%s", thirdAuthAck.ErrorCode)
+	}
+}
+
+// TestControlMessageDispatcherAuthFailureBanByConnectorID 验证认证失败会在 connector_id 维度触发短时封禁。
+func TestControlMessageDispatcherAuthFailureBanByConnectorID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	guard := appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{
+		AuthFailureLimitBySource:    100,
+		AuthFailureLimitByConnector: 1,
+		AuthFailureBanDuration:      time.Hour,
+	})
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		handshakeGuard: guard,
+	})
+
+	firstState := newControlChannelSessionState("10.0.2.1:39080")
+	firstState.setHelloContext("connector-ban-same", 1)
+	firstAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-same", "dbt_missing.secret-a"),
+		firstState,
+	)
+	if err != nil {
+		testingObject.Fatalf("first auth should return auth ack payload, got err=%v", err)
+	}
+	firstAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, firstAuthReply)
+	if firstAuthAck.ErrorCode != appauth.AuthErrorInvalidToken {
+		testingObject.Fatalf("unexpected first auth error code: got=%s", firstAuthAck.ErrorCode)
+	}
+
+	secondState := newControlChannelSessionState("10.0.2.2:39080")
+	secondState.setHelloContext("connector-ban-same", 2)
+	secondAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-same", "dbt_missing.secret-b"),
+		secondState,
+	)
+	if err != nil {
+		testingObject.Fatalf("second auth should return auth ack payload, got err=%v", err)
+	}
+	secondAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, secondAuthReply)
+	if secondAuthAck.ErrorCode != appauth.AuthErrorInvalidToken {
+		testingObject.Fatalf("unexpected second auth error code: got=%s", secondAuthAck.ErrorCode)
+	}
+
+	thirdState := newControlChannelSessionState("10.0.2.3:39080")
+	thirdState.setHelloContext("connector-ban-same", 3)
+	thirdAuthReply, err := dispatcher.handleConnectorAuthEnvelope(
+		buildAuthEnvelopeForTest(testingObject, "connector-ban-same", "dbt_missing.secret-c"),
+		thirdState,
+	)
+	if err != nil {
+		testingObject.Fatalf("third auth should return auth ack payload, got err=%v", err)
+	}
+	thirdAuthAck := decodeConnectorAuthAckFromEnvelope(testingObject, thirdAuthReply)
+	if thirdAuthAck.ErrorCode != appauth.AuthErrorRateLimited {
+		testingObject.Fatalf("expected connector_id ban rate limit, got=%s", thirdAuthAck.ErrorCode)
+	}
+}
+
+// TestControlMessageDispatcherAuthRejectNormalization 验证未知 connector/无效 token/吊销 token 对外口径统一。
+func TestControlMessageDispatcherAuthRejectNormalization(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		authCoordinator: appauth.NewCoordinator(appauth.CoordinatorOptions{
+			SessionRegistry: sessionRegistry,
+			TokenStore: appauth.NewInMemoryTokenStore([]appauth.TokenRecord{
+				{
+					TokenID:         "valid-token",
+					ConnectorID:     "connector-valid",
+					TokenSecretHash: appauth.MustHashTokenSecretArgon2ID("valid-secret"),
+					HashAlgorithm:   appauth.TokenHashAlgorithmArgon2ID,
+					HashVersion:     appauth.TokenHashVersionV1,
+					Status:          appauth.TokenStatusActive,
+				},
+				{
+					TokenID:         "revoked-token",
+					ConnectorID:     "connector-revoked",
+					TokenSecretHash: appauth.MustHashTokenSecretArgon2ID("revoked-secret"),
+					HashAlgorithm:   appauth.TokenHashAlgorithmArgon2ID,
+					HashVersion:     appauth.TokenHashVersionV1,
+					Status:          appauth.TokenStatusRevoked,
+				},
+			}),
+		}),
+	})
+	testCases := []struct {
+		name        string
+		connectorID string
+		token       string
+	}{
+		{
+			name:        "unknown connector",
+			connectorID: "connector-unknown",
+			token:       "dbt_missing-token.secret",
+		},
+		{
+			name:        "invalid token secret",
+			connectorID: "connector-valid",
+			token:       "dbt_valid-token.invalid-secret",
+		},
+		{
+			name:        "revoked token",
+			connectorID: "connector-revoked",
+			token:       "dbt_revoked-token.revoked-secret",
+		},
+	}
+	for _, testCase := range testCases {
+		testCase := testCase
+		testingObject.Run(testCase.name, func(testingObject *testing.T) {
+			sessionState := newControlChannelSessionState("10.0.3.1:39080")
+			sessionState.setHelloContext(testCase.connectorID, 1)
+			authReply, err := dispatcher.handleConnectorAuthEnvelope(
+				buildAuthEnvelopeForTest(testingObject, testCase.connectorID, testCase.token),
+				sessionState,
+			)
+			if err != nil {
+				testingObject.Fatalf("auth should return auth ack payload, got err=%v", err)
+			}
+			authAck := decodeConnectorAuthAckFromEnvelope(testingObject, authReply)
+			if authAck.Success {
+				testingObject.Fatalf("expected auth reject")
+			}
+			if authAck.ErrorCode != appauth.AuthErrorInvalidToken {
+				testingObject.Fatalf("expected normalized auth error code, got=%s", authAck.ErrorCode)
+			}
+			if authAck.ErrorMessage != "authentication rejected" {
+				testingObject.Fatalf("expected normalized auth error message, got=%s", authAck.ErrorMessage)
+			}
+		})
 	}
 }
 
@@ -1323,6 +1721,98 @@ func TestControlMessageDispatcherResourceEventDoesNotReactivateDrainingSession(t
 			sessionSnapshot.LastHeartbeat,
 			oldHeartbeat,
 		)
+	}
+}
+
+// TestControlChannelSessionStateLifecycleTransition
+// 验证控制连接生命周期状态机符合 connecting->connected->control_ready->authenticated->draining->closed。
+func TestControlChannelSessionStateLifecycleTransition(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionState := newControlChannelSessionState("10.0.5.1:39080")
+	if sessionState.lifecycle != controlChannelStateConnecting {
+		testingObject.Fatalf("unexpected initial lifecycle: got=%s want=%s", sessionState.lifecycle, controlChannelStateConnecting)
+	}
+	sessionState.markConnected()
+	if sessionState.lifecycle != controlChannelStateConnected {
+		testingObject.Fatalf("unexpected lifecycle after connected: got=%s want=%s", sessionState.lifecycle, controlChannelStateConnected)
+	}
+	sessionState.markControlReady()
+	if sessionState.lifecycle != controlChannelStateControlReady {
+		testingObject.Fatalf("unexpected lifecycle after control_ready: got=%s want=%s", sessionState.lifecycle, controlChannelStateControlReady)
+	}
+	sessionState.markAuthenticated()
+	if sessionState.lifecycle != controlChannelStateAuthenticated {
+		testingObject.Fatalf("unexpected lifecycle after authenticated: got=%s want=%s", sessionState.lifecycle, controlChannelStateAuthenticated)
+	}
+	sessionState.markDraining()
+	if sessionState.lifecycle != controlChannelStateDraining {
+		testingObject.Fatalf("unexpected lifecycle after draining: got=%s want=%s", sessionState.lifecycle, controlChannelStateDraining)
+	}
+	sessionState.markClosed()
+	if sessionState.lifecycle != controlChannelStateClosed {
+		testingObject.Fatalf("unexpected lifecycle after closed: got=%s want=%s", sessionState.lifecycle, controlChannelStateClosed)
+	}
+}
+
+// TestControlMessageDispatcherMarkSessionFailedPurgesTunnel
+// 验证会话进入 FAILED 后会清理该会话下全部 tunnel 并降级服务状态。
+func TestControlMessageDispatcherMarkSessionFailedPurgesTunnel(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-failed",
+		ConnectorID:   "connector-1",
+		Epoch:         7,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.Upsert(now, pb.Service{
+		ServiceID:    "svc-failed",
+		ServiceKey:   "dev/demo/failover-service",
+		ConnectorID:  "connector-1",
+		Status:       pb.ServiceStatusActive,
+		HealthStatus: pb.HealthStatusHealthy,
+	})
+	tunnelRegistry := registry.NewTunnelRegistry()
+	failedTunnel := &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-failed"}
+	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-failed", failedTunnel); err != nil {
+		testingObject.Fatalf("upsert failed session tunnel failed: %v", err)
+	}
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		serviceRegistry: serviceRegistry,
+		tunnelRegistry:  tunnelRegistry,
+	})
+	sessionState := newControlChannelSessionState("10.0.5.2:39080")
+	sessionState.setSession("session-failed", 7)
+	sessionState.markAuthenticated()
+
+	dispatcher.markSessionFailedFromState(now.Add(time.Second), sessionState, "unit_test_control_channel_failed")
+
+	sessionSnapshot, exists := sessionRegistry.GetBySession("session-failed")
+	if !exists {
+		testingObject.Fatalf("expected failed session exists")
+	}
+	if sessionSnapshot.State != registry.SessionFailed {
+		testingObject.Fatalf("unexpected session state after failed transition: got=%s want=%s", sessionSnapshot.State, registry.SessionFailed)
+	}
+	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-failed")
+	if !exists {
+		testingObject.Fatalf("expected service snapshot exists")
+	}
+	if serviceSnapshot.Status != pb.ServiceStatusStale {
+		testingObject.Fatalf("unexpected service status after failed transition: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusStale)
+	}
+	if _, exists := tunnelRegistry.Get("tunnel-failed"); exists {
+		testingObject.Fatalf("expected failed session tunnel purged")
+	}
+	if !failedTunnel.closed {
+		testingObject.Fatalf("expected failed session tunnel closed")
 	}
 }
 

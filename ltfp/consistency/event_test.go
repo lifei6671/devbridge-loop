@@ -11,12 +11,12 @@ import (
 func TestBuildDedupKey(t *testing.T) {
 	t.Parallel()
 
-	key, err := BuildDedupKey("session-001", 7, "event-001")
+	key, err := BuildDedupKey("session-001", "event-001")
 	if err != nil {
 		t.Fatalf("build dedup key failed: %v", err)
 	}
-	// 三元组应完整进入去重键。
-	if key != "session-001:7:event-001" {
+	// 去重键作用域固定为 session_id + event_id。
+	if key != "session-001:event-001" {
 		t.Fatalf("unexpected key: %s", key)
 	}
 }
@@ -25,7 +25,7 @@ func TestBuildDedupKey(t *testing.T) {
 func TestBuildDedupKeyRejectInvalidInput(t *testing.T) {
 	t.Parallel()
 
-	_, err := BuildDedupKey("", 1, "event-001")
+	_, err := BuildDedupKey("", "event-001")
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}

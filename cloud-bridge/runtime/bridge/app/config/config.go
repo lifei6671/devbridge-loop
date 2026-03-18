@@ -1,4 +1,4 @@
-package app
+package config
 
 import (
 	"fmt"
@@ -10,6 +10,54 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
 )
+
+// controlPlaneTLSMode 表示控制面 TLS 接入模式。
+type controlPlaneTLSMode string
+
+const (
+	// controlPlaneTLSModeRequired 表示只允许 TLS 连接。
+	controlPlaneTLSModeRequired controlPlaneTLSMode = "required"
+	// controlPlaneTLSModeOptional 表示同时允许 TLS/明文连接。
+	controlPlaneTLSModeOptional controlPlaneTLSMode = "optional"
+	// controlPlaneTLSModePlaintext 表示只允许明文连接。
+	controlPlaneTLSModePlaintext controlPlaneTLSMode = "plaintext"
+)
+
+// controlPlaneTLSCertSource 表示控制面证书来源模式。
+type controlPlaneTLSCertSource string
+
+const (
+	// controlPlaneTLSCertSourceExternal 表示使用外部提供的 cert/key。
+	controlPlaneTLSCertSourceExternal controlPlaneTLSCertSource = "external"
+	// controlPlaneTLSCertSourceManagedCA 表示使用自建 CA 动态签发。
+	controlPlaneTLSCertSourceManagedCA controlPlaneTLSCertSource = "managed_ca"
+)
+
+// normalizeControlPlaneTLSMode 归一化并校验 TLS 模式文本。
+func normalizeControlPlaneTLSMode(rawMode string) (controlPlaneTLSMode, error) {
+	switch strings.ToLower(strings.TrimSpace(rawMode)) {
+	case "", string(controlPlaneTLSModePlaintext):
+		return controlPlaneTLSModePlaintext, nil
+	case string(controlPlaneTLSModeRequired):
+		return controlPlaneTLSModeRequired, nil
+	case string(controlPlaneTLSModeOptional):
+		return controlPlaneTLSModeOptional, nil
+	default:
+		return "", fmt.Errorf("unsupported control_plane.tls_mode=%s", rawMode)
+	}
+}
+
+// normalizeControlPlaneTLSCertSource 归一化并校验证书来源模式文本。
+func normalizeControlPlaneTLSCertSource(rawSource string) (controlPlaneTLSCertSource, error) {
+	switch strings.ToLower(strings.TrimSpace(rawSource)) {
+	case "", string(controlPlaneTLSCertSourceExternal):
+		return controlPlaneTLSCertSourceExternal, nil
+	case string(controlPlaneTLSCertSourceManagedCA):
+		return controlPlaneTLSCertSourceManagedCA, nil
+	default:
+		return "", fmt.Errorf("unsupported control_plane.tls_cert_source=%s", rawSource)
+	}
+}
 
 // Config defines top-level runtime settings for the bridge skeleton.
 type Config struct {
@@ -68,12 +116,20 @@ type ObservabilityConfig struct {
 }
 
 type ControlPlaneConfig struct {
-	ListenAddr       string        `yaml:"listen_addr"`
-	GRPCH2ListenAddr string        `yaml:"grpc_h2_listen_addr"`
-	HeartbeatTimeout time.Duration `yaml:"heartbeat_timeout"`
-	TLSMode          string        `yaml:"tls_mode"`
-	TLSCertFile      string        `yaml:"tls_cert_file"`
-	TLSKeyFile       string        `yaml:"tls_key_file"`
+	ListenAddr               string        `yaml:"listen_addr"`
+	GRPCH2ListenAddr         string        `yaml:"grpc_h2_listen_addr"`
+	HeartbeatTimeout         time.Duration `yaml:"heartbeat_timeout"`
+	TLSMode                  string        `yaml:"tls_mode"`
+	TLSCertSource            string        `yaml:"tls_cert_source"`
+	TLSCertFile              string        `yaml:"tls_cert_file"`
+	TLSKeyFile               string        `yaml:"tls_key_file"`
+	TLSCACertFile            string        `yaml:"tls_ca_cert_file"`
+	TLSCAKeyFile             string        `yaml:"tls_ca_key_file"`
+	TLSServerCommonName      string        `yaml:"tls_server_common_name"`
+	TLSServerSANDNS          []string      `yaml:"tls_server_san_dns"`
+	TLSServerSANIPs          []string      `yaml:"tls_server_san_ips"`
+	TLSServerCertTTL         time.Duration `yaml:"tls_server_cert_ttl"`
+	TLSServerCertRenewBefore time.Duration `yaml:"tls_server_cert_renew_before"`
 }
 
 type TunnelReuseConfig struct {
@@ -130,10 +186,13 @@ func DefaultConfig() Config {
 			LogLevel:    "info",
 		},
 		ControlPlane: ControlPlaneConfig{
-			ListenAddr:       ":39080",
-			GRPCH2ListenAddr: ":39082",
-			HeartbeatTimeout: 30 * time.Second,
-			TLSMode:          string(controlPlaneTLSModePlaintext),
+			ListenAddr:               ":39080",
+			GRPCH2ListenAddr:         ":39082",
+			HeartbeatTimeout:         30 * time.Second,
+			TLSMode:                  string(controlPlaneTLSModePlaintext),
+			TLSCertSource:            string(controlPlaneTLSCertSourceExternal),
+			TLSServerCertTTL:         168 * time.Hour,
+			TLSServerCertRenewBefore: 24 * time.Hour,
 		},
 		TunnelReuse: TunnelReuseConfig{
 			MaxReuseCount:     256,
@@ -218,12 +277,73 @@ func (c Config) Validate() error {
 	if err != nil {
 		return fmt.Errorf("validate config: %w", err)
 	}
+	normalizedTLSCertSource, err := normalizeControlPlaneTLSCertSource(c.ControlPlane.TLSCertSource)
+	if err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
 	if normalizedTLSMode != controlPlaneTLSModePlaintext {
-		if strings.TrimSpace(c.ControlPlane.TLSCertFile) == "" {
-			return fmt.Errorf("validate config: empty control_plane.tls_cert_file when tls_mode=%s", normalizedTLSMode)
-		}
-		if strings.TrimSpace(c.ControlPlane.TLSKeyFile) == "" {
-			return fmt.Errorf("validate config: empty control_plane.tls_key_file when tls_mode=%s", normalizedTLSMode)
+		switch normalizedTLSCertSource {
+		case controlPlaneTLSCertSourceExternal:
+			if strings.TrimSpace(c.ControlPlane.TLSCertFile) == "" {
+				return fmt.Errorf(
+					"validate config: empty control_plane.tls_cert_file when tls_mode=%s tls_cert_source=%s",
+					normalizedTLSMode,
+					normalizedTLSCertSource,
+				)
+			}
+			if strings.TrimSpace(c.ControlPlane.TLSKeyFile) == "" {
+				return fmt.Errorf(
+					"validate config: empty control_plane.tls_key_file when tls_mode=%s tls_cert_source=%s",
+					normalizedTLSMode,
+					normalizedTLSCertSource,
+				)
+			}
+		case controlPlaneTLSCertSourceManagedCA:
+			if strings.TrimSpace(c.ControlPlane.TLSCACertFile) == "" {
+				return fmt.Errorf(
+					"validate config: empty control_plane.tls_ca_cert_file when tls_mode=%s tls_cert_source=%s",
+					normalizedTLSMode,
+					normalizedTLSCertSource,
+				)
+			}
+			if strings.TrimSpace(c.ControlPlane.TLSCAKeyFile) == "" {
+				return fmt.Errorf(
+					"validate config: empty control_plane.tls_ca_key_file when tls_mode=%s tls_cert_source=%s",
+					normalizedTLSMode,
+					normalizedTLSCertSource,
+				)
+			}
+			sanDNSNames := normalizeNonEmptyStringSlice(c.ControlPlane.TLSServerSANDNS)
+			sanIPTexts := normalizeNonEmptyStringSlice(c.ControlPlane.TLSServerSANIPs)
+			// managed_ca 模式必须至少有一个 SAN，确保 Agent 可按地址做证书匹配。
+			if len(sanDNSNames) == 0 && len(sanIPTexts) == 0 {
+				return fmt.Errorf(
+					"validate config: empty control_plane tls server san when tls_mode=%s tls_cert_source=%s",
+					normalizedTLSMode,
+					normalizedTLSCertSource,
+				)
+			}
+			for _, sanIPText := range sanIPTexts {
+				if net.ParseIP(sanIPText) == nil {
+					return fmt.Errorf("validate config: invalid control_plane.tls_server_san_ips item=%s", sanIPText)
+				}
+			}
+			if c.ControlPlane.TLSServerCertTTL <= 0 {
+				return fmt.Errorf("validate config: invalid control_plane.tls_server_cert_ttl=%s", c.ControlPlane.TLSServerCertTTL)
+			}
+			if c.ControlPlane.TLSServerCertRenewBefore < 0 {
+				return fmt.Errorf(
+					"validate config: invalid control_plane.tls_server_cert_renew_before=%s",
+					c.ControlPlane.TLSServerCertRenewBefore,
+				)
+			}
+			if c.ControlPlane.TLSServerCertRenewBefore >= c.ControlPlane.TLSServerCertTTL {
+				return fmt.Errorf(
+					"validate config: control_plane.tls_server_cert_renew_before must be less than tls_server_cert_ttl",
+				)
+			}
+		default:
+			return fmt.Errorf("validate config: unsupported control_plane.tls_cert_source=%s", normalizedTLSCertSource)
 		}
 	}
 	if c.TunnelReuse.MaxReuseCount <= 0 {
@@ -315,4 +435,20 @@ func normalizeOrigin(rawOrigin string) (string, bool) {
 		return "", false
 	}
 	return strings.ToLower(parsedOrigin.Scheme) + "://" + strings.ToLower(parsedOrigin.Host), true
+}
+
+// normalizeNonEmptyStringSlice 对字符串数组做 trim，并过滤空值项。
+func normalizeNonEmptyStringSlice(rawItems []string) []string {
+	if len(rawItems) == 0 {
+		return nil
+	}
+	normalizedItems := make([]string, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		normalizedItem := strings.TrimSpace(rawItem)
+		if normalizedItem == "" {
+			continue
+		}
+		normalizedItems = append(normalizedItems, normalizedItem)
+	}
+	return normalizedItems
 }

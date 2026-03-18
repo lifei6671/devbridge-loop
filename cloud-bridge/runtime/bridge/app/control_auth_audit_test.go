@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
@@ -31,7 +32,7 @@ func TestNormalizeConnectorAuthSourceIP(testingObject *testing.T) {
 		testCase := testCase
 		testingObject.Run(testCase.name, func(testingObject *testing.T) {
 			testingObject.Parallel()
-			if gotIP := normalizeConnectorAuthSourceIP(testCase.peerAddr); gotIP != testCase.wantIP {
+			if gotIP := appauth.NormalizeSourceIP(testCase.peerAddr); gotIP != testCase.wantIP {
 				testingObject.Fatalf("unexpected source ip: got=%s want=%s", gotIP, testCase.wantIP)
 			}
 		})
@@ -57,7 +58,7 @@ func TestExtractConnectorTokenIDForAuditRequiresParsableToken(testingObject *tes
 		testCase := testCase
 		testingObject.Run(testCase.name, func(testingObject *testing.T) {
 			testingObject.Parallel()
-			if gotID := extractConnectorTokenIDForAudit(testCase.rawToken); gotID != testCase.wantID {
+			if gotID := appauth.ExtractTokenIDForAudit(testCase.rawToken); gotID != testCase.wantID {
 				testingObject.Fatalf("unexpected token id: got=%s want=%s", gotID, testCase.wantID)
 			}
 		})
@@ -165,8 +166,8 @@ func TestServeControlChannelAuthAuditLogMasksTokenID(testingObject *testing.T) {
 	if gotSourceIP, _ := logEntry["source_ip"].(string); gotSourceIP != "10.20.30.40" {
 		testingObject.Fatalf("unexpected source ip in audit log: got=%v want=%s", logEntry["source_ip"], "10.20.30.40")
 	}
-	if gotErrorCode, _ := logEntry["error_code"].(string); gotErrorCode != connectorAuthErrorInvalidMethod {
-		testingObject.Fatalf("unexpected error code in audit log: got=%v want=%s", logEntry["error_code"], connectorAuthErrorInvalidMethod)
+	if gotErrorCode, _ := logEntry["error_code"].(string); gotErrorCode != appauth.AuthErrorInvalidMethod {
+		testingObject.Fatalf("unexpected error code in audit log: got=%v want=%s", logEntry["error_code"], appauth.AuthErrorInvalidMethod)
 	}
 	if strings.Contains(logBuffer.String(), "connector-auth-invalid-method.secret-a") {
 		testingObject.Fatalf("expected raw token secret not present in audit logs")
@@ -249,8 +250,8 @@ func TestServeControlChannelAuthAuditLogOmitsTokenIDBeforeWelcome(testingObject 
 	if gotSourceIP, _ := logEntry["source_ip"].(string); gotSourceIP != "10.20.30.40" {
 		testingObject.Fatalf("unexpected source ip in audit log: got=%v want=%s", logEntry["source_ip"], "10.20.30.40")
 	}
-	if gotErrorCode, _ := logEntry["error_code"].(string); gotErrorCode != connectorAuthErrorInternal {
-		testingObject.Fatalf("unexpected error code in audit log: got=%v want=%s", logEntry["error_code"], connectorAuthErrorInternal)
+	if gotErrorCode, _ := logEntry["error_code"].(string); gotErrorCode != appauth.AuthErrorInternal {
+		testingObject.Fatalf("unexpected error code in audit log: got=%v want=%s", logEntry["error_code"], appauth.AuthErrorInternal)
 	}
 	if strings.Contains(logBuffer.String(), "connector-auth-prewelcome.secret-a") {
 		testingObject.Fatalf("expected raw token secret not present in audit logs")

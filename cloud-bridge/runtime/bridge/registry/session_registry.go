@@ -13,7 +13,9 @@ const (
 	SessionActive   SessionState = "ACTIVE"
 	SessionDraining SessionState = "DRAINING"
 	SessionStale    SessionState = "STALE"
-	SessionClosed   SessionState = "CLOSED"
+	// SessionFailed 表示控制面会话发生失败并已进入强制收敛阶段。
+	SessionFailed SessionState = "FAILED"
+	SessionClosed SessionState = "CLOSED"
 )
 
 // SessionRuntime 保存 session 的运行态信息。
@@ -95,7 +97,7 @@ func (r *SessionRegistry) CommitAuthoritative(
 			if strings.TrimSpace(currentSession.SessionID) != normalizedSessionID {
 				if currentSession.Epoch > runtime.Epoch {
 					switch currentSession.State {
-					case SessionStale, SessionClosed:
+					case SessionStale, SessionFailed, SessionClosed:
 						// 旧权威已终态时，允许 Agent 重启后的低 epoch 连接重新接管。
 					default:
 						return result, false
@@ -103,7 +105,7 @@ func (r *SessionRegistry) CommitAuthoritative(
 				}
 				if currentSession.Epoch == runtime.Epoch {
 					switch currentSession.State {
-					case SessionStale, SessionClosed:
+					case SessionStale, SessionFailed, SessionClosed:
 						// 同 epoch 但旧权威已终态时允许同代接管。
 					default:
 						return result, false

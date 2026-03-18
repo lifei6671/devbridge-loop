@@ -99,7 +99,8 @@ func (handler *TunnelReportHandler) validateSessionEpoch(sessionID string, sessi
 	if !exists {
 		return false
 	}
-	return sessionRuntime.Epoch == sessionEpoch
+	// 仅 ACTIVE 会话允许驱动 tunnel 池工作态，旧会话必须冻结补池与池状态写入。
+	return sessionRuntime.Epoch == sessionEpoch && sessionRuntime.State == registry.SessionActive
 }
 
 func (handler *TunnelReportHandler) snapshotBridgePoolBySession(sessionID string) (int, int) {

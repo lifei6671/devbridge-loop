@@ -1,4 +1,4 @@
-package app
+package tls
 
 import (
 	"crypto/tls"
@@ -16,6 +16,8 @@ import (
 const (
 	// controlPlaneTLSHandshakeTimeout 控制服务端 TLS 握手最长等待时间。
 	controlPlaneTLSHandshakeTimeout = 5 * time.Second
+	// tcpConnectionClassifierReadTimeout 定义 TCP 入站连接类型判别的首包读取超时。
+	tcpConnectionClassifierReadTimeout = 2 * time.Second
 )
 
 var (
@@ -57,10 +59,18 @@ func loadControlPlaneServerTLSConfig(certFile string, keyFile string) (*tls.Conf
 	if normalizedCertFile == "" && normalizedKeyFile == "" {
 		return nil, nil
 	}
+	if err := validatePrivateKeyFilePermission(normalizedKeyFile); err != nil {
+		return nil, fmt.Errorf("load control plane tls certificate: %w", err)
+	}
 	certificate, err := tls.LoadX509KeyPair(normalizedCertFile, normalizedKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load control plane tls certificate: %w", err)
 	}
+	return buildControlPlaneServerTLSConfigFromCertificate(certificate), nil
+}
+
+// buildControlPlaneServerTLSConfigFromCertificate 基于服务端证书生成统一 TLS 配置。
+func buildControlPlaneServerTLSConfigFromCertificate(certificate tls.Certificate) *tls.Config {
 	return &tls.Config{
 		// 控制面固定收敛到 TLS 1.3，避免不同版本混用。
 		MinVersion: tls.VersionTLS13,
@@ -72,7 +82,7 @@ func loadControlPlaneServerTLSConfig(certFile string, keyFile string) (*tls.Conf
 		},
 		// gRPC over TLS 需要 h2；tcp_framed 即使未协商 ALPN 也可正常工作。
 		NextProtos: []string{"h2"},
-	}, nil
+	}
 }
 
 // acceptControlPlaneConnWithTLS 根据 tls_mode 判定入站连接是否需要 TLS 握手。
@@ -189,26 +199,31 @@ func looksLikeTLSClientHello(prefix []byte) bool {
 // controlPlaneTLSAwareListener 在 grpc server Accept 之前完成 tls_mode 判定与握手。
 type controlPlaneTLSAwareListener struct {
 	net.Listener
-	tlsMode       controlPlaneTLSMode
-	serverTLSConf *tls.Config
-	metrics       *obs.Metrics
+	tlsMode                controlPlaneTLSMode
+	resolveServerTLSConfig func() *tls.Config
+	metrics                *obs.Metrics
 }
 
 // newControlPlaneTLSAwareListener 创建带 tls_mode 判定能力的 listener 包装器。
 func newControlPlaneTLSAwareListener(
 	listener net.Listener,
 	tlsMode controlPlaneTLSMode,
-	serverTLSConfig *tls.Config,
+	resolveServerTLSConfig func() *tls.Config,
 	metrics *obs.Metrics,
 ) net.Listener {
 	if listener == nil {
 		return nil
 	}
+	serverTLSConfigResolver := resolveServerTLSConfig
+	if serverTLSConfigResolver == nil {
+		// 兜底返回 nil，保持与 plaintext 模式/旧路径语义一致。
+		serverTLSConfigResolver = func() *tls.Config { return nil }
+	}
 	return &controlPlaneTLSAwareListener{
-		Listener:      listener,
-		tlsMode:       tlsMode,
-		serverTLSConf: serverTLSConfig,
-		metrics:       metrics,
+		Listener:               listener,
+		tlsMode:                tlsMode,
+		resolveServerTLSConfig: serverTLSConfigResolver,
+		metrics:                metrics,
 	}
 }
 
@@ -222,7 +237,12 @@ func (listener *controlPlaneTLSAwareListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		acceptedConn, tlsEnabled, wrapErr := acceptControlPlaneConnWithTLS(rawConn, listener.tlsMode, listener.serverTLSConf, listener.metrics)
+		acceptedConn, tlsEnabled, wrapErr := acceptControlPlaneConnWithTLS(
+			rawConn,
+			listener.tlsMode,
+			listener.resolveServerTLSConfig(),
+			listener.metrics,
+		)
 		if wrapErr != nil {
 			slog.Warn(
 				"reject grpc control connection by tls mode",
@@ -241,6 +261,26 @@ func (listener *controlPlaneTLSAwareListener) Accept() (net.Conn, error) {
 		)
 		return acceptedConn, nil
 	}
+}
+
+// prefixedNetConn 在底层连接前拼接一段已读前缀，便于判别后回放首包。
+type prefixedNetConn struct {
+	net.Conn
+	prefix []byte
+}
+
+// Read 优先消费前缀数据，消费完后回落到底层连接。
+func (conn *prefixedNetConn) Read(payload []byte) (int, error) {
+	if conn == nil || len(payload) == 0 {
+		return 0, nil
+	}
+	if len(conn.prefix) == 0 {
+		// 前缀读完后直接透传到底层连接。
+		return conn.Conn.Read(payload)
+	}
+	copiedLength := copy(payload, conn.prefix)
+	conn.prefix = conn.prefix[copiedLength:]
+	return copiedLength, nil
 }
 
 // remoteAddrString 返回连接对端地址字符串，供日志使用。

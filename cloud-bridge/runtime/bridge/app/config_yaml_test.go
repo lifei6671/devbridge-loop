@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 )
 
 // TestParseConfigYAMLAppliesDefaultsAndOverrides 验证 YAML 仅覆盖显式字段，其余字段保持默认值。
@@ -52,8 +54,15 @@ observability:
 	if config.ControlPlane.HeartbeatTimeout != 45*time.Second {
 		testingObject.Fatalf("unexpected heartbeat timeout: got=%s want=%s", config.ControlPlane.HeartbeatTimeout, 45*time.Second)
 	}
-	if config.ControlPlane.TLSMode != string(controlPlaneTLSModePlaintext) {
-		testingObject.Fatalf("unexpected tls mode: got=%s want=%s", config.ControlPlane.TLSMode, controlPlaneTLSModePlaintext)
+	if config.ControlPlane.TLSMode != string(apptls.ModePlaintext) {
+		testingObject.Fatalf("unexpected tls mode: got=%s want=%s", config.ControlPlane.TLSMode, apptls.ModePlaintext)
+	}
+	if config.ControlPlane.TLSCertSource != string(apptls.CertSourceExternal) {
+		testingObject.Fatalf(
+			"unexpected tls cert source default: got=%s want=%s",
+			config.ControlPlane.TLSCertSource,
+			apptls.CertSourceExternal,
+		)
 	}
 	// 未在 YAML 中配置的字段应继续沿用默认值。
 	if config.Ingress.HTTPAddr != ":38080" {
@@ -137,9 +146,15 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	config.ControlPlane.ListenAddr = ":19080"
 	config.ControlPlane.GRPCH2ListenAddr = ":19082"
 	config.ControlPlane.HeartbeatTimeout = 45 * time.Second
-	config.ControlPlane.TLSMode = string(controlPlaneTLSModeOptional)
-	config.ControlPlane.TLSCertFile = "/tmp/bridge-cert.pem"
-	config.ControlPlane.TLSKeyFile = "/tmp/bridge-key.pem"
+	config.ControlPlane.TLSMode = string(apptls.ModeRequired)
+	config.ControlPlane.TLSCertSource = string(apptls.CertSourceManagedCA)
+	config.ControlPlane.TLSCACertFile = "/tmp/managed-root-ca.crt"
+	config.ControlPlane.TLSCAKeyFile = "/tmp/managed-root-ca.key"
+	config.ControlPlane.TLSServerCommonName = "bridge.internal.example"
+	config.ControlPlane.TLSServerSANDNS = []string{"bridge.internal.example"}
+	config.ControlPlane.TLSServerSANIPs = []string{"127.0.0.1"}
+	config.ControlPlane.TLSServerCertTTL = 72 * time.Hour
+	config.ControlPlane.TLSServerCertRenewBefore = 12 * time.Hour
 	config.Admin.BasePath = "/console"
 	config.Observability.LogLevel = "debug"
 
@@ -162,6 +177,34 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	}
 	if loadedConfig.ControlPlane.TLSMode != config.ControlPlane.TLSMode {
 		testingObject.Fatalf("unexpected control_plane.tls_mode: got=%s want=%s", loadedConfig.ControlPlane.TLSMode, config.ControlPlane.TLSMode)
+	}
+	if loadedConfig.ControlPlane.TLSCertSource != config.ControlPlane.TLSCertSource {
+		testingObject.Fatalf(
+			"unexpected control_plane.tls_cert_source: got=%s want=%s",
+			loadedConfig.ControlPlane.TLSCertSource,
+			config.ControlPlane.TLSCertSource,
+		)
+	}
+	if loadedConfig.ControlPlane.TLSCACertFile != config.ControlPlane.TLSCACertFile {
+		testingObject.Fatalf(
+			"unexpected control_plane.tls_ca_cert_file: got=%s want=%s",
+			loadedConfig.ControlPlane.TLSCACertFile,
+			config.ControlPlane.TLSCACertFile,
+		)
+	}
+	if loadedConfig.ControlPlane.TLSCAKeyFile != config.ControlPlane.TLSCAKeyFile {
+		testingObject.Fatalf(
+			"unexpected control_plane.tls_ca_key_file: got=%s want=%s",
+			loadedConfig.ControlPlane.TLSCAKeyFile,
+			config.ControlPlane.TLSCAKeyFile,
+		)
+	}
+	if loadedConfig.ControlPlane.TLSServerCertTTL != config.ControlPlane.TLSServerCertTTL {
+		testingObject.Fatalf(
+			"unexpected control_plane.tls_server_cert_ttl: got=%s want=%s",
+			loadedConfig.ControlPlane.TLSServerCertTTL,
+			config.ControlPlane.TLSServerCertTTL,
+		)
 	}
 	if loadedConfig.Admin.BasePath != config.Admin.BasePath {
 		testingObject.Fatalf("unexpected admin.base_path: got=%s want=%s", loadedConfig.Admin.BasePath, config.Admin.BasePath)

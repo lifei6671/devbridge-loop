@@ -244,34 +244,63 @@
 - [x] TLS 三模式在配置、运行时、测试、观测中全部闭环
 - [x] §7.11 认证流程具备可复现实验与自动化回归
 
-### S13. Bridge 自建 CA 与证书运维闭环
+### S13. Bridge 证书来源双模式与 CA 运维闭环
 
-- [ ] 初始化生成 Root CA 私钥与证书，并独立持久化
-- [ ] 由 Root CA 签发 Bridge 服务端证书，替代“仅加载外部 `tls_cert_file/tls_key_file`”路径
-- [ ] Bridge 服务端证书支持短周期续签、替换与热加载
-- [ ] Root CA 带外分发、轮换、紧急替换 runbook 与配置入口补齐
-- [ ] Root CA 私钥与 Bridge 服务端私钥分开存储，最小权限访问并排除普通日志/通用备份
+- [x] 为 Bridge 启动配置新增证书来源模式开关，明确区分“外部证书模式”和“自建 CA 模式”
+- [x] 证书来源配置同时支持 YAML 配置文件加载与环境变量覆盖，并固定“环境变量优先于配置文件”的合并规则
+- [x] 外部证书模式继续支持直接加载 `tls_cert_file/tls_key_file`，保持现有自定义证书接入能力
+- [x] 自建 CA 模式下初始化生成或加载 Root CA 私钥与证书，并由 Root CA 签发 Bridge 服务端证书
+- [x] Bridge 服务端证书支持短周期续签、替换与热加载；两种模式下都要有明确切换与回滚路径
+- [x] 自建 CA 模式下补齐 Root CA 带外分发、轮换、紧急替换 runbook 与配置入口
+- [x] 自建 CA 模式下 Root CA 私钥与 Bridge 服务端私钥分开存储；外部证书模式下至少保证服务端私钥最小权限访问并排除普通日志/通用备份
 
 代码落点建议：
 
 - `cloud-bridge/runtime/bridge/app/bootstrap.go`
 - `cloud-bridge/runtime/bridge/app/config.go`
 - `cloud-bridge/runtime/bridge/app/control_plane_tls.go`
+- `cloud-bridge/runtime/bridge/app/config_yaml.go`
+- `cloud-bridge/cmd/cloud-bridge/main.go`
 - `docs/Agent‑BridgeSecurityArchitectureAndAuthDesign.md`
+
+配置命名冻结：
+
+- YAML 键：`control_plane.tls_cert_source`
+- YAML 值：`external | managed_ca`
+- 环境变量前缀：统一使用 `DEV_BRIDGE_CFG_CONTROL_PLANE_*`
+- 数组类环境变量：`TLS_SERVER_SAN_DNS`、`TLS_SERVER_SAN_IPS` 使用逗号分隔
+- 默认值：未显式指定 `tls_cert_source` 时默认 `external`
+
+环境变量清单：
+
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_MODE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_SOURCE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_FILE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_KEY_FILE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_CERT_FILE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_KEY_FILE`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_COMMON_NAME`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_DNS`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_IPS`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_TTL`
+- `DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_RENEW_BEFORE`
 
 验收标准：
 
-- Bridge 能在无预制 cert/key 的场景完成首次 CA 初始化和服务端证书签发
-- Agent 仅信任 Bridge Root CA 时可成功完成 TLS 握手
-- Root CA 轮换与紧急替换具备可演练的带外操作路径
+- Bridge 启动时可显式选择“外部证书模式”或“自建 CA 模式”
+- 相同配置可通过 YAML 文件与环境变量两种来源加载，且环境变量覆盖行为可预测、可测试
+- 外部证书模式下，现有 `tls_cert_file/tls_key_file` 路径可继续完成 TLS 握手
+- 自建 CA 模式下，Bridge 能在无预制 cert/key 的场景完成首次 CA 初始化和服务端证书签发
+- Agent 预置信任与所选模式对应的 trust anchor 后，可在两种模式下成功完成 TLS 握手
+- 自建 CA 轮换与紧急替换具备可演练的带外操作路径
 
 ### S14. 未认证入口限流、失败封禁与枚举抑制
 
-- [ ] 对未认证 `ConnectorHello` 实现 `source_ip/connector_id` 双维度限流
-- [ ] 对认证失败实现 `source_ip/connector_id` 双维度失败限流与短时封禁
-- [ ] 对未知 `connector_id`、无效 token、吊销 token 等场景统一外显响应口径，降低枚举区分度
-- [ ] 为握手洪泛增加连接预算与并发预算控制
-- [ ] 补齐未认证入口限流、封禁、枚举抑制自动化测试
+- [x] 对未认证 `ConnectorHello` 实现 `source_ip/connector_id` 双维度限流
+- [x] 对认证失败实现 `source_ip/connector_id` 双维度失败限流与短时封禁
+- [x] 对未知 `connector_id`、无效 token、吊销 token 等场景统一外显响应口径，降低枚举区分度
+- [x] 为握手洪泛增加连接预算与并发预算控制
+- [x] 补齐未认证入口限流、封禁、枚举抑制自动化测试
 
 代码落点建议：
 
@@ -287,11 +316,11 @@
 
 ### S15. Session 状态机与旧会话收敛
 
-- [ ] 显式落地 `connecting -> connected -> control_ready -> authenticated -> draining/closed/failed` 状态机
-- [ ] 未进入 `authenticated` 前禁止发布服务、分配实际 traffic、进入 tunnel pool 工作态
-- [ ] 新 `session_epoch` 生效后，旧 session 必须进入 `draining/stale` 并冻结控制面资源写入
-- [ ] `failed` 状态必须终止控制面并清理该 session 下全部 tunnel
-- [ ] Agent 收到 `auth_session_superseded` 或 `auth_rate_limited` 后执行指数退避
+- [x] 显式落地 `connecting -> connected -> control_ready -> authenticated -> draining/closed/failed` 状态机
+- [x] 未进入 `authenticated` 前禁止发布服务、分配实际 traffic、进入 tunnel pool 工作态
+- [x] 新 `session_epoch` 生效后，旧 session 必须进入 `draining/stale` 并冻结控制面资源写入
+- [x] `failed` 状态必须终止控制面并清理该 session 下全部 tunnel
+- [x] Agent 收到 `auth_session_superseded` 或 `auth_rate_limited` 后执行指数退避
 
 代码落点建议：
 
@@ -308,10 +337,11 @@
 
 ### S16. 控制面一致性与幂等语义
 
-- [ ] 资源级控制消息统一校验 `session_epoch/event_id/resource_version`
-- [ ] `event_id` 去重作用域固定为 `session_id + event_id`
-- [ ] 为 `PublishServiceAck/UnpublishServiceAck/RouteAssignAck/RouteRevokeAck` 固定 accepted/current version 语义
-- [ ] 补齐重复投递、乱序投递、低 epoch 覆盖、高 epoch 并发写入回归测试
+- [x] 资源级控制消息统一校验 `session_epoch/event_id/resource_version`
+- [x] `event_id` 去重作用域固定为 `session_id + event_id`
+- [x] 为 `PublishServiceAck/UnpublishServiceAck/RouteAssignAck/RouteRevokeAck` 固定 accepted/current version 语义
+- [x] 补齐重复投递、乱序投递、低 epoch 覆盖、高 epoch 并发写入回归测试
+- [x] `cloud-bridge/runtime/bridge/app` 按职责拆分为 `app/auth`、`app/config`、`app/tls` 子包，`app` 保留运行时编排与组装职责
 
 代码落点建议：
 
@@ -328,9 +358,13 @@
 
 ### S17. 资源身份与策略边界
 
-- [ ] 固定 `service_key=<namespace>/<environment>/<service_name>` 为 canonical lookup key
+- [ ] 固定 `service_key=<service_name>/<protocol>` 为 canonical lookup key，并规范 `protocol=trim+lower-case`
+- [ ] 固定同一 `service_key` 可由多 connector 并发发布，并统一归并到同一逻辑服务池
 - [ ] 固定 `service_id` 为全局 opaque identity，并在 runtime/traffic/ACK/audit 中统一使用
 - [ ] 当 `PublishService.service_id` 为空时，若 `service_key` 已存在必须复用既有 `service_id`，仅首次出现时分配新值
+- [ ] 固定 `service_instance_id` 为运行时实例维度主键（内部模型），用于区分服务池内不同 connector/session 实例
+- [ ] 固定 L7 路由支持 `RouteMatch.header_matches`，在相同 host/path 下可按 header 条件分流到不同 target service
+- [ ] 固定 route 命中服务池后只在 `ACTIVE + HEALTHY` 实例集合内进行随机或等价无状态均衡，单条 traffic 生命周期内保持实例粘性
 - [ ] publish policy / route policy 与 token 绑定关系彻底解耦，避免 token 承载 scope 与资源治理策略
 - [ ] 补齐 service republish、route target、audit 字段使用 `service_id/service_key` 的回归测试
 
@@ -344,7 +378,9 @@
 验收标准：
 
 - 同一 `service_key` 的重复发布不会无故漂移 `service_id`
-- 路由层使用 `service_key`，运行时与审计使用 `service_id` 的职责边界清晰可测
+- 同一 `service_key` 的多 connector 发布可稳定归并为服务池，并可观测到实例级状态变化
+- 同 host/path 的 L7 route 可通过 `header_matches` 稳定分流到不同 target service，匹配规则可测
+- 路由层使用 `service_key`，运行时与审计使用 `service_id`（可附 `service_instance_id`）的职责边界清晰可测
 - token 仅承担接入认证，不承载资源发布与路由治理策略
 
 ### S18. Token 生命周期与吊销治理
@@ -418,7 +454,7 @@
 
 1. 先做 `S0/S6`，冻结协议结构与校验边界。
 2. 再做 `S2/S3/S7/S14`，完成 Bridge 认证核心能力、未认证入口防护与会话权威提交。
-3. 接着做 `S4/S5/S13`，打通 TLS 模式、Agent 校验与 Bridge 自建 CA 闭环。
+3. 接着做 `S4/S5/S13`，打通 TLS 模式、Agent 校验与 Bridge 双证书来源闭环。
 4. 然后做 `S15/S16/S17`，收敛 session 状态机、控制面一致性与资源身份边界。
 5. 再做 `S8/S9/S20`，对齐数据面关闭回收、超时治理与错误码。
 6. 然后做 `S18/S19`，补齐 token 生命周期治理与 Agent 凭证安全存储。
@@ -430,8 +466,50 @@
 
 - M1（协议冻结）：完成 `S0/S6`
 - M2（认证基线）：完成 `S2/S3/S7/S14`
-- M3（TLS 与证书）：完成 `S4/S5/S13`
+- M3（TLS 与证书来源）：完成 `S4/S5/S13`
 - M4（控制面收敛）：完成 `S15/S16/S17`
 - M5（数据面边界）：完成 `S8/S9/S20`
 - M6（凭证治理）：完成 `S18/S19`
 - M7（可发布）：完成 `S10/S11/S12`
+
+---
+
+## 七、S17 `service_key` 口径改造清单（追加）
+
+### 7.1 协议与文档冻结
+
+- [ ] 将 `service_key` 规范统一改为 `<service_name>/<protocol>`，并在文档中显式声明 `service_name` 禁止包含 `/`
+- [ ] 明确同一条 `PublishService` 中 `endpoints[*].protocol` 必须一致，多协议需拆分多条 service
+- [ ] 明确 `namespace/environment` 为可选 scope 约束字段，不参与 canonical identity 计算
+
+### 7.2 控制面校验与发布语义
+
+- [ ] `ValidatePublishService` 增加“单服务单协议”校验与 `service_key` canonical 格式校验
+- [ ] `PublishService` 入站时若 `service_key` 为空，按 `service_name/protocol` 自动补全 canonical key
+- [ ] 当来包 `service_id` 为空时，按 canonical key 复用或分配 `service_id`
+
+### 7.3 注册表模型改造
+
+- [ ] 在 registry 中引入“服务池（`service_id`）+ 实例（`service_instance_id`）”双层结构
+- [ ] 支持同一 `service_key/service_id` 下挂接多个实例，避免后写覆盖前写
+- [ ] 会话失活、connector 下线、健康降级时，实例状态可独立收敛
+
+### 7.4 路由解析与实例选择
+
+- [ ] `service_key` 命中逻辑服务池后，仅在 `ACTIVE + HEALTHY` 实例集合内选择
+- [ ] 首版实例选择实现随机或 P2C，保持无状态且可快速落地
+- [ ] 单条 traffic 生命周期固定实例，不引入 mid-stream failover
+- [ ] L7 路由支持 `header_matches` 条件（header 名大小写无关、值精确匹配、全部条件命中）
+
+### 7.5 观测与审计
+
+- [ ] ACK、运行时日志与审计记录默认输出 `service_id`，必要时附带 `service_instance_id`
+- [ ] 指标新增服务池级与实例级维度（发布数、可用实例数、路由命中数、失败原因）
+- [ ] 排障链路支持从 `traffic_id` 反查 `service_id` 与实例归属
+
+### 7.6 回归测试与验收
+
+- [ ] 补齐同 key 多 connector 并发发布、反复 republish、实例摘除/恢复的回归测试
+- [ ] 补齐路由实例选择公平性、健康过滤、实例粘性与失效收敛测试
+- [ ] 补齐同 host/path 下按 `header_matches` 分流到不同 target service 的回归测试（含 header 大小写与多值场景）
+- [ ] 补齐 `service_id/service_key/service_instance_id` 在 ACK、audit、runtime 中的一致性测试

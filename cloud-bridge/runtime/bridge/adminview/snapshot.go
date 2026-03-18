@@ -173,7 +173,7 @@ func BuildBridgeOverview(
 		switch session.State {
 		case registry.SessionActive:
 			activeSessions++
-		case registry.SessionStale:
+		case registry.SessionStale, registry.SessionFailed:
 			staleSessions++
 		}
 	}
@@ -703,7 +703,7 @@ func BuildDiagnoseSummary(
 	issues := make([]string, 0, 4)
 	staleSessionCount := 0
 	for _, session := range sessions {
-		if session.State == registry.SessionStale {
+		if session.State == registry.SessionStale || session.State == registry.SessionFailed {
 			staleSessionCount++
 		}
 	}

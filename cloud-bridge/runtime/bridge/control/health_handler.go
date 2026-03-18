@@ -48,9 +48,9 @@ func (handler *HealthHandler) HandleReport(envelope pb.ControlEnvelope, report p
 	normalizedServiceID := strings.TrimSpace(report.ServiceID)
 	normalizedServiceKey := strings.TrimSpace(report.ServiceKey)
 	if !handler.validateSessionEpoch(envelope) {
-		// 旧会话上报直接丢弃，避免覆盖新 session 真相源。
+		// 非 ACTIVE 会话或旧代际上报直接丢弃，避免覆盖新 session 真相源。
 		slog.Info(
-			"bridge ignore service health report: invalid session epoch",
+			"bridge ignore service health report: invalid session runtime",
 			"connector_id", strings.TrimSpace(envelope.ConnectorID),
 			"session_id", strings.TrimSpace(envelope.SessionID),
 			"session_epoch", envelope.SessionEpoch,
@@ -120,7 +120,8 @@ func (handler *HealthHandler) validateSessionEpoch(envelope pb.ControlEnvelope) 
 	if !exists {
 		return false
 	}
-	return sessionRuntime.Epoch == envelope.SessionEpoch
+	// 仅 ACTIVE 会话允许写入健康状态，防止旧会话在 draining/stale/failed 阶段继续污染状态。
+	return sessionRuntime.Epoch == envelope.SessionEpoch && sessionRuntime.State == registry.SessionActive
 }
 
 // normalizeHealthStatus 将非法健康状态回退为 UNKNOWN。
