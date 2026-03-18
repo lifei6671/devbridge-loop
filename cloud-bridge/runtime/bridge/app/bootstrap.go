@@ -115,6 +115,31 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 					return adminConfigStore.snapshot()
 				},
 				Metrics: sharedMetrics,
+				ResolveTrafficOwnership: func(trafficID string) (adminapi.TrafficOwnershipRecord, bool) {
+					if dataPlane == nil {
+						return adminapi.TrafficOwnershipRecord{}, false
+					}
+					ownership, exists := dataPlane.resolveTrafficOwnership(trafficID)
+					if !exists {
+						return adminapi.TrafficOwnershipRecord{}, false
+					}
+					updatedAtMS := uint64(0)
+					if !ownership.UpdatedAt.IsZero() {
+						updatedAtMS = uint64(ownership.UpdatedAt.UTC().UnixMilli())
+					}
+					return adminapi.TrafficOwnershipRecord{
+						TrafficID:         strings.TrimSpace(ownership.TrafficID),
+						RouteID:           strings.TrimSpace(ownership.RouteID),
+						TargetKind:        strings.TrimSpace(ownership.TargetKind),
+						IngressMode:       strings.TrimSpace(ownership.IngressMode),
+						ServiceID:         strings.TrimSpace(ownership.ServiceID),
+						ServiceKey:        strings.TrimSpace(ownership.ServiceKey),
+						ServiceInstanceID: strings.TrimSpace(ownership.ServiceInstanceID),
+						ConnectorID:       strings.TrimSpace(ownership.ConnectorID),
+						SessionID:         strings.TrimSpace(ownership.SessionID),
+						UpdatedAtMS:       updatedAtMS,
+					}, true
+				},
 				ReloadConfig: func(now time.Time, actor string) (adminapi.ReloadConfigResult, error) {
 					return adminConfigStore.reload(now, actor)
 				},

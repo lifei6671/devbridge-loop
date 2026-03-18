@@ -337,10 +337,12 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 			Guard:           eventGuard,
 			SessionRegistry: sessionRegistry,
 			ServiceRegistry: serviceRegistry,
+			Metrics:         metrics,
 		}),
 		healthHandler: bridgecontrol.NewHealthHandler(bridgecontrol.HealthHandlerOptions{
 			SessionRegistry: sessionRegistry,
 			ServiceRegistry: serviceRegistry,
+			Metrics:         metrics,
 		}),
 		tunnelHandler: bridgecontrol.NewTunnelReportHandler(bridgecontrol.TunnelReportHandlerOptions{
 			SessionRegistry: sessionRegistry,
@@ -1246,13 +1248,24 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 		shouldMarkConnectorInactive := normalizedReason == "session_epoch_takeover" ||
 			dispatcher.isCurrentConnectorSession(sessionRuntime)
 		if dispatcher.serviceRegistry != nil && shouldMarkConnectorInactive {
-			// takeover 场景下旧 session 已不再是当前权威，但旧 connector 服务仍需立即摘流。
-			// DRAINING 后立即摘流：服务标记 INACTIVE，避免被 resolver 继续命中。
-			dispatcher.serviceRegistry.MarkLifecycleByConnector(
+			affectedServiceIDs := dispatcher.serviceRegistry.ListServiceIDsByRuntime(
+				sessionRuntime.ConnectorID,
+				"",
+			)
+			// takeover 场景下旧 session 已不再是当前权威，但旧实例仍需立即摘流。
+			// 优先按 connector+session 收敛，避免同 connector 新会话实例被误摘流。
+			dispatcher.serviceRegistry.MarkLifecycleByConnectorAndSession(
 				now,
 				sessionRuntime.ConnectorID,
+				sessionRuntime.SessionID,
 				pb.ServiceStatusInactive,
 				pb.HealthStatusUnknown,
+			)
+			// 生命周期收敛后回刷可用实例快照，保证服务池可用数实时更新。
+			bridgecontrol.RefreshServiceAvailabilityMetricsByServiceIDs(
+				dispatcher.metrics,
+				dispatcher.serviceRegistry,
+				affectedServiceIDs,
 			)
 		}
 		if dispatcher.tunnelRegistry != nil {
@@ -1263,12 +1276,23 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
 		}
 		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
+			affectedServiceIDs := dispatcher.serviceRegistry.ListServiceIDsByRuntime(
+				sessionRuntime.ConnectorID,
+				"",
+			)
 			// STALE/FAILED/CLOSED 服务仅保留审计价值，不再参与路由解析。
-			dispatcher.serviceRegistry.MarkLifecycleByConnector(
+			dispatcher.serviceRegistry.MarkLifecycleByConnectorAndSession(
 				now,
 				sessionRuntime.ConnectorID,
+				sessionRuntime.SessionID,
 				pb.ServiceStatusStale,
 				pb.HealthStatusUnknown,
+			)
+			// 终态会话收敛后同步刷新可用实例快照，避免保留过期可用状态。
+			bridgecontrol.RefreshServiceAvailabilityMetricsByServiceIDs(
+				dispatcher.metrics,
+				dispatcher.serviceRegistry,
+				affectedServiceIDs,
 			)
 		}
 		if dispatcher.tunnelRegistry != nil {

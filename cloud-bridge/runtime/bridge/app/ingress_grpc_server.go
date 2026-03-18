@@ -79,24 +79,49 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		Namespace:   namespace,
 		Environment: environment,
 		Metadata: map[string]string{
-			"grpc_path": request.URL.Path,
+			routing.RouteLookupMetadataTrafficIDKey: trafficID,
+			"grpc_path":                             request.URL.Path,
 		},
+		Headers: cloneHTTPHeaderValues(request.Header),
 	})
 	if lookupErr != nil {
 		mappedFailure := ingressHTTPFailureMapper.Map(lookupErr, routing.PathExecuteResult{})
 		writeIngressError(writer, mappedFailure.HTTPStatus, mappedFailure.Code, mappedFailure.Message, trafficID, traceID)
+		log.Printf(
+			"bridge ingress grpc lookup failed authority=%s path=%s http=%d code=%s traffic_id=%s trace_id=%s err=%v",
+			authority,
+			request.URL.Path,
+			mappedFailure.HTTPStatus,
+			mappedFailure.Code,
+			trafficID,
+			traceID,
+			lookupErr,
+		)
 		return
 	}
 	resolution, resolveErr := runtime.dataPlane.resolver.Resolve(lookupRequest)
 	if resolveErr != nil {
 		mappedFailure := ingressHTTPFailureMapper.Map(resolveErr, routing.PathExecuteResult{})
 		writeIngressError(writer, mappedFailure.HTTPStatus, mappedFailure.Code, mappedFailure.Message, trafficID, traceID)
+		log.Printf(
+			"bridge ingress grpc resolve failed authority=%s path=%s http=%d code=%s traffic_id=%s trace_id=%s err=%v",
+			authority,
+			request.URL.Path,
+			mappedFailure.HTTPStatus,
+			mappedFailure.Code,
+			trafficID,
+			traceID,
+			resolveErr,
+		)
 		return
 	}
+	resolvedServiceID := resolveTrafficServiceIDFromResolution(resolution)
+	resolvedServiceKey := resolveTrafficServiceKeyFromResolution(resolution)
+	resolvedServiceInstanceID := resolveTrafficServiceInstanceIDFromResolution(resolution)
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:    trafficID,
 		RouteID:      strings.TrimSpace(resolution.Route.RouteID),
-		ServiceID:    resolveTrafficServiceIDFromResolution(resolution),
+		ServiceID:    resolvedServiceID,
 		SourceAddr:   strings.TrimSpace(request.RemoteAddr),
 		ProtocolHint: "grpc",
 		TraceID:      traceID,
@@ -104,6 +129,13 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 			"grpc_path": request.URL.Path,
 		},
 	}
+	// 统一补齐服务身份元数据，便于后续日志链路直接复用。
+	enrichTrafficOpenServiceIdentity(
+		&trafficOpen,
+		resolvedServiceID,
+		resolvedServiceKey,
+		resolvedServiceInstanceID,
+	)
 	pathExecuteResult := routing.PathExecuteResult{TargetKind: resolution.TargetKind}
 	var proxyErr error
 	switch resolution.TargetKind {
@@ -141,10 +173,34 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		return
 	}
 	if errors.Is(proxyErr, errIngressResponseCommitted) {
+		log.Printf(
+			"bridge ingress grpc proxy post-commit error ignored authority=%s path=%s target_kind=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
+			authority,
+			request.URL.Path,
+			resolution.TargetKind,
+			trafficID,
+			traceID,
+			resolvedServiceID,
+			resolvedServiceInstanceID,
+			proxyErr,
+		)
 		return
 	}
 	mappedFailure := ingressHTTPFailureMapper.Map(proxyErr, pathExecuteResult)
 	writeIngressError(writer, mappedFailure.HTTPStatus, mappedFailure.Code, mappedFailure.Message, trafficID, traceID)
+	log.Printf(
+		"bridge ingress grpc proxy failed authority=%s path=%s target_kind=%s http=%d code=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
+		authority,
+		request.URL.Path,
+		resolution.TargetKind,
+		mappedFailure.HTTPStatus,
+		mappedFailure.Code,
+		trafficID,
+		traceID,
+		resolvedServiceID,
+		resolvedServiceInstanceID,
+		proxyErr,
+	)
 }
 
 func isGRPCContentType(rawContentType string) bool {
@@ -258,8 +314,10 @@ func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
 				// close_ack 闭环未完成时把 tunnel 标记为不可安全回收，后续由 dispatcher 直接关闭。
 				recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(closeErr)
 				log.Printf(
-					"bridge ingress grpc close-ack wait failed, fallback close traffic_id=%s recycle_error_code=%s err=%v",
+					"bridge ingress grpc close-ack wait failed, fallback close traffic_id=%s service_id=%s service_instance_id=%s recycle_error_code=%s err=%v",
 					strings.TrimSpace(trafficID),
+					strings.TrimSpace(trafficOpen.ServiceID),
+					strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]),
 					recycleErrorCode,
 					closeErr,
 				)

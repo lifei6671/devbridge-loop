@@ -368,3 +368,120 @@ func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected sni_name: %+v", item["sni_name"])
 	}
 }
+
+// TestTrafficOwnershipLookupByTrafficID 验证可按 traffic_id 查询服务归属。
+func TestTrafficOwnershipLookupByTrafficID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			ResolveTrafficOwnership: func(trafficID string) (TrafficOwnershipRecord, bool) {
+				if strings.TrimSpace(trafficID) != "traffic-ownership-1" {
+					return TrafficOwnershipRecord{}, false
+				}
+				return TrafficOwnershipRecord{
+					TrafficID:         "traffic-ownership-1",
+					RouteID:           "route-1",
+					TargetKind:        "connector_service",
+					IngressMode:       "l7_shared",
+					ServiceID:         "svc-1",
+					ServiceKey:        "dev/demo/order-service",
+					ServiceInstanceID: "svcinst:svc-1|connector-1|session-1",
+					ConnectorID:       "connector-1",
+					SessionID:         "session-1",
+					UpdatedAtMS:       1700000000000,
+				}, true
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership?traffic_id=traffic-ownership-1", nil)
+	request.Header.Set("Authorization", "Bearer viewer-token")
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		testingObject.Fatalf("decode traffic ownership payload failed: %v body=%s", err, recorder.Body.String())
+	}
+	ownership, ok := payload["ownership"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("ownership payload missing: %+v", payload)
+	}
+	if ownership["service_id"] != "svc-1" {
+		testingObject.Fatalf("unexpected service_id: %+v", ownership["service_id"])
+	}
+	if ownership["service_instance_id"] != "svcinst:svc-1|connector-1|session-1" {
+		testingObject.Fatalf("unexpected service_instance_id: %+v", ownership["service_instance_id"])
+	}
+}
+
+// TestTrafficOwnershipLookupRequiresTrafficID 验证 traffic ownership 查询必须携带 traffic_id。
+func TestTrafficOwnershipLookupRequiresTrafficID(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			ResolveTrafficOwnership: func(trafficID string) (TrafficOwnershipRecord, bool) {
+				_ = trafficID
+				return TrafficOwnershipRecord{}, false
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership", nil)
+	request.Header.Set("Authorization", "Bearer viewer-token")
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+// TestTrafficOwnershipLookupNotFound 验证未知 traffic_id 返回 not found。
+func TestTrafficOwnershipLookupNotFound(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			ResolveTrafficOwnership: func(trafficID string) (TrafficOwnershipRecord, bool) {
+				_ = trafficID
+				return TrafficOwnershipRecord{}, false
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership?traffic_id=traffic-missing", nil)
+	request.Header.Set("Authorization", "Bearer viewer-token")
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusNotFound)
+	}
+}

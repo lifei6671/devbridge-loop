@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
@@ -153,5 +154,161 @@ func TestHealthHandlerIgnoreNonActiveSession(t *testing.T) {
 	}
 	if serviceSnapshot.HealthStatus != pb.HealthStatusUnknown {
 		t.Fatalf("draining session should be ignored, got=%s", serviceSnapshot.HealthStatus)
+	}
+}
+
+// TestHealthHandlerUpdatesMatchedInstanceOnly 验证同池多实例场景下仅更新上报实例健康状态。
+func TestHealthHandlerUpdatesMatchedInstanceOnly(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-a",
+		ConnectorID: "connector-a",
+		Epoch:       8,
+		State:       registry.SessionActive,
+	})
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-b",
+		ConnectorID: "connector-b",
+		Epoch:       9,
+		State:       registry.SessionActive,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
+		ServiceID:       "svc-shared",
+		ServiceKey:      "order-service/http",
+		Namespace:       "dev",
+		Environment:     "demo",
+		ConnectorID:     "connector-a",
+		ServiceName:     "order-service",
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: 1,
+		HealthStatus:    pb.HealthStatusUnknown,
+	}, "session-a")
+	serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
+		ServiceID:       "svc-shared",
+		ServiceKey:      "order-service/http",
+		Namespace:       "dev",
+		Environment:     "demo",
+		ConnectorID:     "connector-b",
+		ServiceName:     "order-service",
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: 2,
+		HealthStatus:    pb.HealthStatusUnknown,
+	}, "session-b")
+	handler := NewHealthHandler(HealthHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ServiceRegistry: serviceRegistry,
+	})
+
+	handler.HandleReport(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageServiceHealthReport,
+		SessionID:    "session-a",
+		SessionEpoch: 8,
+		ConnectorID:  "connector-a",
+	}, pb.ServiceHealthReport{
+		ServiceID:           "svc-shared",
+		ServiceKey:          "order-service/http",
+		ServiceHealthStatus: pb.HealthStatusHealthy,
+		CheckTimeUnix:       time.Now().UTC().Unix(),
+	})
+
+	instances := serviceRegistry.ListInstancesByServiceKey("order-service/http")
+	if len(instances) != 2 {
+		t.Fatalf("unexpected instance count: got=%d want=2", len(instances))
+	}
+	healthByConnector := map[string]pb.HealthStatus{}
+	for _, instance := range instances {
+		healthByConnector[instance.Service.ConnectorID] = instance.Service.HealthStatus
+	}
+	if healthByConnector["connector-a"] != pb.HealthStatusHealthy {
+		t.Fatalf("expected connector-a health updated to healthy, got=%s", healthByConnector["connector-a"])
+	}
+	if healthByConnector["connector-b"] != pb.HealthStatusUnknown {
+		t.Fatalf("expected connector-b health remains unknown, got=%s", healthByConnector["connector-b"])
+	}
+}
+
+// TestHealthHandlerRefreshesServiceAvailabilityMetrics 验证健康更新会刷新服务池/实例可用性指标。
+func TestHealthHandlerRefreshesServiceAvailabilityMetrics(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-a",
+		ConnectorID: "connector-a",
+		Epoch:       10,
+		State:       registry.SessionActive,
+	})
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-b",
+		ConnectorID: "connector-b",
+		Epoch:       11,
+		State:       registry.SessionActive,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	instanceA := serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
+		ServiceID:       "svc-availability",
+		ServiceKey:      "availability-service/http",
+		Namespace:       "dev",
+		Environment:     "demo",
+		ConnectorID:     "connector-a",
+		ServiceName:     "availability-service",
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: 1,
+		HealthStatus:    pb.HealthStatusUnknown,
+	}, "session-a")
+	instanceB := serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
+		ServiceID:       "svc-availability",
+		ServiceKey:      "availability-service/http",
+		Namespace:       "dev",
+		Environment:     "demo",
+		ConnectorID:     "connector-b",
+		ServiceName:     "availability-service",
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: 2,
+		HealthStatus:    pb.HealthStatusUnknown,
+	}, "session-b")
+	metrics := obs.NewMetrics()
+	handler := NewHealthHandler(HealthHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ServiceRegistry: serviceRegistry,
+		Metrics:         metrics,
+	})
+
+	handler.HandleReport(pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageServiceHealthReport,
+		SessionID:    "session-a",
+		SessionEpoch: 10,
+		ConnectorID:  "connector-a",
+	}, pb.ServiceHealthReport{
+		ServiceID:           "svc-availability",
+		ServiceKey:          "availability-service/http",
+		ServiceHealthStatus: pb.HealthStatusHealthy,
+		CheckTimeUnix:       time.Now().UTC().Unix(),
+	})
+
+	if metrics.BridgeServiceAvailableInstanceTotal("svc-availability") != 1 {
+		t.Fatalf(
+			"unexpected service available instance total: got=%d want=1",
+			metrics.BridgeServiceAvailableInstanceTotal("svc-availability"),
+		)
+	}
+	if metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceA) != 1 {
+		t.Fatalf(
+			"expected instance-a available metric is 1, got=%d",
+			metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceA),
+		)
+	}
+	if metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceB) != 0 {
+		t.Fatalf(
+			"expected instance-b available metric is 0, got=%d",
+			metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceB),
+		)
 	}
 }

@@ -25,22 +25,40 @@ type LocalRegistration struct {
 	Metadata        map[string]string
 }
 
-// BuildServiceKey 基于 scope 与 serviceName 构造稳定 service_key。
-func BuildServiceKey(namespace string, environment string, serviceName string) string {
-	// service_key 固定格式为 <namespace>/<environment>/<service_name>。
-	return fmt.Sprintf("%s/%s/%s",
-		strings.TrimSpace(namespace),
-		strings.TrimSpace(environment),
-		strings.TrimSpace(serviceName),
-	)
+// BuildServiceKey 基于 service_name 与 protocol 构造 canonical service_key。
+func BuildServiceKey(serviceName string, protocol string) string {
+	normalizedServiceName := strings.TrimSpace(serviceName)
+	normalizedProtocol := strings.ToLower(strings.TrimSpace(protocol))
+	if normalizedServiceName == "" || normalizedProtocol == "" {
+		// canonical key 任一关键段缺失时返回空值，交由上游校验失败。
+		return ""
+	}
+	// service_key 固定格式为 <service_name>/<protocol>。
+	return fmt.Sprintf("%s/%s", normalizedServiceName, normalizedProtocol)
+}
+
+// ResolveServiceProtocol 解析服务协议，优先 endpoint.protocol，其次 service_type。
+func ResolveServiceProtocol(serviceType string, endpoints []pb.ServiceEndpoint) string {
+	for _, endpoint := range endpoints {
+		normalizedProtocol := strings.ToLower(strings.TrimSpace(endpoint.Protocol))
+		if normalizedProtocol != "" {
+			// 以 endpoint 为准，避免 service_type 与 endpoint 不一致。
+			return normalizedProtocol
+		}
+	}
+	// endpoint 未声明协议时回退 service_type，兼容历史调用路径。
+	return strings.ToLower(strings.TrimSpace(serviceType))
 }
 
 // ToPublishService 将本地注册对象转换为 PublishService 消息。
 func ToPublishService(local LocalRegistration) pb.PublishService {
 	serviceKey := strings.TrimSpace(local.ServiceKey)
 	if serviceKey == "" {
-		// 未显式提供 serviceKey 时按协议格式自动生成。
-		serviceKey = BuildServiceKey(local.Namespace, local.Environment, local.ServiceName)
+		// 未显式提供 serviceKey 时按 canonical 规则自动生成。
+		serviceKey = BuildServiceKey(
+			local.ServiceName,
+			ResolveServiceProtocol(local.ServiceType, local.Endpoints),
+		)
 	}
 	return pb.PublishService{
 		ServiceID:       strings.TrimSpace(local.ServiceID),
@@ -62,8 +80,11 @@ func ToPublishService(local LocalRegistration) pb.PublishService {
 func ToUnpublishService(local LocalRegistration, reason string) pb.UnpublishService {
 	serviceKey := strings.TrimSpace(local.ServiceKey)
 	if serviceKey == "" {
-		// 未显式提供 serviceKey 时按协议格式自动生成。
-		serviceKey = BuildServiceKey(local.Namespace, local.Environment, local.ServiceName)
+		// 未显式提供 serviceKey 时按 canonical 规则自动生成。
+		serviceKey = BuildServiceKey(
+			local.ServiceName,
+			ResolveServiceProtocol(local.ServiceType, local.Endpoints),
+		)
 	}
 	return pb.UnpublishService{
 		ServiceID:   strings.TrimSpace(local.ServiceID),

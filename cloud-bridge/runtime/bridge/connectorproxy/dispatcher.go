@@ -24,6 +24,8 @@ const (
 	trafficOpenHintEndpointAddrKey = "endpoint_addr"
 	openAckActualEndpointIDKey     = "actual_endpoint_id"
 	openAckActualEndpointAddrKey   = "actual_endpoint_addr"
+	// trafficOpenMetadataServiceInstanceIDKey 定义 TrafficOpen 元数据中的 service_instance_id 键。
+	trafficOpenMetadataServiceInstanceIDKey = "service_instance_id"
 )
 
 // DispatchRequest 描述 connector path 执行请求。
@@ -118,10 +120,12 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	resolvedServiceInstanceID := strings.TrimSpace(request.TrafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey])
 	baseLogFields := obs.LogFields{
-		TrafficID:   strings.TrimSpace(request.TrafficOpen.TrafficID),
-		ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
-		ConnectorID: normalizedConnectorID,
+		TrafficID:         strings.TrimSpace(request.TrafficOpen.TrafficID),
+		ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
+		ServiceInstanceID: resolvedServiceInstanceID,
+		ConnectorID:       normalizedConnectorID,
 	}
 
 	acquiredTunnel, err := dispatcher.tunnelAcquirer.AcquireIdleTunnel(normalizedContext, normalizedConnectorID)
@@ -147,10 +151,11 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		log.Printf(
 			"bridge connector dispatch failed event=mark_tunnel_active_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
-				TrafficID:   trafficID,
-				ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
-				ConnectorID: normalizedConnectorID,
-				TunnelID:    strings.TrimSpace(acquiredTunnel.TunnelID),
+				TrafficID:         trafficID,
+				ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ServiceInstanceID: resolvedServiceInstanceID,
+				ConnectorID:       normalizedConnectorID,
+				TunnelID:          strings.TrimSpace(acquiredTunnel.TunnelID),
 			}),
 			err,
 		)
@@ -169,10 +174,11 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 		log.Printf(
 			"bridge connector dispatch failed event=open_handshake_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
-				TrafficID:   trafficID,
-				ServiceID:   strings.TrimSpace(request.TrafficOpen.ServiceID),
-				ConnectorID: normalizedConnectorID,
-				TunnelID:    strings.TrimSpace(acquiredTunnel.TunnelID),
+				TrafficID:         trafficID,
+				ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ServiceInstanceID: resolvedServiceInstanceID,
+				ConnectorID:       normalizedConnectorID,
+				TunnelID:          strings.TrimSpace(acquiredTunnel.TunnelID),
 			}),
 			err,
 		)
@@ -206,6 +212,7 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          trafficID,
 				ServiceID:          strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ServiceInstanceID:  resolvedServiceInstanceID,
 				ActualEndpointID:   strings.TrimSpace(openAck.Metadata[openAckActualEndpointIDKey]),
 				ActualEndpointAddr: strings.TrimSpace(openAck.Metadata[openAckActualEndpointAddrKey]),
 				ConnectorID:        normalizedConnectorID,
@@ -224,6 +231,7 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, request DispatchRequ
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          trafficID,
 				ServiceID:          strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ServiceInstanceID:  resolvedServiceInstanceID,
 				ActualEndpointID:   strings.TrimSpace(openAck.Metadata[openAckActualEndpointIDKey]),
 				ActualEndpointAddr: strings.TrimSpace(openAck.Metadata[openAckActualEndpointAddrKey]),
 				ConnectorID:        normalizedConnectorID,

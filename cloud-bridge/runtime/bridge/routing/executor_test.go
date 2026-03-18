@@ -311,6 +311,75 @@ func TestPathExecutorHybridPolicyForbidden(testingObject *testing.T) {
 	}
 }
 
+// TestPathExecutorRecordsRouteFailureReasonMetrics 验证执行失败会记录服务池/实例维度失败原因指标。
+func TestPathExecutorRecordsRouteFailureReasonMetrics(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	connectorDispatcher := &routingTestConnectorDispatcher{
+		result: connectorproxy.DispatchResult{
+			HTTPStatus: 503,
+			ErrorCode:  connectorproxy.FailureCodeNoIdleTunnel,
+		},
+		err: connectorproxy.ErrNoIdleTunnel,
+	}
+	directExecutor := &routingTestDirectExecutor{}
+	metrics := obs.NewMetrics()
+	executor, err := NewPathExecutor(PathExecutorOptions{
+		Connector: connectorDispatcher,
+		Direct:    directExecutor,
+		Metrics:   metrics,
+	})
+	if err != nil {
+		testingObject.Fatalf("new path executor failed: %v", err)
+	}
+
+	_, err = executor.Execute(context.Background(), PathExecuteRequest{
+		Resolution: ResolveResult{
+			TargetKind: pb.RouteTargetTypeConnectorService,
+			Connector: &ConnectorResolution{
+				Service: pb.Service{
+					ServiceID:   "svc-exec-failure",
+					ServiceKey:  "exec-failure/http",
+					ConnectorID: "connector-1",
+				},
+				Session: registry.SessionRuntime{
+					SessionID:   "session-1",
+					ConnectorID: "connector-1",
+					State:       registry.SessionActive,
+				},
+				ServiceInstanceID: "svcinst:svc-exec-failure|connector-1|session-1",
+			},
+		},
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID: "traffic-exec-failure-1",
+			ServiceID: "svc-exec-failure",
+			Metadata: map[string]string{
+				trafficOpenMetadataServiceInstanceIDKey: "svcinst:svc-exec-failure|connector-1|session-1",
+			},
+		},
+	})
+	if !errors.Is(err, connectorproxy.ErrNoIdleTunnel) {
+		testingObject.Fatalf("expected no-idle error, got=%v", err)
+	}
+	if metrics.BridgeServiceRouteFailureReasonTotal("svc-exec-failure", connectorproxy.FailureCodeNoIdleTunnel) != 1 {
+		testingObject.Fatalf(
+			"unexpected service failure reason total: got=%d want=1",
+			metrics.BridgeServiceRouteFailureReasonTotal("svc-exec-failure", connectorproxy.FailureCodeNoIdleTunnel),
+		)
+	}
+	if metrics.BridgeServiceInstanceRouteFailureReasonTotal(
+		"svc-exec-failure",
+		"svcinst:svc-exec-failure|connector-1|session-1",
+		connectorproxy.FailureCodeNoIdleTunnel,
+	) != 1 {
+		testingObject.Fatalf("unexpected instance failure reason total: got=%d want=1", metrics.BridgeServiceInstanceRouteFailureReasonTotal(
+			"svc-exec-failure",
+			"svcinst:svc-exec-failure|connector-1|session-1",
+			connectorproxy.FailureCodeNoIdleTunnel,
+		))
+	}
+}
+
 func buildHybridResolution(policy pb.FallbackPolicy) ResolveResult {
 	return ResolveResult{
 		TargetKind: pb.RouteTargetTypeHybridGroup,

@@ -228,9 +228,8 @@ func normalizeRegistration(registration adapter.LocalRegistration) adapter.Local
 	if normalized.ServiceKey == "" {
 		// 未显式提供 key 时按协议规则自动构造。
 		normalized.ServiceKey = adapter.BuildServiceKey(
-			normalized.Namespace,
-			normalized.Environment,
 			normalized.ServiceName,
+			adapter.ResolveServiceProtocol(normalized.ServiceType, normalized.Endpoints),
 		)
 	}
 	return normalized

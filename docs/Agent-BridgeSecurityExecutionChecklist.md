@@ -358,13 +358,13 @@
 
 ### S17. 资源身份与策略边界
 
-- [ ] 固定 `service_key=<service_name>/<protocol>` 为 canonical lookup key，并规范 `protocol=trim+lower-case`
-- [ ] 固定同一 `service_key` 可由多 connector 并发发布，并统一归并到同一逻辑服务池
+- [x] 固定 `service_key=<service_name>/<protocol>` 为 canonical lookup key，并规范 `protocol=trim+lower-case`
+- [x] 固定同一 `service_key` 可由多 connector 并发发布，并统一归并到同一逻辑服务池
 - [ ] 固定 `service_id` 为全局 opaque identity，并在 runtime/traffic/ACK/audit 中统一使用
-- [ ] 当 `PublishService.service_id` 为空时，若 `service_key` 已存在必须复用既有 `service_id`，仅首次出现时分配新值
-- [ ] 固定 `service_instance_id` 为运行时实例维度主键（内部模型），用于区分服务池内不同 connector/session 实例
-- [ ] 固定 L7 路由支持 `RouteMatch.header_matches`，在相同 host/path 下可按 header 条件分流到不同 target service
-- [ ] 固定 route 命中服务池后只在 `ACTIVE + HEALTHY` 实例集合内进行随机或等价无状态均衡，单条 traffic 生命周期内保持实例粘性
+- [x] 当 `PublishService.service_id` 为空时，若 `service_key` 已存在必须复用既有 `service_id`，仅首次出现时分配新值
+- [x] 固定 `service_instance_id` 为运行时实例维度主键（内部模型），用于区分服务池内不同 connector/session 实例
+- [x] 固定 L7 路由支持 `RouteMatch.header_matches`，在相同 host/path 下可按 header 条件分流到不同 target service
+- [x] 固定 route 命中服务池后只在 `ACTIVE + HEALTHY` 实例集合内进行随机或等价无状态均衡，单条 traffic 生命周期内保持实例粘性
 - [ ] publish policy / route policy 与 token 绑定关系彻底解耦，避免 token 承载 scope 与资源治理策略
 - [ ] 补齐 service republish、route target、audit 字段使用 `service_id/service_key` 的回归测试
 
@@ -478,38 +478,38 @@
 
 ### 7.1 协议与文档冻结
 
-- [ ] 将 `service_key` 规范统一改为 `<service_name>/<protocol>`，并在文档中显式声明 `service_name` 禁止包含 `/`
-- [ ] 明确同一条 `PublishService` 中 `endpoints[*].protocol` 必须一致，多协议需拆分多条 service
-- [ ] 明确 `namespace/environment` 为可选 scope 约束字段，不参与 canonical identity 计算
+- [x] 将 `service_key` 规范统一改为 `<service_name>/<protocol>`，并在文档中显式声明 `service_name` 禁止包含 `/`
+- [x] 明确同一条 `PublishService` 中 `endpoints[*].protocol` 必须一致，多协议需拆分多条 service
+- [x] 明确 `namespace/environment` 为可选 scope 约束字段，不参与 canonical identity 计算
 
 ### 7.2 控制面校验与发布语义
 
-- [ ] `ValidatePublishService` 增加“单服务单协议”校验与 `service_key` canonical 格式校验
-- [ ] `PublishService` 入站时若 `service_key` 为空，按 `service_name/protocol` 自动补全 canonical key
-- [ ] 当来包 `service_id` 为空时，按 canonical key 复用或分配 `service_id`
+- [x] `ValidatePublishService` 增加“单服务单协议”校验与 `service_key` canonical 格式校验
+- [x] `PublishService` 入站时若 `service_key` 为空，按 `service_name/protocol` 自动补全 canonical key
+- [x] 当来包 `service_id` 为空时，按 canonical key 复用或分配 `service_id`
 
 ### 7.3 注册表模型改造
 
-- [ ] 在 registry 中引入“服务池（`service_id`）+ 实例（`service_instance_id`）”双层结构
-- [ ] 支持同一 `service_key/service_id` 下挂接多个实例，避免后写覆盖前写
-- [ ] 会话失活、connector 下线、健康降级时，实例状态可独立收敛
+- [x] 在 registry 中引入“服务池（`service_id`）+ 实例（`service_instance_id`）”双层结构
+- [x] 支持同一 `service_key/service_id` 下挂接多个实例，避免后写覆盖前写
+- [x] 会话失活、connector 下线、健康降级时，实例状态可独立收敛
 
 ### 7.4 路由解析与实例选择
 
-- [ ] `service_key` 命中逻辑服务池后，仅在 `ACTIVE + HEALTHY` 实例集合内选择
-- [ ] 首版实例选择实现随机或 P2C，保持无状态且可快速落地
-- [ ] 单条 traffic 生命周期固定实例，不引入 mid-stream failover
-- [ ] L7 路由支持 `header_matches` 条件（header 名大小写无关、值精确匹配、全部条件命中）
+- [x] `service_key` 命中逻辑服务池后，仅在 `ACTIVE + HEALTHY` 实例集合内选择
+- [x] 首版实例选择实现随机或 P2C，保持无状态且可快速落地
+- [x] 单条 traffic 生命周期固定实例，不引入 mid-stream failover
+- [x] L7 路由支持 `header_matches` 条件（header 名大小写无关、值精确匹配、全部条件命中）
 
 ### 7.5 观测与审计
 
-- [ ] ACK、运行时日志与审计记录默认输出 `service_id`，必要时附带 `service_instance_id`
-- [ ] 指标新增服务池级与实例级维度（发布数、可用实例数、路由命中数、失败原因）
-- [ ] 排障链路支持从 `traffic_id` 反查 `service_id` 与实例归属
+- [x] ACK、运行时日志与审计记录默认输出 `service_id`，必要时附带 `service_instance_id`
+- [x] 指标新增服务池级与实例级维度（发布数、可用实例数、路由命中数、失败原因）
+- [x] 排障链路支持从 `traffic_id` 反查 `service_id` 与实例归属
 
 ### 7.6 回归测试与验收
 
-- [ ] 补齐同 key 多 connector 并发发布、反复 republish、实例摘除/恢复的回归测试
-- [ ] 补齐路由实例选择公平性、健康过滤、实例粘性与失效收敛测试
-- [ ] 补齐同 host/path 下按 `header_matches` 分流到不同 target service 的回归测试（含 header 大小写与多值场景）
-- [ ] 补齐 `service_id/service_key/service_instance_id` 在 ACK、audit、runtime 中的一致性测试
+- [x] 补齐同 key 多 connector 并发发布、反复 republish、实例摘除/恢复的回归测试
+- [x] 补齐路由实例选择公平性、健康过滤、实例粘性与失效收敛测试
+- [x] 补齐同 host/path 下按 `header_matches` 分流到不同 target service 的回归测试（含 header 大小写与多值场景）
+- [x] 补齐 `service_id/service_key/service_instance_id` 在 ACK、audit、runtime 中的一致性测试

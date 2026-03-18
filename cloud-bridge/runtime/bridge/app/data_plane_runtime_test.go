@@ -377,6 +377,33 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 	if writes[0].OpenReq == nil || writes[0].OpenReq.TrafficID != "traffic-1" {
 		testingObject.Fatalf("expected first payload to be open req with traffic-1")
 	}
+	if writes[0].OpenReq.Metadata[trafficMetadataServiceIDKey] != "svc-1" {
+		testingObject.Fatalf(
+			"unexpected open req service_id metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataServiceIDKey],
+			"svc-1",
+		)
+	}
+	if writes[0].OpenReq.Metadata[trafficMetadataServiceKeyKey] != "dev/demo/order-service" {
+		testingObject.Fatalf(
+			"unexpected open req service_key metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataServiceKeyKey],
+			"dev/demo/order-service",
+		)
+	}
+	if writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey] == "" {
+		testingObject.Fatalf("expected open req service_instance_id metadata not empty")
+	}
+	if result.Resolution.Connector == nil {
+		testingObject.Fatalf("expected connector resolution for service identity assert")
+	}
+	if writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey] != result.Resolution.Connector.ServiceInstanceID {
+		testingObject.Fatalf(
+			"unexpected open req service_instance_id metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey],
+			result.Resolution.Connector.ServiceInstanceID,
+		)
+	}
 	if writes[1].CloseAck == nil || writes[1].CloseAck.TrafficID != "traffic-1" || !writes[1].CloseAck.Accepted {
 		testingObject.Fatalf("expected second payload to be close_ack accepted for traffic-1")
 	}
@@ -402,6 +429,33 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 			tunnelRuntime.ReuseCount,
 			tunnelRuntime.RecycleSeq,
 		)
+	}
+	ownership, ownershipExists := runtime.dataPlane.resolveTrafficOwnership("traffic-1")
+	if !ownershipExists {
+		testingObject.Fatalf("expected traffic ownership exists for traffic-1")
+	}
+	if ownership.ServiceID != "svc-1" {
+		testingObject.Fatalf("unexpected ownership service_id: got=%s want=svc-1", ownership.ServiceID)
+	}
+	if result.Resolution.Connector == nil {
+		testingObject.Fatalf("expected connector resolution exists for ownership assert")
+	}
+	if ownership.ServiceInstanceID != result.Resolution.Connector.ServiceInstanceID {
+		testingObject.Fatalf(
+			"unexpected ownership service_instance_id: got=%s want=%s",
+			ownership.ServiceInstanceID,
+			result.Resolution.Connector.ServiceInstanceID,
+		)
+	}
+	if ownership.ConnectorID != "connector-1" || ownership.SessionID != "session-1" {
+		testingObject.Fatalf(
+			"unexpected ownership runtime fields: connector_id=%s session_id=%s",
+			ownership.ConnectorID,
+			ownership.SessionID,
+		)
+	}
+	if ownership.RouteID != "route-1" {
+		testingObject.Fatalf("unexpected ownership route_id: got=%s want=route-1", ownership.RouteID)
 	}
 }
 

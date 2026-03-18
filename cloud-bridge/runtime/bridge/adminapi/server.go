@@ -82,6 +82,20 @@ type AgentTunnelPoolSummary struct {
 	UpdatedAtMS uint64 `json:"updated_at_ms"`
 }
 
+// TrafficOwnershipRecord 定义按 traffic_id 反查得到的服务归属快照。
+type TrafficOwnershipRecord struct {
+	TrafficID         string `json:"traffic_id"`
+	RouteID           string `json:"route_id"`
+	TargetKind        string `json:"target_kind"`
+	IngressMode       string `json:"ingress_mode"`
+	ServiceID         string `json:"service_id"`
+	ServiceKey        string `json:"service_key"`
+	ServiceInstanceID string `json:"service_instance_id"`
+	ConnectorID       string `json:"connector_id"`
+	SessionID         string `json:"session_id"`
+	UpdatedAtMS       uint64 `json:"updated_at_ms"`
+}
+
 // Dependencies 定义管理后台只读 API 所需依赖。
 type Dependencies struct {
 	// Now 允许测试注入当前时间。
@@ -102,6 +116,8 @@ type Dependencies struct {
 	BuildConfigSnapshot func() map[string]any
 	// Metrics 指向 Bridge 指标容器。
 	Metrics *obs.Metrics
+	// ResolveTrafficOwnership 按 traffic_id 反查服务归属。
+	ResolveTrafficOwnership func(trafficID string) (TrafficOwnershipRecord, bool)
 	// ReloadConfig 执行配置重载操作（受控写接口）。
 	ReloadConfig func(now time.Time, actor string) (ReloadConfigResult, error)
 	// DrainSession 把指定 session 标记为 DRAINING，并触发生命周期收敛副作用。
@@ -250,6 +266,7 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/admin/tunnels/summary", server.wrapHandler(RoleViewer, "tunnels", "summary", server.handleTunnelSummary))
 	mux.Handle("/api/admin/tunnels", server.wrapHandler(RoleViewer, "tunnels", "list", server.handleTunnelsList))
 	mux.Handle("/api/admin/traffic/summary", server.wrapHandler(RoleViewer, "traffic", "summary", server.handleTrafficSummary))
+	mux.Handle("/api/admin/traffic/ownership", server.wrapHandler(RoleViewer, "traffic", "ownership", server.handleTrafficOwnership))
 	mux.Handle("/api/admin/config/snapshot", server.wrapHandler(RoleViewer, "config", "snapshot", server.handleConfigSnapshot))
 	mux.Handle("/api/admin/config", server.wrapHandler(RoleAdmin, "config", "update", server.handleConfigUpdate))
 	mux.Handle("/api/admin/logs/search", server.wrapHandler(RoleViewer, "logs", "search", server.handleLogsSearch))
@@ -814,6 +831,33 @@ func (server *Server) handleTrafficSummary(writer http.ResponseWriter, request *
 	})
 }
 
+// handleTrafficOwnership 按 traffic_id 查询服务归属快照。
+func (server *Server) handleTrafficOwnership(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writeError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET is required")
+		return
+	}
+	trafficID := strings.TrimSpace(request.URL.Query().Get("traffic_id"))
+	if trafficID == "" {
+		writeError(writer, http.StatusBadRequest, "INVALID_ARGUMENT", "traffic_id is required")
+		return
+	}
+	ownership, exists := safeResolveTrafficOwnership(server.dependencies, trafficID)
+	if !exists {
+		writeError(
+			writer,
+			http.StatusNotFound,
+			"RESOURCE_NOT_FOUND",
+			fmt.Sprintf("traffic ownership not found for traffic_id=%s", trafficID),
+		)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"ownership": ownership,
+		"source":    "bridge.adminapi.readonly",
+	})
+}
+
 func (server *Server) handleConfigSnapshot(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "GET is required")
@@ -1143,6 +1187,16 @@ func safeListTunnels(dependencies Dependencies) []registry.TunnelRuntime {
 		return []registry.TunnelRuntime{}
 	}
 	return dependencies.ListTunnels()
+}
+
+func safeResolveTrafficOwnership(
+	dependencies Dependencies,
+	trafficID string,
+) (TrafficOwnershipRecord, bool) {
+	if dependencies.ResolveTrafficOwnership == nil {
+		return TrafficOwnershipRecord{}, false
+	}
+	return dependencies.ResolveTrafficOwnership(strings.TrimSpace(trafficID))
 }
 
 func safeTunnelSnapshot(dependencies Dependencies) registry.TunnelSnapshot {

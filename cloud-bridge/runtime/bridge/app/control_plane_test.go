@@ -301,7 +301,7 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 
 	publishPayload := pb.PublishService{
 		ServiceID:   "svc-001",
-		ServiceKey:  "dev/demo/order-service",
+		ServiceKey:  "order-service/http",
 		Namespace:   "dev",
 		Environment: "demo",
 		ServiceName: "order-service",
@@ -413,7 +413,7 @@ func TestServeControlChannelRejectPublishServiceBeforeAuth(testingObject *testin
 
 	publishPayload := pb.PublishService{
 		ServiceID:   "svc-unauth",
-		ServiceKey:  "dev/demo/unauth-service",
+		ServiceKey:  "unauth-service/http",
 		Namespace:   "dev",
 		Environment: "demo",
 		ServiceName: "unauth-service",
@@ -1068,7 +1068,7 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 
 	publishPayload := pb.PublishService{
 		ServiceID:   "svc-002",
-		ServiceKey:  "dev/demo/pay-service",
+		ServiceKey:  "pay-service/http",
 		Namespace:   "dev",
 		Environment: "demo",
 		ServiceName: "pay-service",
@@ -1139,7 +1139,7 @@ func TestControlMessageDispatcherHandleServiceHealthReport(testingObject *testin
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
 		ServiceID:       "svc-2001",
-		ServiceKey:      "dev/demo/order-service",
+		ServiceKey:      "order-service/http",
 		Namespace:       "dev",
 		Environment:     "demo",
 		ServiceName:     "order-service",
@@ -1154,7 +1154,7 @@ func TestControlMessageDispatcherHandleServiceHealthReport(testingObject *testin
 
 	healthPayload := pb.ServiceHealthReport{
 		ServiceID:           "svc-2001",
-		ServiceKey:          "dev/demo/order-service",
+		ServiceKey:          "order-service/http",
 		ServiceHealthStatus: pb.HealthStatusUnhealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	}
@@ -1372,7 +1372,7 @@ func TestControlMessageDispatcherSessionTakeoverLifecycle(testingObject *testing
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(now, pb.Service{
 		ServiceID:    "svc-old",
-		ServiceKey:   "dev/demo/order-service",
+		ServiceKey:   "order-service/http",
 		ConnectorID:  "connector-1",
 		Status:       pb.ServiceStatusActive,
 		HealthStatus: pb.HealthStatusHealthy,
@@ -1429,6 +1429,80 @@ func TestControlMessageDispatcherSessionTakeoverLifecycle(testingObject *testing
 	}
 }
 
+// TestControlMessageDispatcherSessionTakeoverDoesNotDowngradeNewSessionInstance
+// 验证 takeover 只收敛旧会话实例，不会把同 connector 下新会话实例一起摘流。
+func TestControlMessageDispatcherSessionTakeoverDoesNotDowngradeNewSessionInstance(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-old",
+		ConnectorID:   "connector-1",
+		Epoch:         1,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.UpsertWithRuntime(now, pb.Service{
+		ServiceID:    "svc-takeover",
+		ServiceKey:   "order-service/http",
+		ConnectorID:  "connector-1",
+		Status:       pb.ServiceStatusActive,
+		HealthStatus: pb.HealthStatusHealthy,
+	}, "session-old")
+	serviceRegistry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
+		ServiceID:    "svc-takeover",
+		ServiceKey:   "order-service/http",
+		ConnectorID:  "connector-1",
+		Status:       pb.ServiceStatusActive,
+		HealthStatus: pb.HealthStatusHealthy,
+	}, "session-new")
+
+	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
+		sessionRegistry: sessionRegistry,
+		serviceRegistry: serviceRegistry,
+	})
+	dispatcher.upsertSessionFromEnvelope(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageTunnelPoolReport,
+		SessionID:       "session-new",
+		SessionEpoch:    2,
+		ConnectorID:     "connector-1",
+		EventID:         "evt-takeover-scope",
+		ResourceVersion: 9,
+	})
+
+	instances := serviceRegistry.ListInstancesByServiceID("svc-takeover")
+	if len(instances) != 2 {
+		testingObject.Fatalf("unexpected instance count: got=%d want=2", len(instances))
+	}
+	instanceStatusBySession := make(map[string]pb.ServiceStatus, len(instances))
+	instanceHealthBySession := make(map[string]pb.HealthStatus, len(instances))
+	for _, instance := range instances {
+		instanceStatusBySession[instance.SessionID] = instance.Service.Status
+		instanceHealthBySession[instance.SessionID] = instance.Service.HealthStatus
+	}
+	if instanceStatusBySession["session-old"] != pb.ServiceStatusInactive ||
+		instanceHealthBySession["session-old"] != pb.HealthStatusUnknown {
+		testingObject.Fatalf(
+			"unexpected old session instance lifecycle after takeover: status=%s health=%s",
+			instanceStatusBySession["session-old"],
+			instanceHealthBySession["session-old"],
+		)
+	}
+	if instanceStatusBySession["session-new"] != pb.ServiceStatusActive ||
+		instanceHealthBySession["session-new"] != pb.HealthStatusHealthy {
+		testingObject.Fatalf(
+			"unexpected new session instance lifecycle after takeover: status=%s health=%s",
+			instanceStatusBySession["session-new"],
+			instanceHealthBySession["session-new"],
+		)
+	}
+}
+
 // TestControlMessageDispatcherEpochResetTakeoverFromStaleSession
 // 验证旧会话已 STALE 时，低 epoch 新会话可在 Agent 重启后接管 connector。
 func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObject *testing.T) {
@@ -1447,7 +1521,7 @@ func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObjec
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(now, pb.Service{
 		ServiceID:       "svc-epoch-reset",
-		ServiceKey:      "dev/demo/order-service",
+		ServiceKey:      "order-service/http",
 		ConnectorID:     "connector-1",
 		Status:          pb.ServiceStatusStale,
 		HealthStatus:    pb.HealthStatusUnknown,
@@ -1460,7 +1534,7 @@ func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObjec
 
 	encodedPayload, err := json.Marshal(pb.PublishService{
 		ServiceID:   "svc-epoch-reset",
-		ServiceKey:  "dev/demo/order-service",
+		ServiceKey:  "order-service/http",
 		Namespace:   "dev",
 		Environment: "demo",
 		ServiceName: "order-service",
@@ -1541,7 +1615,7 @@ func TestControlMessageDispatcherSweepSessionLifecycle(testingObject *testing.T)
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(now, pb.Service{
 		ServiceID:    "svc-4001",
-		ServiceKey:   "dev/demo/order-service",
+		ServiceKey:   "order-service/http",
 		ConnectorID:  "connector-1",
 		Status:       pb.ServiceStatusActive,
 		HealthStatus: pb.HealthStatusHealthy,
@@ -1618,7 +1692,7 @@ func TestControlMessageDispatcherStaleOldSessionDoesNotDowngradeCurrentServices(
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(now, pb.Service{
 		ServiceID:    "svc-new",
-		ServiceKey:   "dev/demo/order-service",
+		ServiceKey:   "order-service/http",
 		ConnectorID:  "connector-1",
 		Status:       pb.ServiceStatusActive,
 		HealthStatus: pb.HealthStatusHealthy,
@@ -1668,7 +1742,7 @@ func TestControlMessageDispatcherResourceEventDoesNotReactivateDrainingSession(t
 	serviceRegistry := registry.NewServiceRegistry()
 	serviceRegistry.Upsert(now, pb.Service{
 		ServiceID:       "svc-1",
-		ServiceKey:      "dev/demo/order-service",
+		ServiceKey:      "order-service/http",
 		ConnectorID:     "connector-1",
 		Status:          pb.ServiceStatusInactive,
 		HealthStatus:    pb.HealthStatusUnknown,
@@ -1681,7 +1755,7 @@ func TestControlMessageDispatcherResourceEventDoesNotReactivateDrainingSession(t
 
 	encodedPayload, err := json.Marshal(pb.ServiceHealthReport{
 		ServiceID:           "svc-1",
-		ServiceKey:          "dev/demo/order-service",
+		ServiceKey:          "order-service/http",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       now.Unix(),
 	})

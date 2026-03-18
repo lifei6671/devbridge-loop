@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/adminapi"
+	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
@@ -347,12 +348,23 @@ func drainSessionForAdmin(
 
 	updatedServiceCount := 0
 	if shouldDrainConnectorServices(dataPlane.sessionRegistry, sessionRuntime) && dataPlane.serviceRegistry != nil {
-		// 仅在目标 session 仍是 connector 当前会话时才批量摘流，避免影响新代会话。
-		updatedServiceCount = dataPlane.serviceRegistry.MarkLifecycleByConnector(
+		affectedServiceIDs := dataPlane.serviceRegistry.ListServiceIDsByRuntime(
+			sessionRuntime.ConnectorID,
+			"",
+		)
+		// 仅收敛目标 session 对应实例，避免同 connector 下其他会话被误摘流。
+		updatedServiceCount = dataPlane.serviceRegistry.MarkLifecycleByConnectorAndSession(
 			normalizedNow,
 			sessionRuntime.ConnectorID,
+			sessionRuntime.SessionID,
 			pb.ServiceStatusInactive,
 			pb.HealthStatusUnknown,
+		)
+		// 管理面手动 drain 后立即刷新可用实例快照，防止指标滞后。
+		bridgecontrol.RefreshServiceAvailabilityMetricsByServiceIDs(
+			dataPlane.connectorMetrics,
+			dataPlane.serviceRegistry,
+			affectedServiceIDs,
 		)
 	}
 	purgedTunnelCount := 0

@@ -97,10 +97,12 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 		Namespace:   namespace,
 		Environment: environment,
 		Metadata: map[string]string{
-			"http_method":      strings.TrimSpace(request.Method),
-			"http_request_uri": request.URL.RequestURI(),
-			"http_user_agent":  strings.TrimSpace(request.UserAgent()),
+			routing.RouteLookupMetadataTrafficIDKey: trafficID,
+			"http_method":                           strings.TrimSpace(request.Method),
+			"http_request_uri":                      request.URL.RequestURI(),
+			"http_user_agent":                       strings.TrimSpace(request.UserAgent()),
 		},
+		Headers: cloneHTTPHeaderValues(request.Header),
 	})
 	if lookupErr != nil {
 		mappedFailure := ingressHTTPFailureMapper.Map(lookupErr, routing.PathExecuteResult{})
@@ -133,11 +135,14 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 		)
 		return
 	}
+	resolvedServiceID := resolveTrafficServiceIDFromResolution(resolution)
+	resolvedServiceKey := resolveTrafficServiceKeyFromResolution(resolution)
+	resolvedServiceInstanceID := resolveTrafficServiceInstanceIDFromResolution(resolution)
 
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:    trafficID,
 		RouteID:      strings.TrimSpace(resolution.Route.RouteID),
-		ServiceID:    resolveTrafficServiceIDFromResolution(resolution),
+		ServiceID:    resolvedServiceID,
 		SourceAddr:   strings.TrimSpace(request.RemoteAddr),
 		ProtocolHint: protocol,
 		TraceID:      traceID,
@@ -146,6 +151,13 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 			"http_request_uri": request.URL.RequestURI(),
 		},
 	}
+	// 统一补齐服务身份元数据，便于后续日志链路直接复用。
+	enrichTrafficOpenServiceIdentity(
+		&trafficOpen,
+		resolvedServiceID,
+		resolvedServiceKey,
+		resolvedServiceInstanceID,
+	)
 
 	writer.Header().Set("X-DevBridge-Traffic-Id", trafficID)
 	writer.Header().Set("X-DevBridge-Trace-Id", traceID)
@@ -168,12 +180,14 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 	if proxyErr != nil {
 		if errors.Is(proxyErr, errIngressResponseCommitted) {
 			log.Printf(
-				"bridge ingress http proxy post-commit error ignored host=%s path=%s target_kind=%s traffic_id=%s trace_id=%s err=%v",
+				"bridge ingress http proxy post-commit error ignored host=%s path=%s target_kind=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
 				authority,
 				request.URL.Path,
 				resolution.TargetKind,
 				trafficID,
 				traceID,
+				resolvedServiceID,
+				resolvedServiceInstanceID,
 				proxyErr,
 			)
 			return
@@ -181,7 +195,7 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 		mappedFailure := ingressHTTPFailureMapper.Map(proxyErr, pathExecuteResult)
 		writeIngressError(writer, mappedFailure.HTTPStatus, mappedFailure.Code, mappedFailure.Message, trafficID, traceID)
 		log.Printf(
-			"bridge ingress http proxy failed host=%s path=%s target_kind=%s http=%d code=%s traffic_id=%s trace_id=%s err=%v",
+			"bridge ingress http proxy failed host=%s path=%s target_kind=%s http=%d code=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
 			authority,
 			request.URL.Path,
 			resolution.TargetKind,
@@ -189,6 +203,8 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 			mappedFailure.Code,
 			trafficID,
 			traceID,
+			resolvedServiceID,
+			resolvedServiceInstanceID,
 			proxyErr,
 		)
 	}
@@ -254,8 +270,10 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 					// close_ack 闭环未完成时把 tunnel 标记为不可安全回收，后续由 dispatcher 直接关闭。
 					recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(closeErr)
 					log.Printf(
-						"bridge ingress http close-ack wait failed, fallback close traffic_id=%s recycle_error_code=%s err=%v",
+						"bridge ingress http close-ack wait failed, fallback close traffic_id=%s service_id=%s service_instance_id=%s recycle_error_code=%s err=%v",
 						strings.TrimSpace(trafficID),
+						strings.TrimSpace(trafficOpen.ServiceID),
+						strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]),
 						recycleErrorCode,
 						closeErr,
 					)
@@ -275,9 +293,11 @@ func (runtime *Runtime) proxyHTTPIngressConnector(
 			}
 			if attempt < retryAttempts && shouldRetryConnectorIngressRead(request, wrappedDispatchErr) {
 				log.Printf(
-					"bridge ingress http connector retry traffic_id=%s route_id=%s attempt=%d/%d err=%v",
+					"bridge ingress http connector retry traffic_id=%s route_id=%s service_id=%s service_instance_id=%s attempt=%d/%d err=%v",
 					strings.TrimSpace(trafficOpen.TrafficID),
 					strings.TrimSpace(trafficOpen.RouteID),
+					strings.TrimSpace(trafficOpen.ServiceID),
+					strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]),
 					attempt+1,
 					retryAttempts,
 					wrappedDispatchErr,
@@ -884,6 +904,32 @@ func firstNonEmptyHeader(headers http.Header, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// cloneHTTPHeaderValues 复制 HTTP Header，避免下游修改原始请求对象。
+func cloneHTTPHeaderValues(headers http.Header) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	copied := make(map[string][]string, len(headers))
+	for headerName, headerValues := range headers {
+		normalizedHeaderName := strings.TrimSpace(headerName)
+		if normalizedHeaderName == "" {
+			continue
+		}
+		if len(headerValues) == 0 {
+			continue
+		}
+		copiedHeaderValues := make([]string, 0, len(headerValues))
+		for _, headerValue := range headerValues {
+			copiedHeaderValues = append(copiedHeaderValues, strings.TrimSpace(headerValue))
+		}
+		copied[normalizedHeaderName] = copiedHeaderValues
+	}
+	if len(copied) == 0 {
+		return nil
+	}
+	return copied
 }
 
 func buildIngressTrafficID(now time.Time) string {

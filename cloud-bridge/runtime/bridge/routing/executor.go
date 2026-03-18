@@ -24,6 +24,8 @@ const (
 	HybridFallbackStagePreOpenNoTunnel = "pre_open_no_tunnel"
 	// HybridFallbackStagePreOpenWithTunnel 表示 pre-open 失败且已分配 tunnel 的 fallback。
 	HybridFallbackStagePreOpenWithTunnel = "pre_open_with_tunnel"
+	// trafficOpenMetadataServiceInstanceIDKey 定义 TrafficOpen 元数据中的 service_instance_id 键。
+	trafficOpenMetadataServiceInstanceIDKey = "service_instance_id"
 )
 
 // ConnectorDispatcher 定义 connector 路径执行入口。
@@ -133,7 +135,7 @@ func (executor *PathExecutor) executeConnector(ctx context.Context, request Path
 		ErrorCode:       dispatchResult.ErrorCode,
 	}
 	if err != nil {
-		return executor.failResult(result, err)
+		return executor.failResult(result, err, request.TrafficOpen)
 	}
 	if result.HTTPStatus <= 0 {
 		result.HTTPStatus = 200
@@ -156,7 +158,7 @@ func (executor *PathExecutor) executeExternal(ctx context.Context, request PathE
 		ErrorCode:    directResult.ErrorCode,
 	}
 	if err != nil {
-		return executor.failResult(result, err)
+		return executor.failResult(result, err, request.TrafficOpen)
 	}
 	if result.HTTPStatus <= 0 {
 		result.HTTPStatus = 200
@@ -194,7 +196,7 @@ func (executor *PathExecutor) executeHybrid(ctx context.Context, request PathExe
 
 	fallbackStage, allowFallback := classifyHybridFallback(primaryResult, primaryErr)
 	if !allowFallback {
-		return executor.failResult(result, primaryErr)
+		return executor.failResult(result, primaryErr, request.TrafficOpen)
 	}
 	fallbackResult, fallbackErr := executor.direct.Execute(ctx, directproxy.ExecuteRequest{
 		TrafficID: strings.TrimSpace(request.TrafficOpen.TrafficID),
@@ -209,12 +211,13 @@ func (executor *PathExecutor) executeHybrid(ctx context.Context, request PathExe
 		log.Printf(
 			"bridge hybrid fallback failed event=hybrid_fallback_execute_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
-				TrafficID: strings.TrimSpace(request.TrafficOpen.TrafficID),
-				ServiceID: strings.TrimSpace(request.TrafficOpen.ServiceID),
+				TrafficID:         strings.TrimSpace(request.TrafficOpen.TrafficID),
+				ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
+				ServiceInstanceID: strings.TrimSpace(request.TrafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
 			}),
 			fallbackErr,
 		)
-		return executor.failResult(result, errors.Join(primaryErr, fallbackErr))
+		return executor.failResult(result, errors.Join(primaryErr, fallbackErr), request.TrafficOpen)
 	}
 	executor.metrics.IncBridgeHybridFallbackTotal()
 	result.UsedHybridFallback = true
@@ -225,20 +228,31 @@ func (executor *PathExecutor) executeHybrid(ctx context.Context, request PathExe
 		"bridge hybrid fallback success event=hybrid_fallback_used stage=%s %s",
 		fallbackStage,
 		obs.FormatLogFields(obs.LogFields{
-			TrafficID: strings.TrimSpace(request.TrafficOpen.TrafficID),
-			ServiceID: strings.TrimSpace(request.TrafficOpen.ServiceID),
+			TrafficID:         strings.TrimSpace(request.TrafficOpen.TrafficID),
+			ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
+			ServiceInstanceID: strings.TrimSpace(request.TrafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
 		}),
 	)
 	return result, nil
 }
 
-func (executor *PathExecutor) failResult(result PathExecuteResult, err error) (PathExecuteResult, error) {
+func (executor *PathExecutor) failResult(
+	result PathExecuteResult,
+	err error,
+	trafficOpen pb.TrafficOpen,
+) (PathExecuteResult, error) {
 	if executor == nil || executor.failureMapper == nil {
 		return result, err
 	}
 	mappedFailure := executor.failureMapper.Map(err, result)
 	result.HTTPStatus = mappedFailure.HTTPStatus
 	result.ErrorCode = mappedFailure.Code
+	// 路由执行失败统一记录失败原因维度，便于按服务池/实例做故障归因。
+	executor.metrics.ObserveBridgeRouteFailureReason(
+		strings.TrimSpace(trafficOpen.ServiceID),
+		strings.TrimSpace(trafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
+		strings.TrimSpace(result.ErrorCode),
+	)
 	return result, err
 }
 

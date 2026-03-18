@@ -74,6 +74,7 @@ func normalizeLookupRequest(request ingress.RouteLookupRequest) ingress.RouteLoo
 	normalized.SNI = strings.ToLower(strings.TrimSpace(request.SNI))
 	normalized.Namespace = strings.TrimSpace(request.Namespace)
 	normalized.Environment = strings.TrimSpace(request.Environment)
+	normalized.Headers = normalizeLookupHeaders(request.Headers)
 	return normalized
 }
 
@@ -114,6 +115,13 @@ func scoreRouteMatch(request ingress.RouteLookupRequest, match pb.RouteMatch) (i
 			return 0, false
 		}
 		score += 10
+	}
+	if normalizedHeaderMatches := normalizeRouteHeaderMatches(match.HeaderMatches); len(normalizedHeaderMatches) > 0 {
+		if !matchLookupHeaders(normalizedHeaderMatches, request.Headers) {
+			return 0, false
+		}
+		// header 条件越多，匹配特异性越高，优先级应更高。
+		score += len(normalizedHeaderMatches) * 6
 	}
 	return score, true
 }
@@ -231,4 +239,82 @@ func extractAuthorityPort(authority string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(port), true
+}
+
+// normalizeLookupHeaders 归一化请求头：header 名统一小写，value 去首尾空白。
+func normalizeLookupHeaders(headers map[string][]string) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	normalized := make(map[string][]string, len(headers))
+	for headerName, headerValues := range headers {
+		normalizedHeaderName := strings.ToLower(strings.TrimSpace(headerName))
+		if normalizedHeaderName == "" {
+			continue
+		}
+		values := normalized[normalizedHeaderName]
+		for _, headerValue := range headerValues {
+			normalizedHeaderValue := strings.TrimSpace(headerValue)
+			if normalizedHeaderValue == "" {
+				continue
+			}
+			values = append(values, normalizedHeaderValue)
+		}
+		if len(values) == 0 {
+			continue
+		}
+		normalized[normalizedHeaderName] = values
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+// normalizeRouteHeaderMatches 归一化路由 header 条件，header 名小写，value 保持精确字符串（仅去空白）。
+func normalizeRouteHeaderMatches(headerMatches map[string]string) map[string]string {
+	if len(headerMatches) == 0 {
+		return nil
+	}
+	normalized := make(map[string]string, len(headerMatches))
+	for headerName, headerValue := range headerMatches {
+		normalizedHeaderName := strings.ToLower(strings.TrimSpace(headerName))
+		normalizedHeaderValue := strings.TrimSpace(headerValue)
+		if normalizedHeaderName == "" || normalizedHeaderValue == "" {
+			continue
+		}
+		normalized[normalizedHeaderName] = normalizedHeaderValue
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+// matchLookupHeaders 校验 route 的 header 条件是否全部命中请求头。
+func matchLookupHeaders(routeHeaderMatches map[string]string, requestHeaders map[string][]string) bool {
+	if len(routeHeaderMatches) == 0 {
+		return true
+	}
+	if len(requestHeaders) == 0 {
+		return false
+	}
+	for headerName, expectedValue := range routeHeaderMatches {
+		requestHeaderValues, exists := requestHeaders[headerName]
+		if !exists || len(requestHeaderValues) == 0 {
+			return false
+		}
+		matched := false
+		for _, requestHeaderValue := range requestHeaderValues {
+			// 值按精确匹配处理：只有完全相同才视为命中。
+			if requestHeaderValue == expectedValue {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
 }

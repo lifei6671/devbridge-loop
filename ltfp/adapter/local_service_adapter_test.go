@@ -11,8 +11,8 @@ import (
 func TestBuildServiceKey(t *testing.T) {
 	t.Parallel()
 
-	serviceKey := BuildServiceKey("dev", "alice", "order-service")
-	if serviceKey != "dev/alice/order-service" {
+	serviceKey := BuildServiceKey("order-service", " HTTP ")
+	if serviceKey != "order-service/http" {
 		t.Fatalf("unexpected service key: %s", serviceKey)
 	}
 }
@@ -38,7 +38,7 @@ func TestToPublishService(t *testing.T) {
 			Enabled: true,
 		},
 	})
-	if publish.ServiceKey != "dev/alice/order-service" {
+	if publish.ServiceKey != "order-service/http" {
 		t.Fatalf("unexpected service key: %s", publish.ServiceKey)
 	}
 	if publish.ServiceID != "svc-001" || publish.ServiceType != "http" {
@@ -55,8 +55,9 @@ func TestToUnpublishService(t *testing.T) {
 		Namespace:   "dev",
 		Environment: "alice",
 		ServiceName: "order-service",
+		ServiceType: "http",
 	}, "service removed")
-	if unpublish.ServiceKey != "dev/alice/order-service" || unpublish.Reason != "service removed" {
+	if unpublish.ServiceKey != "order-service/http" || unpublish.Reason != "service removed" {
 		t.Fatalf("unexpected unpublish payload: %+v", unpublish)
 	}
 }
@@ -67,7 +68,7 @@ func TestToHealthReport(t *testing.T) {
 
 	report := ToHealthReport(
 		"svc-001",
-		"dev/alice/order-service",
+		"order-service/http",
 		[]pb.EndpointHealthStatus{
 			{EndpointID: "ep-1", HealthStatus: pb.HealthStatusHealthy},
 			{EndpointID: "ep-2", HealthStatus: pb.HealthStatusUnknown},

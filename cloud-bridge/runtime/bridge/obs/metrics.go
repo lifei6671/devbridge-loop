@@ -35,6 +35,22 @@ const (
 	MetricBridgeTLSRejectTLSOnPlaintextTotal = "bridge_tls_reject_tls_on_plaintext_total"
 	// MetricBridgeTunnelRecycleFailureTotal 统计 tunnel recycle 失败次数。
 	MetricBridgeTunnelRecycleFailureTotal = "bridge_tunnel_recycle_failure_total"
+	// MetricBridgeServicePublishTotal 统计服务池维度发布次数。
+	MetricBridgeServicePublishTotal = "bridge_service_publish_total"
+	// MetricBridgeServiceInstancePublishTotal 统计实例维度发布次数。
+	MetricBridgeServiceInstancePublishTotal = "bridge_service_instance_publish_total"
+	// MetricBridgeServiceAvailableInstances 统计服务池当前可用实例数。
+	MetricBridgeServiceAvailableInstances = "bridge_service_available_instances"
+	// MetricBridgeServiceInstanceAvailable 统计实例当前是否可用（0/1）。
+	MetricBridgeServiceInstanceAvailable = "bridge_service_instance_available"
+	// MetricBridgeRouteHitTotal 统计服务池维度路由命中次数。
+	MetricBridgeRouteHitTotal = "bridge_route_hit_total"
+	// MetricBridgeServiceInstanceRouteHitTotal 统计实例维度路由命中次数。
+	MetricBridgeServiceInstanceRouteHitTotal = "bridge_service_instance_route_hit_total"
+	// MetricBridgeRouteFailureReasonTotal 统计服务池维度路由失败原因次数。
+	MetricBridgeRouteFailureReasonTotal = "bridge_route_failure_reason_total"
+	// MetricBridgeServiceInstanceRouteFailureReasonTotal 统计实例维度路由失败原因次数。
+	MetricBridgeServiceInstanceRouteFailureReasonTotal = "bridge_service_instance_route_failure_reason_total"
 )
 
 // Metrics holds metric collectors for the bridge runtime.
@@ -64,13 +80,29 @@ type Metrics struct {
 
 	recycleErrorCodeMu     sync.Mutex
 	recycleErrorCodeTotals map[string]uint64
+
+	serviceDimensionMu                      sync.Mutex
+	servicePublishTotals                    map[string]uint64
+	serviceInstancePublishTotals            map[string]map[string]uint64
+	serviceAvailableInstances               map[string]map[string]struct{}
+	serviceRouteHitTotals                   map[string]uint64
+	serviceInstanceRouteHitTotals           map[string]map[string]uint64
+	serviceRouteFailureReasonTotals         map[string]map[string]uint64
+	serviceInstanceRouteFailureReasonTotals map[string]map[string]map[string]uint64
 }
 
 // NewMetrics 创建桥接运行时指标容器。
 func NewMetrics() *Metrics {
 	return &Metrics{
-		authErrorCodeTotals:    make(map[string]uint64),
-		recycleErrorCodeTotals: make(map[string]uint64),
+		authErrorCodeTotals:                     make(map[string]uint64),
+		recycleErrorCodeTotals:                  make(map[string]uint64),
+		servicePublishTotals:                    make(map[string]uint64),
+		serviceInstancePublishTotals:            make(map[string]map[string]uint64),
+		serviceAvailableInstances:               make(map[string]map[string]struct{}),
+		serviceRouteHitTotals:                   make(map[string]uint64),
+		serviceInstanceRouteHitTotals:           make(map[string]map[string]uint64),
+		serviceRouteFailureReasonTotals:         make(map[string]map[string]uint64),
+		serviceInstanceRouteFailureReasonTotals: make(map[string]map[string]map[string]uint64),
 	}
 }
 
@@ -365,4 +397,261 @@ func (metrics *Metrics) BridgeAuthErrorCodeTotals() map[string]uint64 {
 		cloned[errorCode] = total
 	}
 	return cloned
+}
+
+const (
+	// defaultBridgeRouteFailureReason 作为空失败原因的统一兜底值。
+	defaultBridgeRouteFailureReason = "unknown"
+)
+
+// ObserveBridgeServicePublish 记录一次发布事件的服务池/实例维度计数。
+func (metrics *Metrics) ObserveBridgeServicePublish(serviceID string, serviceInstanceID string) {
+	if metrics == nil {
+		return
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return
+	}
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	metrics.servicePublishTotals[normalizedServiceID]++
+	if normalizedServiceInstanceID == "" {
+		return
+	}
+	if metrics.serviceInstancePublishTotals[normalizedServiceID] == nil {
+		metrics.serviceInstancePublishTotals[normalizedServiceID] = make(map[string]uint64)
+	}
+	metrics.serviceInstancePublishTotals[normalizedServiceID][normalizedServiceInstanceID]++
+}
+
+// BridgeServicePublishTotal 返回指定服务池发布累计值。
+func (metrics *Metrics) BridgeServicePublishTotal(serviceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	return metrics.servicePublishTotals[normalizedServiceID]
+}
+
+// BridgeServiceInstancePublishTotal 返回指定实例发布累计值。
+func (metrics *Metrics) BridgeServiceInstancePublishTotal(serviceID string, serviceInstanceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	if normalizedServiceID == "" || normalizedServiceInstanceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	instanceTotals, exists := metrics.serviceInstancePublishTotals[normalizedServiceID]
+	if !exists {
+		return 0
+	}
+	return instanceTotals[normalizedServiceInstanceID]
+}
+
+// SetBridgeServiceAvailableInstances 用服务池当前可用实例快照覆盖可用性指标。
+func (metrics *Metrics) SetBridgeServiceAvailableInstances(serviceID string, serviceInstanceIDs []string) {
+	if metrics == nil {
+		return
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return
+	}
+	normalizedAvailableInstances := make(map[string]struct{}, len(serviceInstanceIDs))
+	for _, serviceInstanceID := range serviceInstanceIDs {
+		normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+		if normalizedServiceInstanceID == "" {
+			continue
+		}
+		// 去重后再写入，避免重复实例导致可用数膨胀。
+		normalizedAvailableInstances[normalizedServiceInstanceID] = struct{}{}
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	if len(normalizedAvailableInstances) == 0 {
+		// 当前服务池无可用实例时直接清空快照。
+		delete(metrics.serviceAvailableInstances, normalizedServiceID)
+		return
+	}
+	metrics.serviceAvailableInstances[normalizedServiceID] = normalizedAvailableInstances
+}
+
+// BridgeServiceAvailableInstanceTotal 返回服务池当前可用实例数。
+func (metrics *Metrics) BridgeServiceAvailableInstanceTotal(serviceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	return uint64(len(metrics.serviceAvailableInstances[normalizedServiceID]))
+}
+
+// BridgeServiceInstanceAvailableTotal 返回实例当前可用状态（可用=1，不可用=0）。
+func (metrics *Metrics) BridgeServiceInstanceAvailableTotal(serviceID string, serviceInstanceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	if normalizedServiceID == "" || normalizedServiceInstanceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	instances := metrics.serviceAvailableInstances[normalizedServiceID]
+	if len(instances) == 0 {
+		return 0
+	}
+	if _, exists := instances[normalizedServiceInstanceID]; exists {
+		return 1
+	}
+	return 0
+}
+
+// ObserveBridgeRouteHit 记录一次路由命中事件的服务池/实例维度计数。
+func (metrics *Metrics) ObserveBridgeRouteHit(serviceID string, serviceInstanceID string) {
+	if metrics == nil {
+		return
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return
+	}
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	metrics.serviceRouteHitTotals[normalizedServiceID]++
+	if normalizedServiceInstanceID == "" {
+		return
+	}
+	if metrics.serviceInstanceRouteHitTotals[normalizedServiceID] == nil {
+		metrics.serviceInstanceRouteHitTotals[normalizedServiceID] = make(map[string]uint64)
+	}
+	metrics.serviceInstanceRouteHitTotals[normalizedServiceID][normalizedServiceInstanceID]++
+}
+
+// BridgeServiceRouteHitTotal 返回指定服务池路由命中累计值。
+func (metrics *Metrics) BridgeServiceRouteHitTotal(serviceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	return metrics.serviceRouteHitTotals[normalizedServiceID]
+}
+
+// BridgeServiceInstanceRouteHitTotal 返回指定实例路由命中累计值。
+func (metrics *Metrics) BridgeServiceInstanceRouteHitTotal(serviceID string, serviceInstanceID string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	if normalizedServiceID == "" || normalizedServiceInstanceID == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	instanceTotals, exists := metrics.serviceInstanceRouteHitTotals[normalizedServiceID]
+	if !exists {
+		return 0
+	}
+	return instanceTotals[normalizedServiceInstanceID]
+}
+
+// ObserveBridgeRouteFailureReason 记录一次路由失败原因的服务池/实例维度计数。
+func (metrics *Metrics) ObserveBridgeRouteFailureReason(serviceID string, serviceInstanceID string, reason string) {
+	if metrics == nil {
+		return
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return
+	}
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	normalizedReason := strings.TrimSpace(reason)
+	if normalizedReason == "" {
+		normalizedReason = defaultBridgeRouteFailureReason
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	if metrics.serviceRouteFailureReasonTotals[normalizedServiceID] == nil {
+		metrics.serviceRouteFailureReasonTotals[normalizedServiceID] = make(map[string]uint64)
+	}
+	metrics.serviceRouteFailureReasonTotals[normalizedServiceID][normalizedReason]++
+	if normalizedServiceInstanceID == "" {
+		return
+	}
+	if metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID] == nil {
+		metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID] = make(map[string]map[string]uint64)
+	}
+	if metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID][normalizedServiceInstanceID] == nil {
+		metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID][normalizedServiceInstanceID] = make(map[string]uint64)
+	}
+	metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID][normalizedServiceInstanceID][normalizedReason]++
+}
+
+// BridgeServiceRouteFailureReasonTotal 返回服务池在指定失败原因上的累计值。
+func (metrics *Metrics) BridgeServiceRouteFailureReasonTotal(serviceID string, reason string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	if normalizedServiceID == "" {
+		return 0
+	}
+	normalizedReason := strings.TrimSpace(reason)
+	if normalizedReason == "" {
+		normalizedReason = defaultBridgeRouteFailureReason
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	reasonTotals := metrics.serviceRouteFailureReasonTotals[normalizedServiceID]
+	return reasonTotals[normalizedReason]
+}
+
+// BridgeServiceInstanceRouteFailureReasonTotal 返回实例在指定失败原因上的累计值。
+func (metrics *Metrics) BridgeServiceInstanceRouteFailureReasonTotal(
+	serviceID string,
+	serviceInstanceID string,
+	reason string,
+) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceID := strings.TrimSpace(serviceID)
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	if normalizedServiceID == "" || normalizedServiceInstanceID == "" {
+		return 0
+	}
+	normalizedReason := strings.TrimSpace(reason)
+	if normalizedReason == "" {
+		normalizedReason = defaultBridgeRouteFailureReason
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	instanceReasonTotals := metrics.serviceInstanceRouteFailureReasonTotals[normalizedServiceID]
+	if len(instanceReasonTotals) == 0 {
+		return 0
+	}
+	return instanceReasonTotals[normalizedServiceInstanceID][normalizedReason]
 }

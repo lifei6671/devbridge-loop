@@ -61,10 +61,6 @@ func ValidateConnectorHello(message pb.ConnectorHello) error {
 
 // ValidatePublishService 校验 PublishService 消息字段。
 func ValidatePublishService(message pb.PublishService) error {
-	// serviceKey 是 lookup key，必须存在。
-	if strings.TrimSpace(message.ServiceKey) == "" {
-		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "serviceKey is required")
-	}
 	// namespace/environment/sni 至少需要一个，避免完全无路由标识的服务进入注册表。
 	hasNamespace := strings.TrimSpace(message.Namespace) != ""
 	hasEnvironment := strings.TrimSpace(message.Environment) != ""
@@ -84,18 +80,32 @@ func ValidatePublishService(message pb.PublishService) error {
 		)
 	}
 	// serviceName 为空会导致无法建立 canonical identity 映射。
-	if strings.TrimSpace(message.ServiceName) == "" {
+	normalizedServiceName := strings.TrimSpace(message.ServiceName)
+	if normalizedServiceName == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "serviceName is required")
+	}
+	if strings.Contains(normalizedServiceName, "/") {
+		return ltfperrors.New(ltfperrors.CodeUnsupportedValue, "serviceName must not contain '/'")
 	}
 	// endpoints 至少需要一个，避免发布不可路由服务。
 	if len(message.Endpoints) == 0 {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "at least one endpoint is required")
 	}
 
+	normalizedServiceProtocol := ""
 	for index, endpoint := range message.Endpoints {
 		// endpoint 协议不能为空，否则无法匹配上游拨号逻辑。
-		if strings.TrimSpace(endpoint.Protocol) == "" {
+		normalizedEndpointProtocol := strings.ToLower(strings.TrimSpace(endpoint.Protocol))
+		if normalizedEndpointProtocol == "" {
 			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, fmt.Sprintf("endpoint[%d].protocol is required", index))
+		}
+		if normalizedServiceProtocol == "" {
+			normalizedServiceProtocol = normalizedEndpointProtocol
+		} else if normalizedServiceProtocol != normalizedEndpointProtocol {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				"all endpoints in one publish service must use the same protocol",
+			)
 		}
 		// endpoint host 不能为空，否则无法建立连接。
 		if strings.TrimSpace(endpoint.Host) == "" {
@@ -104,6 +114,17 @@ func ValidatePublishService(message pb.PublishService) error {
 		// endpoint port 必须为正数。
 		if endpoint.Port == 0 {
 			return ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("endpoint[%d].port must be greater than 0", index))
+		}
+	}
+	normalizedServiceKey := strings.TrimSpace(message.ServiceKey)
+	if normalizedServiceKey != "" {
+		expectedServiceKey := normalizedServiceName + "/" + normalizedServiceProtocol
+		if normalizedServiceKey != expectedServiceKey {
+			// 显式上送 service_key 时必须命中 canonical 规则，避免同服务出现多 identity。
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				fmt.Sprintf("serviceKey must equal canonical key %q", expectedServiceKey),
+			)
 		}
 	}
 	return nil

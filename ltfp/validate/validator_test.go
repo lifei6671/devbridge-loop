@@ -99,6 +99,17 @@ func TestValidatePublishService(t *testing.T) {
 	}
 }
 
+// TestValidatePublishServiceAcceptsEmptyServiceKey 验证 serviceKey 为空时允许由服务端按 canonical 规则补全。
+func TestValidatePublishServiceAcceptsEmptyServiceKey(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.ServiceKey = ""
+	if err := ValidatePublishService(message); err != nil {
+		t.Fatalf("validate publish service with empty service key failed: %v", err)
+	}
+}
+
 // TestValidatePublishServiceAcceptsSNIWithoutScope 验证无 namespace/environment 时，只要有 SNI 仍可发布。
 func TestValidatePublishServiceAcceptsSNIWithoutScope(t *testing.T) {
 	t.Parallel()
@@ -124,6 +135,42 @@ func TestValidatePublishServiceRejectMissingEndpoint(t *testing.T) {
 	}
 	// 缺字段场景应返回缺失字段错误码。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestValidatePublishServiceRejectMixedEndpointProtocol 验证单条 PublishService 仅允许单协议 endpoint。
+func TestValidatePublishServiceRejectMixedEndpointProtocol(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.Endpoints = append(message.Endpoints, pb.ServiceEndpoint{
+		EndpointID: "ep-2",
+		Protocol:   "grpc",
+		Host:       "127.0.0.1",
+		Port:       19090,
+	})
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedValue) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestValidatePublishServiceRejectNonCanonicalServiceKey 验证显式 service_key 不符合 canonical 规则时会被拒绝。
+func TestValidatePublishServiceRejectNonCanonicalServiceKey(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	// 人为构造旧格式 key，验证新规则会拒绝非 canonical 值。
+	message.ServiceKey = "dev/alice/order-service"
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedValue) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -305,9 +305,8 @@ func normalizeLocalRegistration(service adapter.LocalRegistration) adapter.Local
 	if normalized.ServiceKey == "" {
 		// service_key 缺失时按协议推荐格式自动补齐。
 		normalized.ServiceKey = adapter.BuildServiceKey(
-			normalized.Namespace,
-			normalized.Environment,
 			normalized.ServiceName,
+			adapter.ResolveServiceProtocol(normalized.ServiceType, normalized.Endpoints),
 		)
 	}
 	if normalized.ServiceID == "" {

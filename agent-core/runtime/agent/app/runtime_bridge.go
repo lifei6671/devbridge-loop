@@ -2314,9 +2314,8 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
 	if normalizedServiceKey == "" {
 		normalizedServiceKey = adapter.BuildServiceKey(
-			normalizedNamespace,
-			normalizedEnvironment,
 			normalizedServiceName,
+			normalizedProtocol,
 		)
 	}
 	healthCheckConfig, err := normalizeServiceHealthCheckConfig(
@@ -2428,9 +2427,8 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 		normalizedServiceKey = strings.TrimSpace(targetRegistration.ServiceKey)
 		if normalizedServiceKey == "" {
 			normalizedServiceKey = adapter.BuildServiceKey(
-				targetRegistration.Namespace,
-				targetRegistration.Environment,
 				targetRegistration.ServiceName,
+				adapter.ResolveServiceProtocol(targetRegistration.ServiceType, targetRegistration.Endpoints),
 			)
 		}
 	}
@@ -2515,9 +2513,8 @@ func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.Rou
 	serviceKey := strings.TrimSpace(registration.ServiceKey)
 	if serviceKey == "" {
 		serviceKey = adapter.BuildServiceKey(
-			registration.Namespace,
-			registration.Environment,
 			registration.ServiceName,
+			adapter.ResolveServiceProtocol(registration.ServiceType, registration.Endpoints),
 		)
 	}
 	if strings.TrimSpace(serviceKey) == "" {
@@ -2595,9 +2592,8 @@ func buildAutoRouteID(registration adapter.LocalRegistration) string {
 	}
 	if resourceID == "" {
 		resourceID = adapter.BuildServiceKey(
-			registration.Namespace,
-			registration.Environment,
 			registration.ServiceName,
+			adapter.ResolveServiceProtocol(registration.ServiceType, registration.Endpoints),
 		)
 	}
 	normalizedResourceID := strings.TrimSpace(resourceID)

@@ -20,6 +20,7 @@ type RouteLookupRequest struct {
 	Namespace   string
 	Environment string
 	Metadata    map[string]string
+	Headers     map[string][]string
 }
 
 // HTTPGatewayRequest 描述 HTTP 入口请求上下文。
@@ -31,6 +32,7 @@ type HTTPGatewayRequest struct {
 	Namespace   string
 	Environment string
 	Metadata    map[string]string
+	Headers     map[string][]string
 }
 
 type l7GatewayRequest struct {
@@ -41,6 +43,7 @@ type l7GatewayRequest struct {
 	Namespace   string
 	Environment string
 	Metadata    map[string]string
+	Headers     map[string][]string
 }
 
 // HTTPGateway 负责把 HTTP 入口请求转换为路由匹配输入。
@@ -63,6 +66,7 @@ func (gateway *HTTPGateway) BuildRouteLookupRequest(request HTTPGatewayRequest) 
 		Namespace:   request.Namespace,
 		Environment: request.Environment,
 		Metadata:    request.Metadata,
+		Headers:     request.Headers,
 	})
 }
 
@@ -104,6 +108,7 @@ func buildL7RouteLookupRequest(
 		Namespace:   strings.TrimSpace(request.Namespace),
 		Environment: strings.TrimSpace(request.Environment),
 		Metadata:    copyStringMap(request.Metadata),
+		Headers:     copyStringSliceMap(request.Headers),
 	}, nil
 }
 
@@ -136,6 +141,32 @@ func copyStringMap(source map[string]string) map[string]string {
 	copied := make(map[string]string, len(source))
 	for key, value := range source {
 		copied[key] = value
+	}
+	return copied
+}
+
+// copyStringSliceMap 复制 map[string][]string，避免调用方共享可变引用。
+func copyStringSliceMap(source map[string][]string) map[string][]string {
+	if len(source) == 0 {
+		return nil
+	}
+	copied := make(map[string][]string, len(source))
+	for key, values := range source {
+		normalizedKey := strings.TrimSpace(key)
+		if normalizedKey == "" {
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		normalizedValues := make([]string, 0, len(values))
+		for _, value := range values {
+			normalizedValues = append(normalizedValues, value)
+		}
+		copied[normalizedKey] = normalizedValues
+	}
+	if len(copied) == 0 {
+		return nil
 	}
 	return copied
 }

@@ -277,12 +277,13 @@ type RouteTarget struct {
 
 // RouteMatch 描述路由匹配条件。
 type RouteMatch struct {
-	Protocol   string `json:"protocol,omitempty"`
-	Host       string `json:"host,omitempty"`
-	Authority  string `json:"authority,omitempty"`
-	ListenPort uint32 `json:"listenPort,omitempty"`
-	PathPrefix string `json:"pathPrefix,omitempty"`
-	SNI        string `json:"sni,omitempty"`
+	Protocol      string            `json:"protocol,omitempty"`
+	Host          string            `json:"host,omitempty"`
+	Authority     string            `json:"authority,omitempty"`
+	ListenPort    uint32            `json:"listenPort,omitempty"`
+	PathPrefix    string            `json:"pathPrefix,omitempty"`
+	SNI           string            `json:"sni,omitempty"`
+	HeaderMatches map[string]string `json:"headerMatches,omitempty"`
 }
 
 // RouteAssign 描述可选扩展 route 下发消息。

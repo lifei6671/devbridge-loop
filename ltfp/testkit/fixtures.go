@@ -26,8 +26,9 @@ func GoldenConnectorHello() pb.ConnectorHello {
 func GoldenPublishService() pb.PublishService {
 	// 使用单 endpoint 样例覆盖首批最小闭环场景。
 	return pb.PublishService{
-		ServiceID:   "svc_01J8Z6C4X9K7M2P4",
-		ServiceKey:  "dev/alice/order-service",
+		ServiceID: "svc_01J8Z6C4X9K7M2P4",
+		// service_key 使用 canonical 口径：<service_name>/<protocol>。
+		ServiceKey:  "order-service/http",
 		Namespace:   "dev",
 		Environment: "alice",
 		ServiceName: "order-service",

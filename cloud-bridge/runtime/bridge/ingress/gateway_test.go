@@ -140,3 +140,48 @@ func TestValidateSharedTLSListenerConstraint(testingObject *testing.T) {
 		testingObject.Fatalf("expected mismatch listener rejected")
 	}
 }
+
+// TestGatewayBuildRouteLookupRequestCarriesHeaders 验证 L7 入口请求头会透传到 route lookup 请求。
+func TestGatewayBuildRouteLookupRequestCarriesHeaders(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	httpRequestHeaders := map[string][]string{
+		"X-Tenant": []string{"alice"},
+		"X-Role":   []string{"admin", "ops"},
+	}
+	httpLookupRequest, err := NewHTTPGateway(80).BuildRouteLookupRequest(HTTPGatewayRequest{
+		Host:     "api.dev.example.com",
+		Path:     "/v1/orders",
+		Headers:  httpRequestHeaders,
+		Protocol: "http",
+	})
+	if err != nil {
+		testingObject.Fatalf("build http lookup request failed: %v", err)
+	}
+	if len(httpLookupRequest.Headers) != 2 {
+		testingObject.Fatalf("unexpected http lookup headers size: got=%d want=2", len(httpLookupRequest.Headers))
+	}
+	if headerValues := httpLookupRequest.Headers["X-Tenant"]; len(headerValues) != 1 || headerValues[0] != "alice" {
+		testingObject.Fatalf("unexpected http lookup header X-Tenant: %v", headerValues)
+	}
+	// 修改原始 headers 不应影响 lookup 请求副本。
+	httpRequestHeaders["X-Tenant"][0] = "bob"
+	if httpLookupRequest.Headers["X-Tenant"][0] != "alice" {
+		testingObject.Fatalf("lookup headers should be isolated copy, got=%s", httpLookupRequest.Headers["X-Tenant"][0])
+	}
+
+	grpcRequestHeaders := map[string][]string{
+		"x-feature": []string{"beta"},
+	}
+	grpcLookupRequest, err := NewGRPCGateway(443).BuildRouteLookupRequest(GRPCGatewayRequest{
+		Authority: "grpc.dev.example.com:443",
+		Path:      "/demo.Service/Call",
+		Headers:   grpcRequestHeaders,
+	})
+	if err != nil {
+		testingObject.Fatalf("build grpc lookup request failed: %v", err)
+	}
+	if headerValues := grpcLookupRequest.Headers["x-feature"]; len(headerValues) != 1 || headerValues[0] != "beta" {
+		testingObject.Fatalf("unexpected grpc lookup header x-feature: %v", headerValues)
+	}
+}
