@@ -1,7 +1,7 @@
-# 
+# DevBridge 多 Agent 服务模型演进技术方案
 
 **文档状态**：Draft for Review  
-**版本**：v1.1  
+**版本**：v1.3  
 **依赖文档**：LTFP-v1-Draft.md (v2.1)、LTFP-TransportAbstraction.md (v2.1)、Agent_and_Bridge_Implementation_Technical_Design.md
 
 ---
@@ -109,29 +109,31 @@ Scope 是独立字段，不编码进任何 name 或 key，始终通过结构化�
 
 ### 2.4 namespace/environment 的职责边界
 
-这两个字段是**配置时字段**，不是**请求时字段**。浏览器等客户端发起请求时不携带、也不需要携带这两个字段。
+这两个字段在系统中承担**双重角色**：配置时用于服务注册和隔离，运行时由调用方通过 Header 携带，驱动 Bridge 的作用域降级查找。
 
 ```
 配置阶段（Agent 注册时）：
   namespace + environment + service_name
-      → 确定唯一性边界
+      → 确定服务唯一性边界
       → 派生对外访问 host（可选）
       → 映射到第三方 Discovery 命名空间
 
 运行时（请求路由时）：
-  host + path + headers
-      → Route Resolver 匹配
-      → 找到绑定的 LogicalService
-      → 路由到 ServiceInstance
+  调用方在 Header 中携带 scope
+      → Bridge Route Resolver 读取 scope
+      → 按 ScopeFallbackPolicy 执行降级链查找
+      → 找到匹配的 LogicalService 后路由到 ServiceInstance
+      → scope Header 在整个链路透传，不修改
 ```
 
-**namespace/environment 的三个作用：**
+**namespace/environment 的作用：**
 
-| 作用 | 说明 |
-|------|------|
-| 唯一性边界 | 同名服务在不同 scope 下互相独立，不冲突 |
-| Host 派生 | 按约定规则自动生成对外访问域名，编码进 DNS 而非请求头 |
-| Discovery 映射 | 向 Nacos/Consul 导出时映射到第三方系统对应概念 |
+| 作用 | 阶段 | 说明 |
+|------|------|------|
+| 唯一性边界 | 配置时 | 同名服务在不同 scope 下互相独立，不冲突 |
+| Host 派生 | 配置时 | 按约定规则自动生成对外访问域名 |
+| Discovery 映射 | 配置时 | 向 Nacos/Consul 导出时映射到第三方系统对应概念 |
+| 请求作用域 | 运行时 | 调用方声明自己的身份，驱动降级查找和链路追踪 |
 
 **Host 派生规则（Bridge 侧可配置模板）：**
 
@@ -146,12 +148,88 @@ Scope 是独立字段，不编码进任何 name 或 key，始终通过结构化�
   →  host = "order-service.alice.dev.example.com"
 ```
 
-Agent 发布时 `exposure.host` 留空，Bridge 自动派生并注册到 ingress。Agent 也可以显式指定 `exposure.host` 来覆盖派生规则，此时 scope 仅用于内部隔离，不影响外部域名。
+Agent 发布时 `exposure.host` 留空则 Bridge 自动派生。Agent 也可以显式指定 `exposure.host` 覆盖派生规则，此时 scope 仅用于内部隔离，不影响外部域名。
 
-**namespace/environment 不做的事：**
-- 不出现在 HTTP 请求头里
-- 不作为 runtime 路由的匹配字段
-- 不需要客户端感知
+### 2.5 Scope 传递机制
+
+scope 由**第一个调用者**（浏览器、客户端、上游服务）在发起请求时携带，后续 Bridge 和 Agent 在转发时透传，不修改。
+
+**默认传递方式：HTTP Header**
+
+```
+请求方设置：
+  X-Bridge-Namespace: dev
+  X-Bridge-Environment: alice
+
+Bridge 收到后：
+  → 解析 Header，得到 scope = {dev, alice}
+  → 执行 ScopeFallbackPolicy 驱动的降级查找
+  → 向 Agent 发 TrafficOpen 时在 metadata 中携带原始 scope
+
+Agent 向本地 upstream 转发时：
+  → 将 scope Header 原样透传给 upstream
+  → upstream 服务可感知调用方身份
+```
+
+**透传规则：**
+- Bridge 和 Agent 只读取、透传 scope，不修改
+- scope 在整条链路上代表"第一个调用者的身份"，语义保持完整
+- 若请求未携带 scope Header，Bridge 使用默认 scope（`default/base`），可在 Bridge 全局配置中覆盖此默认值
+
+### 2.6 ScopeFallbackPolicy（管理员配置）
+
+降级策略由 Bridge 管理员按 namespace 维度配置，不同 namespace 可以有独立策略，也可以完全禁用降级。
+
+```proto
+message ScopeFallbackPolicy {
+  string   policy_id  = 1;  // 唯一标识
+  string   namespace  = 2;  // 此策略生效的 namespace（必填）
+  bool     enabled    = 3;  // 是否启用降级，false 则精确匹配失败直接返回 404
+
+  // 降级链：按顺序逐级尝试，由管理员配置
+  repeated FallbackStep chain = 4;
+
+  // 外部注册中心兜底（仅在本地降级链全部 miss 后启用）
+  ExternalFallbackConfig external = 5;
+}
+
+message FallbackStep {
+  Scope target_scope = 1;  // 降级目标 scope
+  // 预留：可扩展匹配条件，如 service_type 过滤等
+}
+
+message ExternalFallbackConfig {
+  bool enabled = 1;  // 是否启用外部兜底
+  // 具体注册中心由全局 DiscoveryProvider 配置决定
+  // 此处仅控制是否在本地 miss 后触发外部查询
+}
+```
+
+**配置示例：**
+
+```yaml
+# dev namespace 的降级策略
+policy_id: fallback-dev
+namespace: dev
+enabled: true
+chain:
+  - target_scope: {namespace: dev, environment: base}      # 第一级：同 namespace 共享环境
+  - target_scope: {namespace: default, environment: base}  # 第二级：全局兜底环境
+external:
+  enabled: true   # 本地全部 miss 后查外部注册中心
+
+# prod namespace：不允许降级
+policy_id: fallback-prod
+namespace: prod
+enabled: false
+```
+
+**默认行为（无配置时）：** 禁用降级，精确匹配失败直接返回 404。管理员需要显式配置才能启用降级链。
+
+**scope "base" 和 "default" 的语义约定：**
+- `environment=base`：该 namespace 下的共享环境，注册到此处的服务对同 namespace 所有 environment 隐式可见（通过降级链）
+- `namespace=default`：全局兜底 namespace，注册到 `default/base` 的服务对所有 namespace 隐式可见
+- 这是**约定语义**，不是系统强制——实际可见性由管理员配置的降级链决定，"base" 和 "default" 只是推荐命名规范
 
 ---
 
@@ -501,55 +579,132 @@ CanonicalConfigRegistry
   └── label_index:      map[label_key=label_val] → []logical_service_id  （可选，供 selector 查询）
 ```
 
-### 5.2 PublishService 处理流程
+### 5.2 instance_id 校验规则
+
+`instance_id` 是 Agent 提供的**复用意图**，不是 server 无条件接受的令牌。所有权由 `(instance_id → connector_id)` 绑定关系决定，`connector_id` 来自经过认证的 session，不由 Agent 在 `PublishService` 消息里自行声明。
+
+**四条强制校验规则（server 侧按顺序执行）：**
+
+| 规则 | 条件 | 失败处理 |
+|------|------|----------|
+| R1 归属校验 | instance 记录中绑定的 `connector_id` 必须等于当前 session 的 `connector_id` | 拒绝，`INSTANCE_OWNERSHIP_MISMATCH`，不修改任何状态 |
+| R2 存在性降级 | instance_id 非空但记录不存在（已被清理或从未存在） | 不报错，静默降级为 FindOrCreate 流程，返回新分配的 instance_id |
+| R3 epoch 单调性 | 新 `session_epoch` 必须 ≥ 已记录的 `session_epoch` | 拒绝，`STALE_SESSION_EPOCH` |
+| R4 Agent 响应要求 | 收到 `INSTANCE_OWNERSHIP_MISMATCH` 必须清空本地缓存，重新走首次发布流程；收到与提示不同的 instance_id 必须以 Ack 为准更新本地缓存 | — |
+
+**规则说明：**
+
+- R1 是安全边界。即使两个 Agent 使用相同的 `connector_id`（split-brain），其 `session_epoch` 不同，R3 会在 R1 之后拦截旧的一方
+- R2 的静默降级保证了 Agent 进程重启后本地缓存失效时能平滑恢复，不需要特殊错误处理路径
+- R3 依赖现有的 `session_epoch` 单调递增保证，无需额外机制
+- instance_id 提示与最终分配结果可能不同（R2 触发时），Agent 不得假设两者一致
+
+### 5.3 PublishService 完整处理流程
 
 ```
-收到 PublishService（service_name="order-service", scope={dev,alice}, connector_id="agent-bob"）
+收到 PublishService{
+  service_name = "order-service",
+  scope        = {dev, alice},
+  instance_id  = "si_001",          // 可能为空
+  connector_id = (来自认证 session)  // 不由消息体声明
+  session_id   = current_session_id
+  session_epoch = current_session_epoch
+}
 
-Step 1: 查找或创建 LogicalService
+━━━ Step 1: 查找或创建 LogicalService ━━━
+
   key = (service_name, scope.namespace, scope.environment)
   if service_index[key] exists:
       logical_service_id = service_index[key]
-      logicalService = logical_services[logical_service_id]
   else:
       logical_service_id = newUUID()
-      logicalService = LogicalService{...}
+      logical_services[logical_service_id] = LogicalService{...}
       service_index[key] = logical_service_id
-      logical_services[logical_service_id] = logicalService
 
-Step 2: 查找或创建 ServiceInstance
+━━━ Step 2: instance_id 校验与实例解析 ━━━
+
+  if msg.instance_id == "":
+      // Case A：首次发布，走 FindOrCreate
+      goto FIND_OR_CREATE
+
+  existing = instances[msg.instance_id]
+
+  if existing == nil:
+      // Case B：记录不存在，静默降级（R2）
+      // 记录日志：instance_id hint not found, fallback to FindOrCreate
+      goto FIND_OR_CREATE
+
+  if existing.connector_id != current_connector_id:
+      // Case C：归属不匹配，拒绝（R1）
+      return PublishServiceAck{
+          accepted     = false,
+          error_code   = "INSTANCE_OWNERSHIP_MISMATCH",
+          error_message = "instance_id is owned by a different connector",
+      }
+
+  if existing.session_epoch > current_session_epoch:
+      // Case D：epoch 倒退，拒绝（R3）
+      return PublishServiceAck{
+          accepted     = false,
+          error_code   = "STALE_SESSION_EPOCH",
+          error_message = "session_epoch must be monotonically increasing",
+      }
+
+  // Case E：校验通过，复用现有实例
+  instance = existing
+  instance.endpoints      = msg.endpoints
+  instance.session_id     = current_session_id
+  instance.session_epoch  = current_session_epoch
+  instance.instance_status = ACTIVE
+  instance.resource_version++
+  goto RECONCILE
+
+FIND_OR_CREATE:
   instance_key = (connector_id, logical_service_id)
-  if msg.instance_id != "" && instances[msg.instance_id] exists:
-      // 重连复用
-      instance = instances[msg.instance_id]
-      instance.endpoints = msg.endpoints
-      instance.session_id = current_session_id
-      instance.session_epoch = current_session_epoch
+  if instance_index[instance_key] exists:
+      // 同 connector 在该逻辑服务下已有实例，直接更新
+      instance = instances[instance_index[instance_key]]
+      instance.endpoints      = msg.endpoints
+      instance.session_id     = current_session_id
+      instance.session_epoch  = current_session_epoch
       instance.instance_status = ACTIVE
       instance.resource_version++
-  elif instance_index[instance_key] exists:
-      // 同 connector 已有实例，更新
-      instance_id = instance_index[instance_key]
-      instance = instances[instance_id]
-      // 更新字段...
   else:
-      // 首次发布，创建新实例
-      instance_id = newUUID()
-      instance = ServiceInstance{...}
-      instance_index[instance_key] = instance_id
-      instances[instance_id] = instance
+      // 全新实例
+      instance = ServiceInstance{
+          instance_id       = newUUID(),
+          logical_service_id = logical_service_id,
+          connector_id      = current_connector_id,
+          session_id        = current_session_id,
+          session_epoch     = current_session_epoch,
+          instance_status   = ACTIVE,
+          health_status     = UNKNOWN,
+          endpoints         = msg.endpoints,
+          resource_version  = 1,
+      }
+      instances[instance.instance_id]   = instance
+      instance_index[instance_key]       = instance.instance_id
 
-Step 3: 重新计算 LogicalService 派生状态
+RECONCILE:
+━━━ Step 3: 重新计算 LogicalService 派生状态 ━━━
+
   recalculateLogicalServiceStatus(logical_service_id)
 
-Step 4: 返回 PublishServiceAck
-  ack.logical_service_id = logical_service_id
-  ack.instance_id = instance.instance_id
-  ack.accepted = true
-  ack.accepted_resource_version = instance.resource_version
+━━━ Step 4: 返回 PublishServiceAck ━━━
+
+  return PublishServiceAck{
+      accepted                 = true,
+      logical_service_id       = logical_service_id,
+      instance_id              = instance.instance_id,   // Agent 必须以此为准更新本地缓存
+      service_name             = msg.service_name,
+      scope                    = msg.scope,
+      accepted_resource_version = instance.resource_version,
+  }
 ```
 
-### 5.3 Session 断线处理
+**注意：** Ack 中返回的 `instance_id` 是 server 认定的最终值。当 Case B（静默降级）触发时，该值与 Agent 提示的 `instance_id` 不同，Agent 必须更新本地缓存。
+
+### 5.4 Session 断线处理
 
 当 session 进入 STALE 时，仅影响该 connector 下的实例，不影响其他 connector 的实例：
 
@@ -564,7 +719,7 @@ recalculateLogicalServiceStatus(logical_service_id)
 // 其他 connector 的实例仍然 ACTIVE，LogicalService 可能仍然 ACTIVE
 ```
 
-### 5.4 LogicalService 状态派生（ServiceController）
+### 5.5 LogicalService 状态派生（ServiceController）
 
 引入 **ServiceController**，持续 Reconcile LogicalService 的派生状态：
 
@@ -603,66 +758,146 @@ func (c *ServiceController) Reconcile(logicalServiceID string) error {
 - session STALE 导致批量实例状态变更
 - 定时兜底（每 30s 全量对账）
 
-### 5.5 Route Resolver 变更
+### 5.6 Route Resolver 变更
 
-路由分为两个独立步骤：**Route 匹配**（找到规则）和**实例选择**（找到 Agent）。
+路由分为三个独立步骤：**scope 解析**、**Route 匹配**（含作用域降级）、**实例选择**。
 
-**Step 1：Route 匹配（多条件组合 + 优先级排序）**
+**Step 0：从请求 Header 解析 scope**
 
 ```go
-func (r *RouteResolver) MatchRoute(req IngressRequest) (*Route, error) {
-    // 1. 候选集合：host 匹配 + path_prefix 匹配
-    candidates := r.index.FindByHostAndPath(req.Host, req.Path)
-
-    // 2. 精确过滤：Header/Query 条件全部满足（AND 关系）
-    matched := make([]*Route, 0)
-    for _, route := range candidates {
-        if r.matchHeaders(route.Match.Headers, req.Headers) &&
-           r.matchQueries(route.Match.Queries, req.QueryParams) {
-            matched = append(matched, route)
-        }
+func (r *RouteResolver) ExtractScope(req IngressRequest) Scope {
+    ns  := req.Headers.Get("X-Bridge-Namespace")
+    env := req.Headers.Get("X-Bridge-Environment")
+    if ns == "" && env == "" {
+        return r.config.DefaultScope  // 管理员配置的全局默认 scope
     }
-    if len(matched) == 0 {
-        return nil, ErrNoRouteMatch
-    }
-
-    // 3. 排序：priority 降序；priority 相同时 path_prefix 长度降序（最长前缀优先）
-    sort.Slice(matched, func(i, j int) bool {
-        if matched[i].Priority != matched[j].Priority {
-            return matched[i].Priority > matched[j].Priority
-        }
-        return len(matched[i].Match.PathPrefix) > len(matched[j].Match.PathPrefix)
-    })
-
-    return matched[0], nil
+    return Scope{Namespace: ns, Environment: env}
 }
 ```
 
-`matchHeaders` 规则：
+**Step 1：构建作用域降级链**
+
+```go
+func (r *RouteResolver) BuildScopeChain(requestScope Scope) []Scope {
+    policy := r.policyRegistry.GetFallbackPolicy(requestScope.Namespace)
+
+    // 未配置策略或降级未启用：只尝试精确 scope
+    if policy == nil || !policy.Enabled {
+        return []Scope{requestScope}
+    }
+
+    // 降级链第一个始终是请求的原始 scope
+    chain := []Scope{requestScope}
+    for _, step := range policy.Chain {
+        // 避免重复（如请求本身就是 dev/base）
+        if step.TargetScope != requestScope {
+            chain = append(chain, step.TargetScope)
+        }
+    }
+    return chain
+}
+```
+
+**Step 2：按降级链执行 Route 匹配**
+
+```go
+func (r *RouteResolver) MatchRoute(req IngressRequest) (*ResolvedRoute, error) {
+    requestScope := r.ExtractScope(req)
+    scopeChain   := r.BuildScopeChain(requestScope)
+
+    // 按降级链逐级查找本地 LogicalService
+    for _, scope := range scopeChain {
+        route, ls, err := r.tryMatchInScope(req, scope)
+        if err == nil {
+            fallbackOccurred := scope != requestScope
+            return &ResolvedRoute{
+                Route:            route,
+                LogicalService:   ls,
+                MatchedScope:     scope,
+                RequestScope:     requestScope,
+                FallbackOccurred: fallbackOccurred,
+            }, nil
+        }
+    }
+
+    // 本地降级链全部 miss，尝试外部注册中心
+    policy := r.policyRegistry.GetFallbackPolicy(requestScope.Namespace)
+    if policy != nil && policy.External.Enabled {
+        return r.tryExternalRegistry(req, requestScope)
+    }
+
+    return nil, ErrNoRouteMatch
+}
+
+func (r *RouteResolver) tryMatchInScope(req IngressRequest, scope Scope) (*Route, *LogicalService, error) {
+    // 1. 按 host + path 找候选 Route
+    candidates := r.index.FindByHostAndPath(req.Host, req.Path)
+
+    // 2. 过滤 Header/Query 条件
+    matched := filterByHeadersAndQueries(candidates, req)
+    if len(matched) == 0 {
+        return nil, nil, ErrNoRouteMatch
+    }
+
+    // 3. 优先级排序
+    sortByPriority(matched)
+
+    // 4. 按 scope 查找对应的 LogicalService
+    for _, route := range matched {
+        ls, err := r.registry.FindLogicalService(route.Target.Selector, scope)
+        if err == nil && ls.Status == ACTIVE {
+            return route, ls, nil
+        }
+    }
+    return nil, nil, ErrNoRouteMatch
+}
+```
+
+**Step 3：外部注册中心查询（本地全部 miss 后的统一兜底）**
+
+```go
+func (r *RouteResolver) tryExternalRegistry(req IngressRequest, requestScope Scope) (*ResolvedRoute, error) {
+    // 外部注册中心查询使用原始 requestScope
+    // 具体 provider、namespace、group 由管理员在 DiscoveryProvider 配置中指定
+    result, err := r.discoveryManager.Query(req.ServiceName, requestScope)
+    if err != nil || len(result.Endpoints) == 0 {
+        return nil, ErrNoRouteMatch
+    }
+    return &ResolvedRoute{
+        ExternalEndpoints: result.Endpoints,
+        MatchedScope:      requestScope,
+        RequestScope:      requestScope,
+        IsExternalFallback: true,
+    }, nil
+}
+```
+
+**外部注册中心的位置说明：**
+- 外部注册中心**不参与降级链本身**，只作为本地降级链全部 miss 后的统一兜底
+- 查询时使用原始 `requestScope`，由管理员在 `DiscoveryProvider` 配置中指定具体的 provider、namespace、group 映射
+- 外部注册中心查询成功后走 `direct proxy` 路径，不经过 ConnectorProxy
+
+**matchHeaders 规则：**
 - `exact`：Header 值完全相同（名称大小写不敏感，值大小写敏感）
 - `prefix`：Header 值以指定字符串开头
 - `regex`：RE2 语法，编译结果缓存，防 ReDoS
 - `present=true`：Header 存在即通过；`present=false`：Header 不存在才通过
 - `Route.Match.Headers` 为空时无 Header 约束，匹配所有请求
 
-**Step 2：实例选择（LogicalService → ServiceInstance）**
+**Step 4：实例选择（LogicalService → ServiceInstance）**
 
 ```go
-func (r *RouteResolver) ResolveConnectorTarget(selector ServiceSelector) (ServiceInstance, error) {
-    ls, err := r.findLogicalService(selector)
-    if err != nil || ls.Status != ACTIVE {
-        return nil, ErrServiceUnavailable
-    }
+func (r *RouteResolver) ResolveConnectorTarget(ls *LogicalService) (ServiceInstance, error) {
     candidates := r.registry.GetEligibleInstances(ls.LogicalServiceID)
     if len(candidates) == 0 {
         return nil, ErrNoEligibleInstance
     }
-    policy := r.getLoadBalancePolicy(selector)
+    policy := r.getLoadBalancePolicy(ls)
     return r.instanceSelector.Select(candidates, policy)
 }
 ```
 
-### 5.6 InstanceSelector 接口
+### 5.7 InstanceSelector 接口
 
 ```go
 type InstanceSelector interface {
@@ -689,7 +924,7 @@ type StickySelector     struct{ hashFunc func(TrafficMeta) uint64 }
 
 **sticky 扩展说明：** 默认基于 client IP hash。若需要基于 HTTP Cookie 或特定 Header 的粘性，需 Ingress 层在 `IngressRequest` 中携带粘性 key，由 Route policy 字段的 `sticky_by` 属性指定（`client_ip | header:X-Session-ID | cookie:session`）。本版预留字段，不强制实现。
 
-### 5.7 Admission Pipeline：Route 冲突检测
+### 5.8 Admission Pipeline：Route 冲突检测
 
 `RouteAssign` 消息写入 Registry 前，必须执行冲突检测，防止不同服务抢占同一入口（场景二）。
 
@@ -888,6 +1123,12 @@ TrafficClose → tunnel 关闭 → Agent 补池
 | `bridge_route_match_candidates_count` | Histogram | 每次请求的候选 Route 数量，用于评估索引效率 |
 | `bridge_route_conflict_rejection_total` | Counter | Admission Pipeline 拒绝 Route 的次数 |
 | `bridge_host_derive_total` | Counter | Host 自动派生次数，按 `success=true/false` 分标签 |
+| `bridge_publish_instance_ownership_mismatch_total` | Counter | PublishService 时 instance_id 归属校验失败次数（R1），持续增长应告警 |
+| `bridge_publish_instance_id_fallback_total` | Counter | PublishService 时 instance_id 提示不存在触发静默降级次数（R2） |
+| `bridge_publish_stale_epoch_rejection_total` | Counter | PublishService 时 session_epoch 倒退被拒绝次数（R3） |
+| `bridge_scope_fallback_total` | Counter | 作用域降级触发次数，按 `from_scope`, `to_scope` 分标签 |
+| `bridge_scope_external_fallback_total` | Counter | 本地降级链全部 miss 后触发外部注册中心查询次数 |
+| `bridge_scope_fallback_miss_total` | Counter | 降级链 + 外部兜底全部失败次数（最终 404/503） |
 
 ### 8.2 新增 Agent 指标
 
@@ -910,6 +1151,10 @@ TrafficClose → tunnel 关闭 → Agent 补池
 | `route_id` | 本次请求匹配到的 Route ID |
 | `route_match_header_count` | 匹配时生效的 Header 条件数量 |
 | `derived_host` | 由 Bridge 自动派生的 host（如果是自动派生） |
+| `request_scope` | 请求携带的原始 scope（namespace/environment） |
+| `matched_scope` | 最终匹配到服务的 scope（降级后可能与 request_scope 不同） |
+| `scope_fallback_steps` | 降级触发时经过的 scope 路径（如 `dev/alice → dev/base`） |
+| `is_external_fallback` | 是否通过外部注册中心兜底路由 |
 
 ---
 
@@ -964,28 +1209,62 @@ TrafficClose → tunnel 关闭 → Agent 补池
 
 ## 10. 边界情况与处理规则
 
-### 10.1 同一 connector 重复发布同一服务
+### 10.1 同一 connector 重连，携带上次 instance_id（正常复用）
 
-**场景：** Agent 重连后再次发送相同 `(service_name, scope)` 的 `PublishService`，且携带了上次的 `instance_id`。
+**场景：** Agent 断线重连后，携带上次 Ack 返回的 `instance_id` 重新发布同一服务。
+
+**处理规则（对应 Case E）：**
+- R1 归属校验通过（同一 connector_id）
+- R3 epoch 单调性通过（重连后 epoch 更大）
+- 复用该实例记录，更新 session 绑定和 endpoints，递增 resource_version
+- Ack 返回相同的 instance_id，Agent 本地缓存不变
+
+### 10.2 两个 connector 发布同名服务（多 Agent HA）
+
+**场景：** `agent-alice` 和 `agent-bob` 都发布了 `(order-service, {dev, alice})`，各自未携带 instance_id 或携带属于自己的 instance_id。
 
 **处理规则：**
-- 校验 `instance_id` 确实归属于该 `connector_id`（防止伪造）
-- 校验 `session_epoch` 不小于当前记录（防止旧 session 覆盖新状态）
-- 满足条件则复用该 instance，更新 endpoints 和 session 信息，递增 `resource_version`
+- 同一 `(service_name, scope)` 对应同一个 `logical_service_id`
+- 两个 connector 各自走 FIND_OR_CREATE，各自获得独立的 instance_id
+- LogicalService 下挂两个 ServiceInstance，正常 HA 场景
 
-### 10.2 两个 connector 发布同名服务
+### 10.3 Agent 携带不属于自己的 instance_id（归属冲突）
 
-**场景：** `agent-alice` 和 `agent-bob` 都发布了 `(order-service, {dev, alice})`。
+**场景：** `agent-bob` 发送 `PublishService{instance_id=si_001}`，但 `si_001` 归属于 `agent-alice`。可能来源：配置错误、本地缓存文件被错误复制、恶意伪造。
+
+**处理规则（对应 Case C，R1 触发）：**
+- server 校验 `instances[si_001].connector_id != agent-bob`，拒绝
+- 返回 `PublishServiceAck{accepted=false, error_code="INSTANCE_OWNERSHIP_MISMATCH"}`
+- `agent-alice` 的实例记录**完全不受影响**
+- `agent-bob` 收到拒绝后，必须清空本地 instance_id 缓存，重新发送 `instance_id=""` 走首次发布流程
+- 记录 `bridge_publish_instance_ownership_mismatch_total`，持续增长应触发告警（可能存在配置错误或攻击）
+
+### 10.4 instance_id 提示存在但记录已被清理（静默降级）
+
+**场景：** Agent 进程重启，本地缓存保留了旧的 instance_id，但 server 侧因 STALE 清理等原因已删除该记录。
+
+**处理规则（对应 Case B，R2 触发）：**
+- server 查找 instance_id 不存在，不报错
+- 静默降级走 FIND_OR_CREATE 流程
+- 若 `(connector_id, logical_service_id)` 下已有实例（旧记录未清理完），直接复用并更新
+- 若无任何记录，分配新的 instance_id
+- Ack 返回最终 instance_id，可能与 Agent 提示的不同
+- Agent 必须以 Ack 为准更新本地缓存
+- 记录 `bridge_publish_instance_id_fallback_total`
+
+### 10.5 同一 Agent 进程的两个实例同时在线（split-brain）
+
+**场景：** `agent-alice` 进程 A（旧，epoch=5）尚未退出，进程 B（新，epoch=6）已启动并重连，两者 connector_id 相同，都携带了 `si_001`。
 
 **处理规则：**
-- 同一 `(service_name, scope)` 对应同一个 `logical_service_id`（唯一）
-- 两个 connector 各自获得独立的 `instance_id`
-- LogicalService 下有两个 ServiceInstance
-- 这是多 Agent HA 的标准场景，正常处理
+- 进程 B 先连上：R1 通过（同 connector），R3 通过（epoch=6 ≥ 5），复用 si_001，session 绑定更新为进程 B 的 session
+- 进程 A 后续发消息或重连：R3 触发（epoch=5 < 6），被拒绝，返回 `STALE_SESSION_EPOCH`
+- 进程 A 的后续 heartbeat 失效，session 进入 STALE，不影响进程 B 持有的实例
+- 依赖现有 `session_epoch` 单调递增保证，无需额外机制
 
-### 10.3 TrafficOpen 中 instance_id 不属于接收 Agent
+### 10.6 TrafficOpen 中 instance_id 不属于接收 Agent
 
-**场景：** Bridge 误发，或 instance 已被另一 connector 接管。
+**场景：** Bridge 误发，或实例已被另一 connector 接管（极少数竞态）。
 
 **处理规则：**
 - Agent 返回 `TrafficOpenAck{success=false, error_code="INSTANCE_NOT_FOUND"}`
@@ -993,17 +1272,16 @@ TrafficClose → tunnel 关闭 → Agent 补池
 - Bridge 将该 tunnel 标记为 broken，从池中移除
 - 记录 `bridge_instance_not_found_total` 指标并告警
 
-### 10.4 LogicalService 下全部实例同时不健康
+### 10.7 LogicalService 下全部实例同时不健康
 
 **场景：** 所有 Agent 的健康检查同时失败（如依赖的数据库挂了）。
 
 **处理规则：**
 - `LogicalService.healthy_instance_count = 0`，但 `active_instance_count > 0`
 - 默认策略：**降级可用**（允许路由到 ACTIVE 但 UNHEALTHY 的实例，让 upstream 返回实际错误）
-- 可通过 Route policy 字段配置为 **硬拒绝**（所有实例不健康时直接返回 503）
-- 此行为通过 `RoutePolicy.unhealthy_instance_policy` 控制（`allow_degraded` | `reject`）
+- 可通过 `RoutePolicy.unhealthy_instance_policy` 配置为 **硬拒绝**（`allow_degraded` | `reject`）
 
-### 10.5 多 Agent 发布，endpoints 不同
+### 10.8 多 Agent 发布，endpoints 不同
 
 **场景：** `agent-alice` 发布 `endpoints: [127.0.0.1:18080]`，`agent-bob` 发布 `endpoints: [192.168.1.5:8080]`，同为 `order-service`。
 
@@ -1022,19 +1300,21 @@ TrafficClose → tunnel 关闭 → Agent 补池
 | `server/service/` | **重大** | 引入 LogicalService + ServiceInstance 两层模型，重写 PublishService 处理逻辑 |
 | `server/registry/canonical/` | **重大** | 新增 logical_service、instance 的存储与索引 |
 | `server/route/` | **重大** | RouteTarget 引用方式从 service_key 改为 ServiceSelector；RouteMatch 增加 headers/queries 字段 |
-| `server/route/resolver/` | **重大** | 路由匹配逻辑扩展为多条件组合 + 优先级排序 |
+| `server/route/resolver/` | **重大** | 路由匹配逻辑扩展为 scope 解析 + 降级链 + 多条件过滤 + 优先级排序 |
+| `server/scope/` | **新增** | ScopeFallbackPolicy 资源模型、存储、管理接口；scope chain 构建逻辑 |
 | `server/admission/` | **新增** | Admission Pipeline 框架及 RouteConflictAdmissionHandler |
 | `server/selector/` | **新增** | InstanceSelector 接口及多种实现 |
 | `server/ingress/host_deriver/` | **新增** | Host 自动派生逻辑，含前置冲突检查 |
 | `server/control/` | **中等** | PublishService/Unpublish/HealthReport handler 适配新字段 |
-| `server/proxy/connector_proxy/` | **中等** | 选实例逻辑，TrafficOpen 携带 instance_id |
-| `server/ingress/` | **小** | IngressRequest 结构增加 Headers/QueryParams 字段供 Route Resolver 使用 |
-| `server/discovery/` | **无** | 不变 |
+| `server/proxy/connector_proxy/` | **中等** | 选实例逻辑，TrafficOpen 携带 instance_id 和透传 scope |
+| `server/proxy/direct_proxy/` | **小** | 外部注册中心兜底路径，透传 scope Header |
+| `server/ingress/` | **小** | IngressRequest 结构增加 Headers/QueryParams 以及 scope 解析入口 |
+| `server/discovery/` | **小** | DiscoveryProvider 查询接口增加 scope 参数，支持外部兜底查询 |
 | `agent/service/catalog.go` | **中等** | 增加 instance_id 管理 |
 | `agent/control/publisher.go` | **中等** | 发送新版 PublishService 格式 |
-| `agent/traffic/acceptor.go` | **小** | 增加 instance_id 校验 |
+| `agent/traffic/acceptor.go` | **小** | 增加 instance_id 校验；透传 scope Header 给本地 upstream |
 | `agent/control/health_reporter.go` | **小** | 上报时携带 instance_id |
-| `proto/` | **中等** | 新增/修改 proto 字段；新增 HeaderMatcher、QueryMatcher、RouteMatch 扩展 |
+| `proto/` | **中等** | 新增/修改 proto 字段；新增 HeaderMatcher、QueryMatcher、RouteMatch 扩展；新增 ScopeFallbackPolicy |
 | `server/metrics/` | **小** | 新增指标 |
 
 ---
@@ -1066,3 +1346,9 @@ ServiceSelector 中的 `match_labels` 在本版标注为"预留，不强制实�
 
 **决策点八：Admission Pipeline 的同步/异步模式**  
 当前设计是同步拦截（注册时立即返回冲突错误）。对于大批量 Route 注册场景（如 Operator 批量同步 K8s Ingress），是否需要支持异步校验模式（先接受，后校验，结果通过 RouteStatusReport 回调）？
+
+**决策点九：scope Header 缺失时的默认行为**  
+当请求未携带 `X-Bridge-Namespace` / `X-Bridge-Environment` 时，当前方案使用管理员配置的全局默认 scope。是否应该改为直接返回 400（强制调用方声明 scope），以避免因遗漏 Header 导致意外路由到默认 scope 的服务？这两种默认行为对不同场景（纯内网服务 vs 对外 API）影响不同。
+
+**决策点十：ScopeFallbackPolicy 的降级链是否需要支持条件触发**  
+当前降级链是无条件的（本级 miss 就降级）。某些场景可能需要"只有当服务 INACTIVE 时才降级，如果服务 ACTIVE 但 UNHEALTHY 则不降级"。是否需要在 `FallbackStep` 里增加触发条件字段（`trigger: service_not_found | service_inactive | service_unhealthy`）？
