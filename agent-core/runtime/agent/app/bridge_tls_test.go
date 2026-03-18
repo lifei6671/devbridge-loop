@@ -3,6 +3,7 @@ package app
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -51,6 +52,20 @@ func TestBuildBridgeClientTLSConfigLoadsRootCA(testingObject *testing.T) {
 	}
 	if tlsConfig.MinVersion == 0 {
 		testingObject.Fatalf("expected tls min version configured")
+	}
+	if tlsConfig.MinVersion != tls.VersionTLS13 || tlsConfig.MaxVersion != tls.VersionTLS13 {
+		testingObject.Fatalf(
+			"unexpected tls version range: min=%d max=%d want=%d",
+			tlsConfig.MinVersion,
+			tlsConfig.MaxVersion,
+			tls.VersionTLS13,
+		)
+	}
+	if !tlsConfig.SessionTicketsDisabled {
+		testingObject.Fatalf("expected session tickets disabled for early-data hardening")
+	}
+	if tlsConfig.ClientSessionCache != nil {
+		testingObject.Fatalf("expected client session cache disabled")
 	}
 	if tlsConfig.RootCAs == nil {
 		testingObject.Fatalf("expected tls root ca pool initialized")

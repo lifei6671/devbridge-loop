@@ -1,9 +1,18 @@
 package app
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -55,6 +64,36 @@ func TestLooksLikeTLSClientHello(testingObject *testing.T) {
 	}
 	if looksLikeTLSClientHello([]byte("PRI")) {
 		testingObject.Fatalf("expected h2c preface not treated as tls client hello")
+	}
+}
+
+// TestLoadControlPlaneServerTLSConfigDisablesSessionResumption 验证服务端 TLS 配置会显式关闭恢复路径。
+func TestLoadControlPlaneServerTLSConfigDisablesSessionResumption(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	certFile, keyFile := writeControlPlaneTLSKeyPair(testingObject, tempDir)
+
+	tlsConfig, err := loadControlPlaneServerTLSConfig(certFile, keyFile)
+	if err != nil {
+		testingObject.Fatalf("load control plane tls config failed: %v", err)
+	}
+	if tlsConfig == nil {
+		testingObject.Fatalf("expected non-nil tls config")
+	}
+	if tlsConfig.MinVersion != tls.VersionTLS13 || tlsConfig.MaxVersion != tls.VersionTLS13 {
+		testingObject.Fatalf(
+			"unexpected tls version range: min=%d max=%d want=%d",
+			tlsConfig.MinVersion,
+			tlsConfig.MaxVersion,
+			tls.VersionTLS13,
+		)
+	}
+	if !tlsConfig.SessionTicketsDisabled {
+		testingObject.Fatalf("expected session tickets disabled for early-data hardening")
+	}
+	if len(tlsConfig.Certificates) != 1 {
+		testingObject.Fatalf("expected one certificate loaded, got=%d", len(tlsConfig.Certificates))
 	}
 }
 
@@ -182,4 +221,49 @@ func TestDetectTLSClientHelloAllowsFragmentedTLSHeader(testingObject *testing.T)
 	if string(prefix) != string([]byte{0x16, 0x03, 0x03}) {
 		testingObject.Fatalf("unexpected detected prefix: %v", prefix)
 	}
+}
+
+// writeControlPlaneTLSKeyPair 写入一组测试证书和私钥，供服务端 TLS 加载路径复用。
+func writeControlPlaneTLSKeyPair(testingObject *testing.T, directory string) (string, string) {
+	testingObject.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		testingObject.Fatalf("generate rsa key failed: %v", err)
+	}
+	serialNumber, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		testingObject.Fatalf("generate serial number failed: %v", err)
+	}
+	certificateTemplate := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "bridge-control-plane",
+		},
+		NotBefore:             time.Now().UTC().Add(-time.Hour),
+		NotAfter:              time.Now().UTC().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"bridge.internal.example"},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, certificateTemplate, certificateTemplate, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		testingObject.Fatalf("create certificate failed: %v", err)
+	}
+	certFile := filepath.Join(directory, "control-plane.crt")
+	keyFile := filepath.Join(directory, "control-plane.key")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: derBytes,
+	}), 0o600); err != nil {
+		testingObject.Fatalf("write certificate file failed: %v", err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}), 0o600); err != nil {
+		testingObject.Fatalf("write private key file failed: %v", err)
+	}
+	return certFile, keyFile
 }

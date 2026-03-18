@@ -27,6 +27,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/validate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 )
 
 const (
@@ -69,12 +70,22 @@ type controlChannelSessionState struct {
 	sessionID    string
 	sessionEpoch uint64
 	connectorID  string
+	// sourceIP 保存连接建立时提取出的源地址，供认证审计直接复用。
+	sourceIP string
 	// assignedSessionEpoch 是 Welcome 阶段预分配给本连接的候选 epoch。
 	assignedSessionEpoch uint64
 	// helloAccepted 标记当前连接是否已完成 ConnectorHello 阶段。
 	helloAccepted bool
 	// authenticated 标记当前连接是否已经完成 ConnectorAuthAck(success=true)。
 	authenticated bool
+}
+
+// newControlChannelSessionState 创建控制连接上下文并预先归一化 source_ip。
+func newControlChannelSessionState(peerAddr string) *controlChannelSessionState {
+	return &controlChannelSessionState{
+		// 连接建立时就提取 source_ip，避免后续每次认证重复解析地址。
+		sourceIP: normalizeConnectorAuthSourceIP(peerAddr),
+	}
 }
 
 // setSession 更新控制连接会话上下文。
@@ -346,7 +357,29 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	envelope pb.ControlEnvelope,
 	sessionState *controlChannelSessionState,
 ) (*pb.ControlEnvelope, error) {
+	auditConnectorID := strings.TrimSpace(envelope.ConnectorID)
+	auditSessionEpoch := uint64(0)
+	auditSourceIP := ""
+	if sessionState != nil {
+		if normalizedConnectorID := strings.TrimSpace(sessionState.connectorID); normalizedConnectorID != "" {
+			auditConnectorID = normalizedConnectorID
+		}
+		auditSessionEpoch = sessionState.assignedSessionEpoch
+		auditSourceIP = strings.TrimSpace(sessionState.sourceIP)
+	}
+	var authPayload pb.ConnectorAuth
+	emitAuditReject := func(errorCode string, sessionID string, sessionEpoch uint64) {
+		emitConnectorAuthAuditLog(false, connectorAuthAuditRecord{
+			ConnectorID:  auditConnectorID,
+			TokenID:      extractConnectorTokenIDForAudit(authPayload.Token),
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			SourceIP:     auditSourceIP,
+			ErrorCode:    errorCode,
+		})
+	}
 	if sessionState == nil || !sessionState.helloAccepted {
+		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -356,8 +389,8 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			"connector_welcome is required before connector_auth",
 		)
 	}
-	var authPayload pb.ConnectorAuth
 	if err := decodeControlPayload(envelope.Payload, &authPayload); err != nil {
+		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -369,6 +402,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	}
 	normalizedConnectorID := strings.TrimSpace(sessionState.connectorID)
 	if normalizedConnectorID == "" {
+		emitAuditReject(connectorAuthErrorConnectorMismatch, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -378,7 +412,10 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			"connector_id is missing in handshake context",
 		)
 	}
+	// Hello 阶段已锁定 connector_id，后续审计统一以该权威值输出。
+	auditConnectorID = normalizedConnectorID
 	if envelopeConnectorID := strings.TrimSpace(envelope.ConnectorID); envelopeConnectorID != "" && envelopeConnectorID != normalizedConnectorID {
+		emitAuditReject(connectorAuthErrorConnectorMismatch, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -389,6 +426,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 		)
 	}
 	if dispatcher == nil || dispatcher.authCoordinator == nil {
+		emitAuditReject(connectorAuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
 			false,
@@ -411,6 +449,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 		},
 	)
 	if !authResult.success {
+		emitAuditReject(authResult.errorCode, "", auditSessionEpoch)
 		slog.Warn(
 			"connector auth rejected",
 			"connector_id", normalizedConnectorID,
@@ -430,6 +469,14 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	// 认证成功后更新连接上下文，供 heartbeat 与后续资源消息复用。
 	sessionState.setSession(authResult.sessionID, authResult.sessionEpoch)
 	sessionState.authenticated = true
+	emitConnectorAuthAuditLog(true, connectorAuthAuditRecord{
+		ConnectorID:  normalizedConnectorID,
+		TokenID:      extractConnectorTokenIDForAudit(authPayload.Token),
+		SessionID:    authResult.sessionID,
+		SessionEpoch: authResult.sessionEpoch,
+		SourceIP:     auditSourceIP,
+		ErrorCode:    "",
+	})
 	slog.Info(
 		"connector auth committed",
 		"connector_id", normalizedConnectorID,
@@ -1467,7 +1514,7 @@ func serveGRPCControlChannelWithDispatcher(
 		// 测试或兼容路径未注入 dispatcher 时按默认实现创建一份。
 		effectiveDispatcher = newControlMessageDispatcher(controlMessageDispatcherOptions{})
 	}
-	sessionState := &controlChannelSessionState{}
+	sessionState := newControlChannelSessionState(grpcPeerAddrString(stream.Context()))
 	for {
 		frameEnvelope, err := stream.Recv()
 		if err != nil {
@@ -1563,7 +1610,12 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 			_ = classifiedConn.Close()
 			return fmt.Errorf("serve tcp inbound: open control channel: %w", openErr)
 		}
-		if serveErr := serveControlChannelWithDispatcher(ctx, controlChannel, server.dispatcher); serveErr != nil && !isControlChannelClosedError(serveErr) {
+		if serveErr := serveControlChannelWithDispatcherAndPeerAddr(
+			ctx,
+			controlChannel,
+			server.dispatcher,
+			remoteAddrString(rawConn),
+		); serveErr != nil && !isControlChannelClosedError(serveErr) {
 			_ = controlChannel.Close(context.Background())
 			return fmt.Errorf("serve tcp inbound: serve control channel: %w", serveErr)
 		}
@@ -2242,6 +2294,16 @@ func serveControlChannelWithDispatcher(
 	controlChannel transport.ControlChannel,
 	dispatcher *controlMessageDispatcher,
 ) error {
+	return serveControlChannelWithDispatcherAndPeerAddr(ctx, controlChannel, dispatcher, "")
+}
+
+// serveControlChannelWithDispatcherAndPeerAddr 处理控制流并把接入源地址注入认证审计上下文。
+func serveControlChannelWithDispatcherAndPeerAddr(
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+	dispatcher *controlMessageDispatcher,
+	peerAddr string,
+) error {
 	effectiveDispatcher := dispatcher
 	if effectiveDispatcher == nil {
 		// 测试或兼容路径未注入 dispatcher 时按默认实现创建一份。
@@ -2250,7 +2312,7 @@ func serveControlChannelWithDispatcher(
 	if controlChannel == nil {
 		return errors.New("control channel is nil")
 	}
-	sessionState := &controlChannelSessionState{}
+	sessionState := newControlChannelSessionState(peerAddr)
 	defer func() {
 		_ = controlChannel.Close(context.Background())
 	}()
@@ -2297,6 +2359,15 @@ func writeControlFrameWithPriority(
 		})
 	}
 	return controlChannel.WriteControlFrame(ctx, frame)
+}
+
+// grpcPeerAddrString 从 gRPC context 中提取对端地址字符串。
+func grpcPeerAddrString(ctx context.Context) string {
+	peerInfo, ok := peer.FromContext(ctx)
+	if !ok || peerInfo.Addr == nil {
+		return ""
+	}
+	return strings.TrimSpace(peerInfo.Addr.String())
 }
 
 func isControlPlaneStopError(err error) bool {

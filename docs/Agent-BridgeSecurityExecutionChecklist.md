@@ -131,7 +131,7 @@
 - [x] 为 Agent 增加 Bridge TLS 配置（Root CA、ServerName、开关）
 - [x] gRPC 通道移除默认 `insecure` 依赖，按配置启用 TLS 凭据
 - [x] TCP binding 在 TLS 模式下支持证书链、SAN、有效期校验
-- [ ] 显式禁用 TLS 1.3 Early Data（0-RTT）
+- [x] 显式禁用 TLS 1.3 Early Data（0-RTT）
 
 代码落点建议：
 
@@ -212,7 +212,7 @@
 
 - [x] 新增认证与握手指标：成功率、错误码分布、supersede 次数、rate limit 次数
 - [x] 新增 TLS 模式拒绝指标：`required` 拒绝明文、`plaintext` 拒绝 TLS
-- [ ] 审计日志保留 `connector_id/token_id(脱敏)/session_id/session_epoch/source_ip/error_code`
+- [x] 审计日志保留 `connector_id/token_id(脱敏)/session_id/session_epoch/source_ip/error_code`
 
 验收标准：
 
@@ -221,10 +221,10 @@
 
 ### S11. 测试矩阵与发布门槛
 
-- [ ] 单测：proto/validator/auth parser/hash/tls mode 判定/epoch 原子提交
-- [ ] 集测：三种 TLS 模式 + 握手全链路 + 并发抢占 + token 状态切换
-- [ ] 数据面：simultaneous close + recycle 成功/失败 + 错误码断言
-- [ ] 回归：`grpc_h2` 与 `tcp_framed` 两种 binding parity
+- [x] 单测：proto/validator/auth parser/hash/tls mode 判定/epoch 原子提交
+- [x] 集测：三种 TLS 模式 + 握手全链路 + 并发抢占 + token 状态切换
+- [x] 数据面：simultaneous close + recycle 成功/失败 + 错误码断言
+- [x] 回归：`grpc_h2` 与 `tcp_framed` 两种 binding parity
 
 建议执行命令：
 
@@ -239,27 +239,199 @@
 
 ### S12. 交付核对（Definition of Done）
 
-- [ ] 方案文档、协议定义、实现代码、测试用例四者一致
-- [ ] `auth_payload` 已完全移除
-- [ ] TLS 三模式在配置、运行时、测试、观测中全部闭环
-- [ ] §7.11 认证流程具备可复现实验与自动化回归
+- [x] 方案文档、协议定义、实现代码、测试用例四者一致
+- [x] `auth_payload` 已完全移除
+- [x] TLS 三模式在配置、运行时、测试、观测中全部闭环
+- [x] §7.11 认证流程具备可复现实验与自动化回归
+
+### S13. Bridge 自建 CA 与证书运维闭环
+
+- [ ] 初始化生成 Root CA 私钥与证书，并独立持久化
+- [ ] 由 Root CA 签发 Bridge 服务端证书，替代“仅加载外部 `tls_cert_file/tls_key_file`”路径
+- [ ] Bridge 服务端证书支持短周期续签、替换与热加载
+- [ ] Root CA 带外分发、轮换、紧急替换 runbook 与配置入口补齐
+- [ ] Root CA 私钥与 Bridge 服务端私钥分开存储，最小权限访问并排除普通日志/通用备份
+
+代码落点建议：
+
+- `cloud-bridge/runtime/bridge/app/bootstrap.go`
+- `cloud-bridge/runtime/bridge/app/config.go`
+- `cloud-bridge/runtime/bridge/app/control_plane_tls.go`
+- `docs/Agent‑BridgeSecurityArchitectureAndAuthDesign.md`
+
+验收标准：
+
+- Bridge 能在无预制 cert/key 的场景完成首次 CA 初始化和服务端证书签发
+- Agent 仅信任 Bridge Root CA 时可成功完成 TLS 握手
+- Root CA 轮换与紧急替换具备可演练的带外操作路径
+
+### S14. 未认证入口限流、失败封禁与枚举抑制
+
+- [ ] 对未认证 `ConnectorHello` 实现 `source_ip/connector_id` 双维度限流
+- [ ] 对认证失败实现 `source_ip/connector_id` 双维度失败限流与短时封禁
+- [ ] 对未知 `connector_id`、无效 token、吊销 token 等场景统一外显响应口径，降低枚举区分度
+- [ ] 为握手洪泛增加连接预算与并发预算控制
+- [ ] 补齐未认证入口限流、封禁、枚举抑制自动化测试
+
+代码落点建议：
+
+- `cloud-bridge/runtime/bridge/app/control_plane.go`
+- `cloud-bridge/runtime/bridge/app/control_auth.go`
+- `cloud-bridge/runtime/bridge/obs/*`
+
+验收标准：
+
+- 未认证洪泛不会无限消耗握手资源
+- 外部请求无法通过错误差异稳定区分“未知 connector”和“已注册 connector”
+- 限流与封禁命中后有统一指标、日志与可回归测试
+
+### S15. Session 状态机与旧会话收敛
+
+- [ ] 显式落地 `connecting -> connected -> control_ready -> authenticated -> draining/closed/failed` 状态机
+- [ ] 未进入 `authenticated` 前禁止发布服务、分配实际 traffic、进入 tunnel pool 工作态
+- [ ] 新 `session_epoch` 生效后，旧 session 必须进入 `draining/stale` 并冻结控制面资源写入
+- [ ] `failed` 状态必须终止控制面并清理该 session 下全部 tunnel
+- [ ] Agent 收到 `auth_session_superseded` 或 `auth_rate_limited` 后执行指数退避
+
+代码落点建议：
+
+- `ltfp/session/*`
+- `agent-core/runtime/agent/app/runtime_bridge.go`
+- `cloud-bridge/runtime/bridge/registry/*`
+- `cloud-bridge/runtime/bridge/app/control_plane.go`
+
+验收标准：
+
+- 认证完成前无法发布服务或接收实际 traffic
+- 新旧 session 切换时不会出现旧会话继续污染控制面状态
+- supersede/rate limit 失败路径具有稳定退避行为
+
+### S16. 控制面一致性与幂等语义
+
+- [ ] 资源级控制消息统一校验 `session_epoch/event_id/resource_version`
+- [ ] `event_id` 去重作用域固定为 `session_id + event_id`
+- [ ] 为 `PublishServiceAck/UnpublishServiceAck/RouteAssignAck/RouteRevokeAck` 固定 accepted/current version 语义
+- [ ] 补齐重复投递、乱序投递、低 epoch 覆盖、高 epoch 并发写入回归测试
+
+代码落点建议：
+
+- `ltfp/consistency/*`
+- `cloud-bridge/runtime/bridge/control/*`
+- `cloud-bridge/runtime/bridge/registry/*`
+- `agent-core/runtime/agent/app/runtime_bridge.go`
+
+验收标准：
+
+- 相同 `session_id + event_id` 的重复消息不会重复生效
+- 低 `session_epoch` 消息无法覆盖高权威状态
+- 关键 ACK 的 accepted/current version 语义在双端一致
+
+### S17. 资源身份与策略边界
+
+- [ ] 固定 `service_key=<namespace>/<environment>/<service_name>` 为 canonical lookup key
+- [ ] 固定 `service_id` 为全局 opaque identity，并在 runtime/traffic/ACK/audit 中统一使用
+- [ ] 当 `PublishService.service_id` 为空时，若 `service_key` 已存在必须复用既有 `service_id`，仅首次出现时分配新值
+- [ ] publish policy / route policy 与 token 绑定关系彻底解耦，避免 token 承载 scope 与资源治理策略
+- [ ] 补齐 service republish、route target、audit 字段使用 `service_id/service_key` 的回归测试
+
+代码落点建议：
+
+- `cloud-bridge/runtime/bridge/control/*`
+- `cloud-bridge/runtime/bridge/registry/*`
+- `agent-core/runtime/agent/app/runtime_bridge.go`
+- `docs/LTFP-v1-Draft.md`
+
+验收标准：
+
+- 同一 `service_key` 的重复发布不会无故漂移 `service_id`
+- 路由层使用 `service_key`，运行时与审计使用 `service_id` 的职责边界清晰可测
+- token 仅承担接入认证，不承载资源发布与路由治理策略
+
+### S18. Token 生命周期与吊销治理
+
+- [ ] 为 `token_secret_hash` 记录算法与参数版本，避免后续轮换失去判定依据
+- [ ] `grace` 状态增加最长 24 小时上限，并支持自动转 `expired/revoked`
+- [ ] 明确“会话期间 token 过期不主动中断现有 active session”的运行时语义与测试
+- [ ] 支持正常轮换场景下的新旧 token 并存窗口与平滑切换
+- [ ] 支持紧急吊销场景下对关联 active session 的强制 drain 或强制关闭路径
+- [ ] 明文 token 仅展示一次，不允许二次展示，不得进入普通日志
+
+代码落点建议：
+
+- `cloud-bridge/runtime/bridge/app/control_auth.go`
+- `cloud-bridge/runtime/bridge/registry/*`
+- `cloud-bridge/runtime/bridge/adminapi/*`
+- `agent-core/runtime/agent/app/runtime_bridge.go`
+
+验收标准：
+
+- `grace` token 不会无限期存活
+- 正常轮换与紧急吊销场景均可通过自动化测试稳定复现
+- token 过期、轮换、吊销对现有 active session 的影响符合方案定义
+
+### S19. Agent 侧凭证安全存储
+
+- [ ] 为桌面/主机场景接入 keyring / Secret Service / Windows DPAPI / macOS Keychain 等安全存储
+- [ ] 为容器场景明确 Secret 管理与静态存储加密方案
+- [ ] 环境变量仅保留为过渡载体，不作为长期高安全推荐方式
+- [ ] 配置文件落盘权限、诊断快照、日志导出路径统一增加高敏感凭证审查
+- [ ] 补齐 token 存储、读取、迁移、脱敏导出测试
+
+代码落点建议：
+
+- `agent-core/runtime/agent/app/config.go`
+- `agent-core/cmd/agent-core/main.go`
+- `agent-core/runtime/agent/app/localrpc_*`
+- `docs/ScaffoldQuickStart.md`
+
+验收标准：
+
+- Agent 默认路径不再依赖明文 token 常驻环境变量
+- 日志、配置、诊断导出均不会泄露 token 明文
+- 主机与容器两类部署形态均有明确的凭证存储规范
+
+### S20. Tunnel 复用边界与超时治理
+
+- [ ] `recycle_seq` 严格限定为单条 tunnel 生命周期内单调递增
+- [ ] `tunnel_id` 在同一 session 生命周期内不得复用
+- [ ] idle tunnel 探活固定在 transport/binding 层，不得写入业务 payload 缓冲区
+- [ ] `Session.Open()` 补齐 `connect/tls/control_ready/auth` 分阶段超时与失败收敛
+- [ ] `TrafficOpenAck` 超时、`TunnelRecycleAck` 超时、idle probe 失败时统一将 tunnel 标记为 `broken` 并补池
+- [ ] 补齐 `recycle_seq` 回退、`tunnel_id` 复用、探活污染缓冲区的回归测试
+
+代码落点建议：
+
+- `ltfp/transport/*`
+- `agent-core/runtime/agent/app/data_plane_runtime.go`
+- `cloud-bridge/runtime/bridge/app/tunnel_runtime_adapter.go`
+- `cloud-bridge/runtime/bridge/connectorproxy/*`
+
+验收标准：
+
+- 任何超时或探活失败路径都不会留下可误复用 tunnel
+- `recycle_seq` 与 `tunnel_id` 的作用域约束可通过自动化测试稳定验证
+- idle tunnel 探活不会污染业务数据缓冲与回收判定
 
 ---
 
 ## 五、建议执行顺序
 
 1. 先做 `S0/S6`，冻结协议结构与校验边界。
-2. 再做 `S2/S3/S7`，完成 Bridge 认证核心能力与会话权威提交。
-3. 接着做 `S4/S5`，打通 TLS 模式与 Agent 连接安全。
-4. 然后做 `S8/S9`，对齐数据面关闭回收与错误码。
-5. 最后做 `S10/S11/S12`，完成观测、测试与交付封板。
+2. 再做 `S2/S3/S7/S14`，完成 Bridge 认证核心能力、未认证入口防护与会话权威提交。
+3. 接着做 `S4/S5/S13`，打通 TLS 模式、Agent 校验与 Bridge 自建 CA 闭环。
+4. 然后做 `S15/S16/S17`，收敛 session 状态机、控制面一致性与资源身份边界。
+5. 再做 `S8/S9/S20`，对齐数据面关闭回收、超时治理与错误码。
+6. 然后做 `S18/S19`，补齐 token 生命周期治理与 Agent 凭证安全存储。
+7. 最后做 `S10/S11/S12`，完成观测、测试与交付封板。
 
 ---
 
 ## 六、里程碑建议
 
 - M1（协议冻结）：完成 `S0/S6`
-- M2（认证可用）：完成 `S2/S3/S7`
-- M3（TLS 可控）：完成 `S4/S5`
-- M4（数据面一致）：完成 `S8/S9`
-- M5（可发布）：完成 `S10/S11/S12`
+- M2（认证基线）：完成 `S2/S3/S7/S14`
+- M3（TLS 与证书）：完成 `S4/S5/S13`
+- M4（控制面收敛）：完成 `S15/S16/S17`
+- M5（数据面边界）：完成 `S8/S9/S20`
+- M6（凭证治理）：完成 `S18/S19`
+- M7（可发布）：完成 `S10/S11/S12`

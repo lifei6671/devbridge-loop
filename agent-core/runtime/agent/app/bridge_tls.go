@@ -35,10 +35,15 @@ func buildBridgeClientTLSConfig(bridgeTLSConfig BridgeTLSConfig, bridgeAddr stri
 		return nil, err
 	}
 	return &tls.Config{
-		// 控制面固定要求 TLS 1.3；Go 标准库未实现 0-RTT，因此 Early Data 默认不可用。
+		// 控制面固定要求 TLS 1.3，避免协商回落到更低版本。
 		MinVersion: tls.VersionTLS13,
-		RootCAs:    rootCAs,
-		ServerName: serverName,
+		MaxVersion: tls.VersionTLS13,
+		// 显式关闭 session ticket/PSK 恢复路径，保持“不启用 0-RTT”的安全基线。
+		SessionTicketsDisabled: true,
+		// 客户端不缓存会话，确保不会尝试 TLS 1.3 session resumption。
+		ClientSessionCache: nil,
+		RootCAs:            rootCAs,
+		ServerName:         serverName,
 		// gRPC over TLS 需要 h2；tcp_framed 即使未协商 ALPN 也可正常传输。
 		NextProtos: []string{"h2"},
 	}, nil

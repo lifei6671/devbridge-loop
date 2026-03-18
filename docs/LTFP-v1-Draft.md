@@ -1231,8 +1231,9 @@ message ConnectorWelcome {
 
 message ConnectorAuth {
   string auth_method = 1;
-  map<string, string> auth_payload = 2;
-  map<string, string> metadata = 3;
+  string token = 2;
+  string client_cap_version = 3;
+  map<string, string> metadata = 4;
 }
 
 message ConnectorAuthAck {

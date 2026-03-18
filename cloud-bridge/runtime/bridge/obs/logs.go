@@ -24,6 +24,12 @@ const (
 	LogFieldSessionEpoch = "session_epoch"
 	// LogFieldConnectorID 表示 connector ID 字段名。
 	LogFieldConnectorID = "connector_id"
+	// LogFieldTokenID 表示脱敏后的 token ID 字段名。
+	LogFieldTokenID = "token_id"
+	// LogFieldSourceIP 表示远端源 IP 字段名。
+	LogFieldSourceIP = "source_ip"
+	// LogFieldErrorCode 表示标准错误码字段名。
+	LogFieldErrorCode = "error_code"
 	// LogFieldTunnelID 表示 tunnel ID 字段名。
 	LogFieldTunnelID = "tunnel_id"
 )

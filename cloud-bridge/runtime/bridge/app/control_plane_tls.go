@@ -62,8 +62,11 @@ func loadControlPlaneServerTLSConfig(certFile string, keyFile string) (*tls.Conf
 		return nil, fmt.Errorf("load control plane tls certificate: %w", err)
 	}
 	return &tls.Config{
-		// 控制面固定收敛到 TLS 1.3；Go 标准库未实现 0-RTT，因此 Early Data 默认不可用。
+		// 控制面固定收敛到 TLS 1.3，避免不同版本混用。
 		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+		// 显式关闭 session ticket/PSK 恢复路径，避免未来演进时偏离“禁用 0-RTT”的约束。
+		SessionTicketsDisabled: true,
 		Certificates: []tls.Certificate{
 			certificate,
 		},
