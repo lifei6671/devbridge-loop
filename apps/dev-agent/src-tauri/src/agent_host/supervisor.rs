@@ -150,6 +150,8 @@ fn replay_manual_services_after_connect(
                 "host": service.host,
                 "port": service.port,
                 "sni_name": service.sni_name,
+                "exposure": service.exposure,
+                "route_hint": service.route_hint,
             }),
             LOCAL_RPC_DEFAULT_TIMEOUT_MS,
         );

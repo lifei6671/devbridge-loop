@@ -26,12 +26,21 @@ func TestToPublishService(t *testing.T) {
 		DiscoveryPolicy: pb.DiscoveryPolicy{
 			Enabled: true,
 		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+			Priority: 9,
+		},
 	})
 	if publish.InstanceID != "si-001" || publish.ServiceType != "http" {
 		t.Fatalf("unexpected publish payload: %+v", publish)
 	}
 	if publish.Scope.Namespace != "dev" || publish.Scope.Environment != "alice" {
 		t.Fatalf("unexpected publish scope: %+v", publish.Scope)
+	}
+	if len(publish.RouteHint.MatchHeaders) != 1 || publish.RouteHint.Priority != 9 {
+		t.Fatalf("unexpected route hint: %+v", publish.RouteHint)
 	}
 }
 

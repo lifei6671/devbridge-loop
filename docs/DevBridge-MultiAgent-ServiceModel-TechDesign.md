@@ -1,7 +1,7 @@
 # DevBridge 多 Agent 服务模型演进技术方案
 
 **文档状态**：Draft for Review  
-**版本**：v1.5  
+**版本**：v1.6  
 **依赖文档**：LTFP-v1-Draft.md (v2.1)、LTFP-TransportAbstraction.md (v2.1)、Agent_and_Bridge_Implementation_Technical_Design.md
 
 ---
@@ -298,7 +298,82 @@ message ServiceInstance {
 - `health_status` 描述实例后端服务的健康状态（业务层面）
 - 只有 `instance_status=ACTIVE` 且 `health_status=HEALTHY` 的实例才进入路由候选池
 
-### 3.3 ServiceSelector（Route 引用服务的方式）
+### 3.3 labels 与 metadata 的定位
+
+PublishService 和 ServiceInstance 上的 `labels` 与 `metadata` 是两个职责完全不同的字段，需要明确区分。
+
+#### labels：参与路由决策的实例过滤标签
+
+labels 的唯一作用是在 **InstanceSelector 阶段**对候选实例进行过滤，即 Route 已经确定了目标 LogicalService 之后，从该服务的多个实例中筛选出符合条件的子集。
+
+```
+Route → LogicalService（order-service）
+            ├── instance-A  labels={version:v2, region:cn}
+            ├── instance-B  labels={version:v1, region:cn}
+            └── instance-C  labels={version:v1, region:us}
+
+ConnectorServiceTarget.instance_selector = {version: v1}
+→ 候选池缩小为 [instance-B, instance-C]
+→ InstanceSelector 在这两个里选一个
+```
+
+**labels 的典型使用场景：**
+
+| 场景 | labels 示例 | 效果 |
+|------|------------|------|
+| 版本灰度 | `{version: v2}` | 只把流量路由到新版本实例 |
+| 主从读写分离 | `{role: primary}` / `{role: replica}` | 写流量打主，读流量打从 |
+| 个人开发环境独占 | `{owner: alice}` | alice 的请求只打到 alice 的本地实例 |
+| 机房就近路由 | `{region: beijing}` | 北京来的请求优先打北京机房 |
+
+**labels 的协议无关性：** labels 的过滤发生在实例选择阶段（控制面决策），不依赖数据面注入，对 HTTP、TCP、UDP 均有效。
+
+**labels 不做的事：**
+- 不作为 RouteMatch 的匹配条件（不影响"哪条 Route 命中请求"）
+- 不透传给 upstream 服务
+- 不影响 Discovery 导出
+
+#### metadata：操作性信息，不参与任何路由决策
+
+metadata 是一个透明的 KV 袋，系统本身不解析，只存储和透传（在控制面范围内）。用于挂载运维、审计、展示类信息。
+
+**metadata 的可达范围（按协议）：**
+
+| 使用场景 | HTTP/gRPC | TCP/UDP |
+|---------|-----------|---------|
+| Bridge 管理面展示、审计日志 | ✓ | ✓ |
+| TrafficOpen.metadata 携带给 Agent | ✓ | ✓ |
+| Agent 侧日志记录 | ✓ | ✓ |
+| Agent 注入为请求 Header 透传给 upstream | ✓（可选实现） | ✗（字节流不可注入） |
+
+对于 TCP/UDP 服务，metadata 在 Agent 边界终止，无法进入字节流，upstream 不可感知。这是协议层面的固有限制，不是设计缺陷。
+
+**metadata 的典型内容：**
+
+```
+{
+  "owner":       "team-infra",
+  "cost-center": "platform",
+  "on-call":     "pagerduty://service-xxx",
+  "deploy-env":  "bare-metal",
+  "git-commit":  "a1b2c3d4"
+}
+```
+
+**metadata 不做的事：**
+- 不参与 Route 匹配
+- 不参与实例选择
+- 不影响健康检查逻辑
+- TCP/UDP 场景下不透传到 upstream
+
+**本地新增服务 UI 的约束：**
+- `labels` / `metadata` 不进入桌面端“新增服务”的主路径表单，避免把它们误当作基础注册字段
+- 桌面端默认开放 `identity + upstream config + exposure + route_hint` 四类输入
+- `exposure` 作为可选声明项，用于覆盖 Bridge 默认入口策略；未填写时 HTTP/HTTPS 仍可沿用自动派生 host/path
+- `route_hint` 仅在 `http/https` 服务下开放，作为自动派生 Route 的高级匹配补充
+- `route_hint` 只在 `l7_shared` 模式下生效；若切到 `tls_sni_shared` 或 `l4_dedicated_port`，桌面端会禁用该输入
+
+### 3.4 ServiceSelector（Route 引用服务的方式）
 
 Route 不再直接引用 service_key 字符串，改为 ServiceSelector：
 
@@ -326,7 +401,7 @@ message ServiceSelector {
 
 三种方式互斥，不叠加。
 
-### 3.4 RouteMatch 扩展
+### 3.5 RouteMatch 扩展
 
 原有 RouteMatch 只支持 host/path/sni/port 级别的匹配，无法表达"同一入口、按请求内容分发到不同服务"的场景。本版扩展增加 Header 与 Query 参数匹配条件。
 
@@ -371,7 +446,7 @@ message QueryMatcher {
 - Header/Query 匹配仅对 `l7_shared` ingress mode 生效；`tls_sni_shared` 和 `l4_dedicated_port` 忽略这两个字段
 - `regex` 匹配需限制复杂度，防止 ReDoS，建议使用 RE2 语法
 
-### 3.5 host+path 多服务映射的四种场景
+### 3.6 host+path 多服务映射的四种场景
 
 同一 host+path 对应多个服务不只一种情况，需要明确区分处理方式：
 
@@ -428,7 +503,7 @@ Route B：host=api.example.com, path_prefix=/api/orders/
 | 相同 path，但 Header 条件不同 | 不冲突（条件可区分） | RouteMatch HeaderMatcher |
 | path_prefix 存在包含关系 | 不冲突（最长前缀保证确定性） | Route priority + path 长度降序 |
 
-### 3.6 与现有资源的关系
+### 3.7 与现有资源的关系
 
 ```
 旧版：
@@ -449,7 +524,7 @@ Route 的 RouteMatch 在现有字段基础上扩展了 headers/queries，其他�
 
 ### 4.1 PublishService（Agent → Bridge）
 
-**变更：** 废弃 `service_key` 字段，拆分为 `service_name` + `scope`；新增 `instance_id` 用于重连时复用。
+**变更：** 废弃 `service_key` 字段，拆分为 `service_name` + `scope`；新增 `instance_id` 用于重连时复用；新增 `route_hint` 用于 Agent 声明自动派生 Route 时的额外匹配条件。
 
 ```proto
 message PublishService {
@@ -458,8 +533,10 @@ message PublishService {
   string service_name   = 2;  // 纯名字，不含 scope 信息（必填）
   Scope  scope          = 3;  // 独立作用域（必填）
 
-  // 元数据
+  // 实例过滤标签（参与 InstanceSelector 过滤，不透传给 upstream）
   map<string,string> labels    = 4;
+
+  // 操作性元数据（管理面/审计用，不参与路由决策；TCP/UDP 场景不透传给 upstream）
   map<string,string> metadata  = 5;
 
   // 服务配置
@@ -468,6 +545,24 @@ message PublishService {
   ServiceExposure  exposure    = 8;
   HealthCheckConfig health_check = 9;
   DiscoveryPolicy  discovery_policy = 10;
+
+  // 路由提示（可选）：Agent 希望自动派生的 Route 额外携带的匹配条件
+  // Bridge 将 exposure + route_hint 组合生成完整 RouteMatch
+  // 若为空，自动派生 Route 仅使用 exposure 中的 host/path 信息
+  RouteHint route_hint = 11;
+}
+
+message RouteHint {
+  // 自动派生 Route 时额外附加的 Header 匹配条件（AND 关系）
+  // 仅对 ingress_mode=l7_shared 的服务生效；l4/sni 模式下忽略
+  repeated HeaderMatcher match_headers = 1;
+
+  // 自动派生 Route 时额外附加的 Query 匹配条件（AND 关系）
+  // 仅对 HTTP 协议生效
+  repeated QueryMatcher  match_queries = 2;
+
+  // 自动派生 Route 的优先级（默认 0，低于管理员手动配置的 Route）
+  uint32 priority = 3;
 }
 ```
 
@@ -553,6 +648,45 @@ message ConnectorServiceTarget {
   string load_balance_policy = 3;  // round_robin | least_conn | random | sticky（可选）
 }
 ```
+
+### 4.7 ServiceExposure、RouteHint 与 RouteMatch 的职责边界
+
+这三个结构容易混淆，明确区分如下：
+
+| 结构 | 所在位置 | 回答的问题 | 使用阶段 |
+|------|---------|-----------|---------|
+| `ServiceExposure` | `PublishService` | 服务挂在哪个入口（host、port、ingress_mode） | 注册时静态声明 |
+| `RouteHint` | `PublishService` | Agent 希望自动派生的 Route 附加什么匹配条件 | 注册时声明，Bridge 用于生成 Route |
+| `RouteMatch` | `RouteAssign` | 什么样的请求命中这条 Route | 路由时动态判断 |
+
+**自动派生 Route 的合成规则：**
+
+当 Bridge 收到 PublishService 后，自动生成 Route 时按如下规则合成 RouteMatch：
+
+```
+RouteMatch.host        ← exposure.host（或按模板自动派生）
+RouteMatch.path_prefix ← exposure.path_prefix
+RouteMatch.listen_port ← exposure.listen_port（L4 场景）
+RouteMatch.sni         ← exposure.sni_name（SNI 场景）
+RouteMatch.headers     ← route_hint.match_headers（若有）
+RouteMatch.queries     ← route_hint.match_queries（若有）
+Route.priority         ← route_hint.priority（默认 0）
+Route.source           ← "auto"（标记为自动派生，区别于管理员手动配置）
+```
+
+**管理员手动 RouteAssign 的优先级高于自动派生：**
+
+```
+管理员配置：Route{host=api.example.com, path=/api/, priority=10} → service-A
+自动派生：  Route{host=api.example.com, path=/api/, priority=0}  → service-A（同一服务，HA 场景）
+管理员配置：Route{host=api.example.com, path=/api/, priority=10} → service-B（不同服务）
+  → 触发 Admission 冲突检测（priority 相同时），或 shadow warning（priority 不同时）
+```
+
+**RouteHint 的协议约束：**
+- `match_headers` 和 `match_queries` 仅对 `ingress_mode=l7_shared` 的服务生效
+- `l4_dedicated_port` 和 `tls_sni_shared` 模式下，Bridge 在 Admission 阶段对这两个字段发出 warning 并忽略
+- 这与 RouteMatch.headers/queries 的约束一致（见 §3.5）
 
 ---
 
@@ -1310,9 +1444,9 @@ TrafficClose → tunnel 关闭 → Agent 补池
 
 | 模块 | 改动类型 | 说明 |
 |------|----------|------|
-| `server/service/` | **重大** | 引入 LogicalService + ServiceInstance 两层模型，重写 PublishService 处理逻辑 |
+| `server/service/` | **重大** | 引入 LogicalService + ServiceInstance 两层模型，重写 PublishService 处理逻辑；处理 RouteHint 合成自动派生 Route |
 | `server/registry/canonical/` | **重大** | 新增 logical_service、instance 的存储与索引 |
-| `server/route/` | **重大** | RouteTarget 引用方式从 service_key 改为 ServiceSelector；RouteMatch 增加 headers/queries 字段 |
+| `server/route/` | **重大** | RouteTarget 引用方式从 service_key 改为 ServiceSelector；RouteMatch 增加 headers/queries 字段；Route 增加 source 字段区分自动派生与手动配置 |
 | `server/route/resolver/` | **重大** | 路由匹配逻辑扩展为 scope 解析 + 降级链 + 多条件过滤 + 优先级排序 |
 | `server/scope/` | **新增** | ScopeFallbackPolicy 资源模型、存储、管理接口；scope chain 构建逻辑 |
 | `server/admission/` | **新增** | Admission Pipeline 框架及 RouteConflictAdmissionHandler |
@@ -1327,7 +1461,7 @@ TrafficClose → tunnel 关闭 → Agent 补池
 | `agent/control/publisher.go` | **中等** | 发送新版 PublishService 格式 |
 | `agent/traffic/acceptor.go` | **小** | 增加 instance_id 校验；透传 scope Header 给本地 upstream |
 | `agent/control/health_reporter.go` | **小** | 上报时携带 instance_id |
-| `proto/` | **中等** | 新增/修改 proto 字段；新增 HeaderMatcher、QueryMatcher、RouteMatch 扩展；新增 ScopeFallbackPolicy |
+| `proto/` | **中等** | 新增/修改 proto 字段；新增 HeaderMatcher、QueryMatcher、RouteMatch 扩展；新增 ScopeFallbackPolicy；新增 RouteHint |
 | `server/metrics/` | **小** | 新增指标 |
 
 ---

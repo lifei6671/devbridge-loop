@@ -89,16 +89,41 @@ type localRPCAuthCompletePayload struct {
 }
 
 type localRPCServiceAddPayload struct {
-	InstanceID             string   `json:"instance_id"`
-	Scope                  pb.Scope `json:"scope"`
-	ServiceName            string `json:"service_name"`
-	Protocol               string `json:"protocol"`
-	Host                   string `json:"host"`
-	Port                   uint32 `json:"port"`
-	SNIName                string `json:"sni_name"`
-	HealthCheckIntervalSec uint32 `json:"health_check_interval_sec"`
-	HealthCheckMode        string `json:"health_check_mode"`
-	HealthCheckPath        string `json:"health_check_path"`
+	InstanceID             string                  `json:"instance_id"`
+	Scope                  pb.Scope                `json:"scope"`
+	ServiceName            string                  `json:"service_name"`
+	Protocol               string                  `json:"protocol"`
+	Host                   string                  `json:"host"`
+	Port                   uint32                  `json:"port"`
+	SNIName                string                  `json:"sni_name"`
+	Exposure               localRPCServiceExposure `json:"exposure"`
+	HealthCheckIntervalSec uint32                  `json:"health_check_interval_sec"`
+	HealthCheckMode        string                  `json:"health_check_mode"`
+	HealthCheckPath        string                  `json:"health_check_path"`
+	RouteHint              localRPCRouteHint       `json:"route_hint"`
+}
+
+type localRPCServiceExposure struct {
+	IngressMode string `json:"ingress_mode"`
+	Host        string `json:"host"`
+	ListenPort  uint32 `json:"listen_port"`
+	SNIName     string `json:"sni_name"`
+	PathPrefix  string `json:"path_prefix"`
+	AllowExport bool   `json:"allow_export"`
+}
+
+type localRPCMatcher struct {
+	Name    string `json:"name"`
+	Exact   string `json:"exact,omitempty"`
+	Prefix  string `json:"prefix,omitempty"`
+	Regex   string `json:"regex,omitempty"`
+	Present *bool  `json:"present,omitempty"`
+}
+
+type localRPCRouteHint struct {
+	MatchHeaders []localRPCMatcher `json:"match_headers,omitempty"`
+	MatchQueries []localRPCMatcher `json:"match_queries,omitempty"`
+	Priority     uint32            `json:"priority,omitempty"`
 }
 
 type localRPCServiceDeletePayload struct {
@@ -120,6 +145,53 @@ type localRPCConnectionAuthState struct {
 type localRPCFailure struct {
 	code    string
 	message string
+}
+
+func (matcher localRPCMatcher) toHeaderMatcher() pb.HeaderMatcher {
+	return pb.HeaderMatcher{
+		Name:    strings.TrimSpace(matcher.Name),
+		Exact:   strings.TrimSpace(matcher.Exact),
+		Prefix:  strings.TrimSpace(matcher.Prefix),
+		Regex:   strings.TrimSpace(matcher.Regex),
+		Present: matcher.Present,
+	}
+}
+
+func (matcher localRPCMatcher) toQueryMatcher() pb.QueryMatcher {
+	return pb.QueryMatcher{
+		Name:    strings.TrimSpace(matcher.Name),
+		Exact:   strings.TrimSpace(matcher.Exact),
+		Prefix:  strings.TrimSpace(matcher.Prefix),
+		Regex:   strings.TrimSpace(matcher.Regex),
+		Present: matcher.Present,
+	}
+}
+
+func (routeHint localRPCRouteHint) toPB() pb.RouteHint {
+	matchHeaders := make([]pb.HeaderMatcher, 0, len(routeHint.MatchHeaders))
+	for _, matcher := range routeHint.MatchHeaders {
+		matchHeaders = append(matchHeaders, matcher.toHeaderMatcher())
+	}
+	matchQueries := make([]pb.QueryMatcher, 0, len(routeHint.MatchQueries))
+	for _, matcher := range routeHint.MatchQueries {
+		matchQueries = append(matchQueries, matcher.toQueryMatcher())
+	}
+	return pb.RouteHint{
+		MatchHeaders: matchHeaders,
+		MatchQueries: matchQueries,
+		Priority:     routeHint.Priority,
+	}
+}
+
+func (exposure localRPCServiceExposure) toPB() pb.ServiceExposure {
+	return pb.ServiceExposure{
+		IngressMode: pb.IngressMode(strings.TrimSpace(exposure.IngressMode)),
+		Host:        strings.TrimSpace(exposure.Host),
+		ListenPort:  exposure.ListenPort,
+		SNIName:     strings.TrimSpace(exposure.SNIName),
+		PathPrefix:  strings.TrimSpace(exposure.PathPrefix),
+		AllowExport: exposure.AllowExport,
+	}
 }
 
 func newLocalRPCServer(agentRuntime *Runtime) (*localRPCServer, error) {
@@ -442,9 +514,11 @@ func (server *localRPCServer) dispatchRequest(
 			Host:                   servicePayload.Host,
 			Port:                   servicePayload.Port,
 			SNIName:                servicePayload.SNIName,
+			Exposure:               servicePayload.Exposure.toPB(),
 			HealthCheckIntervalSec: servicePayload.HealthCheckIntervalSec,
 			HealthCheckMode:        servicePayload.HealthCheckMode,
 			HealthCheckPath:        servicePayload.HealthCheckPath,
+			RouteHint:              servicePayload.RouteHint.toPB(),
 		})
 		if addErr != nil {
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: addErr.Error()}

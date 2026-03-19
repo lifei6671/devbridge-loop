@@ -186,6 +186,41 @@ interface ServiceListItem {
   endpoint_count: number;
   last_error: string | null;
   updated_at_ms: number;
+  exposure?: ServiceExposureInput | null;
+  route_hint?: RouteHintInput | null;
+}
+
+type ServiceExposureMode = "l7_shared" | "tls_sni_shared" | "l4_dedicated_port";
+type RouteHintMatcherMode = "exact" | "prefix" | "regex" | "present";
+
+interface ServiceExposureInput {
+  ingress_mode?: ServiceExposureMode;
+  host?: string;
+  listen_port?: number;
+  sni_name?: string;
+  path_prefix?: string;
+  allow_export?: boolean;
+}
+
+interface RouteHintMatcherInput {
+  name: string;
+  exact?: string;
+  prefix?: string;
+  regex?: string;
+  present?: boolean;
+}
+
+interface RouteHintInput {
+  match_headers?: RouteHintMatcherInput[];
+  match_queries?: RouteHintMatcherInput[];
+  priority?: number;
+}
+
+interface RouteHintMatcherDraft {
+  id: string;
+  name: string;
+  mode: RouteHintMatcherMode;
+  value: string;
 }
 
 interface TunnelListItem {
@@ -213,6 +248,8 @@ interface ServiceAddInput {
   host: string;
   port: number;
   sni_name?: string;
+  exposure?: ServiceExposureInput;
+  route_hint?: RouteHintInput;
 }
 
 interface ServiceDeleteInput {
@@ -242,6 +279,16 @@ interface ServiceCreateDraft {
   host: string;
   portText: string;
   sniName: string;
+  exposureEnabled: boolean;
+  exposureMode: ServiceExposureMode;
+  exposureHost: string;
+  exposureListenPortText: string;
+  exposureSniName: string;
+  exposurePathPrefix: string;
+  exposureAllowExport: boolean;
+  routePriorityText: string;
+  headerMatchers: RouteHintMatcherDraft[];
+  queryMatchers: RouteHintMatcherDraft[];
 }
 
 const DEFAULT_SERVICE_CREATE_DRAFT: ServiceCreateDraft = {
@@ -253,7 +300,213 @@ const DEFAULT_SERVICE_CREATE_DRAFT: ServiceCreateDraft = {
   host: "127.0.0.1",
   portText: "8080",
   sniName: "",
+  exposureEnabled: false,
+  exposureMode: "l7_shared",
+  exposureHost: "",
+  exposureListenPortText: "",
+  exposureSniName: "",
+  exposurePathPrefix: "/",
+  exposureAllowExport: false,
+  routePriorityText: "0",
+  headerMatchers: [],
+  queryMatchers: [],
 };
+
+let routeHintMatcherSequence = 0;
+
+function nextRouteHintMatcherID(): string {
+  routeHintMatcherSequence += 1;
+  return `route-matcher-${routeHintMatcherSequence}`;
+}
+
+function createRouteHintMatcherDraft(
+  overrides: Partial<RouteHintMatcherDraft> = {},
+): RouteHintMatcherDraft {
+  return {
+    id: nextRouteHintMatcherID(),
+    name: "",
+    mode: "exact",
+    value: "",
+    ...overrides,
+  };
+}
+
+function routeHintMatchersToDrafts(matchers?: RouteHintMatcherInput[] | null): RouteHintMatcherDraft[] {
+  if (!matchers || matchers.length === 0) {
+    return [];
+  }
+  return matchers.map((matcher) => {
+    const name = matcher.name?.trim() ?? "";
+    if (matcher.prefix) {
+      return createRouteHintMatcherDraft({ name, mode: "prefix", value: matcher.prefix });
+    }
+    if (matcher.regex) {
+      return createRouteHintMatcherDraft({ name, mode: "regex", value: matcher.regex });
+    }
+    if (matcher.present) {
+      return createRouteHintMatcherDraft({ name, mode: "present", value: "" });
+    }
+    return createRouteHintMatcherDraft({ name, mode: "exact", value: matcher.exact ?? "" });
+  });
+}
+
+function routeHintToDraft(routeHint?: RouteHintInput | null): Pick<ServiceCreateDraft, "routePriorityText" | "headerMatchers" | "queryMatchers"> {
+  return {
+    routePriorityText: String(routeHint?.priority ?? 0),
+    headerMatchers: routeHintMatchersToDrafts(routeHint?.match_headers),
+    queryMatchers: routeHintMatchersToDrafts(routeHint?.match_queries),
+  };
+}
+
+function normalizeExposureModeForProtocol(protocol: string, mode?: ServiceExposureMode | null): ServiceExposureMode {
+  const normalizedProtocol = protocol.trim().toLowerCase();
+  const allowedModes: ServiceExposureMode[] = normalizedProtocol === "https"
+    ? ["l7_shared", "tls_sni_shared", "l4_dedicated_port"]
+    : normalizedProtocol === "http"
+      ? ["l7_shared", "l4_dedicated_port"]
+      : ["l4_dedicated_port"];
+  if (mode && allowedModes.includes(mode)) {
+    return mode;
+  }
+  return allowedModes[0];
+}
+
+function hasServiceExposure(exposure?: ServiceExposureInput | null): boolean {
+  if (!exposure) {
+    return false;
+  }
+  return Boolean(
+    exposure.ingress_mode
+      || exposure.host?.trim()
+      || exposure.listen_port
+      || exposure.sni_name?.trim()
+      || exposure.path_prefix?.trim()
+      || exposure.allow_export,
+  );
+}
+
+function exposureToDraft(
+  protocol: string,
+  exposure?: ServiceExposureInput | null,
+): Pick<
+  ServiceCreateDraft,
+  | "exposureEnabled"
+  | "exposureMode"
+  | "exposureHost"
+  | "exposureListenPortText"
+  | "exposureSniName"
+  | "exposurePathPrefix"
+  | "exposureAllowExport"
+> {
+  const enabled = hasServiceExposure(exposure);
+  return {
+    exposureEnabled: enabled,
+    exposureMode: normalizeExposureModeForProtocol(protocol, exposure?.ingress_mode),
+    exposureHost: exposure?.host ?? "",
+    exposureListenPortText: exposure?.listen_port ? String(exposure.listen_port) : "",
+    exposureSniName: exposure?.sni_name ?? "",
+    exposurePathPrefix: exposure?.path_prefix ?? "/",
+    exposureAllowExport: exposure?.allow_export ?? false,
+  };
+}
+
+function formatServiceExposureSummary(protocol: string, exposure?: ServiceExposureInput | null): string {
+  if (!hasServiceExposure(exposure)) {
+    return protocol === "http" || protocol === "https"
+      ? "默认入口策略"
+      : "未声明入口暴露";
+  }
+  const ingressMode = exposure?.ingress_mode ?? normalizeExposureModeForProtocol(protocol);
+  switch (ingressMode) {
+    case "l7_shared": {
+      const hostText = exposure?.host?.trim() ? `host=${exposure.host.trim()}` : "host=自动派生";
+      const pathText = `path=${exposure?.path_prefix?.trim() || "/"}`;
+      return `${ingressMode} / ${hostText} / ${pathText}`;
+    }
+    case "tls_sni_shared":
+      return `${ingressMode} / sni=${exposure?.sni_name?.trim() || "--"}`;
+    case "l4_dedicated_port":
+      return `${ingressMode} / port=${exposure?.listen_port ?? "--"}`;
+    default:
+      return "入口配置已声明";
+  }
+}
+
+function buildExposureDraftSummary(
+  draft: Pick<
+    ServiceCreateDraft,
+    | "protocol"
+    | "exposureEnabled"
+    | "exposureMode"
+    | "exposureHost"
+    | "exposureListenPortText"
+    | "exposureSniName"
+    | "exposurePathPrefix"
+    | "exposureAllowExport"
+  >,
+): string {
+  if (!draft.exposureEnabled) {
+    return draft.protocol === "http" || draft.protocol === "https"
+      ? "未显式声明 exposure，将沿用 Bridge 默认入口策略"
+      : "当前不声明入口暴露";
+  }
+  switch (draft.exposureMode) {
+    case "l7_shared":
+      return `l7_shared / host=${draft.exposureHost.trim() || "自动派生"} / path=${draft.exposurePathPrefix.trim() || "/"}`;
+    case "tls_sni_shared":
+      return `tls_sni_shared / sni=${draft.exposureSniName.trim() || "--"} / port=${draft.exposureListenPortText.trim() || "--"}`;
+    case "l4_dedicated_port":
+      return `l4_dedicated_port / port=${draft.exposureListenPortText.trim() || "--"}`;
+    default:
+      return "入口配置已声明";
+  }
+}
+
+function hasRouteHint(routeHint?: RouteHintInput | null): boolean {
+  if (!routeHint) {
+    return false;
+  }
+  return (routeHint.priority ?? 0) > 0
+    || (routeHint.match_headers?.length ?? 0) > 0
+    || (routeHint.match_queries?.length ?? 0) > 0;
+}
+
+function formatRouteHintSummary(routeHint?: RouteHintInput | null): string {
+  if (!hasRouteHint(routeHint)) {
+    return "默认自动路由";
+  }
+  const summaryParts: string[] = [];
+  const headerCount = routeHint?.match_headers?.length ?? 0;
+  const queryCount = routeHint?.match_queries?.length ?? 0;
+  const priority = routeHint?.priority ?? 0;
+  if (headerCount > 0) {
+    summaryParts.push(`Header ${headerCount}`);
+  }
+  if (queryCount > 0) {
+    summaryParts.push(`Query ${queryCount}`);
+  }
+  if (priority > 0) {
+    summaryParts.push(`P${priority}`);
+  }
+  return summaryParts.join(" / ");
+}
+
+function buildRouteHintDraftSummary(draft: Pick<ServiceCreateDraft, "routePriorityText" | "headerMatchers" | "queryMatchers">): string {
+  const summaryParts: string[] = [];
+  const headerCount = draft.headerMatchers.filter((item) => item.name.trim() !== "").length;
+  const queryCount = draft.queryMatchers.filter((item) => item.name.trim() !== "").length;
+  const normalizedPriority = draft.routePriorityText.trim();
+  if (headerCount > 0) {
+    summaryParts.push(`Header ${headerCount}`);
+  }
+  if (queryCount > 0) {
+    summaryParts.push(`Query ${queryCount}`);
+  }
+  if (normalizedPriority !== "" && normalizedPriority !== "0") {
+    summaryParts.push(`P${normalizedPriority}`);
+  }
+  return summaryParts.length > 0 ? summaryParts.join(" / ") : "当前未配置额外匹配条件";
+}
 
 interface HostConfigUpdateInput {
   runtime_program: string;
@@ -387,16 +640,16 @@ const SERVICE_FORM_FIELD_HELP: Record<string, SettingsFieldHelp> = {
     impact: "用于复用同一实例记录；修改实例 ID 可能触发新的实例身份。",
   },
   namespace: {
-    usage: "可选隔离域，例如 dev / stage / prod。",
-    impact: "参与 scope 匹配和路由过滤；需与环境/SNI 至少填写一项。",
+    usage: "必填命名空间，例如 dev / stage / prod。",
+    impact: "与 environment 共同组成 PublishService.scope；缺失时当前注册协议会直接拒绝。",
   },
   environment: {
-    usage: "可选环境标签，例如 demo / alice / prod。",
-    impact: "参与 scope 匹配和路由过滤；需与命名空间/SNI 至少填写一项。",
+    usage: "必填环境标签，例如 demo / alice / prod。",
+    impact: "与 namespace 共同组成 PublishService.scope；缺失时当前注册协议会直接拒绝。",
   },
   protocol: {
     usage: "选择服务协议（tcp / http / https）。",
-    impact: "影响健康检查与自动路由能力；协议选择错误会导致转发行为异常。",
+    impact: "影响 upstream 连接方式以及是否允许填写 route_hint；协议选择错误会导致转发行为异常。",
   },
   host: {
     usage: "填写服务监听地址，例如 127.0.0.1 或内网 IP。",
@@ -407,8 +660,36 @@ const SERVICE_FORM_FIELD_HELP: Record<string, SettingsFieldHelp> = {
     impact: "与主机地址共同确定上游目标，配置错误会导致连接失败。",
   },
   sniName: {
-    usage: "可选 TLS SNI 域名，例如 order.dev.example.com。",
-    impact: "可作为路由匹配关键条件；namespace/environment 为空时可单独作为注册标识。",
+    usage: "仅 `https` upstream 可选；填写 TLS server_name / SNI，例如 order.dev.example.com。",
+    impact: "用于 Agent 发起 TLS 连接时的服务端名称校验；不参与实例身份和 Route 匹配。",
+  },
+  exposureMode: {
+    usage: "声明服务挂载到 Bridge 哪种入口：L7 共享入口、TLS SNI 共享入口、或 L4 专属端口。",
+    impact: "决定 Bridge 自动派生 Route 时使用 host/path、sni 还是 listen_port；模式选错会导致入口匹配失效。",
+  },
+  exposureHost: {
+    usage: "L7 共享入口下可选覆盖外部 host；留空则由 Bridge 按 service_name + scope 自动派生。",
+    impact: "用于控制外部域名；填写后会覆盖默认派生规则。",
+  },
+  exposureListenPort: {
+    usage: "共享入口或专属端口的监听端口；L4 专属端口模式建议显式填写。",
+    impact: "决定外部请求应打到哪个入口端口；端口错误会导致入口不可达。",
+  },
+  exposurePathPrefix: {
+    usage: "L7 共享入口下的路径前缀，例如 /api/order；留空时默认 /。",
+    impact: "参与 RouteMatch.path_prefix；不同前缀会影响路由优先级和冲突判定。",
+  },
+  exposureSniName: {
+    usage: "TLS SNI 共享入口下必填，例如 order.dev.example.com。",
+    impact: "Bridge 会按该 SNI 匹配入口流量；缺失时该模式无法建立有效匹配。",
+  },
+  exposureAllowExport: {
+    usage: "允许 Bridge 将该入口信息导出给外部发现系统时开启。",
+    impact: "会影响 discovery/export 准入，不会直接改变本地 upstream 转发。",
+  },
+  routePriority: {
+    usage: "自动派生 HTTP/HTTPS 路由的优先级；默认 0，数值越大越优先。",
+    impact: "只影响 Bridge 上自动生成的 Route 顺序；与现有 Route 精确冲突时仍会被 Admission 拒绝。",
   },
 };
 
@@ -663,6 +944,22 @@ function SettingsField(props: {
   );
 }
 
+function ServiceFormSection(props: {
+  title: string;
+  description: string;
+  children: ReactNode;
+}): JSX.Element {
+  return (
+    <section className="rounded-2xl border border-[#dbe4f3] bg-[#f8fbff] p-4">
+      <div className="mb-3 flex flex-col gap-1 border-b border-[#e5ecf7] pb-3">
+        <h3 className="text-sm font-semibold tracking-[0.01em] text-[#22304a]">{props.title}</h3>
+        <p className="text-xs leading-5 text-[#6e7d96]">{props.description}</p>
+      </div>
+      {props.children}
+    </section>
+  );
+}
+
 function formatTime(tsMs: number | null): string {
   if (!tsMs) {
     return "--";
@@ -702,6 +999,60 @@ function formatScopeText(scope?: { namespace?: string; environment?: string } | 
     return `${namespace}/${environment}`;
   }
   return namespace || environment;
+}
+
+function parseRouteHintPriority(rawValue: string): number {
+  const normalizedValue = rawValue.trim();
+  if (normalizedValue === "") {
+    return 0;
+  }
+  if (!/^\d+$/.test(normalizedValue)) {
+    throw new Error("路由优先级必须是大于等于 0 的整数");
+  }
+  return Number.parseInt(normalizedValue, 10);
+}
+
+function buildRouteHintMatcherPayloads(
+  drafts: RouteHintMatcherDraft[],
+  fieldLabel: string,
+): RouteHintMatcherInput[] {
+  const payloads: RouteHintMatcherInput[] = [];
+  drafts.forEach((draft, index) => {
+    const normalizedName = draft.name.trim();
+    const normalizedValue = draft.value.trim();
+    if (!normalizedName && !normalizedValue) {
+      return;
+    }
+    if (!normalizedName) {
+      throw new Error(`${fieldLabel}第 ${index + 1} 条缺少名称`);
+    }
+    switch (draft.mode) {
+      case "present":
+        payloads.push({ name: normalizedName, present: true });
+        return;
+      case "exact":
+        if (!normalizedValue) {
+          throw new Error(`${fieldLabel}第 ${index + 1} 条缺少精确匹配值`);
+        }
+        payloads.push({ name: normalizedName, exact: normalizedValue });
+        return;
+      case "prefix":
+        if (!normalizedValue) {
+          throw new Error(`${fieldLabel}第 ${index + 1} 条缺少前缀匹配值`);
+        }
+        payloads.push({ name: normalizedName, prefix: normalizedValue });
+        return;
+      case "regex":
+        if (!normalizedValue) {
+          throw new Error(`${fieldLabel}第 ${index + 1} 条缺少正则表达式`);
+        }
+        payloads.push({ name: normalizedName, regex: normalizedValue });
+        return;
+      default:
+        return;
+    }
+  });
+  return payloads;
 }
 
 function formatUptime(startedAtMs: number | null): string {
@@ -2058,6 +2409,8 @@ export default function App(): JSX.Element {
   }, []);
 
   const openEditServiceForm = useCallback((item: ServiceListItem) => {
+    const routeHintDraft = routeHintToDraft(item.route_hint);
+    const exposureDraft = exposureToDraft(item.protocol || "tcp", item.exposure);
     setServiceFormMode("edit");
     setServiceEditingID(item.instance_id);
     setServiceCreateDraft({
@@ -2069,6 +2422,16 @@ export default function App(): JSX.Element {
       host: item.host || "127.0.0.1",
       portText: String(item.port > 0 ? item.port : 8080),
       sniName: item.sni_name || "",
+      exposureEnabled: exposureDraft.exposureEnabled,
+      exposureMode: exposureDraft.exposureMode,
+      exposureHost: exposureDraft.exposureHost,
+      exposureListenPortText: exposureDraft.exposureListenPortText,
+      exposureSniName: exposureDraft.exposureSniName,
+      exposurePathPrefix: exposureDraft.exposurePathPrefix,
+      exposureAllowExport: exposureDraft.exposureAllowExport,
+      routePriorityText: routeHintDraft.routePriorityText,
+      headerMatchers: routeHintDraft.headerMatchers,
+      queryMatchers: routeHintDraft.queryMatchers,
     });
     setServiceFormOpen(true);
   }, []);
@@ -2084,12 +2447,33 @@ export default function App(): JSX.Element {
     const namespace = serviceCreateDraft.namespace.trim();
     const environment = serviceCreateDraft.environment.trim();
     const sniName = serviceCreateDraft.sniName.trim();
+    const normalizedProtocol = serviceCreateDraft.protocol.trim().toLowerCase();
+    const normalizedExposureMode = normalizeExposureModeForProtocol(
+      normalizedProtocol,
+      serviceCreateDraft.exposureMode,
+    );
     if (!serviceName) {
       notify("warning", "参数不完整", "请输入服务名称");
       return;
     }
-    if (!namespace && !environment && !sniName) {
-      notify("warning", "参数不完整", "命名空间、环境、SNI 至少填写一个");
+    if (serviceName.includes("/")) {
+      notify("warning", "参数不合法", "服务名称不能包含 /");
+      return;
+    }
+    if (!["tcp", "http", "https"].includes(normalizedProtocol)) {
+      notify("warning", "参数不合法", "协议仅支持 tcp / http / https");
+      return;
+    }
+    if (!namespace) {
+      notify("warning", "参数不完整", "请输入命名空间");
+      return;
+    }
+    if (!environment) {
+      notify("warning", "参数不完整", "请输入环境");
+      return;
+    }
+    if (!serviceCreateDraft.host.trim()) {
+      notify("warning", "参数不完整", "请输入主机地址");
       return;
     }
     let port: number;
@@ -2101,6 +2485,70 @@ export default function App(): JSX.Element {
     }
     if (port > 65535) {
       notify("warning", "参数不合法", "port 不能超过 65535");
+      return;
+    }
+    let exposure: ServiceExposureInput | undefined;
+    try {
+      if (serviceCreateDraft.exposureEnabled) {
+        const exposurePayload: ServiceExposureInput = {
+          ingress_mode: normalizedExposureMode,
+          allow_export: serviceCreateDraft.exposureAllowExport,
+        };
+        const exposureListenPortText = serviceCreateDraft.exposureListenPortText.trim();
+        if (exposureListenPortText) {
+          const exposureListenPort = parsePositiveInteger(exposureListenPortText, "exposure.listen_port");
+          if (exposureListenPort > 65535) {
+            notify("warning", "参数不合法", "exposure.listen_port 不能超过 65535");
+            return;
+          }
+          exposurePayload.listen_port = exposureListenPort;
+        }
+        if (normalizedExposureMode === "l7_shared") {
+          const exposureHost = serviceCreateDraft.exposureHost.trim();
+          const exposurePathPrefix = serviceCreateDraft.exposurePathPrefix.trim();
+          if (exposureHost) {
+            exposurePayload.host = exposureHost;
+          }
+          if (exposurePathPrefix && !exposurePathPrefix.startsWith("/")) {
+            notify("warning", "参数不合法", "入口 path_prefix 必须以 / 开头");
+            return;
+          }
+          exposurePayload.path_prefix = exposurePathPrefix || "/";
+        } else if (normalizedExposureMode === "tls_sni_shared") {
+          const exposureSniName = serviceCreateDraft.exposureSniName.trim();
+          if (!exposureSniName) {
+            notify("warning", "参数不完整", "tls_sni_shared 模式需要填写入口 SNI");
+            return;
+          }
+          exposurePayload.sni_name = exposureSniName;
+        } else if (normalizedExposureMode === "l4_dedicated_port" && !exposurePayload.listen_port) {
+          notify("warning", "参数不完整", "l4_dedicated_port 模式需要填写入口监听端口");
+          return;
+        }
+        exposure = exposurePayload;
+      }
+    } catch (error) {
+      notify("warning", "入口暴露配置不合法", normalizeErrorMessage(error));
+      return;
+    }
+    const supportsRouteHint = (normalizedProtocol === "http" || normalizedProtocol === "https")
+      && (!serviceCreateDraft.exposureEnabled || normalizedExposureMode === "l7_shared");
+    let routeHint: RouteHintInput | undefined;
+    try {
+      if (supportsRouteHint) {
+        const priority = parseRouteHintPriority(serviceCreateDraft.routePriorityText);
+        const matchHeaders = buildRouteHintMatcherPayloads(serviceCreateDraft.headerMatchers, "Header 匹配");
+        const matchQueries = buildRouteHintMatcherPayloads(serviceCreateDraft.queryMatchers, "Query 匹配");
+        if (priority > 0 || matchHeaders.length > 0 || matchQueries.length > 0) {
+          routeHint = {
+            priority,
+            match_headers: matchHeaders.length > 0 ? matchHeaders : undefined,
+            match_queries: matchQueries.length > 0 ? matchQueries : undefined,
+          };
+        }
+      }
+    } catch (error) {
+      notify("warning", "高级路由配置不合法", normalizeErrorMessage(error));
       return;
     }
     const normalizedInstanceID = serviceFormMode === "edit"
@@ -2117,10 +2565,12 @@ export default function App(): JSX.Element {
         environment: environment || undefined,
       },
       service_name: serviceName,
-      protocol: serviceCreateDraft.protocol.trim().toLowerCase(),
+      protocol: normalizedProtocol,
       host: serviceCreateDraft.host.trim(),
       port,
-      sni_name: sniName || undefined,
+      sni_name: normalizedProtocol === "https" ? (sniName || undefined) : undefined,
+      exposure,
+      route_hint: routeHint,
     };
     setCreatingService(true);
     try {
@@ -2224,10 +2674,31 @@ export default function App(): JSX.Element {
                   <td className={TABLE_CELL_CLASS}>{item.logical_service_id || "--"}</td>
                   <td className={TABLE_CELL_CLASS}>{item.instance_id}</td>
                   <td className={TABLE_CELL_CLASS}>{formatScopeText(item.scope)}</td>
-                  <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
-                  <td className={TABLE_CELL_CLASS}>{item.protocol || "--"}</td>
                   <td className={TABLE_CELL_CLASS}>
-                    {item.host ? `${item.host}${item.port > 0 ? `:${item.port}` : ""}` : "--"}
+                    <div className="space-y-1">
+                      <div>{item.service_name}</div>
+                      {(item.protocol === "http" || item.protocol === "https") ? (
+                        <div className="text-xs text-[#7b89a1]">{formatRouteHintSummary(item.route_hint)}</div>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className={TABLE_CELL_CLASS}>
+                    <div className="space-y-1">
+                      <div>{item.protocol || "--"}</div>
+                      {(item.protocol === "http" || item.protocol === "https") && hasRouteHint(item.route_hint) ? (
+                        <span className="inline-flex rounded-full border border-[#d6e4fb] bg-[#f3f8ff] px-2 py-0.5 text-[11px] font-medium text-[#3365b6]">
+                          route_hint
+                        </span>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className={TABLE_CELL_CLASS}>
+                    <div className="space-y-1">
+                      <div>{item.host ? `${item.host}${item.port > 0 ? `:${item.port}` : ""}` : "--"}</div>
+                      <div className="text-xs text-[#7b89a1]">
+                        {formatServiceExposureSummary(item.protocol, item.exposure)}
+                      </div>
+                    </div>
                   </td>
                   <td className={TABLE_CELL_CLASS}>{item.sni_name || "--"}</td>
                   <td className={TABLE_CELL_CLASS}>{item.endpoint_count}</td>
@@ -2266,142 +2737,511 @@ export default function App(): JSX.Element {
     </Card>
   );
 
-  const renderServiceFormModal = (): JSX.Element => (
-    <Modal
-      open={serviceFormOpen}
-      onOpenChange={handleServiceFormOpenChange}
-      title={serviceFormMode === "edit" ? "编辑服务" : "新增服务"}
-      description="保存后会立即写入本地服务目录，并在 Bridge 会话可用时自动尝试同步。"
-      className="max-w-[860px]"
-    >
-      <div className="space-y-4">
-        {serviceFormMode === "edit" && serviceEditingID ? (
-          <div className="inline-flex rounded-md border border-[#d9e2f2] bg-[#f7faff] px-2.5 py-1 text-[11px] text-[#657391]">
-            instance_id: {serviceEditingID}
+  const renderServiceFormModal = (): JSX.Element => {
+    const normalizedExposureMode = normalizeExposureModeForProtocol(
+      serviceCreateDraft.protocol,
+      serviceCreateDraft.exposureMode,
+    );
+    const supportsRouteHint = (serviceCreateDraft.protocol === "http" || serviceCreateDraft.protocol === "https")
+      && (!serviceCreateDraft.exposureEnabled || normalizedExposureMode === "l7_shared");
+    const supportsTLSUpstream = serviceCreateDraft.protocol === "https";
+    const exposureModeOptions: Array<{ value: ServiceExposureMode; label: string }> = serviceCreateDraft.protocol === "https"
+      ? [
+          { value: "l7_shared", label: "L7 共享入口" },
+          { value: "tls_sni_shared", label: "TLS SNI 共享入口" },
+          { value: "l4_dedicated_port", label: "L4 专属端口" },
+        ]
+      : serviceCreateDraft.protocol === "http"
+        ? [
+            { value: "l7_shared", label: "L7 共享入口" },
+            { value: "l4_dedicated_port", label: "L4 专属端口" },
+          ]
+        : [
+            { value: "l4_dedicated_port", label: "L4 专属端口" },
+          ];
+    const updateMatcherDraft = (
+      field: "headerMatchers" | "queryMatchers",
+      matcherID: string,
+      patch: Partial<RouteHintMatcherDraft>,
+    ) => {
+      setServiceCreateDraft((prev) => ({
+        ...prev,
+        [field]: prev[field].map((item) => (item.id === matcherID ? { ...item, ...patch } : item)),
+      }));
+    };
+    const removeMatcherDraft = (field: "headerMatchers" | "queryMatchers", matcherID: string) => {
+      setServiceCreateDraft((prev) => ({
+        ...prev,
+        [field]: prev[field].filter((item) => item.id !== matcherID),
+      }));
+    };
+    const addMatcherDraft = (field: "headerMatchers" | "queryMatchers") => {
+      setServiceCreateDraft((prev) => ({
+        ...prev,
+        [field]: [...prev[field], createRouteHintMatcherDraft()],
+      }));
+    };
+    const renderMatcherEditor = (
+      title: string,
+      drafts: RouteHintMatcherDraft[],
+      field: "headerMatchers" | "queryMatchers",
+      placeholder: string,
+    ): JSX.Element => (
+      <div className="rounded-xl border border-[#dbe4f3] bg-white p-3">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h4 className="text-sm font-semibold text-[#24324d]">{title}</h4>
+            <p className="mt-1 text-xs text-[#7b89a1]">支持 exact / prefix / regex / present 四种匹配方式。</p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-8 rounded-lg px-3 text-xs"
+            onClick={() => addMatcherDraft(field)}
+          >
+            + 新增条件
+          </Button>
+        </div>
+        {drafts.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-3 py-4 text-xs text-[#8090aa]">
+            暂无条件。仅当你需要更细粒度的 HTTP 匹配时再添加。
           </div>
         ) : null}
-        <form
-          className="grid grid-cols-1 gap-3 md:grid-cols-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void submitServiceForm();
-          }}
-        >
-          <SettingsField label="服务名称" hint="必填" help={SERVICE_FORM_FIELD_HELP.serviceName}>
-            <Input
-              placeholder="例如 order-service"
-              value={serviceCreateDraft.serviceName}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <SettingsField
-            label="实例 ID"
-            hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}
-            help={SERVICE_FORM_FIELD_HELP.instanceId}
-          >
-            <Input
-              placeholder="例如 inst-order"
-              value={serviceCreateDraft.instanceId}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, instanceId: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-              disabled={serviceFormMode === "edit"}
-            />
-          </SettingsField>
-          <SettingsField label="命名空间" hint="可选" help={SERVICE_FORM_FIELD_HELP.namespace}>
-            <Input
-              placeholder="例如 dev"
-              value={serviceCreateDraft.namespace}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <SettingsField label="环境" hint="可选" help={SERVICE_FORM_FIELD_HELP.environment}>
-            <Input
-              placeholder="例如 demo"
-              value={serviceCreateDraft.environment}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <SettingsField label="协议" hint="tcp / http / https" help={SERVICE_FORM_FIELD_HELP.protocol}>
-            <select
-              value={serviceCreateDraft.protocol}
-              className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, protocol: event.target.value }))
-              }
-            >
-              <option value="tcp">tcp</option>
-              <option value="http">http</option>
-              <option value="https">https</option>
-            </select>
-          </SettingsField>
-          <SettingsField label="主机地址" hint="如 127.0.0.1" help={SERVICE_FORM_FIELD_HELP.host}>
-            <Input
-              placeholder="例如 127.0.0.1"
-              value={serviceCreateDraft.host}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <SettingsField label="端口" hint="1 - 65535" help={SERVICE_FORM_FIELD_HELP.port}>
-            <Input
-              placeholder="例如 8080"
-              value={serviceCreateDraft.portText}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
-              }
-              inputMode="numeric"
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <SettingsField
-            label="SNI (可选)"
-            hint="与命名空间/环境三选一至少填一项"
-            help={SERVICE_FORM_FIELD_HELP.sniName}
-          >
-            <Input
-              placeholder="例如 order.dev.example.com"
-              value={serviceCreateDraft.sniName}
-              onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, sniName: event.target.value }))
-              }
-              className="h-9 rounded-lg bg-white"
-            />
-          </SettingsField>
-          <div className="md:col-span-2 flex items-end justify-end gap-2 pt-1">
-            <Button
-              type="button"
-              variant="outline"
-              className="h-9 rounded-lg text-xs"
-              disabled={creatingService}
-              onClick={closeServiceForm}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
-              disabled={creatingService}
-            >
-              {creatingService ? "提交中..." : serviceFormMode === "edit" ? "保存修改" : "提交新增"}
-            </Button>
-          </div>
-        </form>
+        <div className="space-y-3">
+          {drafts.map((draft, index) => (
+            <div key={draft.id} className="rounded-lg border border-[#e6edf8] bg-[#fbfdff] p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-medium text-[#61708b]">{title} #{index + 1}</span>
+                <button
+                  type="button"
+                  className="text-xs font-medium text-[#b14d4d]"
+                  onClick={() => removeMatcherDraft(field, draft.id)}
+                >
+                  删除
+                </button>
+              </div>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-[1.4fr_0.9fr_1.7fr]">
+                <Input
+                  placeholder={placeholder}
+                  value={draft.name}
+                  onChange={(event) => updateMatcherDraft(field, draft.id, { name: event.target.value })}
+                  className="h-9 rounded-lg bg-white"
+                />
+                <select
+                  value={draft.mode}
+                  className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                  onChange={(event) => updateMatcherDraft(field, draft.id, {
+                    mode: event.target.value as RouteHintMatcherMode,
+                    value: event.target.value === "present" ? "" : draft.value,
+                  })}
+                >
+                  <option value="exact">exact</option>
+                  <option value="prefix">prefix</option>
+                  <option value="regex">regex</option>
+                  <option value="present">present</option>
+                </select>
+                {draft.mode === "present" ? (
+                  <div className="flex h-9 items-center rounded-lg border border-dashed border-[#d8dfeb] bg-[#f8fbff] px-3 text-xs text-[#74839e]">
+                    仅要求该项存在，不比较具体值
+                  </div>
+                ) : (
+                  <Input
+                    placeholder={draft.mode === "regex" ? "例如 ^/api/" : "填写匹配值"}
+                    value={draft.value}
+                    onChange={(event) => updateMatcherDraft(field, draft.id, { value: event.target.value })}
+                    className="h-9 rounded-lg bg-white"
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
-    </Modal>
-  );
+    );
+
+    return (
+      <Modal
+        open={serviceFormOpen}
+        onOpenChange={handleServiceFormOpenChange}
+        title={serviceFormMode === "edit" ? "编辑服务" : "新增服务"}
+        description="保存后会立即写入本地服务目录，并在 Bridge 会话可用时自动尝试同步。"
+        className="max-w-[980px]"
+      >
+        <div className="space-y-4">
+          {serviceFormMode === "edit" && serviceEditingID ? (
+            <div className="inline-flex rounded-md border border-[#d9e2f2] bg-[#f7faff] px-2.5 py-1 text-[11px] text-[#657391]">
+              instance_id: {serviceEditingID}
+            </div>
+          ) : null}
+          <form
+            className="space-y-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitServiceForm();
+            }}
+          >
+            <ServiceFormSection
+              title="身份信息"
+              description="定义这条服务是谁。当前注册协议要求 scope.namespace 和 scope.environment 都明确给出。"
+            >
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <SettingsField label="服务名称" hint="必填" help={SERVICE_FORM_FIELD_HELP.serviceName}>
+                  <Input
+                    placeholder="例如 order-service"
+                    value={serviceCreateDraft.serviceName}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, serviceName: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                  />
+                </SettingsField>
+                <SettingsField
+                  label="实例 ID"
+                  hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}
+                  help={SERVICE_FORM_FIELD_HELP.instanceId}
+                >
+                  <Input
+                    placeholder="例如 inst-order"
+                    value={serviceCreateDraft.instanceId}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, instanceId: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                    disabled={serviceFormMode === "edit"}
+                  />
+                </SettingsField>
+                <SettingsField label="命名空间" hint="必填" help={SERVICE_FORM_FIELD_HELP.namespace}>
+                  <Input
+                    placeholder="例如 dev"
+                    value={serviceCreateDraft.namespace}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, namespace: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                  />
+                </SettingsField>
+                <SettingsField label="环境" hint="必填" help={SERVICE_FORM_FIELD_HELP.environment}>
+                  <Input
+                    placeholder="例如 demo"
+                    value={serviceCreateDraft.environment}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, environment: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                  />
+                </SettingsField>
+              </div>
+            </ServiceFormSection>
+
+            <ServiceFormSection
+              title="服务配置"
+              description="定义本地 upstream 的接入地址和协议。SNI 只在 `https` upstream 下生效。"
+            >
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <SettingsField label="协议" hint="tcp / http / https" help={SERVICE_FORM_FIELD_HELP.protocol}>
+                  <select
+                    value={serviceCreateDraft.protocol}
+                    className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => {
+                        const nextProtocol = event.target.value;
+                        return {
+                          ...prev,
+                          protocol: nextProtocol,
+                          exposureMode: normalizeExposureModeForProtocol(nextProtocol, prev.exposureMode),
+                        };
+                      })
+                    }
+                  >
+                    <option value="tcp">tcp</option>
+                    <option value="http">http</option>
+                    <option value="https">https</option>
+                  </select>
+                </SettingsField>
+                <SettingsField label="主机地址" hint="如 127.0.0.1" help={SERVICE_FORM_FIELD_HELP.host}>
+                  <Input
+                    placeholder="例如 127.0.0.1"
+                    value={serviceCreateDraft.host}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, host: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                  />
+                </SettingsField>
+                <SettingsField label="端口" hint="1 - 65535" help={SERVICE_FORM_FIELD_HELP.port}>
+                  <Input
+                    placeholder="例如 8080"
+                    value={serviceCreateDraft.portText}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, portText: event.target.value }))
+                    }
+                    inputMode="numeric"
+                    className="h-9 rounded-lg bg-white"
+                  />
+                </SettingsField>
+                <SettingsField
+                  label="SNI (可选)"
+                  hint={supportsTLSUpstream ? "仅 https 生效" : "当前协议不使用"}
+                  help={SERVICE_FORM_FIELD_HELP.sniName}
+                >
+                  <Input
+                    placeholder={supportsTLSUpstream ? "例如 order.dev.example.com" : "切换到 https 后可填写"}
+                    value={serviceCreateDraft.sniName}
+                    onChange={(event) =>
+                      setServiceCreateDraft((prev) => ({ ...prev, sniName: event.target.value }))
+                    }
+                    className="h-9 rounded-lg bg-white"
+                    disabled={!supportsTLSUpstream}
+                  />
+                </SettingsField>
+              </div>
+            </ServiceFormSection>
+
+            <ServiceFormSection
+              title="入口暴露"
+              description="可选声明服务应挂在哪个 Bridge 入口。HTTP/HTTPS 留空时仍可沿用默认自动派生策略。"
+            >
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className={cn(
+                      "inline-flex h-9 items-center gap-2 rounded-full border px-4 text-sm font-medium transition",
+                      serviceCreateDraft.exposureEnabled
+                        ? "border-[#2d6be6] bg-[#edf4ff] text-[#2458bf]"
+                        : "border-[#d8dfeb] bg-white text-[#5d6a83]",
+                    )}
+                    onClick={() =>
+                      setServiceCreateDraft((prev) => ({
+                        ...prev,
+                        exposureEnabled: !prev.exposureEnabled,
+                        exposureMode: normalizeExposureModeForProtocol(prev.protocol, prev.exposureMode),
+                      }))
+                    }
+                  >
+                    {serviceCreateDraft.exposureEnabled ? <Check className="h-4 w-4" /> : null}
+                    {serviceCreateDraft.exposureEnabled ? "已声明 exposure" : "启用入口暴露"}
+                  </button>
+                  <span className="text-xs text-[#7b89a1]">
+                    {buildExposureDraftSummary(serviceCreateDraft)}
+                  </span>
+                </div>
+                {serviceCreateDraft.exposureEnabled ? (
+                  <div className="space-y-3">
+                    <div className="rounded-xl border border-[#dce7f8] bg-[#f7fbff] px-3 py-3 text-xs leading-6 text-[#5e6f8e]">
+                      入口模式会决定 Bridge 自动派生 Route 时使用 host/path、sni 还是 listen_port。只有 `l7_shared`
+                      模式下，`route_hint` 才会参与路由匹配。
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      <SettingsField label="入口模式" hint="必填" help={SERVICE_FORM_FIELD_HELP.exposureMode}>
+                        <select
+                          value={normalizedExposureMode}
+                          className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
+                          onChange={(event) =>
+                            setServiceCreateDraft((prev) => ({
+                              ...prev,
+                              exposureMode: event.target.value as ServiceExposureMode,
+                            }))
+                          }
+                        >
+                          {exposureModeOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </SettingsField>
+                      <SettingsField
+                        label="允许导出"
+                        hint="可选"
+                        help={SERVICE_FORM_FIELD_HELP.exposureAllowExport}
+                      >
+                        <button
+                          type="button"
+                          className={cn(
+                            "inline-flex h-9 items-center gap-2 rounded-full border px-4 text-sm font-medium transition",
+                            serviceCreateDraft.exposureAllowExport
+                              ? "border-[#2d6be6] bg-[#edf4ff] text-[#2458bf]"
+                              : "border-[#d8dfeb] bg-white text-[#5d6a83]",
+                          )}
+                          onClick={() =>
+                            setServiceCreateDraft((prev) => ({
+                              ...prev,
+                              exposureAllowExport: !prev.exposureAllowExport,
+                            }))
+                          }
+                        >
+                          {serviceCreateDraft.exposureAllowExport ? <Check className="h-4 w-4" /> : null}
+                          {serviceCreateDraft.exposureAllowExport ? "已开启 allow_export" : "关闭 allow_export"}
+                        </button>
+                      </SettingsField>
+                      {normalizedExposureMode === "l7_shared" ? (
+                        <>
+                          <SettingsField label="入口 Host" hint="可选" help={SERVICE_FORM_FIELD_HELP.exposureHost}>
+                            <Input
+                              placeholder="留空则按模板自动派生"
+                              value={serviceCreateDraft.exposureHost}
+                              onChange={(event) =>
+                                setServiceCreateDraft((prev) => ({ ...prev, exposureHost: event.target.value }))
+                              }
+                              className="h-9 rounded-lg bg-white"
+                            />
+                          </SettingsField>
+                          <SettingsField label="Path Prefix" hint="默认 /" help={SERVICE_FORM_FIELD_HELP.exposurePathPrefix}>
+                            <Input
+                              placeholder="例如 /api/order"
+                              value={serviceCreateDraft.exposurePathPrefix}
+                              onChange={(event) =>
+                                setServiceCreateDraft((prev) => ({ ...prev, exposurePathPrefix: event.target.value }))
+                              }
+                              className="h-9 rounded-lg bg-white"
+                            />
+                          </SettingsField>
+                          <SettingsField
+                            label="入口监听端口"
+                            hint="可选"
+                            help={SERVICE_FORM_FIELD_HELP.exposureListenPort}
+                          >
+                            <Input
+                              placeholder="留空则使用网关共享端口"
+                              value={serviceCreateDraft.exposureListenPortText}
+                              onChange={(event) =>
+                                setServiceCreateDraft((prev) => ({
+                                  ...prev,
+                                  exposureListenPortText: event.target.value,
+                                }))
+                              }
+                              inputMode="numeric"
+                              className="h-9 rounded-lg bg-white"
+                            />
+                          </SettingsField>
+                        </>
+                      ) : null}
+                      {normalizedExposureMode === "tls_sni_shared" ? (
+                        <>
+                          <SettingsField label="入口 SNI" hint="必填" help={SERVICE_FORM_FIELD_HELP.exposureSniName}>
+                            <Input
+                              placeholder="例如 order.dev.example.com"
+                              value={serviceCreateDraft.exposureSniName}
+                              onChange={(event) =>
+                                setServiceCreateDraft((prev) => ({ ...prev, exposureSniName: event.target.value }))
+                              }
+                              className="h-9 rounded-lg bg-white"
+                            />
+                          </SettingsField>
+                          <SettingsField
+                            label="入口监听端口"
+                            hint="可选"
+                            help={SERVICE_FORM_FIELD_HELP.exposureListenPort}
+                          >
+                            <Input
+                              placeholder="留空则使用网关共享端口"
+                              value={serviceCreateDraft.exposureListenPortText}
+                              onChange={(event) =>
+                                setServiceCreateDraft((prev) => ({
+                                  ...prev,
+                                  exposureListenPortText: event.target.value,
+                                }))
+                              }
+                              inputMode="numeric"
+                              className="h-9 rounded-lg bg-white"
+                            />
+                          </SettingsField>
+                        </>
+                      ) : null}
+                      {normalizedExposureMode === "l4_dedicated_port" ? (
+                        <SettingsField
+                          label="入口监听端口"
+                          hint="必填"
+                          help={SERVICE_FORM_FIELD_HELP.exposureListenPort}
+                        >
+                          <Input
+                            placeholder="例如 18080"
+                            value={serviceCreateDraft.exposureListenPortText}
+                            onChange={(event) =>
+                              setServiceCreateDraft((prev) => ({
+                                ...prev,
+                                exposureListenPortText: event.target.value,
+                              }))
+                            }
+                            inputMode="numeric"
+                            className="h-9 rounded-lg bg-white"
+                          />
+                        </SettingsField>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-4 py-5 text-sm text-[#7b89a1]">
+                    未显式声明 exposure。HTTP/HTTPS 服务仍可由 Bridge 按默认规则自动派生 Host 与基础 Route。
+                  </div>
+                )}
+              </div>
+            </ServiceFormSection>
+
+            <ServiceFormSection
+              title="高级路由"
+              description="仅用于增强 HTTP / HTTPS 自动派生 Route 的匹配条件。纯 TCP 端口转发通常不需要这里的配置。"
+            >
+              <div className="mb-3 rounded-xl border border-[#e3ebf7] bg-white px-3 py-3 text-xs leading-6 text-[#6c7b95]">
+                `labels` 用于实例过滤，`metadata` 用于附加语义与观测，它们不属于本地新增服务的主路径输入。为避免误用，这个入口当前只开放
+                `route_hint`。
+              </div>
+              {supportsRouteHint ? (
+                <div className="space-y-3">
+                  <div className="rounded-xl border border-[#dce7f8] bg-[#f7fbff] px-3 py-3 text-xs leading-6 text-[#5e6f8e]">
+                    当前摘要：{buildRouteHintDraftSummary(serviceCreateDraft)}
+                  </div>
+                  <SettingsField
+                    label="路由优先级"
+                    hint="默认 0"
+                    help={SERVICE_FORM_FIELD_HELP.routePriority}
+                  >
+                    <Input
+                      placeholder="例如 10"
+                      value={serviceCreateDraft.routePriorityText}
+                      onChange={(event) =>
+                        setServiceCreateDraft((prev) => ({ ...prev, routePriorityText: event.target.value }))
+                      }
+                      inputMode="numeric"
+                      className="h-9 rounded-lg bg-white"
+                    />
+                  </SettingsField>
+                  {renderMatcherEditor("Header 匹配", serviceCreateDraft.headerMatchers, "headerMatchers", "例如 x-tenant")}
+                  {renderMatcherEditor("Query 匹配", serviceCreateDraft.queryMatchers, "queryMatchers", "例如 version")}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-4 py-5 text-sm text-[#7b89a1]">
+                  {serviceCreateDraft.protocol === "tcp"
+                    ? "当前协议为 `tcp`，不会生成基于 Header / Query 的 HTTP 路由增强条件。"
+                    : `当前 exposure 模式为 \`${normalizedExposureMode}\`，只有 \`l7_shared\` 模式才会应用 route_hint。`}
+                </div>
+              )}
+            </ServiceFormSection>
+
+            <div className="flex items-end justify-end gap-2 pt-1">
+              <Button
+                type="button"
+                variant="outline"
+                className="h-9 rounded-lg text-xs"
+                disabled={creatingService}
+                onClick={closeServiceForm}
+              >
+                取消
+              </Button>
+              <Button
+                type="submit"
+                className="h-9 rounded-lg bg-[#1f67e5] px-4 text-xs font-semibold hover:bg-[#1a58c7]"
+                disabled={creatingService}
+              >
+                {creatingService ? "提交中..." : serviceFormMode === "edit" ? "保存修改" : "提交新增"}
+              </Button>
+            </div>
+          </form>
+        </div>
+      </Modal>
+    );
+  };
 
   const renderLogsCard = (): JSX.Element => (
     <Card>

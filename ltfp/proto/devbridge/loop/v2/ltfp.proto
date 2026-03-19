@@ -158,17 +158,31 @@ message ExternalFallbackConfig {
   bool enabled = 1;
 }
 
+message RouteHint {
+  // 自动派生 HTTP/HTTPS Route 时追加的 Header 匹配条件。
+  repeated HeaderMatcher match_headers = 1;
+  // 自动派生 HTTP/HTTPS Route 时追加的 Query 匹配条件。
+  repeated QueryMatcher match_queries = 2;
+  // 自动派生 Route 的优先级；未填写时按 0 处理。
+  uint32 priority = 3;
+}
+
 message PublishService {
   string instance_id = 1;
   string service_name = 2;
   Scope scope = 3;
+  // labels 仅用于“选中 LogicalService 之后”的实例过滤，不应用来承载展示文案或观测扩展信息。
   map<string, string> labels = 4;
+  // metadata 仅用于附加语义、观测和策略提示，不参与路由命中或实例过滤决策。
   map<string, string> metadata = 5;
   string service_type = 6;
   repeated ServiceEndpoint endpoints = 7;
+  // exposure 定义入口挂载点；Bridge 会基于该信息决定是否派生对外 Route。
   ServiceExposure exposure = 8;
   HealthCheckConfig health_check = 9;
   DiscoveryPolicy discovery_policy = 10;
+  // route_hint 仅用于补充自动派生 Route 的匹配条件，不替代 exposure 的 host/path 等入口定义。
+  RouteHint route_hint = 11;
 }
 
 message PublishServiceAck {

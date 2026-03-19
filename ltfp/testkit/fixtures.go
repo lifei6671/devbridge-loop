@@ -44,6 +44,12 @@ func GoldenPublishService() pb.PublishService {
 			PathPrefix:  "/order",
 			AllowExport: true,
 		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+			Priority: 10,
+		},
 	}
 }
 

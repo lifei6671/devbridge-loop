@@ -816,8 +816,8 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 		testingObject.Fatalf("sync service control state failed: %v", err)
 	}
 	frames := controlChannel.Frames()
-	if len(frames) != 4 {
-		testingObject.Fatalf("unexpected control frame count: got=%d want=4", len(frames))
+	if len(frames) != 3 {
+		testingObject.Fatalf("unexpected control frame count: got=%d want=3", len(frames))
 	}
 	firstEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
 	if err != nil {
@@ -841,47 +841,10 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	if err != nil {
 		testingObject.Fatalf("decode third business frame failed: %v", err)
 	}
-	if thirdEnvelope.MessageType != pb.ControlMessageRouteAssign {
+	if thirdEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
 		testingObject.Fatalf(
 			"unexpected third message type: got=%s want=%s",
 			thirdEnvelope.MessageType,
-			pb.ControlMessageRouteAssign,
-		)
-	}
-	var routeAssignPayload pb.RouteAssign
-	if err := json.Unmarshal(thirdEnvelope.Payload, &routeAssignPayload); err != nil {
-		testingObject.Fatalf("decode route assign payload failed: %v", err)
-	}
-	if routeAssignPayload.RouteID != "agent-auto-route-svc-5001" {
-		testingObject.Fatalf("unexpected route id: got=%s want=%s", routeAssignPayload.RouteID, "agent-auto-route-svc-5001")
-	}
-	if routeAssignPayload.Match.Host != "order.demo.example.com" {
-		testingObject.Fatalf("unexpected route host: got=%s want=%s", routeAssignPayload.Match.Host, "order.demo.example.com")
-	}
-	if routeAssignPayload.Match.PathPrefix != "/" {
-		testingObject.Fatalf("unexpected route path prefix: got=%s want=%s", routeAssignPayload.Match.PathPrefix, "/")
-	}
-	if routeAssignPayload.Target.ConnectorService == nil {
-		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
-	}
-	if routeAssignPayload.Target.ConnectorService.Selector.LogicalServiceID != "svc-5001" {
-		testingObject.Fatalf("unexpected route selector logical_service_id: %+v", routeAssignPayload.Target.ConnectorService.Selector)
-	}
-	if routeAssignPayload.Target.ConnectorService.Selector.ServiceName != "order-service" {
-		testingObject.Fatalf("unexpected route selector service_name: %+v", routeAssignPayload.Target.ConnectorService.Selector)
-	}
-	if routeAssignPayload.Target.ConnectorService.Selector.Scope.Namespace != "dev" ||
-		routeAssignPayload.Target.ConnectorService.Selector.Scope.Environment != "demo" {
-		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
-	}
-	fourthEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[3].Frame)
-	if err != nil {
-		testingObject.Fatalf("decode fourth business frame failed: %v", err)
-	}
-	if fourthEnvelope.MessageType != pb.ControlMessageServiceHealthReport {
-		testingObject.Fatalf(
-			"unexpected fourth message type: got=%s want=%s",
-			fourthEnvelope.MessageType,
 			pb.ControlMessageServiceHealthReport,
 		)
 	}
@@ -958,8 +921,8 @@ func TestAddOrUpdateServiceSyncsDuringSessionWarmup(testingObject *testing.T) {
 	}
 
 	frames := controlChannel.Frames()
-	if len(frames) != 4 {
-		testingObject.Fatalf("unexpected control frame count during warmup sync: got=%d want=4", len(frames))
+	if len(frames) != 3 {
+		testingObject.Fatalf("unexpected control frame count during warmup sync: got=%d want=3", len(frames))
 	}
 	firstEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
 	if err != nil {
@@ -1029,8 +992,8 @@ func TestAddOrUpdateServiceUsesDefaultHealthCheckConfig(testingObject *testing.T
 	}
 }
 
-// TestAddOrUpdateServiceRejectsMissingScopeAndSNI 验证 namespace/environment/sni 全空会被拒绝。
-func TestAddOrUpdateServiceRejectsMissingScopeAndSNI(testingObject *testing.T) {
+// TestAddOrUpdateServiceRejectsMissingNamespace 验证缺失 namespace 会被拒绝。
+func TestAddOrUpdateServiceRejectsMissingNamespace(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	runtime := &Runtime{
@@ -1044,48 +1007,128 @@ func TestAddOrUpdateServiceRejectsMissingScopeAndSNI(testingObject *testing.T) {
 		Port:        18090,
 	})
 	if err == nil {
-		testingObject.Fatalf("expected add service to reject empty scope/sni")
+		testingObject.Fatalf("expected add service to reject missing namespace")
 	}
-	if !strings.Contains(err.Error(), "至少填写一个") {
-		testingObject.Fatalf("unexpected error for missing scope/sni: %v", err)
+	if !strings.Contains(err.Error(), "scope.namespace is required") {
+		testingObject.Fatalf("unexpected error for missing namespace: %v", err)
 	}
 }
 
-// TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided 验证仅 SNI 注册时不会补齐 scope 默认值。
-func TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided(testingObject *testing.T) {
+// TestAddOrUpdateServiceRejectsMissingEnvironment 验证缺失 environment 会被拒绝。
+func TestAddOrUpdateServiceRejectsMissingEnvironment(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime := &Runtime{
+		serviceCatalog: service.NewCatalog(),
+	}
+	_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+		InstanceID:  "inst-missing-environment",
+		ServiceName: "payment-service",
+		Protocol:    "http",
+		Scope: pb.Scope{
+			Namespace: "dev",
+		},
+		Host: "127.0.0.1",
+		Port: 18091,
+	})
+	if err == nil {
+		testingObject.Fatalf("expected add service to reject missing environment")
+	}
+	if !strings.Contains(err.Error(), "scope.environment is required") {
+		testingObject.Fatalf("unexpected error for missing environment: %v", err)
+	}
+}
+
+// TestAddOrUpdateServiceDropsSNIForNonTLS 验证非 https upstream 不保留 SNI。
+func TestAddOrUpdateServiceDropsSNIForNonTLS(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	runtime := &Runtime{
 		serviceCatalog: service.NewCatalog(),
 	}
 	addedPayload, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		InstanceID:  "inst-sni-only",
+		InstanceID:  "inst-drop-sni",
 		ServiceName: "payment-service",
 		Protocol:    "http",
-		Host:        "127.0.0.1",
-		Port:        18091,
-		SNIName:     "pay.demo.example.com",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Host:    "127.0.0.1",
+		Port:    18091,
+		SNIName: "pay.demo.example.com",
 	})
 	if err != nil {
-		testingObject.Fatalf("add service with sni-only failed: %v", err)
+		testingObject.Fatalf("add service failed: %v", err)
 	}
-	scopePayload, ok := addedPayload["scope"].(pb.Scope)
-	if !ok {
-		testingObject.Fatalf("unexpected scope payload type: %T", addedPayload["scope"])
-	}
-	if scopePayload.Namespace != "" || scopePayload.Environment != "" {
-		testingObject.Fatalf("unexpected scope defaulted: %+v", scopePayload)
+	if addedPayload["sni_name"] != "" {
+		testingObject.Fatalf("unexpected sni_name payload: %+v", addedPayload["sni_name"])
 	}
 	records := runtime.serviceCatalog.List()
 	if len(records) != 1 {
 		testingObject.Fatalf("unexpected service catalog count: got=%d want=1", len(records))
 	}
-	if records[0].Registration.Scope.Namespace != "" || records[0].Registration.Scope.Environment != "" {
-		testingObject.Fatalf(
-			"unexpected catalog scope defaulted: namespace=%q environment=%q",
-			records[0].Registration.Scope.Namespace,
-			records[0].Registration.Scope.Environment,
-		)
+	if records[0].Registration.Endpoints[0].ServerName != "" {
+		testingObject.Fatalf("unexpected endpoint server_name: %+v", records[0].Registration.Endpoints[0].ServerName)
+	}
+}
+
+// TestAddOrUpdateServiceRejectsInvalidRouteHint 验证非法 route_hint 会在本地入口被拦截。
+func TestAddOrUpdateServiceRejectsInvalidRouteHint(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testCases := []struct {
+		name      string
+		routeHint pb.RouteHint
+		errorCode string
+	}{
+		{
+			name: "missing matcher name",
+			routeHint: pb.RouteHint{
+				MatchHeaders: []pb.HeaderMatcher{
+					{Exact: "demo"},
+				},
+			},
+			errorCode: ltfperrors.CodeMissingRequiredField,
+		},
+		{
+			name: "invalid regex",
+			routeHint: pb.RouteHint{
+				MatchHeaders: []pb.HeaderMatcher{
+					{Name: "x-tenant", Regex: "["},
+				},
+			},
+			errorCode: ltfperrors.CodeUnsupportedValue,
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+		testingObject.Run(testCase.name, func(testingObject *testing.T) {
+			testingObject.Parallel()
+
+			runtime := &Runtime{
+				serviceCatalog: service.NewCatalog(),
+			}
+			_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
+				InstanceID:  "inst-invalid-route-hint",
+				ServiceName: "order-service",
+				Protocol:    "http",
+				Scope: pb.Scope{
+					Namespace:   "dev",
+					Environment: "demo",
+				},
+				Host:      "127.0.0.1",
+				Port:      18090,
+				RouteHint: testCase.routeHint,
+			})
+			if err == nil {
+				testingObject.Fatalf("expected add service to reject invalid route_hint")
+			}
+			if !ltfperrors.IsCode(err, testCase.errorCode) {
+				testingObject.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
@@ -1307,34 +1350,16 @@ func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing
 		testingObject.Fatalf("expected service catalog empty after delete")
 	}
 	frames := controlChannel.Frames()
-	if len(frames) != 2 {
-		testingObject.Fatalf("unexpected frame count after delete: got=%d want=2", len(frames))
+	if len(frames) != 1 {
+		testingObject.Fatalf("unexpected frame count after delete: got=%d want=1", len(frames))
 	}
-	routeRevokeEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
-	if err != nil {
-		testingObject.Fatalf("decode route revoke frame failed: %v", err)
-	}
-	if routeRevokeEnvelope.MessageType != pb.ControlMessageRouteRevoke {
-		testingObject.Fatalf(
-			"unexpected first message type: got=%s want=%s",
-			routeRevokeEnvelope.MessageType,
-			pb.ControlMessageRouteRevoke,
-		)
-	}
-	var routeRevokePayload pb.RouteRevoke
-	if err := json.Unmarshal(routeRevokeEnvelope.Payload, &routeRevokePayload); err != nil {
-		testingObject.Fatalf("decode route revoke payload failed: %v", err)
-	}
-	if routeRevokePayload.RouteID != "agent-auto-route-svc-7001" {
-		testingObject.Fatalf("unexpected route revoke id: got=%s want=%s", routeRevokePayload.RouteID, "agent-auto-route-svc-7001")
-	}
-	unpublishEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[1].Frame)
+	unpublishEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[0].Frame)
 	if err != nil {
 		testingObject.Fatalf("decode unpublish frame failed: %v", err)
 	}
 	if unpublishEnvelope.MessageType != pb.ControlMessageUnpublishService {
 		testingObject.Fatalf(
-			"unexpected unpublish message type: got=%s want=%s",
+			"unexpected first message type: got=%s want=%s",
 			unpublishEnvelope.MessageType,
 			pb.ControlMessageUnpublishService,
 		)

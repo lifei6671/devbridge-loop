@@ -31,7 +31,7 @@
 - 校验与错误码：旧 `service_key/service_id/namespace/environment` 主路径请求会被显式拒绝，新增实例归属与 session_epoch 相关错误码已接通。
 - Bridge 控制面与注册表：已完成 `LogicalService + ServiceInstance` 两层注册表、Publish/Unpublish/Health 新语义切换。
 - 路由与数据面：已完成 scope 降级链、external fallback gating、Header/Query matcher、regex cache、Admission 冲突检测、shadow warning、`TrafficOpen(logical_service_id + instance_id)` 全链路切换。
-- Agent：已完成 `instance_id` 持久化复用、TrafficOpen 实例归属校验、自动路由切换到 `ServiceSelector`。
+- Agent：已完成 `instance_id` 持久化复用、TrafficOpen 实例归属校验；自动路由已收口到 Bridge，在 `PublishService(exposure + route_hint)` 受理后直接派生 Route。
 - 管理面与观测：已完成 `logical_service_id/instance_id/scope` 展示、`scope_fallback_total`/`bridge_host_derive_total`/`bridge_instance_selector_pick_total`/`bridge_route_conflict_rejection_total` 指标接通。
 - 运行验证：`cloud-bridge`、`agent-core`、`ltfp` 已完成 `go test ./... -timeout 60s`，`cloud-bridge/web` 已完成 `npm run build`。
 
@@ -71,7 +71,7 @@
 | T15 | P1 | 外部注册中心查询接口改为 scope 驱动 | `cloud-bridge/runtime/bridge/directproxy/discovery_adapter.go`, `ltfp/discovery/*` | 1) 外部查询输入包含 request_scope；2) 仅在本地降级链 miss 后触发；3) 观测字段可区分 local miss 与 external hit |
 | T16 | P1 | 管理面快照与 UI 字段重构 | `cloud-bridge/runtime/bridge/adminview/snapshot.go`, `adminapi/server.go`, `web/src/App.tsx` | 1) 服务列表展示 `logical_service_id/instance_id/scope`；2) 路由目标展示 selector；3) 移除 UI 对 `service_key/hybrid_fallback_total` 的硬依赖 |
 | T17 | P1 | 观测与审计字段迁移 | `cloud-bridge/runtime/bridge/obs/metrics.go`, `obs/logs.go`, 相关日志打点 | 1) 指标新增/重命名与文档8章一致；2) 日志字段包含 `request_scope/matched_scope/is_external_fallback`；3) 原关键指标可对账 |
-| T18 | P1 | Route 自动生成逻辑从 `service_key` 切换到 `ServiceSelector` | `agent-core/runtime/agent/app/runtime_bridge.go`（`buildAutoRouteAssignPayload`） | 1) 自动路由 payload 不再写 `connector_service.service_key`；2) 使用 `service_name + scope` selector；3) 新增自动路由单测 |
+| T18 | P1 | 自动路由从 Agent 下发收口到 Bridge 在 PublishService 阶段派生 | `cloud-bridge/runtime/bridge/control/publish_handler.go`, `agent-core/runtime/agent/app/runtime_bridge.go`, `ltfp/proto/devbridge/loop/v2/ltfp.proto` | 1) `PublishService` 新增 `route_hint`；2) Bridge 基于 `exposure + route_hint` 直接生成 Route；3) Agent 不再补发自动 `RouteAssign/RouteRevoke`；4) 新增自动路由与冲突拒绝单测 |
 | T19 | P2 | Host 自动派生能力落地（模板可配置） | Bridge 新增 `host_deriver` 模块，接入发布/路由路径 | 1) `exposure.host` 为空时按模板派生；2) 冲突时可被 Admission 拦截；3) 指标 `bridge_host_derive_total` 生效 |
 | T20 | P2 | Selector 增强项（label selector、sticky_by、weighted） | `routing/selector.go`, `routing/instance_selector.go`, policy 结构 | 1) `match_labels`/`instance_labels` 可选启用；2) sticky_by（header/cookie/client_ip）可配置；3) weighted 策略有压测或统计验证 |
 
@@ -138,6 +138,7 @@
 | 2026-03-19 | E07 | Done | 已移除 `hybrid_group/pre_open_only` 主路径；已删除 `ltfp/fallback/*` 与 Bridge hybrid resolver/executor 路径；旧路径测试已替换，`ltfp/cloud-bridge/agent-core` 均已完成 `go test ./... -timeout 60s` | 无 | 进入 E08，推进 `default_scope/fallback_policies`、scope header 标准化、external discovery scope 化 |
 | 2026-03-19 | E08 | Done | 已完成 E01-E07；已完成 `default_scope/fallback_policies` 配置模型、合法性校验与 YAML/管理面快照回写；HTTP/gRPC ingress 已统一收敛到 `X-Bridge-Namespace/X-Bridge-Environment` 并在缺失时使用 `default_scope`；resolver 已改为“本地 connector 优先、local miss 后再落 external”，并新增按 namespace policy 的 `external.enabled` 显式 gating；`request_scope/matched_scope/is_external_fallback` 已进入 direct path 日志字段、traffic ownership/admin API 与 Web UI 查询面板；Ops UI 已支持 `default_scope.namespace/default_scope.environment` 配置补丁 | 无 | 进入 E09，开始推进 Host 自动派生与 selector 增强能力 |
 | 2026-03-19 | E09 | Done | 已完成 T19-T20：新增 `ingress.base_domain` 配置与 `hostderiver` 模块；`PublishService` 与 `RouteAssign` 在空 host 时可按 `service_name + scope + base_domain` 自动派生；resolver 已支持 label-only `ServiceSelector.match_labels` 解析、`instance_labels` 实例过滤、`load_balance_policy=sticky/weighted`；`sticky_by` 已支持 `client_ip/header:/cookie:`；`bridge_host_derive_total` 与 `bridge_instance_selector_pick_total` 指标已接通；`cloud-bridge` 已完成 `go test ./... -timeout 60s` 与 `cloud-bridge/web` `npm run build` | 无 | 进入后续收尾/发布闸门或继续补全跨模块专项回归 |
+| 2026-03-19 | Patch | Done | 已补充 `PublishService.route_hint`，Bridge 在受理 `PublishService` 后会基于 `exposure + route_hint` 自动派生 Route 并执行 admission；Agent 已停止补发自动 `RouteAssign/RouteRevoke`；`apps/dev-agent` “新增服务”已重构为身份信息 / 服务配置 / 入口暴露 / 高级路由四段式表单，并开放 `exposure` 与 `route_hint` 编辑器；Tauri/Agent runtime 的 `service.add` 校验已与当前协议对齐为 `scope.namespace + scope.environment` 必填，且仅 `https` 保留 upstream `sni_name`；localrpc 已改为 snake_case 传递 `route_hint/exposure`；服务列表已增加 `route_hint` 与 `exposure` 摘要展示；`ltfp`、`cloud-bridge/runtime/bridge/...`、`agent-core/runtime/agent/app/...` 已完成相关 `go test` | `labels/metadata` 仍未在桌面端表单直接开放（按设计有意保持关闭） | 如需后续支持 labels/metadata，建议作为折叠的高级实例策略编辑器单独设计 |
 | 2026-03-19 | Release Gate | Done | 已完成 `cloud-bridge`、`agent-core`、`ltfp` 全量 `go test ./... -timeout 60s`；`cloud-bridge/web` `npm run build` 通过；协议、功能、正确性、可观测、稳定性门槛全部达成 | 无 | 本任务清单关闭 |
 
 ---
@@ -169,7 +170,7 @@
 | W06-01 | E06 | Agent catalog 持久化 instance_id | `agent-core/runtime/agent/app/runtime_bridge.go` | W05-03 | 重连复用 instance_id 生效 |
 | W06-02 | E06 | Agent TrafficOpen 按 instance_id 定位 | `agent-core/runtime/agent/traffic/*` | W06-01 | 非本 connector 返回 `INSTANCE_NOT_FOUND` |
 | W06-03 | E06 | 健康上报按 instance_id | `agent-core/runtime/agent/control/health_reporter.go` | W06-02 | 健康上报与实例绑定一致 |
-| W06-04 | E06 | 自动路由 payload 切换为 selector | `runtime_bridge.go` (`buildAutoRouteAssignPayload`) | W06-03 | 不再写 `connector_service.service_key` |
+| W06-04 | E06 | 自动路由权威生成点迁移到 Bridge Publish 阶段 | `publish_handler.go`, `runtime_bridge.go`, `ltfp.proto` | W06-03 | `PublishService.route_hint` 生效，Bridge 自动派生 Route，Agent 不再补发自动路由消息 |
 | W07-01 | E07 | 清理 hybrid_group/pre_open_only 主路径 | `routing/hybrid.go`, `ltfp/fallback/*` | W06-04 | 主执行链不再引用旧语义 |
 | W07-02 | E07 | 新增边界回归用例（第10章） | `cloud-bridge/*_test.go`, `agent-core/*_test.go` | W07-01 | 边界用例齐全并稳定通过 |
 | W07-03 | E07 | 全仓测试收敛 | `cloud-bridge`, `agent-core`, `ltfp` | W07-02 | `go test ./...` 全绿 |

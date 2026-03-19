@@ -27,6 +27,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/validate"
 )
 
 const (
@@ -35,7 +36,6 @@ const (
 	bridgeHeartbeatWriteTimeout  = 2 * time.Second
 	bridgeBusinessWriteTimeout   = 3 * time.Second
 	bridgeTCPTunnelHandshakeTO   = 2 * time.Second
-	bridgeAutoRouteIDPrefix      = "agent-auto-route"
 
 	bridgeRetryInitialBackoff = time.Second
 	bridgeRetryMaxBackoff     = 8 * time.Second
@@ -104,9 +104,11 @@ type runtimeServiceAddInput struct {
 	Host                   string
 	Port                   uint32
 	SNIName                string
+	Exposure               pb.ServiceExposure
 	HealthCheckIntervalSec uint32
 	HealthCheckMode        string
 	HealthCheckPath        string
+	RouteHint              pb.RouteHint
 }
 
 type runtimeServiceDeleteInput struct {
@@ -1370,9 +1372,6 @@ func (r *Runtime) syncServiceControlState(ctx context.Context) error {
 	if err := r.publishCatalogServices(ctx); err != nil {
 		return err
 	}
-	if err := r.publishCatalogRoutes(ctx); err != nil {
-		return err
-	}
 	if err := r.reportCatalogHealth(ctx); err != nil {
 		return err
 	}
@@ -1431,37 +1430,6 @@ func (r *Runtime) publishCatalogServices(ctx context.Context) error {
 		}
 		if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
 			return fmt.Errorf("send publish service failed: %w", err)
-		}
-	}
-	return nil
-}
-
-// publishCatalogRoutes 基于本地服务目录下发 RouteAssign，打通 Host/Path 到 connector_service 的映射链路。
-func (r *Runtime) publishCatalogRoutes(ctx context.Context) error {
-	if r == nil || r.serviceCatalog == nil || r.controlPublisher == nil {
-		return nil
-	}
-	records := r.serviceCatalog.List()
-	if len(records) == 0 {
-		return nil
-	}
-	for _, record := range records {
-		routeAssignPayload, shouldPublish := buildAutoRouteAssignPayload(record.Registration)
-		if !shouldPublish {
-			continue
-		}
-		envelope, err := r.controlPublisher.Publish(
-			ctx,
-			pb.ControlMessageRouteAssign,
-			"route",
-			strings.TrimSpace(routeAssignPayload.RouteID),
-			routeAssignPayload,
-		)
-		if err != nil {
-			return fmt.Errorf("build route assign envelope failed: %w", err)
-		}
-		if err := r.sendBusinessControlEnvelope(ctx, envelope); err != nil {
-			return fmt.Errorf("send route assign failed: %w", err)
 		}
 	}
 	return nil
@@ -2279,6 +2247,159 @@ func normalizeServiceHealthCheckConfig(
 	}, nil
 }
 
+func isL7CapableServiceProtocol(serviceProtocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(serviceProtocol)) {
+	case "http", "https", "grpc", "grpc_h2", "grpc-h2":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasMeaningfulServiceExposure(exposure pb.ServiceExposure) bool {
+	return strings.TrimSpace(string(exposure.IngressMode)) != "" ||
+		strings.TrimSpace(exposure.Host) != "" ||
+		exposure.ListenPort > 0 ||
+		strings.TrimSpace(exposure.SNIName) != "" ||
+		strings.TrimSpace(exposure.PathPrefix) != "" ||
+		exposure.AllowExport
+}
+
+func normalizeServiceExposure(serviceProtocol string, exposure pb.ServiceExposure) (pb.ServiceExposure, error) {
+	normalizedExposure := pb.ServiceExposure{
+		IngressMode: pb.IngressMode(strings.TrimSpace(string(exposure.IngressMode))),
+		Host:        strings.ToLower(strings.TrimSpace(exposure.Host)),
+		ListenPort:  exposure.ListenPort,
+		SNIName:     strings.TrimSpace(exposure.SNIName),
+		PathPrefix:  strings.TrimSpace(exposure.PathPrefix),
+		AllowExport: exposure.AllowExport,
+	}
+	if normalizedExposure.IngressMode == "" && !hasMeaningfulServiceExposure(normalizedExposure) {
+		return pb.ServiceExposure{}, nil
+	}
+	if normalizedExposure.IngressMode == "" {
+		if isL7CapableServiceProtocol(serviceProtocol) {
+			normalizedExposure.IngressMode = pb.IngressModeL7Shared
+		} else {
+			normalizedExposure.IngressMode = pb.IngressModeL4DedicatedPort
+		}
+	}
+	switch normalizedExposure.IngressMode {
+	case pb.IngressModeL7Shared:
+		if !isL7CapableServiceProtocol(serviceProtocol) {
+			return pb.ServiceExposure{}, fmt.Errorf("exposure.ingress_mode=%s requires an http/https/grpc upstream", normalizedExposure.IngressMode)
+		}
+		normalizedExposure.SNIName = ""
+	case pb.IngressModeTLSSNIShared:
+		if strings.ToLower(strings.TrimSpace(serviceProtocol)) != "https" {
+			return pb.ServiceExposure{}, fmt.Errorf("exposure.ingress_mode=%s requires protocol=https", normalizedExposure.IngressMode)
+		}
+		if normalizedExposure.SNIName == "" {
+			return pb.ServiceExposure{}, errors.New("exposure.sni_name is required for tls_sni_shared")
+		}
+		normalizedExposure.Host = ""
+		normalizedExposure.PathPrefix = ""
+	case pb.IngressModeL4DedicatedPort:
+		normalizedExposure.Host = ""
+		normalizedExposure.PathPrefix = ""
+		normalizedExposure.SNIName = ""
+	default:
+		return pb.ServiceExposure{}, fmt.Errorf("unsupported exposure.ingress_mode=%s", normalizedExposure.IngressMode)
+	}
+	return normalizedExposure, nil
+}
+
+func buildLocalRPCHeaderMatcherPayloads(matchers []pb.HeaderMatcher) []map[string]any {
+	if len(matchers) == 0 {
+		return nil
+	}
+	payloads := make([]map[string]any, 0, len(matchers))
+	for _, matcher := range matchers {
+		payload := map[string]any{
+			"name": strings.TrimSpace(matcher.Name),
+		}
+		if strings.TrimSpace(matcher.Exact) != "" {
+			payload["exact"] = strings.TrimSpace(matcher.Exact)
+		}
+		if strings.TrimSpace(matcher.Prefix) != "" {
+			payload["prefix"] = strings.TrimSpace(matcher.Prefix)
+		}
+		if strings.TrimSpace(matcher.Regex) != "" {
+			payload["regex"] = strings.TrimSpace(matcher.Regex)
+		}
+		if matcher.Present != nil {
+			payload["present"] = *matcher.Present
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads
+}
+
+func buildLocalRPCQueryMatcherPayloads(matchers []pb.QueryMatcher) []map[string]any {
+	if len(matchers) == 0 {
+		return nil
+	}
+	payloads := make([]map[string]any, 0, len(matchers))
+	for _, matcher := range matchers {
+		payload := map[string]any{
+			"name": strings.TrimSpace(matcher.Name),
+		}
+		if strings.TrimSpace(matcher.Exact) != "" {
+			payload["exact"] = strings.TrimSpace(matcher.Exact)
+		}
+		if strings.TrimSpace(matcher.Prefix) != "" {
+			payload["prefix"] = strings.TrimSpace(matcher.Prefix)
+		}
+		if strings.TrimSpace(matcher.Regex) != "" {
+			payload["regex"] = strings.TrimSpace(matcher.Regex)
+		}
+		if matcher.Present != nil {
+			payload["present"] = *matcher.Present
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads
+}
+
+func buildLocalRPCRouteHintPayload(routeHint pb.RouteHint) map[string]any {
+	if len(routeHint.MatchHeaders) == 0 && len(routeHint.MatchQueries) == 0 && routeHint.Priority == 0 {
+		return nil
+	}
+	payload := map[string]any{
+		"priority": routeHint.Priority,
+	}
+	if matchHeaders := buildLocalRPCHeaderMatcherPayloads(routeHint.MatchHeaders); len(matchHeaders) > 0 {
+		payload["match_headers"] = matchHeaders
+	}
+	if matchQueries := buildLocalRPCQueryMatcherPayloads(routeHint.MatchQueries); len(matchQueries) > 0 {
+		payload["match_queries"] = matchQueries
+	}
+	return payload
+}
+
+func buildLocalRPCServiceExposurePayload(exposure pb.ServiceExposure) map[string]any {
+	if !hasMeaningfulServiceExposure(exposure) {
+		return nil
+	}
+	payload := map[string]any{
+		"ingress_mode": string(exposure.IngressMode),
+		"allow_export": exposure.AllowExport,
+	}
+	if strings.TrimSpace(exposure.Host) != "" {
+		payload["host"] = strings.ToLower(strings.TrimSpace(exposure.Host))
+	}
+	if exposure.ListenPort > 0 {
+		payload["listen_port"] = exposure.ListenPort
+	}
+	if strings.TrimSpace(exposure.SNIName) != "" {
+		payload["sni_name"] = strings.TrimSpace(exposure.SNIName)
+	}
+	if strings.TrimSpace(exposure.PathPrefix) != "" {
+		payload["path_prefix"] = strings.TrimSpace(exposure.PathPrefix)
+	}
+	return payload
+}
+
 func serviceHealthCheckInterval(registration adapter.LocalRegistration) time.Duration {
 	intervalSec := registration.HealthCheck.IntervalSec
 	if intervalSec == 0 {
@@ -2310,8 +2431,14 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	}
 	normalizedNamespace := strings.TrimSpace(input.Scope.Namespace)
 	normalizedEnvironment := strings.TrimSpace(input.Scope.Environment)
-	if normalizedNamespace == "" && normalizedEnvironment == "" && normalizedSNIName == "" {
-		return nil, errors.New("scope.namespace、scope.environment、sni_name 至少填写一个")
+	if normalizedNamespace == "" {
+		return nil, errors.New("scope.namespace is required")
+	}
+	if normalizedEnvironment == "" {
+		return nil, errors.New("scope.environment is required")
+	}
+	if normalizedProtocol != "https" {
+		normalizedSNIName = ""
 	}
 	healthCheckConfig, err := normalizeServiceHealthCheckConfig(
 		normalizedProtocol,
@@ -2320,6 +2447,13 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		input.HealthCheckPath,
 	)
 	if err != nil {
+		return nil, err
+	}
+	normalizedExposure, err := normalizeServiceExposure(normalizedProtocol, input.Exposure)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate.ValidateRouteHint(input.RouteHint); err != nil {
 		return nil, err
 	}
 
@@ -2332,7 +2466,9 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		},
 		ServiceName: normalizedServiceName,
 		ServiceType: normalizedProtocol,
+		Exposure:    normalizedExposure,
 		HealthCheck: healthCheckConfig,
+		RouteHint:   input.RouteHint,
 		Endpoints: []pb.ServiceEndpoint{
 			{
 				EndpointID: fmt.Sprintf("%s-%s-%d", normalizedServiceName, normalizedHost, input.Port),
@@ -2372,9 +2508,11 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 		"host":                      normalizedHost,
 		"port":                      input.Port,
 		"sni_name":                  normalizedSNIName,
+		"exposure":                  buildLocalRPCServiceExposurePayload(record.Registration.Exposure),
 		"health_check_mode":         record.Registration.HealthCheck.Type,
 		"health_check_interval_sec": record.Registration.HealthCheck.IntervalSec,
 		"health_check_path":         record.Registration.HealthCheck.Endpoint,
+		"route_hint":                buildLocalRPCRouteHintPayload(record.Registration.RouteHint),
 		"endpoint_count":            len(record.Registration.Endpoints),
 		"updated_at_ms":             updatedAtMS,
 		"source":                    "agent.runtime",
@@ -2422,36 +2560,6 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 	deleted := r.serviceCatalog.RemoveByInstanceID(normalizedInstanceID)
 	if deleted {
 		if _, _, active := r.bridgeSessionConnectedMeta(); active && r.controlPublisher != nil {
-			if routeID := buildAutoRouteID(targetRegistration); routeID != "" {
-				routeRevokePayload := pb.RouteRevoke{
-					RouteID: routeID,
-					Scope:   targetRegistration.Scope,
-					Reason:  "service_removed",
-				}
-				envelope, err := r.controlPublisher.Publish(
-					context.Background(),
-					pb.ControlMessageRouteRevoke,
-					"route",
-					strings.TrimSpace(routeRevokePayload.RouteID),
-					routeRevokePayload,
-				)
-				if err != nil {
-					r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-						Level:   events.EventWarn,
-						Module:  events.ModuleAgentRuntimeService,
-						Code:    events.CodeServiceRouteRevokeBuildFailed,
-						Message: fmt.Sprintf("build route revoke envelope failed: %v", err),
-					})
-				} else if err := r.sendBusinessControlEnvelope(context.Background(), envelope); err != nil {
-					r.appendDiagnoseEvent(runtimeDiagnoseEvent{
-						Level:   events.EventWarn,
-						Module:  events.ModuleAgentRuntimeService,
-						Code:    events.CodeServiceRouteRevokeSendFailed,
-						Message: fmt.Sprintf("send route revoke failed: %v", err),
-					})
-				}
-			}
-
 			unpublishPayload := adapter.ToUnpublishService(
 				targetRegistration,
 				"service removed by agent localrpc",
@@ -2493,96 +2601,6 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 		"updated_at_ms":      runtimeNowMillis(),
 		"source":             "agent.runtime",
 	}, nil
-}
-
-func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.RouteAssign, bool) {
-	normalizedProtocol := normalizeAutoRouteProtocol(registration.ServiceType)
-	if normalizedProtocol == "" {
-		return pb.RouteAssign{}, false
-	}
-	routeID := buildAutoRouteID(registration)
-	if routeID == "" {
-		return pb.RouteAssign{}, false
-	}
-	pathPrefix := strings.TrimSpace(registration.Exposure.PathPrefix)
-	if pathPrefix == "" {
-		pathPrefix = "/"
-	}
-	return pb.RouteAssign{
-		RouteID: routeID,
-		Scope:   registration.Scope,
-		Match: pb.RouteMatch{
-			Protocol:   normalizedProtocol,
-			Host:       resolveAutoRouteHost(registration),
-			PathPrefix: pathPrefix,
-		},
-		Target: pb.RouteTarget{
-			Type: pb.RouteTargetTypeConnectorService,
-			ConnectorService: &pb.ConnectorServiceTarget{
-				Selector: pb.ServiceSelector{
-					LogicalServiceID: strings.TrimSpace(registration.LogicalServiceID),
-					ServiceName:      strings.TrimSpace(registration.ServiceName),
-					Scope:            registration.Scope,
-				},
-			},
-		},
-		Priority: 100,
-		Metadata: map[string]string{
-			"source":             "agent.auto_route",
-			"logical_service_id": strings.TrimSpace(registration.LogicalServiceID),
-			"service_name":       strings.TrimSpace(registration.ServiceName),
-			"ingress_mode":       string(pb.IngressModeL7Shared),
-		},
-	}, true
-}
-
-func normalizeAutoRouteProtocol(serviceType string) string {
-	switch strings.ToLower(strings.TrimSpace(serviceType)) {
-	case "http", "https":
-		return "http"
-	case "grpc", "grpc_h2", "grpc-h2":
-		return "grpc"
-	default:
-		return ""
-	}
-}
-
-func resolveAutoRouteHost(registration adapter.LocalRegistration) string {
-	normalizedHost := strings.TrimSpace(registration.Exposure.Host)
-	if normalizedHost != "" {
-		return normalizedHost
-	}
-	for _, endpoint := range registration.Endpoints {
-		if endpointHost := strings.TrimSpace(endpoint.ServerName); endpointHost != "" {
-			return endpointHost
-		}
-	}
-	if exposureSNI := strings.TrimSpace(registration.Exposure.SNIName); exposureSNI != "" {
-		return exposureSNI
-	}
-	return ""
-}
-
-func buildAutoRouteID(registration adapter.LocalRegistration) string {
-	resourceID := strings.TrimSpace(registration.LogicalServiceID)
-	if resourceID == "" {
-		resourceID = strings.TrimSpace(registration.InstanceID)
-	}
-	if resourceID == "" {
-		resourceID = buildRuntimeScopeServiceNameKey(registration.ServiceName, registration.Scope)
-	}
-	normalizedResourceID := strings.TrimSpace(resourceID)
-	if normalizedResourceID == "" {
-		return ""
-	}
-	sanitizedResourceID := strings.NewReplacer(
-		"/", "-",
-		"\\", "-",
-		":", "-",
-		".", "-",
-		" ", "-",
-	).Replace(normalizedResourceID)
-	return fmt.Sprintf("%s-%s", bridgeAutoRouteIDPrefix, sanitizedResourceID)
 }
 
 func buildRuntimeScopeServiceNameKey(serviceName string, scope pb.Scope) string {
@@ -2634,9 +2652,11 @@ func (r *Runtime) serviceListPayload() map[string]any {
 			"service_name":              record.Registration.ServiceName,
 			"service_type":              record.Registration.ServiceType,
 			"protocol":                  record.Registration.ServiceType,
+			"exposure":                  buildLocalRPCServiceExposurePayload(record.Registration.Exposure),
 			"health_check_mode":         record.Registration.HealthCheck.Type,
 			"health_check_interval_sec": record.Registration.HealthCheck.IntervalSec,
 			"health_check_path":         record.Registration.HealthCheck.Endpoint,
+			"route_hint":                buildLocalRPCRouteHintPayload(record.Registration.RouteHint),
 			"status":                    string(pb.ServiceStatusActive),
 			"health_status":             string(record.HealthStatus),
 			"endpoints":                 endpointsPayload,

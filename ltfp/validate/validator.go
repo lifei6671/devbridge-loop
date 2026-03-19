@@ -3,6 +3,7 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
@@ -108,6 +109,50 @@ func ValidatePublishService(message pb.PublishService) error {
 		}
 		if endpoint.Port == 0 {
 			return ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("endpoint[%d].port must be greater than 0", index))
+		}
+	}
+	if err := ValidateRouteHint(message.RouteHint); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateRouteHint 校验 RouteHint 的 matcher 结构合法性。
+func ValidateRouteHint(routeHint pb.RouteHint) error {
+	for matcherIndex, matcher := range routeHint.MatchHeaders {
+		if strings.TrimSpace(matcher.Name) == "" {
+			return ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				fmt.Sprintf("routeHint.matchHeaders[%d].name is required", matcherIndex),
+			)
+		}
+		normalizedPattern := strings.TrimSpace(matcher.Regex)
+		if normalizedPattern == "" {
+			continue
+		}
+		if _, err := regexp.Compile(normalizedPattern); err != nil {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				fmt.Sprintf("routeHint.matchHeaders[%d].regex is invalid: %v", matcherIndex, err),
+			)
+		}
+	}
+	for matcherIndex, matcher := range routeHint.MatchQueries {
+		if strings.TrimSpace(matcher.Name) == "" {
+			return ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				fmt.Sprintf("routeHint.matchQueries[%d].name is required", matcherIndex),
+			)
+		}
+		normalizedPattern := strings.TrimSpace(matcher.Regex)
+		if normalizedPattern == "" {
+			continue
+		}
+		if _, err := regexp.Compile(normalizedPattern); err != nil {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				fmt.Sprintf("routeHint.matchQueries[%d].regex is invalid: %v", matcherIndex, err),
+			)
 		}
 	}
 	return nil

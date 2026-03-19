@@ -31,6 +31,8 @@ pub struct ServiceListItem {
     pub endpoint_count: u64,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
+    pub exposure: Option<Value>,
+    pub route_hint: Option<Value>,
 }
 
 /// 新增服务输入体：由前端“服务菜单”提交。
@@ -43,6 +45,8 @@ pub struct ServiceAddInput {
     pub host: String,
     pub port: u16,
     pub sni_name: Option<String>,
+    pub exposure: Option<Value>,
+    pub route_hint: Option<Value>,
 }
 
 /// 删除服务输入体：支持按 logical_service_id 或 instance_id 删除。
@@ -111,6 +115,10 @@ fn value_scope(payload: &Value, key: &str) -> ServiceScope {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
     }
+}
+
+fn value_object(payload: &Value, key: &str) -> Option<Value> {
+    payload.get(key).filter(|value| value.is_object()).cloned()
 }
 
 /// 从 `endpoints` 数组推断协议字段，兼容 `service_type` 未填场景。
@@ -234,6 +242,8 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
                     .and_then(Value::as_str)
                     .map(|value| value.to_string()),
                 updated_at_ms: value_u64_or(item, "updated_at_ms", now_ms()),
+                exposure: value_object(item, "exposure"),
+                route_hint: value_object(item, "route_hint"),
             }
         })
         .collect()
@@ -244,9 +254,15 @@ fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String>
     if service_name.is_empty() {
         return Err("service_name 不能为空".to_string());
     }
+    if service_name.contains('/') {
+        return Err("service_name 不能包含 /".to_string());
+    }
     let protocol = input.protocol.trim().to_ascii_lowercase();
     if protocol.is_empty() {
         return Err("protocol 不能为空".to_string());
+    }
+    if !matches!(protocol.as_str(), "tcp" | "http" | "https") {
+        return Err("protocol 仅支持 tcp/http/https".to_string());
     }
     let host = input.host.trim().to_string();
     if host.is_empty() {
@@ -258,10 +274,23 @@ fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String>
     let input_scope = input.scope.unwrap_or_default();
     let normalized_namespace = normalize_optional_trimmed_text(input_scope.namespace);
     let normalized_environment = normalize_optional_trimmed_text(input_scope.environment);
-    let normalized_sni_name = normalize_optional_trimmed_text(input.sni_name);
-    if normalized_namespace.is_none() && normalized_environment.is_none() && normalized_sni_name.is_none() {
-        return Err("scope.namespace、scope.environment、sni_name 至少填写一个".to_string());
+    if normalized_namespace.is_none() {
+        return Err("scope.namespace 不能为空".to_string());
     }
+    if normalized_environment.is_none() {
+        return Err("scope.environment 不能为空".to_string());
+    }
+    let normalized_sni_name = if protocol == "https" {
+        normalize_optional_trimmed_text(input.sni_name)
+    } else {
+        None
+    };
+    let normalized_exposure = input.exposure.filter(|value| !value.is_null());
+    let normalized_route_hint = if matches!(protocol.as_str(), "http" | "https") {
+        input.route_hint.filter(|value| !value.is_null())
+    } else {
+        None
+    };
     Ok(ServiceAddInput {
         instance_id: input
             .instance_id
@@ -276,11 +305,15 @@ fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String>
         host,
         port: input.port,
         sni_name: normalized_sni_name,
+        exposure: normalized_exposure,
+        route_hint: normalized_route_hint,
     })
 }
 
 fn normalize_optional_trimmed_text(value: Option<String>) -> Option<String> {
-    value.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+    value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
 }
 
 fn validate_delete_input(input: ServiceDeleteInput) -> Result<ServiceDeleteInput, String> {
@@ -326,6 +359,8 @@ fn request_service_add_payload(
             "host": input.host,
             "port": input.port,
             "sni_name": input.sni_name,
+            "exposure": input.exposure,
+            "route_hint": input.route_hint,
         }),
         LOCAL_RPC_DEFAULT_TIMEOUT_MS,
     );
@@ -517,6 +552,8 @@ pub fn service_add(
                 host: normalized_input.host.clone(),
                 port: normalized_input.port,
                 sni_name: normalized_input.sni_name.clone(),
+                exposure: normalized_input.exposure.clone(),
+                route_hint: normalized_input.route_hint.clone(),
             },
         )?;
 
@@ -650,6 +687,8 @@ mod tests {
                     "scope": {"namespace": "dev", "environment": "demo"},
                     "service_name": "order-service",
                     "service_type": "http",
+                    "exposure": {"ingress_mode": "l7_shared", "path_prefix": "/orders"},
+                    "route_hint": {"priority": 9, "match_headers": [{"name": "x-tenant", "exact": "demo"}]},
                     "status": "ACTIVE",
                     "health_status": "HEALTHY",
                     "endpoints": [
@@ -669,6 +708,22 @@ mod tests {
         assert_eq!(items[0].protocol, "http");
         assert_eq!(items[0].status, "HEALTHY");
         assert_eq!(items[0].endpoint_count, 2);
+        assert_eq!(
+            items[0]
+                .exposure
+                .as_ref()
+                .and_then(|value| value.get("path_prefix"))
+                .and_then(serde_json::Value::as_str),
+            Some("/orders")
+        );
+        assert_eq!(
+            items[0]
+                .route_hint
+                .as_ref()
+                .and_then(|value| value.get("priority"))
+                .and_then(serde_json::Value::as_u64),
+            Some(9)
+        );
     }
 
     /// 验证缺失 `endpoint_count` 时可回退 `endpoints` 数组长度。

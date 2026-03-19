@@ -19,6 +19,7 @@ type LocalRegistration struct {
 	Exposure         pb.ServiceExposure
 	HealthCheck      pb.HealthCheckConfig
 	DiscoveryPolicy  pb.DiscoveryPolicy
+	RouteHint        pb.RouteHint
 	Labels           map[string]string
 	Metadata         map[string]string
 }
@@ -45,6 +46,7 @@ func ToPublishService(local LocalRegistration) pb.PublishService {
 		Exposure:        local.Exposure,
 		HealthCheck:     local.HealthCheck,
 		DiscoveryPolicy: local.DiscoveryPolicy,
+		RouteHint:       cloneRouteHint(local.RouteHint),
 		Labels:          cloneStringMap(local.Labels),
 		Metadata:        cloneStringMap(local.Metadata),
 	}
@@ -110,4 +112,13 @@ func cloneStringMap(source map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+// cloneRouteHint 深拷贝 route hint，避免调用方共享 matcher 切片。
+func cloneRouteHint(routeHint pb.RouteHint) pb.RouteHint {
+	return pb.RouteHint{
+		MatchHeaders: append([]pb.HeaderMatcher(nil), routeHint.MatchHeaders...),
+		MatchQueries: append([]pb.QueryMatcher(nil), routeHint.MatchQueries...),
+		Priority:     routeHint.Priority,
+	}
 }

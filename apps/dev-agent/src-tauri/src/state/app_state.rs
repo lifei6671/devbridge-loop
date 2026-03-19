@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -49,6 +49,10 @@ pub struct ManualServiceConfig {
     pub port: u16,
     #[serde(default)]
     pub sni_name: Option<String>,
+    #[serde(default)]
+    pub exposure: Option<Value>,
+    #[serde(default)]
+    pub route_hint: Option<Value>,
 }
 
 impl ManualServiceConfig {
@@ -75,7 +79,7 @@ impl ManualServiceConfig {
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if normalized_namespace.is_none() && normalized_environment.is_none() && normalized_sni_name.is_none() {
+        if normalized_namespace.is_none() || normalized_environment.is_none() {
             return None;
         }
         Some(Self {
@@ -91,12 +95,22 @@ impl ManualServiceConfig {
             host,
             port: self.port,
             sni_name: normalized_sni_name,
+            exposure: self
+                .exposure
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .cloned(),
+            route_hint: self
+                .route_hint
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .cloned(),
         })
     }
 }
 
 /// 判断两个手动服务配置是否指向同一条逻辑服务记录。
-/// 优先按 instance_id，对无 instance_id 的配置按 namespace/environment/service_name/sni 组合匹配。
+/// 优先按 instance_id，对无 instance_id 的配置按 namespace/environment/service_name 组合匹配。
 fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServiceConfig) -> bool {
     match (&left.instance_id, &right.instance_id) {
         (Some(left_id), Some(right_id)) => left_id == right_id,
@@ -104,7 +118,6 @@ fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServic
             left.namespace == right.namespace
                 && left.environment == right.environment
                 && left.service_name == right.service_name
-                && left.sni_name == right.sni_name
         }
     }
 }
@@ -974,7 +987,7 @@ pub fn update_runtime_config(
     Ok(())
 }
 
-/// 持久化手动服务配置：按 `instance_id` 或 `namespace/environment/service_name/sni` 执行 upsert。
+/// 持久化手动服务配置：按 `instance_id` 或 `namespace/environment/service_name` 执行 upsert。
 pub fn upsert_manual_service_config(
     state: &Arc<AppRuntimeState>,
     service: ManualServiceConfig,

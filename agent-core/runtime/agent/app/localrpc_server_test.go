@@ -134,10 +134,21 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 			"instance_id":"inst-order-service",
 			"service_name":"order-service",
 			"scope":{"namespace":"dev","environment":"demo"},
-			"protocol":"http",
+			"protocol":"https",
 			"host":"127.0.0.1",
 			"port":18080,
 			"sni_name":"order.dev.example.com",
+			"exposure":{
+				"ingress_mode":"l7_shared",
+				"host":"api.dev.example.com",
+				"path_prefix":"/orders",
+				"allow_export":true
+			},
+			"route_hint":{
+				"priority":9,
+				"match_headers":[{"name":"x-tenant","exact":"demo"}],
+				"match_queries":[{"name":"version","prefix":"v2"}]
+			},
 			"health_check_interval_sec":15,
 			"health_check_mode":"http",
 			"health_check_path":"healthz"
@@ -182,6 +193,27 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 	}
 	if services[0]["instance_id"] != "inst-order-service" {
 		testingObject.Fatalf("unexpected instance_id: %+v", services[0]["instance_id"])
+	}
+	exposurePayload, ok := services[0]["exposure"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected exposure payload type: %T", services[0]["exposure"])
+	}
+	if exposurePayload["ingress_mode"] != "l7_shared" || exposurePayload["host"] != "api.dev.example.com" {
+		testingObject.Fatalf("unexpected exposure payload: %+v", exposurePayload)
+	}
+	if exposurePayload["path_prefix"] != "/orders" {
+		testingObject.Fatalf("unexpected exposure path_prefix: %+v", exposurePayload["path_prefix"])
+	}
+	routeHintPayload, ok := services[0]["route_hint"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected route_hint payload type: %T", services[0]["route_hint"])
+	}
+	if routeHintPayload["priority"] != uint32(9) {
+		testingObject.Fatalf("unexpected route_hint priority: %+v", routeHintPayload["priority"])
+	}
+	matchHeaders, ok := routeHintPayload["match_headers"].([]map[string]any)
+	if !ok || len(matchHeaders) != 1 || matchHeaders[0]["name"] != "x-tenant" {
+		testingObject.Fatalf("unexpected route_hint match_headers: %+v", routeHintPayload["match_headers"])
 	}
 }
 

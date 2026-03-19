@@ -1517,25 +1517,93 @@ func (x *ExternalFallbackConfig) GetEnabled() bool {
 	return false
 }
 
+type RouteHint struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 自动派生 HTTP/HTTPS Route 时追加的 Header 匹配条件。
+	MatchHeaders []*HeaderMatcher `protobuf:"bytes,1,rep,name=match_headers,json=matchHeaders,proto3" json:"match_headers,omitempty"`
+	// 自动派生 HTTP/HTTPS Route 时追加的 Query 匹配条件。
+	MatchQueries []*QueryMatcher `protobuf:"bytes,2,rep,name=match_queries,json=matchQueries,proto3" json:"match_queries,omitempty"`
+	// 自动派生 Route 的优先级；未填写时按 0 处理。
+	Priority      uint32 `protobuf:"varint,3,opt,name=priority,proto3" json:"priority,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RouteHint) Reset() {
+	*x = RouteHint{}
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RouteHint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RouteHint) ProtoMessage() {}
+
+func (x *RouteHint) ProtoReflect() protoreflect.Message {
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RouteHint.ProtoReflect.Descriptor instead.
+func (*RouteHint) Descriptor() ([]byte, []int) {
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RouteHint) GetMatchHeaders() []*HeaderMatcher {
+	if x != nil {
+		return x.MatchHeaders
+	}
+	return nil
+}
+
+func (x *RouteHint) GetMatchQueries() []*QueryMatcher {
+	if x != nil {
+		return x.MatchQueries
+	}
+	return nil
+}
+
+func (x *RouteHint) GetPriority() uint32 {
+	if x != nil {
+		return x.Priority
+	}
+	return 0
+}
+
 type PublishService struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	InstanceId      string                 `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	ServiceName     string                 `protobuf:"bytes,2,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
-	Scope           *Scope                 `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
-	Labels          map[string]string      `protobuf:"bytes,4,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Metadata        map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	ServiceType     string                 `protobuf:"bytes,6,opt,name=service_type,json=serviceType,proto3" json:"service_type,omitempty"`
-	Endpoints       []*ServiceEndpoint     `protobuf:"bytes,7,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
-	Exposure        *ServiceExposure       `protobuf:"bytes,8,opt,name=exposure,proto3" json:"exposure,omitempty"`
-	HealthCheck     *HealthCheckConfig     `protobuf:"bytes,9,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
-	DiscoveryPolicy *DiscoveryPolicy       `protobuf:"bytes,10,opt,name=discovery_policy,json=discoveryPolicy,proto3" json:"discovery_policy,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	InstanceId  string                 `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	ServiceName string                 `protobuf:"bytes,2,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
+	Scope       *Scope                 `protobuf:"bytes,3,opt,name=scope,proto3" json:"scope,omitempty"`
+	// labels 仅用于“选中 LogicalService 之后”的实例过滤，不应用来承载展示文案或观测扩展信息。
+	Labels map[string]string `protobuf:"bytes,4,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// metadata 仅用于附加语义、观测和策略提示，不参与路由命中或实例过滤决策。
+	Metadata    map[string]string  `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ServiceType string             `protobuf:"bytes,6,opt,name=service_type,json=serviceType,proto3" json:"service_type,omitempty"`
+	Endpoints   []*ServiceEndpoint `protobuf:"bytes,7,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
+	// exposure 定义入口挂载点；Bridge 会基于该信息决定是否派生对外 Route。
+	Exposure        *ServiceExposure   `protobuf:"bytes,8,opt,name=exposure,proto3" json:"exposure,omitempty"`
+	HealthCheck     *HealthCheckConfig `protobuf:"bytes,9,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
+	DiscoveryPolicy *DiscoveryPolicy   `protobuf:"bytes,10,opt,name=discovery_policy,json=discoveryPolicy,proto3" json:"discovery_policy,omitempty"`
+	// route_hint 仅用于补充自动派生 Route 的匹配条件，不替代 exposure 的 host/path 等入口定义。
+	RouteHint     *RouteHint `protobuf:"bytes,11,opt,name=route_hint,json=routeHint,proto3" json:"route_hint,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishService) Reset() {
 	*x = PublishService{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[17]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1547,7 +1615,7 @@ func (x *PublishService) String() string {
 func (*PublishService) ProtoMessage() {}
 
 func (x *PublishService) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[17]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1560,7 +1628,7 @@ func (x *PublishService) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishService.ProtoReflect.Descriptor instead.
 func (*PublishService) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{17}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *PublishService) GetInstanceId() string {
@@ -1633,6 +1701,13 @@ func (x *PublishService) GetDiscoveryPolicy() *DiscoveryPolicy {
 	return nil
 }
 
+func (x *PublishService) GetRouteHint() *RouteHint {
+	if x != nil {
+		return x.RouteHint
+	}
+	return nil
+}
+
 type PublishServiceAck struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	Accepted                bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
@@ -1650,7 +1725,7 @@ type PublishServiceAck struct {
 
 func (x *PublishServiceAck) Reset() {
 	*x = PublishServiceAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[18]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1662,7 +1737,7 @@ func (x *PublishServiceAck) String() string {
 func (*PublishServiceAck) ProtoMessage() {}
 
 func (x *PublishServiceAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[18]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1675,7 +1750,7 @@ func (x *PublishServiceAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishServiceAck.ProtoReflect.Descriptor instead.
 func (*PublishServiceAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{18}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PublishServiceAck) GetAccepted() bool {
@@ -1754,7 +1829,7 @@ type UnpublishService struct {
 
 func (x *UnpublishService) Reset() {
 	*x = UnpublishService{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[19]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1766,7 +1841,7 @@ func (x *UnpublishService) String() string {
 func (*UnpublishService) ProtoMessage() {}
 
 func (x *UnpublishService) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[19]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1779,7 +1854,7 @@ func (x *UnpublishService) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnpublishService.ProtoReflect.Descriptor instead.
 func (*UnpublishService) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{19}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *UnpublishService) GetInstanceId() string {
@@ -1832,7 +1907,7 @@ type UnpublishServiceAck struct {
 
 func (x *UnpublishServiceAck) Reset() {
 	*x = UnpublishServiceAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[20]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1844,7 +1919,7 @@ func (x *UnpublishServiceAck) String() string {
 func (*UnpublishServiceAck) ProtoMessage() {}
 
 func (x *UnpublishServiceAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[20]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1857,7 +1932,7 @@ func (x *UnpublishServiceAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnpublishServiceAck.ProtoReflect.Descriptor instead.
 func (*UnpublishServiceAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{20}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *UnpublishServiceAck) GetAccepted() bool {
@@ -1920,7 +1995,7 @@ type EndpointHealthStatus struct {
 
 func (x *EndpointHealthStatus) Reset() {
 	*x = EndpointHealthStatus{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[21]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1932,7 +2007,7 @@ func (x *EndpointHealthStatus) String() string {
 func (*EndpointHealthStatus) ProtoMessage() {}
 
 func (x *EndpointHealthStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[21]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1945,7 +2020,7 @@ func (x *EndpointHealthStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndpointHealthStatus.ProtoReflect.Descriptor instead.
 func (*EndpointHealthStatus) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{21}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *EndpointHealthStatus) GetEndpointId() string {
@@ -1984,7 +2059,7 @@ type ServiceHealthReport struct {
 
 func (x *ServiceHealthReport) Reset() {
 	*x = ServiceHealthReport{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[22]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1996,7 +2071,7 @@ func (x *ServiceHealthReport) String() string {
 func (*ServiceHealthReport) ProtoMessage() {}
 
 func (x *ServiceHealthReport) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[22]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2009,7 +2084,7 @@ func (x *ServiceHealthReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServiceHealthReport.ProtoReflect.Descriptor instead.
 func (*ServiceHealthReport) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{22}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ServiceHealthReport) GetInstanceId() string {
@@ -2072,7 +2147,7 @@ type ConnectorServiceTarget struct {
 
 func (x *ConnectorServiceTarget) Reset() {
 	*x = ConnectorServiceTarget{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[23]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2084,7 +2159,7 @@ func (x *ConnectorServiceTarget) String() string {
 func (*ConnectorServiceTarget) ProtoMessage() {}
 
 func (x *ConnectorServiceTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[23]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2097,7 +2172,7 @@ func (x *ConnectorServiceTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConnectorServiceTarget.ProtoReflect.Descriptor instead.
 func (*ConnectorServiceTarget) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{23}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ConnectorServiceTarget) GetSelector() *ServiceSelector {
@@ -2137,7 +2212,7 @@ type ExternalServiceTarget struct {
 
 func (x *ExternalServiceTarget) Reset() {
 	*x = ExternalServiceTarget{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[24]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2149,7 +2224,7 @@ func (x *ExternalServiceTarget) String() string {
 func (*ExternalServiceTarget) ProtoMessage() {}
 
 func (x *ExternalServiceTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[24]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2162,7 +2237,7 @@ func (x *ExternalServiceTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExternalServiceTarget.ProtoReflect.Descriptor instead.
 func (*ExternalServiceTarget) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{24}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ExternalServiceTarget) GetProvider() string {
@@ -2232,7 +2307,7 @@ type RouteTarget struct {
 
 func (x *RouteTarget) Reset() {
 	*x = RouteTarget{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[25]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2244,7 +2319,7 @@ func (x *RouteTarget) String() string {
 func (*RouteTarget) ProtoMessage() {}
 
 func (x *RouteTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[25]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2257,7 +2332,7 @@ func (x *RouteTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteTarget.ProtoReflect.Descriptor instead.
 func (*RouteTarget) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{25}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *RouteTarget) GetType() string {
@@ -2297,7 +2372,7 @@ type RouteMatch struct {
 
 func (x *RouteMatch) Reset() {
 	*x = RouteMatch{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[26]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2309,7 +2384,7 @@ func (x *RouteMatch) String() string {
 func (*RouteMatch) ProtoMessage() {}
 
 func (x *RouteMatch) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[26]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2322,7 +2397,7 @@ func (x *RouteMatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteMatch.ProtoReflect.Descriptor instead.
 func (*RouteMatch) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{26}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *RouteMatch) GetProtocol() string {
@@ -2396,7 +2471,7 @@ type RouteAssign struct {
 
 func (x *RouteAssign) Reset() {
 	*x = RouteAssign{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[27]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2408,7 +2483,7 @@ func (x *RouteAssign) String() string {
 func (*RouteAssign) ProtoMessage() {}
 
 func (x *RouteAssign) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[27]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2421,7 +2496,7 @@ func (x *RouteAssign) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteAssign.ProtoReflect.Descriptor instead.
 func (*RouteAssign) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{27}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *RouteAssign) GetRouteId() string {
@@ -2488,7 +2563,7 @@ type RouteAssignAck struct {
 
 func (x *RouteAssignAck) Reset() {
 	*x = RouteAssignAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[28]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2500,7 +2575,7 @@ func (x *RouteAssignAck) String() string {
 func (*RouteAssignAck) ProtoMessage() {}
 
 func (x *RouteAssignAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[28]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2513,7 +2588,7 @@ func (x *RouteAssignAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteAssignAck.ProtoReflect.Descriptor instead.
 func (*RouteAssignAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{28}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *RouteAssignAck) GetAccepted() bool {
@@ -2576,7 +2651,7 @@ type RouteRevoke struct {
 
 func (x *RouteRevoke) Reset() {
 	*x = RouteRevoke{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[29]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2588,7 +2663,7 @@ func (x *RouteRevoke) String() string {
 func (*RouteRevoke) ProtoMessage() {}
 
 func (x *RouteRevoke) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[29]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2601,7 +2676,7 @@ func (x *RouteRevoke) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteRevoke.ProtoReflect.Descriptor instead.
 func (*RouteRevoke) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{29}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *RouteRevoke) GetRouteId() string {
@@ -2639,7 +2714,7 @@ type RouteRevokeAck struct {
 
 func (x *RouteRevokeAck) Reset() {
 	*x = RouteRevokeAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[30]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2651,7 +2726,7 @@ func (x *RouteRevokeAck) String() string {
 func (*RouteRevokeAck) ProtoMessage() {}
 
 func (x *RouteRevokeAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[30]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2664,7 +2739,7 @@ func (x *RouteRevokeAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteRevokeAck.ProtoReflect.Descriptor instead.
 func (*RouteRevokeAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{30}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *RouteRevokeAck) GetAccepted() bool {
@@ -2720,7 +2795,7 @@ type RouteStatusReport struct {
 
 func (x *RouteStatusReport) Reset() {
 	*x = RouteStatusReport{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[31]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2732,7 +2807,7 @@ func (x *RouteStatusReport) String() string {
 func (*RouteStatusReport) ProtoMessage() {}
 
 func (x *RouteStatusReport) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[31]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2745,7 +2820,7 @@ func (x *RouteStatusReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteStatusReport.ProtoReflect.Descriptor instead.
 func (*RouteStatusReport) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{31}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RouteStatusReport) GetRouteId() string {
@@ -2782,7 +2857,7 @@ type NegotiationProfile struct {
 
 func (x *NegotiationProfile) Reset() {
 	*x = NegotiationProfile{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[32]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2794,7 +2869,7 @@ func (x *NegotiationProfile) String() string {
 func (*NegotiationProfile) ProtoMessage() {}
 
 func (x *NegotiationProfile) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[32]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2807,7 +2882,7 @@ func (x *NegotiationProfile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NegotiationProfile.ProtoReflect.Descriptor instead.
 func (*NegotiationProfile) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{32}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *NegotiationProfile) GetVersionMajor() uint32 {
@@ -2859,7 +2934,7 @@ type NegotiationResult struct {
 
 func (x *NegotiationResult) Reset() {
 	*x = NegotiationResult{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[33]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2871,7 +2946,7 @@ func (x *NegotiationResult) String() string {
 func (*NegotiationResult) ProtoMessage() {}
 
 func (x *NegotiationResult) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[33]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2884,7 +2959,7 @@ func (x *NegotiationResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NegotiationResult.ProtoReflect.Descriptor instead.
 func (*NegotiationResult) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{33}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *NegotiationResult) GetAccepted() bool {
@@ -2947,7 +3022,7 @@ type ForwardIntent struct {
 
 func (x *ForwardIntent) Reset() {
 	*x = ForwardIntent{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2959,7 +3034,7 @@ func (x *ForwardIntent) String() string {
 func (*ForwardIntent) ProtoMessage() {}
 
 func (x *ForwardIntent) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[34]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2972,7 +3047,7 @@ func (x *ForwardIntent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardIntent.ProtoReflect.Descriptor instead.
 func (*ForwardIntent) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{34}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ForwardIntent) GetRequestId() string {
@@ -3064,7 +3139,7 @@ type ForwardDecision struct {
 
 func (x *ForwardDecision) Reset() {
 	*x = ForwardDecision{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3076,7 +3151,7 @@ func (x *ForwardDecision) String() string {
 func (*ForwardDecision) ProtoMessage() {}
 
 func (x *ForwardDecision) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[35]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3089,7 +3164,7 @@ func (x *ForwardDecision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForwardDecision.ProtoReflect.Descriptor instead.
 func (*ForwardDecision) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{35}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ForwardDecision) GetAccepted() bool {
@@ -3182,7 +3257,7 @@ type ControlError struct {
 
 func (x *ControlError) Reset() {
 	*x = ControlError{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3194,7 +3269,7 @@ func (x *ControlError) String() string {
 func (*ControlError) ProtoMessage() {}
 
 func (x *ControlError) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[36]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3207,7 +3282,7 @@ func (x *ControlError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlError.ProtoReflect.Descriptor instead.
 func (*ControlError) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{36}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ControlError) GetScope() string {
@@ -3262,7 +3337,7 @@ type TrafficOpen struct {
 
 func (x *TrafficOpen) Reset() {
 	*x = TrafficOpen{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3274,7 +3349,7 @@ func (x *TrafficOpen) String() string {
 func (*TrafficOpen) ProtoMessage() {}
 
 func (x *TrafficOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[37]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3287,7 +3362,7 @@ func (x *TrafficOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficOpen.ProtoReflect.Descriptor instead.
 func (*TrafficOpen) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{37}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *TrafficOpen) GetTrafficId() string {
@@ -3366,7 +3441,7 @@ type TrafficOpenAck struct {
 
 func (x *TrafficOpenAck) Reset() {
 	*x = TrafficOpenAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3378,7 +3453,7 @@ func (x *TrafficOpenAck) String() string {
 func (*TrafficOpenAck) ProtoMessage() {}
 
 func (x *TrafficOpenAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[38]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3391,7 +3466,7 @@ func (x *TrafficOpenAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficOpenAck.ProtoReflect.Descriptor instead.
 func (*TrafficOpenAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{38}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *TrafficOpenAck) GetTrafficId() string {
@@ -3439,7 +3514,7 @@ type TrafficClose struct {
 
 func (x *TrafficClose) Reset() {
 	*x = TrafficClose{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[39]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3451,7 +3526,7 @@ func (x *TrafficClose) String() string {
 func (*TrafficClose) ProtoMessage() {}
 
 func (x *TrafficClose) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[39]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3464,7 +3539,7 @@ func (x *TrafficClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficClose.ProtoReflect.Descriptor instead.
 func (*TrafficClose) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{39}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *TrafficClose) GetTrafficId() string {
@@ -3494,7 +3569,7 @@ type TrafficCloseAck struct {
 
 func (x *TrafficCloseAck) Reset() {
 	*x = TrafficCloseAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[40]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3506,7 +3581,7 @@ func (x *TrafficCloseAck) String() string {
 func (*TrafficCloseAck) ProtoMessage() {}
 
 func (x *TrafficCloseAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[40]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3519,7 +3594,7 @@ func (x *TrafficCloseAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficCloseAck.ProtoReflect.Descriptor instead.
 func (*TrafficCloseAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{40}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *TrafficCloseAck) GetTrafficId() string {
@@ -3568,7 +3643,7 @@ type TrafficReset struct {
 
 func (x *TrafficReset) Reset() {
 	*x = TrafficReset{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[41]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3580,7 +3655,7 @@ func (x *TrafficReset) String() string {
 func (*TrafficReset) ProtoMessage() {}
 
 func (x *TrafficReset) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[41]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3593,7 +3668,7 @@ func (x *TrafficReset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficReset.ProtoReflect.Descriptor instead.
 func (*TrafficReset) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{41}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *TrafficReset) GetTrafficId() string {
@@ -3630,7 +3705,7 @@ type TunnelRecycle struct {
 
 func (x *TunnelRecycle) Reset() {
 	*x = TunnelRecycle{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[42]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3642,7 +3717,7 @@ func (x *TunnelRecycle) String() string {
 func (*TunnelRecycle) ProtoMessage() {}
 
 func (x *TunnelRecycle) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[42]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3655,7 +3730,7 @@ func (x *TunnelRecycle) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelRecycle.ProtoReflect.Descriptor instead.
 func (*TunnelRecycle) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{42}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *TunnelRecycle) GetTunnelId() string {
@@ -3707,7 +3782,7 @@ type TunnelRecycleAck struct {
 
 func (x *TunnelRecycleAck) Reset() {
 	*x = TunnelRecycleAck{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[43]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3719,7 +3794,7 @@ func (x *TunnelRecycleAck) String() string {
 func (*TunnelRecycleAck) ProtoMessage() {}
 
 func (x *TunnelRecycleAck) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[43]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3732,7 +3807,7 @@ func (x *TunnelRecycleAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelRecycleAck.ProtoReflect.Descriptor instead.
 func (*TunnelRecycleAck) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{43}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *TunnelRecycleAck) GetTunnelId() string {
@@ -3796,7 +3871,7 @@ type StreamPayload struct {
 
 func (x *StreamPayload) Reset() {
 	*x = StreamPayload{}
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[44]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3808,7 +3883,7 @@ func (x *StreamPayload) String() string {
 func (*StreamPayload) ProtoMessage() {}
 
 func (x *StreamPayload) ProtoReflect() protoreflect.Message {
-	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[44]
+	mi := &file_devbridge_loop_v2_ltfp_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3821,7 +3896,7 @@ func (x *StreamPayload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamPayload.ProtoReflect.Descriptor instead.
 func (*StreamPayload) Descriptor() ([]byte, []int) {
-	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{44}
+	return file_devbridge_loop_v2_ltfp_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *StreamPayload) GetPayload() isStreamPayload_Payload {
@@ -4124,7 +4199,11 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	"\fFallbackStep\x12;\n" +
 	"\ftarget_scope\x18\x01 \x01(\v2\x18.devbridge.loop.v2.ScopeR\vtargetScope\"2\n" +
 	"\x16ExternalFallbackConfig\x12\x18\n" +
-	"\aenabled\x18\x01 \x01(\bR\aenabled\"\xcd\x05\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\"\xb4\x01\n" +
+	"\tRouteHint\x12E\n" +
+	"\rmatch_headers\x18\x01 \x03(\v2 .devbridge.loop.v2.HeaderMatcherR\fmatchHeaders\x12D\n" +
+	"\rmatch_queries\x18\x02 \x03(\v2\x1f.devbridge.loop.v2.QueryMatcherR\fmatchQueries\x12\x1a\n" +
+	"\bpriority\x18\x03 \x01(\rR\bpriority\"\x8a\x06\n" +
 	"\x0ePublishService\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12!\n" +
@@ -4137,7 +4216,9 @@ const file_devbridge_loop_v2_ltfp_proto_rawDesc = "" +
 	"\bexposure\x18\b \x01(\v2\".devbridge.loop.v2.ServiceExposureR\bexposure\x12G\n" +
 	"\fhealth_check\x18\t \x01(\v2$.devbridge.loop.v2.HealthCheckConfigR\vhealthCheck\x12M\n" +
 	"\x10discovery_policy\x18\n" +
-	" \x01(\v2\".devbridge.loop.v2.DiscoveryPolicyR\x0fdiscoveryPolicy\x1a9\n" +
+	" \x01(\v2\".devbridge.loop.v2.DiscoveryPolicyR\x0fdiscoveryPolicy\x12;\n" +
+	"\n" +
+	"route_hint\x18\v \x01(\v2\x1c.devbridge.loop.v2.RouteHintR\trouteHint\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a;\n" +
@@ -4428,7 +4509,7 @@ func file_devbridge_loop_v2_ltfp_proto_rawDescGZIP() []byte {
 	return file_devbridge_loop_v2_ltfp_proto_rawDescData
 }
 
-var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 73)
+var file_devbridge_loop_v2_ltfp_proto_msgTypes = make([]protoimpl.MessageInfo, 74)
 var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	(*Scope)(nil),                  // 0: devbridge.loop.v2.Scope
 	(*ControlEnvelope)(nil),        // 1: devbridge.loop.v2.ControlEnvelope
@@ -4447,131 +4528,135 @@ var file_devbridge_loop_v2_ltfp_proto_goTypes = []any{
 	(*ScopeFallbackPolicy)(nil),    // 14: devbridge.loop.v2.ScopeFallbackPolicy
 	(*FallbackStep)(nil),           // 15: devbridge.loop.v2.FallbackStep
 	(*ExternalFallbackConfig)(nil), // 16: devbridge.loop.v2.ExternalFallbackConfig
-	(*PublishService)(nil),         // 17: devbridge.loop.v2.PublishService
-	(*PublishServiceAck)(nil),      // 18: devbridge.loop.v2.PublishServiceAck
-	(*UnpublishService)(nil),       // 19: devbridge.loop.v2.UnpublishService
-	(*UnpublishServiceAck)(nil),    // 20: devbridge.loop.v2.UnpublishServiceAck
-	(*EndpointHealthStatus)(nil),   // 21: devbridge.loop.v2.EndpointHealthStatus
-	(*ServiceHealthReport)(nil),    // 22: devbridge.loop.v2.ServiceHealthReport
-	(*ConnectorServiceTarget)(nil), // 23: devbridge.loop.v2.ConnectorServiceTarget
-	(*ExternalServiceTarget)(nil),  // 24: devbridge.loop.v2.ExternalServiceTarget
-	(*RouteTarget)(nil),            // 25: devbridge.loop.v2.RouteTarget
-	(*RouteMatch)(nil),             // 26: devbridge.loop.v2.RouteMatch
-	(*RouteAssign)(nil),            // 27: devbridge.loop.v2.RouteAssign
-	(*RouteAssignAck)(nil),         // 28: devbridge.loop.v2.RouteAssignAck
-	(*RouteRevoke)(nil),            // 29: devbridge.loop.v2.RouteRevoke
-	(*RouteRevokeAck)(nil),         // 30: devbridge.loop.v2.RouteRevokeAck
-	(*RouteStatusReport)(nil),      // 31: devbridge.loop.v2.RouteStatusReport
-	(*NegotiationProfile)(nil),     // 32: devbridge.loop.v2.NegotiationProfile
-	(*NegotiationResult)(nil),      // 33: devbridge.loop.v2.NegotiationResult
-	(*ForwardIntent)(nil),          // 34: devbridge.loop.v2.ForwardIntent
-	(*ForwardDecision)(nil),        // 35: devbridge.loop.v2.ForwardDecision
-	(*ControlError)(nil),           // 36: devbridge.loop.v2.ControlError
-	(*TrafficOpen)(nil),            // 37: devbridge.loop.v2.TrafficOpen
-	(*TrafficOpenAck)(nil),         // 38: devbridge.loop.v2.TrafficOpenAck
-	(*TrafficClose)(nil),           // 39: devbridge.loop.v2.TrafficClose
-	(*TrafficCloseAck)(nil),        // 40: devbridge.loop.v2.TrafficCloseAck
-	(*TrafficReset)(nil),           // 41: devbridge.loop.v2.TrafficReset
-	(*TunnelRecycle)(nil),          // 42: devbridge.loop.v2.TunnelRecycle
-	(*TunnelRecycleAck)(nil),       // 43: devbridge.loop.v2.TunnelRecycleAck
-	(*StreamPayload)(nil),          // 44: devbridge.loop.v2.StreamPayload
-	nil,                            // 45: devbridge.loop.v2.ConnectorHello.LabelsEntry
-	nil,                            // 46: devbridge.loop.v2.ConnectorHello.MetadataEntry
-	nil,                            // 47: devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	nil,                            // 48: devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	nil,                            // 49: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	nil,                            // 50: devbridge.loop.v2.Heartbeat.MetadataEntry
-	nil,                            // 51: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	nil,                            // 52: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	nil,                            // 53: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
-	nil,                            // 54: devbridge.loop.v2.ServiceSelector.MatchLabelsEntry
-	nil,                            // 55: devbridge.loop.v2.ServiceSelector.InstanceLabelsEntry
-	nil,                            // 56: devbridge.loop.v2.PublishService.LabelsEntry
-	nil,                            // 57: devbridge.loop.v2.PublishService.MetadataEntry
-	nil,                            // 58: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	nil,                            // 59: devbridge.loop.v2.ConnectorServiceTarget.InstanceSelectorEntry
-	nil,                            // 60: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
-	nil,                            // 61: devbridge.loop.v2.RouteAssign.MetadataEntry
-	nil,                            // 62: devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	nil,                            // 63: devbridge.loop.v2.NegotiationResult.MetadataEntry
-	nil,                            // 64: devbridge.loop.v2.ForwardIntent.MetadataEntry
-	nil,                            // 65: devbridge.loop.v2.ForwardDecision.MetadataEntry
-	nil,                            // 66: devbridge.loop.v2.ControlError.MetadataEntry
-	nil,                            // 67: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	nil,                            // 68: devbridge.loop.v2.TrafficOpen.MetadataEntry
-	nil,                            // 69: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
-	nil,                            // 70: devbridge.loop.v2.TrafficCloseAck.MetadataEntry
-	nil,                            // 71: devbridge.loop.v2.TunnelRecycle.MetadataEntry
-	nil,                            // 72: devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
+	(*RouteHint)(nil),              // 17: devbridge.loop.v2.RouteHint
+	(*PublishService)(nil),         // 18: devbridge.loop.v2.PublishService
+	(*PublishServiceAck)(nil),      // 19: devbridge.loop.v2.PublishServiceAck
+	(*UnpublishService)(nil),       // 20: devbridge.loop.v2.UnpublishService
+	(*UnpublishServiceAck)(nil),    // 21: devbridge.loop.v2.UnpublishServiceAck
+	(*EndpointHealthStatus)(nil),   // 22: devbridge.loop.v2.EndpointHealthStatus
+	(*ServiceHealthReport)(nil),    // 23: devbridge.loop.v2.ServiceHealthReport
+	(*ConnectorServiceTarget)(nil), // 24: devbridge.loop.v2.ConnectorServiceTarget
+	(*ExternalServiceTarget)(nil),  // 25: devbridge.loop.v2.ExternalServiceTarget
+	(*RouteTarget)(nil),            // 26: devbridge.loop.v2.RouteTarget
+	(*RouteMatch)(nil),             // 27: devbridge.loop.v2.RouteMatch
+	(*RouteAssign)(nil),            // 28: devbridge.loop.v2.RouteAssign
+	(*RouteAssignAck)(nil),         // 29: devbridge.loop.v2.RouteAssignAck
+	(*RouteRevoke)(nil),            // 30: devbridge.loop.v2.RouteRevoke
+	(*RouteRevokeAck)(nil),         // 31: devbridge.loop.v2.RouteRevokeAck
+	(*RouteStatusReport)(nil),      // 32: devbridge.loop.v2.RouteStatusReport
+	(*NegotiationProfile)(nil),     // 33: devbridge.loop.v2.NegotiationProfile
+	(*NegotiationResult)(nil),      // 34: devbridge.loop.v2.NegotiationResult
+	(*ForwardIntent)(nil),          // 35: devbridge.loop.v2.ForwardIntent
+	(*ForwardDecision)(nil),        // 36: devbridge.loop.v2.ForwardDecision
+	(*ControlError)(nil),           // 37: devbridge.loop.v2.ControlError
+	(*TrafficOpen)(nil),            // 38: devbridge.loop.v2.TrafficOpen
+	(*TrafficOpenAck)(nil),         // 39: devbridge.loop.v2.TrafficOpenAck
+	(*TrafficClose)(nil),           // 40: devbridge.loop.v2.TrafficClose
+	(*TrafficCloseAck)(nil),        // 41: devbridge.loop.v2.TrafficCloseAck
+	(*TrafficReset)(nil),           // 42: devbridge.loop.v2.TrafficReset
+	(*TunnelRecycle)(nil),          // 43: devbridge.loop.v2.TunnelRecycle
+	(*TunnelRecycleAck)(nil),       // 44: devbridge.loop.v2.TunnelRecycleAck
+	(*StreamPayload)(nil),          // 45: devbridge.loop.v2.StreamPayload
+	nil,                            // 46: devbridge.loop.v2.ConnectorHello.LabelsEntry
+	nil,                            // 47: devbridge.loop.v2.ConnectorHello.MetadataEntry
+	nil,                            // 48: devbridge.loop.v2.ConnectorWelcome.MetadataEntry
+	nil,                            // 49: devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	nil,                            // 50: devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	nil,                            // 51: devbridge.loop.v2.Heartbeat.MetadataEntry
+	nil,                            // 52: devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	nil,                            // 53: devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	nil,                            // 54: devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	nil,                            // 55: devbridge.loop.v2.ServiceSelector.MatchLabelsEntry
+	nil,                            // 56: devbridge.loop.v2.ServiceSelector.InstanceLabelsEntry
+	nil,                            // 57: devbridge.loop.v2.PublishService.LabelsEntry
+	nil,                            // 58: devbridge.loop.v2.PublishService.MetadataEntry
+	nil,                            // 59: devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	nil,                            // 60: devbridge.loop.v2.ConnectorServiceTarget.InstanceSelectorEntry
+	nil,                            // 61: devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	nil,                            // 62: devbridge.loop.v2.RouteAssign.MetadataEntry
+	nil,                            // 63: devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	nil,                            // 64: devbridge.loop.v2.NegotiationResult.MetadataEntry
+	nil,                            // 65: devbridge.loop.v2.ForwardIntent.MetadataEntry
+	nil,                            // 66: devbridge.loop.v2.ForwardDecision.MetadataEntry
+	nil,                            // 67: devbridge.loop.v2.ControlError.MetadataEntry
+	nil,                            // 68: devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	nil,                            // 69: devbridge.loop.v2.TrafficOpen.MetadataEntry
+	nil,                            // 70: devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	nil,                            // 71: devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	nil,                            // 72: devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	nil,                            // 73: devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
 }
 var file_devbridge_loop_v2_ltfp_proto_depIdxs = []int32{
-	45, // 0: devbridge.loop.v2.ConnectorHello.labels:type_name -> devbridge.loop.v2.ConnectorHello.LabelsEntry
-	46, // 1: devbridge.loop.v2.ConnectorHello.metadata:type_name -> devbridge.loop.v2.ConnectorHello.MetadataEntry
-	47, // 2: devbridge.loop.v2.ConnectorWelcome.metadata:type_name -> devbridge.loop.v2.ConnectorWelcome.MetadataEntry
-	48, // 3: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
-	49, // 4: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
-	50, // 5: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
-	51, // 6: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
-	52, // 7: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
-	53, // 8: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
+	46, // 0: devbridge.loop.v2.ConnectorHello.labels:type_name -> devbridge.loop.v2.ConnectorHello.LabelsEntry
+	47, // 1: devbridge.loop.v2.ConnectorHello.metadata:type_name -> devbridge.loop.v2.ConnectorHello.MetadataEntry
+	48, // 2: devbridge.loop.v2.ConnectorWelcome.metadata:type_name -> devbridge.loop.v2.ConnectorWelcome.MetadataEntry
+	49, // 3: devbridge.loop.v2.ConnectorAuth.metadata:type_name -> devbridge.loop.v2.ConnectorAuth.MetadataEntry
+	50, // 4: devbridge.loop.v2.ConnectorAuthAck.metadata:type_name -> devbridge.loop.v2.ConnectorAuthAck.MetadataEntry
+	51, // 5: devbridge.loop.v2.Heartbeat.metadata:type_name -> devbridge.loop.v2.Heartbeat.MetadataEntry
+	52, // 6: devbridge.loop.v2.ServiceEndpoint.metadata:type_name -> devbridge.loop.v2.ServiceEndpoint.MetadataEntry
+	53, // 7: devbridge.loop.v2.DiscoveryPolicy.tags:type_name -> devbridge.loop.v2.DiscoveryPolicy.TagsEntry
+	54, // 8: devbridge.loop.v2.DiscoveryPolicy.metadata:type_name -> devbridge.loop.v2.DiscoveryPolicy.MetadataEntry
 	0,  // 9: devbridge.loop.v2.ServiceSelector.scope:type_name -> devbridge.loop.v2.Scope
-	54, // 10: devbridge.loop.v2.ServiceSelector.match_labels:type_name -> devbridge.loop.v2.ServiceSelector.MatchLabelsEntry
-	55, // 11: devbridge.loop.v2.ServiceSelector.instance_labels:type_name -> devbridge.loop.v2.ServiceSelector.InstanceLabelsEntry
+	55, // 10: devbridge.loop.v2.ServiceSelector.match_labels:type_name -> devbridge.loop.v2.ServiceSelector.MatchLabelsEntry
+	56, // 11: devbridge.loop.v2.ServiceSelector.instance_labels:type_name -> devbridge.loop.v2.ServiceSelector.InstanceLabelsEntry
 	15, // 12: devbridge.loop.v2.ScopeFallbackPolicy.chain:type_name -> devbridge.loop.v2.FallbackStep
 	16, // 13: devbridge.loop.v2.ScopeFallbackPolicy.external:type_name -> devbridge.loop.v2.ExternalFallbackConfig
 	0,  // 14: devbridge.loop.v2.FallbackStep.target_scope:type_name -> devbridge.loop.v2.Scope
-	0,  // 15: devbridge.loop.v2.PublishService.scope:type_name -> devbridge.loop.v2.Scope
-	56, // 16: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
-	57, // 17: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
-	7,  // 18: devbridge.loop.v2.PublishService.endpoints:type_name -> devbridge.loop.v2.ServiceEndpoint
-	8,  // 19: devbridge.loop.v2.PublishService.exposure:type_name -> devbridge.loop.v2.ServiceExposure
-	9,  // 20: devbridge.loop.v2.PublishService.health_check:type_name -> devbridge.loop.v2.HealthCheckConfig
-	10, // 21: devbridge.loop.v2.PublishService.discovery_policy:type_name -> devbridge.loop.v2.DiscoveryPolicy
-	0,  // 22: devbridge.loop.v2.PublishServiceAck.scope:type_name -> devbridge.loop.v2.Scope
-	0,  // 23: devbridge.loop.v2.UnpublishService.scope:type_name -> devbridge.loop.v2.Scope
-	21, // 24: devbridge.loop.v2.ServiceHealthReport.endpoint_statuses:type_name -> devbridge.loop.v2.EndpointHealthStatus
-	58, // 25: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
-	11, // 26: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ServiceSelector
-	59, // 27: devbridge.loop.v2.ConnectorServiceTarget.instance_selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.InstanceSelectorEntry
-	60, // 28: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
-	23, // 29: devbridge.loop.v2.RouteTarget.connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
-	24, // 30: devbridge.loop.v2.RouteTarget.external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
-	12, // 31: devbridge.loop.v2.RouteMatch.headers:type_name -> devbridge.loop.v2.HeaderMatcher
-	13, // 32: devbridge.loop.v2.RouteMatch.queries:type_name -> devbridge.loop.v2.QueryMatcher
-	0,  // 33: devbridge.loop.v2.RouteAssign.scope:type_name -> devbridge.loop.v2.Scope
-	26, // 34: devbridge.loop.v2.RouteAssign.match:type_name -> devbridge.loop.v2.RouteMatch
-	25, // 35: devbridge.loop.v2.RouteAssign.target:type_name -> devbridge.loop.v2.RouteTarget
-	61, // 36: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
-	0,  // 37: devbridge.loop.v2.RouteRevoke.scope:type_name -> devbridge.loop.v2.Scope
-	62, // 38: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
-	63, // 39: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
-	32, // 40: devbridge.loop.v2.ForwardIntent.negotiation_profile:type_name -> devbridge.loop.v2.NegotiationProfile
-	64, // 41: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
-	33, // 42: devbridge.loop.v2.ForwardDecision.negotiation_result:type_name -> devbridge.loop.v2.NegotiationResult
-	65, // 43: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
-	66, // 44: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
-	67, // 45: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
-	68, // 46: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
-	69, // 47: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
-	70, // 48: devbridge.loop.v2.TrafficCloseAck.metadata:type_name -> devbridge.loop.v2.TrafficCloseAck.MetadataEntry
-	71, // 49: devbridge.loop.v2.TunnelRecycle.metadata:type_name -> devbridge.loop.v2.TunnelRecycle.MetadataEntry
-	72, // 50: devbridge.loop.v2.TunnelRecycleAck.metadata:type_name -> devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
-	37, // 51: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
-	38, // 52: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
-	39, // 53: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
-	40, // 54: devbridge.loop.v2.StreamPayload.close_ack:type_name -> devbridge.loop.v2.TrafficCloseAck
-	41, // 55: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
-	42, // 56: devbridge.loop.v2.StreamPayload.recycle:type_name -> devbridge.loop.v2.TunnelRecycle
-	43, // 57: devbridge.loop.v2.StreamPayload.recycle_ack:type_name -> devbridge.loop.v2.TunnelRecycleAck
-	1,  // 58: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
-	44, // 59: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
-	1,  // 60: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
-	44, // 61: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
-	60, // [60:62] is the sub-list for method output_type
-	58, // [58:60] is the sub-list for method input_type
-	58, // [58:58] is the sub-list for extension type_name
-	58, // [58:58] is the sub-list for extension extendee
-	0,  // [0:58] is the sub-list for field type_name
+	12, // 15: devbridge.loop.v2.RouteHint.match_headers:type_name -> devbridge.loop.v2.HeaderMatcher
+	13, // 16: devbridge.loop.v2.RouteHint.match_queries:type_name -> devbridge.loop.v2.QueryMatcher
+	0,  // 17: devbridge.loop.v2.PublishService.scope:type_name -> devbridge.loop.v2.Scope
+	57, // 18: devbridge.loop.v2.PublishService.labels:type_name -> devbridge.loop.v2.PublishService.LabelsEntry
+	58, // 19: devbridge.loop.v2.PublishService.metadata:type_name -> devbridge.loop.v2.PublishService.MetadataEntry
+	7,  // 20: devbridge.loop.v2.PublishService.endpoints:type_name -> devbridge.loop.v2.ServiceEndpoint
+	8,  // 21: devbridge.loop.v2.PublishService.exposure:type_name -> devbridge.loop.v2.ServiceExposure
+	9,  // 22: devbridge.loop.v2.PublishService.health_check:type_name -> devbridge.loop.v2.HealthCheckConfig
+	10, // 23: devbridge.loop.v2.PublishService.discovery_policy:type_name -> devbridge.loop.v2.DiscoveryPolicy
+	17, // 24: devbridge.loop.v2.PublishService.route_hint:type_name -> devbridge.loop.v2.RouteHint
+	0,  // 25: devbridge.loop.v2.PublishServiceAck.scope:type_name -> devbridge.loop.v2.Scope
+	0,  // 26: devbridge.loop.v2.UnpublishService.scope:type_name -> devbridge.loop.v2.Scope
+	22, // 27: devbridge.loop.v2.ServiceHealthReport.endpoint_statuses:type_name -> devbridge.loop.v2.EndpointHealthStatus
+	59, // 28: devbridge.loop.v2.ServiceHealthReport.metadata:type_name -> devbridge.loop.v2.ServiceHealthReport.MetadataEntry
+	11, // 29: devbridge.loop.v2.ConnectorServiceTarget.selector:type_name -> devbridge.loop.v2.ServiceSelector
+	60, // 30: devbridge.loop.v2.ConnectorServiceTarget.instance_selector:type_name -> devbridge.loop.v2.ConnectorServiceTarget.InstanceSelectorEntry
+	61, // 31: devbridge.loop.v2.ExternalServiceTarget.selector:type_name -> devbridge.loop.v2.ExternalServiceTarget.SelectorEntry
+	24, // 32: devbridge.loop.v2.RouteTarget.connector_service:type_name -> devbridge.loop.v2.ConnectorServiceTarget
+	25, // 33: devbridge.loop.v2.RouteTarget.external_service:type_name -> devbridge.loop.v2.ExternalServiceTarget
+	12, // 34: devbridge.loop.v2.RouteMatch.headers:type_name -> devbridge.loop.v2.HeaderMatcher
+	13, // 35: devbridge.loop.v2.RouteMatch.queries:type_name -> devbridge.loop.v2.QueryMatcher
+	0,  // 36: devbridge.loop.v2.RouteAssign.scope:type_name -> devbridge.loop.v2.Scope
+	27, // 37: devbridge.loop.v2.RouteAssign.match:type_name -> devbridge.loop.v2.RouteMatch
+	26, // 38: devbridge.loop.v2.RouteAssign.target:type_name -> devbridge.loop.v2.RouteTarget
+	62, // 39: devbridge.loop.v2.RouteAssign.metadata:type_name -> devbridge.loop.v2.RouteAssign.MetadataEntry
+	0,  // 40: devbridge.loop.v2.RouteRevoke.scope:type_name -> devbridge.loop.v2.Scope
+	63, // 41: devbridge.loop.v2.NegotiationProfile.metadata:type_name -> devbridge.loop.v2.NegotiationProfile.MetadataEntry
+	64, // 42: devbridge.loop.v2.NegotiationResult.metadata:type_name -> devbridge.loop.v2.NegotiationResult.MetadataEntry
+	33, // 43: devbridge.loop.v2.ForwardIntent.negotiation_profile:type_name -> devbridge.loop.v2.NegotiationProfile
+	65, // 44: devbridge.loop.v2.ForwardIntent.metadata:type_name -> devbridge.loop.v2.ForwardIntent.MetadataEntry
+	34, // 45: devbridge.loop.v2.ForwardDecision.negotiation_result:type_name -> devbridge.loop.v2.NegotiationResult
+	66, // 46: devbridge.loop.v2.ForwardDecision.metadata:type_name -> devbridge.loop.v2.ForwardDecision.MetadataEntry
+	67, // 47: devbridge.loop.v2.ControlError.metadata:type_name -> devbridge.loop.v2.ControlError.MetadataEntry
+	68, // 48: devbridge.loop.v2.TrafficOpen.endpoint_selection_hint:type_name -> devbridge.loop.v2.TrafficOpen.EndpointSelectionHintEntry
+	69, // 49: devbridge.loop.v2.TrafficOpen.metadata:type_name -> devbridge.loop.v2.TrafficOpen.MetadataEntry
+	70, // 50: devbridge.loop.v2.TrafficOpenAck.metadata:type_name -> devbridge.loop.v2.TrafficOpenAck.MetadataEntry
+	71, // 51: devbridge.loop.v2.TrafficCloseAck.metadata:type_name -> devbridge.loop.v2.TrafficCloseAck.MetadataEntry
+	72, // 52: devbridge.loop.v2.TunnelRecycle.metadata:type_name -> devbridge.loop.v2.TunnelRecycle.MetadataEntry
+	73, // 53: devbridge.loop.v2.TunnelRecycleAck.metadata:type_name -> devbridge.loop.v2.TunnelRecycleAck.MetadataEntry
+	38, // 54: devbridge.loop.v2.StreamPayload.open_req:type_name -> devbridge.loop.v2.TrafficOpen
+	39, // 55: devbridge.loop.v2.StreamPayload.open_ack:type_name -> devbridge.loop.v2.TrafficOpenAck
+	40, // 56: devbridge.loop.v2.StreamPayload.close:type_name -> devbridge.loop.v2.TrafficClose
+	41, // 57: devbridge.loop.v2.StreamPayload.close_ack:type_name -> devbridge.loop.v2.TrafficCloseAck
+	42, // 58: devbridge.loop.v2.StreamPayload.reset:type_name -> devbridge.loop.v2.TrafficReset
+	43, // 59: devbridge.loop.v2.StreamPayload.recycle:type_name -> devbridge.loop.v2.TunnelRecycle
+	44, // 60: devbridge.loop.v2.StreamPayload.recycle_ack:type_name -> devbridge.loop.v2.TunnelRecycleAck
+	1,  // 61: devbridge.loop.v2.DevBridgeControlService.ControlChannel:input_type -> devbridge.loop.v2.ControlEnvelope
+	45, // 62: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:input_type -> devbridge.loop.v2.StreamPayload
+	1,  // 63: devbridge.loop.v2.DevBridgeControlService.ControlChannel:output_type -> devbridge.loop.v2.ControlEnvelope
+	45, // 64: devbridge.loop.v2.DevBridgeTunnelService.TunnelStream:output_type -> devbridge.loop.v2.StreamPayload
+	63, // [63:65] is the sub-list for method output_type
+	61, // [61:63] is the sub-list for method input_type
+	61, // [61:61] is the sub-list for extension type_name
+	61, // [61:61] is the sub-list for extension extendee
+	0,  // [0:61] is the sub-list for field type_name
 }
 
 func init() { file_devbridge_loop_v2_ltfp_proto_init() }
@@ -4591,7 +4676,7 @@ func file_devbridge_loop_v2_ltfp_proto_init() {
 		(*QueryMatcher_Regex)(nil),
 		(*QueryMatcher_Present)(nil),
 	}
-	file_devbridge_loop_v2_ltfp_proto_msgTypes[44].OneofWrappers = []any{
+	file_devbridge_loop_v2_ltfp_proto_msgTypes[45].OneofWrappers = []any{
 		(*StreamPayload_OpenReq)(nil),
 		(*StreamPayload_OpenAck)(nil),
 		(*StreamPayload_Data)(nil),
@@ -4607,7 +4692,7 @@ func file_devbridge_loop_v2_ltfp_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_devbridge_loop_v2_ltfp_proto_rawDesc), len(file_devbridge_loop_v2_ltfp_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   73,
+			NumMessages:   74,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

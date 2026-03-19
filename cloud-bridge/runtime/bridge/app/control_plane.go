@@ -343,6 +343,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 			Guard:           eventGuard,
 			SessionRegistry: sessionRegistry,
 			ServiceRegistry: serviceRegistry,
+			RouteRegistry:   routeRegistry,
 			Metrics:         metrics,
 			HostDeriver:     hostDeriver,
 		}),

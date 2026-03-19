@@ -299,6 +299,7 @@ func normalizeRegistration(registration adapter.LocalRegistration) adapter.Local
 		Exposure:        registration.Exposure,
 		HealthCheck:     registration.HealthCheck,
 		DiscoveryPolicy: registration.DiscoveryPolicy,
+		RouteHint:       registration.RouteHint,
 		Labels:          cloneStringMap(registration.Labels),
 		Metadata:        cloneStringMap(registration.Metadata),
 	}
@@ -338,6 +339,7 @@ func cloneRecord(record Record) Record {
 			Exposure:        record.Registration.Exposure,
 			HealthCheck:     record.Registration.HealthCheck,
 			DiscoveryPolicy: record.Registration.DiscoveryPolicy,
+			RouteHint:       record.Registration.RouteHint,
 			Labels:          cloneStringMap(record.Registration.Labels),
 			Metadata:        cloneStringMap(record.Registration.Metadata),
 		},

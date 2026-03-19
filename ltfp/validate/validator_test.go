@@ -157,6 +157,40 @@ func TestValidatePublishServiceRejectMixedEndpointProtocol(t *testing.T) {
 	}
 }
 
+// TestValidatePublishServiceRejectInvalidRouteHintHeaderRegex 验证 route_hint header regex 非法时会被拒绝。
+func TestValidatePublishServiceRejectInvalidRouteHintHeaderRegex(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.RouteHint.MatchHeaders = []pb.HeaderMatcher{
+		{Name: "x-tenant", Regex: "["},
+	}
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedValue) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestValidatePublishServiceRejectMissingRouteHintHeaderName 验证 route_hint header 缺失名称会被拒绝。
+func TestValidatePublishServiceRejectMissingRouteHintHeaderName(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.RouteHint.MatchHeaders = []pb.HeaderMatcher{
+		{Exact: "alice"},
+	}
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestValidateUnpublishService 验证下线消息支持实例或逻辑服务定位。
 func TestValidateUnpublishService(t *testing.T) {
 	t.Parallel()

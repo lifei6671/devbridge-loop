@@ -240,6 +240,326 @@ func TestPublishHandlerDerivesExposureHostAndPersistsPayload(t *testing.T) {
 	}
 }
 
+// TestPublishHandlerAutoRegistersRouteFromPublishService 验证 PublishService 会在 Bridge 侧自动派生路由。
+func TestPublishHandlerAutoRegistersRouteFromPublishService(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-route",
+		ConnectorID: "connector-route",
+		Epoch:       7,
+		State:       registry.SessionActive,
+	})
+	routeRegistry := registry.NewRouteRegistry()
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		RouteRegistry:   routeRegistry,
+		HostDeriver: publishHandlerTestHostDeriver{
+			host: "orders.alice.dev.example.com",
+		},
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-route"
+		},
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-route",
+		SessionEpoch:    7,
+		EventID:         "evt-route",
+		ResourceVersion: 9,
+	}, pb.PublishService{
+		InstanceID:  "inst-route",
+		ServiceName: "orders",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+		Exposure: pb.ServiceExposure{
+			IngressMode: pb.IngressModeL7Shared,
+			PathPrefix:  "/api/orders",
+		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+			MatchQueries: []pb.QueryMatcher{
+				{Name: "version", Exact: "v2"},
+			},
+			Priority: 23,
+		},
+	})
+	if !ack.Accepted {
+		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
+	}
+
+	routeSnapshot, exists := routeRegistry.Get("agent-auto-route-ls-route")
+	if !exists {
+		t.Fatalf("expected auto route registered")
+	}
+	if routeSnapshot.Match.Host != "orders.alice.dev.example.com" {
+		t.Fatalf("unexpected route host: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Match.Protocol != "http" {
+		t.Fatalf("unexpected route protocol: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Match.PathPrefix != "/api/orders" {
+		t.Fatalf("unexpected route path prefix: %+v", routeSnapshot.Match)
+	}
+	if len(routeSnapshot.Match.Headers) != 1 || routeSnapshot.Match.Headers[0].Name != "x-tenant" {
+		t.Fatalf("unexpected route headers: %+v", routeSnapshot.Match.Headers)
+	}
+	if len(routeSnapshot.Match.Queries) != 1 || routeSnapshot.Match.Queries[0].Name != "version" {
+		t.Fatalf("unexpected route queries: %+v", routeSnapshot.Match.Queries)
+	}
+	if routeSnapshot.Priority != 23 {
+		t.Fatalf("unexpected route priority: %+v", routeSnapshot)
+	}
+}
+
+// TestPublishHandlerAutoRegistersTLSSNIRoute 验证 tls_sni_shared 自动路由使用 TLS/SNI 维度匹配。
+func TestPublishHandlerAutoRegistersTLSSNIRoute(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-tls-route",
+		ConnectorID: "connector-tls-route",
+		Epoch:       8,
+		State:       registry.SessionActive,
+	})
+	routeRegistry := registry.NewRouteRegistry()
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		RouteRegistry:   routeRegistry,
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-tls-route"
+		},
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-tls-route",
+		SessionEpoch:    8,
+		EventID:         "evt-tls-route",
+		ResourceVersion: 10,
+	}, pb.PublishService{
+		InstanceID:  "inst-tls-route",
+		ServiceName: "payments",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "https",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "https", Host: "127.0.0.1", Port: 18443},
+		},
+		Exposure: pb.ServiceExposure{
+			IngressMode: pb.IngressModeTLSSNIShared,
+			ListenPort:  443,
+			SNIName:     "pay.dev.example.com",
+		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+			MatchQueries: []pb.QueryMatcher{
+				{Name: "version", Exact: "v2"},
+			},
+			Priority: 7,
+		},
+	})
+	if !ack.Accepted {
+		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
+	}
+
+	routeSnapshot, exists := routeRegistry.Get("agent-auto-route-ls-tls-route")
+	if !exists {
+		t.Fatalf("expected tls-sni auto route registered")
+	}
+	if routeSnapshot.Match.Protocol != "tls" || routeSnapshot.Match.SNI != "pay.dev.example.com" {
+		t.Fatalf("unexpected tls-sni route match: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Match.ListenPort != 443 {
+		t.Fatalf("unexpected tls-sni listen port: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Match.Host != "" || routeSnapshot.Match.PathPrefix != "" {
+		t.Fatalf("unexpected tls-sni host/path match: %+v", routeSnapshot.Match)
+	}
+	if len(routeSnapshot.Match.Headers) != 0 || len(routeSnapshot.Match.Queries) != 0 {
+		t.Fatalf("unexpected tls-sni header/query matchers: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Priority != 7 {
+		t.Fatalf("unexpected tls-sni route priority: %+v", routeSnapshot)
+	}
+}
+
+// TestPublishHandlerAutoRegistersL4DedicatedPortRoute 验证 l4_dedicated_port 自动路由使用 TCP/端口匹配。
+func TestPublishHandlerAutoRegistersL4DedicatedPortRoute(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-l4-route",
+		ConnectorID: "connector-l4-route",
+		Epoch:       9,
+		State:       registry.SessionActive,
+	})
+	routeRegistry := registry.NewRouteRegistry()
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		RouteRegistry:   routeRegistry,
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-l4-route"
+		},
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-l4-route",
+		SessionEpoch:    9,
+		EventID:         "evt-l4-route",
+		ResourceVersion: 12,
+	}, pb.PublishService{
+		InstanceID:  "inst-l4-route",
+		ServiceName: "tcp-echo",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "tcp",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "tcp", Host: "127.0.0.1", Port: 19090},
+		},
+		Exposure: pb.ServiceExposure{
+			IngressMode: pb.IngressModeL4DedicatedPort,
+			ListenPort:  18081,
+		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+			MatchQueries: []pb.QueryMatcher{
+				{Name: "version", Exact: "v2"},
+			},
+			Priority: 9,
+		},
+	})
+	if !ack.Accepted {
+		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
+	}
+
+	routeSnapshot, exists := routeRegistry.Get("agent-auto-route-ls-l4-route")
+	if !exists {
+		t.Fatalf("expected l4 auto route registered")
+	}
+	if routeSnapshot.Match.Protocol != "tcp" || routeSnapshot.Match.ListenPort != 18081 {
+		t.Fatalf("unexpected l4 route match: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Match.Host != "" || routeSnapshot.Match.PathPrefix != "" || routeSnapshot.Match.SNI != "" {
+		t.Fatalf("unexpected l4 host/path/sni match: %+v", routeSnapshot.Match)
+	}
+	if len(routeSnapshot.Match.Headers) != 0 || len(routeSnapshot.Match.Queries) != 0 {
+		t.Fatalf("unexpected l4 header/query matchers: %+v", routeSnapshot.Match)
+	}
+	if routeSnapshot.Priority != 9 {
+		t.Fatalf("unexpected l4 route priority: %+v", routeSnapshot)
+	}
+}
+
+// TestPublishHandlerRejectsPublishWhenAutoRouteConflicts 验证自动派生路由冲突时会拒绝 PublishService。
+func TestPublishHandlerRejectsPublishWhenAutoRouteConflicts(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-conflict",
+		ConnectorID: "connector-conflict",
+		Epoch:       5,
+		State:       registry.SessionActive,
+	})
+	routeRegistry := registry.NewRouteRegistry()
+	routeRegistry.Upsert(time.Now().UTC(), pb.Route{
+		RouteID:         "route-existing",
+		Scope:           pb.Scope{Namespace: "dev", Environment: "alice"},
+		ResourceVersion: 1,
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.dev.example.com",
+			PathPrefix: "/orders",
+			Headers: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{LogicalServiceID: "ls-existing"},
+			},
+		},
+		Priority: 0,
+		Metadata: map[string]string{"source": "manual"},
+	})
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		RouteRegistry:   routeRegistry,
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-conflict"
+		},
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-conflict",
+		SessionEpoch:    5,
+		EventID:         "evt-conflict",
+		ResourceVersion: 11,
+	}, pb.PublishService{
+		InstanceID:  "inst-conflict",
+		ServiceName: "orders",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 19090},
+		},
+		Exposure: pb.ServiceExposure{
+			IngressMode: pb.IngressModeL7Shared,
+			Host:        "api.dev.example.com",
+			PathPrefix:  "/orders",
+		},
+		RouteHint: pb.RouteHint{
+			MatchHeaders: []pb.HeaderMatcher{
+				{Name: "x-tenant", Exact: "alice"},
+			},
+		},
+	})
+	if ack.Accepted {
+		t.Fatalf("expected publish rejected on route conflict")
+	}
+	if ack.ErrorCode != ltfperrors.CodeIngressRouteMismatch {
+		t.Fatalf("unexpected error code: got=%s want=%s", ack.ErrorCode, ltfperrors.CodeIngressRouteMismatch)
+	}
+	if services := handler.serviceRegistry.List(); len(services) != 0 {
+		t.Fatalf("unexpected services persisted on conflict: %+v", services)
+	}
+}
+
 // TestPublishHandlerRejectLegacyPayloadFields 验证旧字段一律拒绝。
 func TestPublishHandlerRejectLegacyPayloadFields(t *testing.T) {
 	t.Parallel()

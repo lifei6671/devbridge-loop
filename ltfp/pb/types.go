@@ -170,6 +170,13 @@ type ExternalFallbackConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
+// RouteHint 描述服务注册时附带的自动路由匹配补充条件。
+type RouteHint struct {
+	MatchHeaders []HeaderMatcher `json:"matchHeaders,omitempty"`
+	MatchQueries []QueryMatcher  `json:"matchQueries,omitempty"`
+	Priority     uint32          `json:"priority,omitempty"`
+}
+
 // PublishService 描述服务发布请求。
 type PublishService struct {
 	InstanceID      string            `json:"instanceId,omitempty"`
@@ -182,6 +189,7 @@ type PublishService struct {
 	Exposure        ServiceExposure   `json:"exposure"`
 	HealthCheck     HealthCheckConfig `json:"healthCheck,omitempty"`
 	DiscoveryPolicy DiscoveryPolicy   `json:"discoveryPolicy,omitempty"`
+	RouteHint       RouteHint         `json:"routeHint,omitempty"`
 }
 
 // PublishServiceAck 描述发布服务响应。

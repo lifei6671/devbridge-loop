@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/admission"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	"github.com/lifei6671/devbridge-loop/ltfp/consistency"
@@ -20,7 +21,9 @@ type PublishHandlerOptions struct {
 	Guard               *consistency.ResourceEventGuard
 	SessionRegistry     *registry.SessionRegistry
 	ServiceRegistry     *registry.ServiceRegistry
+	RouteRegistry       *registry.RouteRegistry
 	Metrics             *obs.Metrics
+	Admission           RouteAdmission
 	HostDeriver         HostDeriver
 	Now                 func() time.Time
 	ServiceIDGenerator  func(now time.Time, logicalServiceKey string) string
@@ -37,7 +40,9 @@ type PublishHandler struct {
 	guard               *consistency.ResourceEventGuard
 	sessionRegistry     *registry.SessionRegistry
 	serviceRegistry     *registry.ServiceRegistry
+	routeRegistry       *registry.RouteRegistry
 	metrics             *obs.Metrics
+	admission           RouteAdmission
 	hostDeriver         HostDeriver
 	now                 func() time.Time
 	serviceIDGenerator  func(now time.Time, logicalServiceKey string) string
@@ -61,6 +66,10 @@ func NewPublishHandler(options PublishHandlerOptions) *PublishHandler {
 	if serviceRegistry == nil {
 		serviceRegistry = registry.NewServiceRegistry()
 	}
+	routeRegistry := options.RouteRegistry
+	if routeRegistry == nil {
+		routeRegistry = registry.NewRouteRegistry()
+	}
 	serviceIDGenerator := options.ServiceIDGenerator
 	if serviceIDGenerator == nil {
 		serviceIDGenerator = defaultPublishLogicalServiceIDGenerator
@@ -73,11 +82,17 @@ func NewPublishHandler(options PublishHandlerOptions) *PublishHandler {
 	if metrics == nil {
 		metrics = obs.DefaultMetrics
 	}
+	routeAdmission := options.Admission
+	if routeAdmission == nil {
+		routeAdmission = admission.NewRouteConflictAdmission(routeRegistry, serviceRegistry)
+	}
 	return &PublishHandler{
 		guard:               guard,
 		sessionRegistry:     options.SessionRegistry,
 		serviceRegistry:     serviceRegistry,
+		routeRegistry:       routeRegistry,
 		metrics:             metrics,
+		admission:           routeAdmission,
 		hostDeriver:         options.HostDeriver,
 		now:                 nowFunc,
 		serviceIDGenerator:  serviceIDGenerator,
@@ -120,7 +135,31 @@ func (handler *PublishHandler) HandlePublish(envelope pb.ControlEnvelope, messag
 		ResourceVersion: envelope.ResourceVersion,
 	})
 	if decision.Status == pb.EventStatusAccepted {
+		autoRoute, shouldUpsertRoute, routeErr := handler.buildAutoRoute(normalizedMessage, logicalService, instance, envelope.ResourceVersion)
+		if routeErr != nil {
+			return handler.rejectPublishAck(normalizedMessage, routeErr)
+		}
+		if shouldUpsertRoute {
+			warnings, metadata, admissionErr := handler.runAdmission(autoRoute)
+			if admissionErr != nil {
+				return handler.rejectPublishAck(normalizedMessage, admissionErr)
+			}
+			if len(warnings) > 0 || len(metadata) > 0 {
+				slog.Warn(
+					"auto route admission warnings",
+					"route_id", strings.TrimSpace(autoRoute.RouteID),
+					"logical_service_id", strings.TrimSpace(logicalService.LogicalServiceID),
+					"warnings", warnings,
+					"metadata", metadata,
+				)
+			}
+		}
 		handler.serviceRegistry.Upsert(handler.now(), logicalService, instance)
+		if shouldUpsertRoute {
+			handler.routeRegistry.Upsert(handler.now(), autoRoute)
+		} else {
+			handler.removeAutoRoute(logicalService.LogicalServiceID, logicalService.ServiceName, logicalService.Scope)
+		}
 		handler.metrics.ObserveBridgeServicePublish(logicalService.LogicalServiceID, instance.InstanceID)
 		RefreshServiceAvailabilityMetrics(handler.metrics, handler.serviceRegistry, logicalService.LogicalServiceID)
 	}
@@ -185,6 +224,7 @@ func (handler *PublishHandler) HandleUnpublish(envelope pb.ControlEnvelope, mess
 		} else if strings.TrimSpace(logicalServiceID) != "" {
 			handler.serviceRegistry.RemoveInstanceByLogicalServiceAndRuntime(logicalServiceID, resolvedConnectorID, envelope.SessionID)
 		}
+		handler.reconcileAutoRouteOnUnpublish(logicalServiceID)
 		RefreshServiceAvailabilityMetrics(handler.metrics, handler.serviceRegistry, logicalServiceID)
 	}
 	handler.emitServiceResourceAuditLog(
@@ -425,6 +465,7 @@ func (handler *PublishHandler) normalizePublishMessage(message pb.PublishService
 	normalizedMessage.Exposure = cloneServiceExposure(message.Exposure)
 	normalizedMessage.HealthCheck = message.HealthCheck
 	normalizedMessage.DiscoveryPolicy = cloneDiscoveryPolicy(message.DiscoveryPolicy)
+	normalizedMessage.RouteHint = cloneRouteHint(message.RouteHint)
 	normalizedMessage.Labels = cloneStringMap(message.Labels)
 	normalizedMessage.Metadata = cloneStringMap(message.Metadata)
 	normalizedMessage.Exposure.Host = strings.ToLower(strings.TrimSpace(normalizedMessage.Exposure.Host))
@@ -467,6 +508,7 @@ func applyPublishPayloadToInstance(instance *pb.ServiceInstance, message pb.Publ
 	instance.Exposure = cloneServiceExposure(message.Exposure)
 	instance.HealthCheck = message.HealthCheck
 	instance.DiscoveryPolicy = cloneDiscoveryPolicy(message.DiscoveryPolicy)
+	instance.RouteHint = cloneRouteHint(message.RouteHint)
 	instance.Labels = cloneStringMap(message.Labels)
 	instance.Metadata = cloneStringMap(message.Metadata)
 }
@@ -499,6 +541,48 @@ func cloneDiscoveryPolicy(policy pb.DiscoveryPolicy) pb.DiscoveryPolicy {
 		Tags:         cloneStringMap(policy.Tags),
 		Metadata:     cloneStringMap(policy.Metadata),
 	}
+}
+
+func cloneRouteHint(routeHint pb.RouteHint) pb.RouteHint {
+	return pb.RouteHint{
+		MatchHeaders: cloneHeaderMatchers(routeHint.MatchHeaders),
+		MatchQueries: cloneQueryMatchers(routeHint.MatchQueries),
+		Priority:     routeHint.Priority,
+	}
+}
+
+func cloneHeaderMatchers(matchers []pb.HeaderMatcher) []pb.HeaderMatcher {
+	if len(matchers) == 0 {
+		return nil
+	}
+	cloned := make([]pb.HeaderMatcher, 0, len(matchers))
+	for _, matcher := range matchers {
+		cloned = append(cloned, pb.HeaderMatcher{
+			Name:    strings.TrimSpace(matcher.Name),
+			Exact:   strings.TrimSpace(matcher.Exact),
+			Prefix:  strings.TrimSpace(matcher.Prefix),
+			Regex:   strings.TrimSpace(matcher.Regex),
+			Present: matcher.Present,
+		})
+	}
+	return cloned
+}
+
+func cloneQueryMatchers(matchers []pb.QueryMatcher) []pb.QueryMatcher {
+	if len(matchers) == 0 {
+		return nil
+	}
+	cloned := make([]pb.QueryMatcher, 0, len(matchers))
+	for _, matcher := range matchers {
+		cloned = append(cloned, pb.QueryMatcher{
+			Name:    strings.TrimSpace(matcher.Name),
+			Exact:   strings.TrimSpace(matcher.Exact),
+			Prefix:  strings.TrimSpace(matcher.Prefix),
+			Regex:   strings.TrimSpace(matcher.Regex),
+			Present: matcher.Present,
+		})
+	}
+	return cloned
 }
 
 func normalizeScope(scope pb.Scope) pb.Scope {
@@ -540,6 +624,198 @@ func defaultPublishInstanceIDGenerator(now time.Time, _ string, _ string) string
 	}
 	sequence := atomic.AddUint64(&publishInstanceIDSequence, 1)
 	return fmt.Sprintf("si-%d-%d", normalizedNow.UnixNano(), sequence)
+}
+
+func (handler *PublishHandler) buildAutoRoute(
+	message pb.PublishService,
+	logicalService pb.LogicalService,
+	instance pb.ServiceInstance,
+	resourceVersion uint64,
+) (pb.Route, bool, error) {
+	routeID := buildPublishAutoRouteID(logicalService.LogicalServiceID, logicalService.ServiceName, logicalService.Scope)
+	if routeID == "" {
+		return pb.Route{}, false, nil
+	}
+	if err := validate.ValidateRouteHint(message.RouteHint); err != nil {
+		return pb.Route{}, false, err
+	}
+	match, ingressMode, shouldUpsertRoute, err := buildPublishAutoRouteMatch(message)
+	if err != nil {
+		return pb.Route{}, false, err
+	}
+	if !shouldUpsertRoute {
+		return pb.Route{}, false, nil
+	}
+	return pb.Route{
+		RouteID:         routeID,
+		Scope:           logicalService.Scope,
+		ResourceVersion: resourceVersion,
+		Match:           match,
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{
+					LogicalServiceID: strings.TrimSpace(logicalService.LogicalServiceID),
+					ServiceName:      strings.TrimSpace(logicalService.ServiceName),
+					Scope:            logicalService.Scope,
+				},
+			},
+		},
+		Priority: message.RouteHint.Priority,
+		Metadata: map[string]string{
+			"source":             "bridge.auto_route",
+			"logical_service_id": strings.TrimSpace(logicalService.LogicalServiceID),
+			"instance_id":        strings.TrimSpace(instance.InstanceID),
+			"service_name":       strings.TrimSpace(logicalService.ServiceName),
+			"ingress_mode":       string(ingressMode),
+		},
+	}, true, nil
+}
+
+func (handler *PublishHandler) reconcileAutoRouteOnUnpublish(logicalServiceID string) {
+	normalizedLogicalServiceID := strings.TrimSpace(logicalServiceID)
+	if normalizedLogicalServiceID == "" || handler == nil || handler.serviceRegistry == nil {
+		return
+	}
+	logicalService, exists := handler.serviceRegistry.GetLogicalServiceByID(normalizedLogicalServiceID)
+	if !exists || logicalService.ActiveInstanceCount > 0 {
+		return
+	}
+	handler.removeAutoRoute(logicalService.LogicalServiceID, logicalService.ServiceName, logicalService.Scope)
+}
+
+func (handler *PublishHandler) removeAutoRoute(logicalServiceID string, serviceName string, scope pb.Scope) {
+	if handler == nil || handler.routeRegistry == nil {
+		return
+	}
+	routeID := buildPublishAutoRouteID(logicalServiceID, serviceName, scope)
+	if routeID == "" {
+		return
+	}
+	handler.routeRegistry.Remove(routeID)
+}
+
+func (handler *PublishHandler) runAdmission(route pb.Route) ([]string, map[string]string, error) {
+	if handler == nil || handler.admission == nil {
+		return nil, nil, nil
+	}
+	warnings, metadata, err := handler.admission.Admit(route)
+	if err != nil {
+		if handler.metrics != nil {
+			handler.metrics.IncBridgeRouteConflictRejectionTotal()
+		}
+		conflictRouteID := admission.ExtractConflictRouteID(err)
+		if metadata == nil && conflictRouteID != "" {
+			metadata = map[string]string{"conflict_route_id": conflictRouteID}
+		}
+		if !ltfperrors.IsCode(err, ltfperrors.CodeIngressRouteMismatch) {
+			err = ltfperrors.New(ltfperrors.CodeIngressRouteMismatch, err.Error())
+		}
+		return nil, metadata, err
+	}
+	return warnings, metadata, nil
+}
+
+func normalizePublishAutoRouteProtocol(message pb.PublishService) string {
+	serviceProtocol := strings.ToLower(strings.TrimSpace(message.ServiceType))
+	if serviceProtocol == "" {
+		for _, endpoint := range message.Endpoints {
+			serviceProtocol = strings.ToLower(strings.TrimSpace(endpoint.Protocol))
+			if serviceProtocol != "" {
+				break
+			}
+		}
+	}
+	switch serviceProtocol {
+	case "http", "https":
+		return "http"
+	case "grpc", "grpc_h2", "grpc-h2":
+		return "grpc"
+	default:
+		return ""
+	}
+}
+
+func normalizePublishAutoRouteIngressMode(message pb.PublishService) pb.IngressMode {
+	switch normalizedMode := pb.IngressMode(strings.TrimSpace(string(message.Exposure.IngressMode))); normalizedMode {
+	case "", pb.IngressModeL7Shared:
+		return pb.IngressModeL7Shared
+	case pb.IngressModeTLSSNIShared:
+		return pb.IngressModeTLSSNIShared
+	case pb.IngressModeL4DedicatedPort:
+		return pb.IngressModeL4DedicatedPort
+	default:
+		return normalizedMode
+	}
+}
+
+func buildPublishAutoRouteMatch(message pb.PublishService) (pb.RouteMatch, pb.IngressMode, bool, error) {
+	normalizedIngressMode := normalizePublishAutoRouteIngressMode(message)
+	switch normalizedIngressMode {
+	case pb.IngressModeL7Shared:
+		normalizedProtocol := normalizePublishAutoRouteProtocol(message)
+		if normalizedProtocol == "" {
+			return pb.RouteMatch{}, "", false, nil
+		}
+		pathPrefix := strings.TrimSpace(message.Exposure.PathPrefix)
+		if pathPrefix == "" {
+			pathPrefix = "/"
+		}
+		return pb.RouteMatch{
+			Protocol:   normalizedProtocol,
+			Host:       strings.ToLower(strings.TrimSpace(message.Exposure.Host)),
+			PathPrefix: pathPrefix,
+			Headers:    cloneHeaderMatchers(message.RouteHint.MatchHeaders),
+			Queries:    cloneQueryMatchers(message.RouteHint.MatchQueries),
+		}, normalizedIngressMode, true, nil
+	case pb.IngressModeTLSSNIShared:
+		normalizedSNIName := strings.ToLower(strings.TrimSpace(message.Exposure.SNIName))
+		if normalizedSNIName == "" {
+			return pb.RouteMatch{}, "", false, ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				"exposure.sni_name is required for tls_sni_shared",
+			)
+		}
+		return pb.RouteMatch{
+			Protocol:   "tls",
+			ListenPort: message.Exposure.ListenPort,
+			SNI:        normalizedSNIName,
+		}, normalizedIngressMode, true, nil
+	case pb.IngressModeL4DedicatedPort:
+		if message.Exposure.ListenPort == 0 {
+			return pb.RouteMatch{}, "", false, ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				"exposure.listen_port is required for l4_dedicated_port",
+			)
+		}
+		return pb.RouteMatch{
+			Protocol:   "tcp",
+			ListenPort: message.Exposure.ListenPort,
+		}, normalizedIngressMode, true, nil
+	default:
+		return pb.RouteMatch{}, "", false, ltfperrors.New(
+			ltfperrors.CodeUnsupportedValue,
+			fmt.Sprintf("unsupported exposure.ingress_mode=%s", normalizedIngressMode),
+		)
+	}
+}
+
+func buildPublishAutoRouteID(logicalServiceID string, serviceName string, scope pb.Scope) string {
+	resourceID := strings.TrimSpace(logicalServiceID)
+	if resourceID == "" {
+		resourceID = buildLogicalServiceKey(serviceName, scope)
+	}
+	if resourceID == "" {
+		return ""
+	}
+	sanitizedResourceID := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		".", "-",
+		" ", "-",
+	).Replace(resourceID)
+	return "agent-auto-route-" + sanitizedResourceID
 }
 
 // emitServiceResourceAuditLog 输出 service 资源变更审计日志。

@@ -58,6 +58,7 @@ type ServiceInstance struct {
 	Exposure         ServiceExposure   `json:"exposure,omitempty"`
 	HealthCheck      HealthCheckConfig `json:"healthCheck,omitempty"`
 	DiscoveryPolicy  DiscoveryPolicy   `json:"discoveryPolicy,omitempty"`
+	RouteHint        RouteHint         `json:"routeHint,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 }
