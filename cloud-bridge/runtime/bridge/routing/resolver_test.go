@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -767,6 +768,176 @@ func TestResolverUsesDefaultScope(t *testing.T) {
 	}
 	if result.MatchedScope != (pb.Scope{Namespace: "default", Environment: "base"}) {
 		t.Fatalf("unexpected matched scope: %+v", result.MatchedScope)
+	}
+}
+
+// TestResolverScopeInjectionAlwaysOverridesRequestScope 验证 always 策略会覆盖请求方 scope。
+func TestResolverScopeInjectionAlwaysOverridesRequestScope(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	routeRegistry := registry.NewRouteRegistry()
+	serviceRegistry := registry.NewServiceRegistry()
+	sessionRegistry := registry.NewSessionRegistry()
+	seedServiceInstanceWithScope(serviceRegistry, pb.Scope{Namespace: "prod", Environment: "main"}, "ls-prod", "inst-prod", "orders", "connector-prod", "session-prod", 1, pb.HealthStatusHealthy, nil)
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-prod",
+		ConnectorID: "connector-prod",
+		Epoch:       1,
+		State:       registry.SessionActive,
+	})
+	routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-prod",
+		Scope:   pb.Scope{Namespace: "prod", Environment: "main"},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	})
+	resolver := NewResolver(ResolverOptions{
+		RouteRegistry:   routeRegistry,
+		ServiceRegistry: serviceRegistry,
+		SessionRegistry: sessionRegistry,
+		DefaultScope:    pb.Scope{Namespace: "default", Environment: "base"},
+	})
+
+	result, err := resolver.Resolve(ingress.RouteLookupRequest{
+		IngressMode: pb.IngressModeL7Shared,
+		Namespace:   "dev",
+		Environment: "alice",
+		Metadata:    map[string]string{RouteLookupMetadataScopeHeadersCompleteKey: strconv.FormatBool(true)},
+		Headers:     map[string][]string{"x-bridge-namespace": {"dev"}, "x-bridge-environment": {"alice"}},
+	})
+	if err != nil {
+		t.Fatalf("resolve with always scope injection failed: %v", err)
+	}
+	if result.RequestScope != (pb.Scope{Namespace: "prod", Environment: "main"}) {
+		t.Fatalf("unexpected request scope after injection: %+v", result.RequestScope)
+	}
+	if result.MatchedScope != (pb.Scope{Namespace: "prod", Environment: "main"}) {
+		t.Fatalf("unexpected matched scope: %+v", result.MatchedScope)
+	}
+}
+
+// TestResolverScopeInjectionMissingOnlyOverridesPartialScope 验证 missing_only 在 scope 未完整提供时会整组覆盖。
+func TestResolverScopeInjectionMissingOnlyOverridesPartialScope(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	routeRegistry := registry.NewRouteRegistry()
+	serviceRegistry := registry.NewServiceRegistry()
+	sessionRegistry := registry.NewSessionRegistry()
+	seedServiceInstanceWithScope(serviceRegistry, pb.Scope{Namespace: "prod", Environment: "main"}, "ls-prod-missing", "inst-prod-missing", "orders", "connector-prod-missing", "session-prod-missing", 1, pb.HealthStatusHealthy, nil)
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-prod-missing",
+		ConnectorID: "connector-prod-missing",
+		Epoch:       1,
+		State:       registry.SessionActive,
+	})
+	routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-prod-missing",
+		Scope:   pb.Scope{Namespace: "prod", Environment: "main"},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyMissingOnly,
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	})
+	resolver := NewResolver(ResolverOptions{
+		RouteRegistry:   routeRegistry,
+		ServiceRegistry: serviceRegistry,
+		SessionRegistry: sessionRegistry,
+		DefaultScope:    pb.Scope{Namespace: "default", Environment: "base"},
+	})
+
+	// 模拟入口仅携带 namespace、environment 缺失后由 default_scope 补齐的场景。
+	result, err := resolver.Resolve(ingress.RouteLookupRequest{
+		IngressMode: pb.IngressModeL7Shared,
+		Namespace:   "dev",
+		Environment: "base",
+		Metadata: map[string]string{
+			RouteLookupMetadataScopeHeadersCompleteKey: strconv.FormatBool(false),
+		},
+		Headers: map[string][]string{"x-bridge-namespace": {"dev"}},
+	})
+	if err != nil {
+		t.Fatalf("resolve with missing_only scope injection failed: %v", err)
+	}
+	if result.RequestScope != (pb.Scope{Namespace: "prod", Environment: "main"}) {
+		t.Fatalf("unexpected request scope after missing_only injection: %+v", result.RequestScope)
+	}
+	if result.MatchedScope != (pb.Scope{Namespace: "prod", Environment: "main"}) {
+		t.Fatalf("unexpected matched scope after missing_only injection: %+v", result.MatchedScope)
+	}
+}
+
+// TestResolverScopeInjectionMissingOnlyKeepsCompleteScope 验证 missing_only 在 scope 完整提供时保留原值。
+func TestResolverScopeInjectionMissingOnlyKeepsCompleteScope(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	routeRegistry := registry.NewRouteRegistry()
+	serviceRegistry := registry.NewServiceRegistry()
+	sessionRegistry := registry.NewSessionRegistry()
+	seedServiceInstanceWithScope(serviceRegistry, pb.Scope{Namespace: "dev", Environment: "alice"}, "ls-dev-alice", "inst-dev-alice", "orders", "connector-dev-alice", "session-dev-alice", 1, pb.HealthStatusHealthy, nil)
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-dev-alice",
+		ConnectorID: "connector-dev-alice",
+		Epoch:       1,
+		State:       registry.SessionActive,
+	})
+	routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-dev-alice",
+		Scope:   pb.Scope{Namespace: "dev", Environment: "alice"},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyMissingOnly,
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	})
+	resolver := NewResolver(ResolverOptions{
+		RouteRegistry:   routeRegistry,
+		ServiceRegistry: serviceRegistry,
+		SessionRegistry: sessionRegistry,
+		DefaultScope:    pb.Scope{Namespace: "default", Environment: "base"},
+	})
+
+	result, err := resolver.Resolve(ingress.RouteLookupRequest{
+		IngressMode: pb.IngressModeL7Shared,
+		Namespace:   "dev",
+		Environment: "alice",
+		Metadata: map[string]string{
+			RouteLookupMetadataScopeHeadersCompleteKey: strconv.FormatBool(true),
+		},
+		Headers: map[string][]string{
+			"x-bridge-namespace":   {"dev"},
+			"x-bridge-environment": {"alice"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolve with complete scope should not inject: %v", err)
+	}
+	if result.RequestScope != (pb.Scope{Namespace: "dev", Environment: "alice"}) {
+		t.Fatalf("unexpected request scope for missing_only complete request: %+v", result.RequestScope)
+	}
+	if result.MatchedScope != (pb.Scope{Namespace: "dev", Environment: "alice"}) {
+		t.Fatalf("unexpected matched scope for missing_only complete request: %+v", result.MatchedScope)
 	}
 }
 

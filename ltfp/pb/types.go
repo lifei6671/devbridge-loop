@@ -170,6 +170,12 @@ type ExternalFallbackConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
+// ScopeInjection 描述 route 命中后的作用域注入规则。
+type ScopeInjection struct {
+	InjectScope  Scope             `json:"injectScope,omitempty"`
+	InjectPolicy ScopeInjectPolicy `json:"injectPolicy,omitempty"`
+}
+
 // RouteHint 描述服务注册时附带的自动路由匹配补充条件。
 type RouteHint struct {
 	MatchHeaders []HeaderMatcher `json:"matchHeaders,omitempty"`
@@ -315,13 +321,14 @@ type RouteMatch struct {
 
 // RouteAssign 描述可选扩展 route 下发消息。
 type RouteAssign struct {
-	RouteID    string            `json:"routeId"`
-	Scope      Scope             `json:"scope,omitempty"`
-	Match      RouteMatch        `json:"match"`
-	Target     RouteTarget       `json:"target"`
-	Priority   uint32            `json:"priority,omitempty"`
-	PolicyJSON string            `json:"policyJson,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
+	RouteID        string            `json:"routeId"`
+	Scope          Scope             `json:"scope,omitempty"`
+	Match          RouteMatch        `json:"match"`
+	Target         RouteTarget       `json:"target"`
+	Priority       uint32            `json:"priority,omitempty"`
+	PolicyJSON     string            `json:"policyJson,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	ScopeInjection ScopeInjection    `json:"scopeInjection,omitempty"`
 }
 
 // RouteAssignAck 描述 route 下发 ACK。

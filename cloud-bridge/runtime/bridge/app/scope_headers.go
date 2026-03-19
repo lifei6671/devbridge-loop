@@ -22,10 +22,15 @@ const (
 	legacyIngressScopeEnvironmentHeaderThree = "X-Env"
 )
 
+type ingressScopeResolution struct {
+	Scope                 pb.Scope
+	HeaderScopeIsComplete bool
+}
+
 // resolveIngressScope 从标准 header 解析请求 scope，缺失字段时回退默认值。
-func resolveIngressScope(headers http.Header, defaultScope pb.Scope) (pb.Scope, error) {
+func resolveIngressScope(headers http.Header, defaultScope pb.Scope) (ingressScopeResolution, error) {
 	if hasLegacyScopeHeaders(headers) {
-		return pb.Scope{}, ltfperrors.New(
+		return ingressScopeResolution{}, ltfperrors.New(
 			ltfperrors.CodeUnsupportedLegacyProtocol,
 			fmt.Sprintf(
 				"legacy scope headers are not supported, use %s and %s",
@@ -34,9 +39,11 @@ func resolveIngressScope(headers http.Header, defaultScope pb.Scope) (pb.Scope, 
 			),
 		)
 	}
+	namespaceHeaderValue := strings.TrimSpace(headers.Get(ingressScopeNamespaceHeader))
+	environmentHeaderValue := strings.TrimSpace(headers.Get(ingressScopeEnvironmentHeader))
 	requestScope := pb.Scope{
-		Namespace:   strings.TrimSpace(headers.Get(ingressScopeNamespaceHeader)),
-		Environment: strings.TrimSpace(headers.Get(ingressScopeEnvironmentHeader)),
+		Namespace:   namespaceHeaderValue,
+		Environment: environmentHeaderValue,
 	}
 	if requestScope.Namespace == "" {
 		requestScope.Namespace = strings.TrimSpace(defaultScope.Namespace)
@@ -44,7 +51,10 @@ func resolveIngressScope(headers http.Header, defaultScope pb.Scope) (pb.Scope, 
 	if requestScope.Environment == "" {
 		requestScope.Environment = strings.TrimSpace(defaultScope.Environment)
 	}
-	return requestScope, nil
+	return ingressScopeResolution{
+		Scope:                 requestScope,
+		HeaderScopeIsComplete: namespaceHeaderValue != "" && environmentHeaderValue != "",
+	}, nil
 }
 
 func hasLegacyScopeHeaders(headers http.Header) bool {
@@ -64,4 +74,23 @@ func hasLegacyScopeHeaders(headers http.Header) bool {
 		}
 	}
 	return false
+}
+
+// applyIngressScopeHeaders 使用解析后的有效 scope 回写标准请求头，确保下游看到一致作用域。
+func applyIngressScopeHeaders(headers http.Header, scope pb.Scope) {
+	if headers == nil {
+		return
+	}
+	normalizedNamespace := strings.TrimSpace(scope.Namespace)
+	normalizedEnvironment := strings.TrimSpace(scope.Environment)
+	if normalizedNamespace == "" {
+		headers.Del(ingressScopeNamespaceHeader)
+	} else {
+		headers.Set(ingressScopeNamespaceHeader, normalizedNamespace)
+	}
+	if normalizedEnvironment == "" {
+		headers.Del(ingressScopeEnvironmentHeader)
+	} else {
+		headers.Set(ingressScopeEnvironmentHeader, normalizedEnvironment)
+	}
 }

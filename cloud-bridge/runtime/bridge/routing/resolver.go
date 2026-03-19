@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,8 @@ const (
 	RouteLookupMetadataTrafficIDKey = "traffic_id"
 	// RouteLookupMetadataClientIPKey 定义 route lookup metadata 中的 client_ip 键。
 	RouteLookupMetadataClientIPKey = "client_ip"
+	// RouteLookupMetadataScopeHeadersCompleteKey 标记入口是否完整提供了标准 scope headers。
+	RouteLookupMetadataScopeHeadersCompleteKey = "request_scope_headers_complete"
 )
 
 type connectorSelectionPolicy struct {
@@ -130,30 +133,43 @@ func (resolver *Resolver) Resolve(request ingress.RouteLookupRequest) (ResolveRe
 			"no route matches current ingress request",
 		)
 	}
-	requestScope := resolver.resolveRequestScope(request)
-	scopeChain := resolver.buildScopeChain(requestScope)
-	orderedCandidates := append([]pb.Route(nil), candidates...)
+	scopedCandidates := resolver.buildScopedRouteCandidates(request, candidates)
+	if len(scopedCandidates) == 0 {
+		return ResolveResult{}, ltfperrors.New(
+			ltfperrors.CodeIngressRouteMismatch,
+			"no route passes scope injection and fallback policy",
+		)
+	}
+	sort.SliceStable(scopedCandidates, func(left, right int) bool {
+		if scopedCandidates[left].ScopeIndex != scopedCandidates[right].ScopeIndex {
+			return scopedCandidates[left].ScopeIndex < scopedCandidates[right].ScopeIndex
+		}
+		return false
+	})
 	var firstFilterError error
 	var externalFallbackCandidates []scopedRouteCandidate
-	for scopeIndex, matchedScope := range scopeChain {
-		scopedCandidates := filterRoutesByScope(orderedCandidates, matchedScope)
-		connectorCandidates, externalCandidates := partitionRouteCandidatesByTarget(scopedCandidates)
-		for _, route := range externalCandidates {
-			externalFallbackCandidates = append(externalFallbackCandidates, scopedRouteCandidate{
-				Route:        route,
-				MatchedScope: matchedScope,
-				ScopeIndex:   scopeIndex,
-			})
+	maxScopeIndex := resolveMaxScopeIndex(scopedCandidates)
+	for scopeIndex := 0; scopeIndex <= maxScopeIndex; scopeIndex++ {
+		scopeCandidates := filterScopedRouteCandidatesByIndex(scopedCandidates, scopeIndex)
+		connectorCandidates, externalCandidates := partitionScopedRouteCandidatesByTarget(scopeCandidates)
+		for _, externalCandidate := range externalCandidates {
+			externalFallbackCandidates = append(externalFallbackCandidates, externalCandidate)
 		}
 		for len(connectorCandidates) > 0 {
-			route, selected := resolver.selector.Select(connectorCandidates)
+			routeCandidates := extractRoutesFromScopedCandidates(connectorCandidates)
+			route, selected := resolver.selector.Select(routeCandidates)
 			if !selected {
 				break
+			}
+			scopedCandidate, exists := findScopedRouteCandidateByRouteID(connectorCandidates, route.RouteID)
+			if !exists {
+				connectorCandidates = removeScopedRouteCandidateByID(connectorCandidates, route.RouteID)
+				continue
 			}
 			result, err := resolver.resolveTarget(route, request)
 			if err != nil {
 				if shouldContinueScopeFallback(err) {
-					connectorCandidates = removeRouteByID(connectorCandidates, route.RouteID)
+					connectorCandidates = removeScopedRouteCandidateByID(connectorCandidates, route.RouteID)
 					continue
 				}
 				if firstFilterError == nil {
@@ -163,17 +179,17 @@ func (resolver *Resolver) Resolve(request ingress.RouteLookupRequest) (ResolveRe
 			}
 			result.Route = route
 			result.IngressMode = resolveRouteIngressMode(route)
-			result.RequestScope = requestScope
-			result.MatchedScope = matchedScope
-			result.ScopeFallbackPath = append([]pb.Scope(nil), scopeChain[:scopeIndex+1]...)
-			if scopeIndex > 0 && resolver.metrics != nil {
+			result.RequestScope = scopedCandidate.RequestScope
+			result.MatchedScope = scopedCandidate.MatchedScope
+			result.ScopeFallbackPath = append([]pb.Scope(nil), scopedCandidate.ScopeFallbackPath...)
+			if scopedCandidate.ScopeIndex > 0 && resolver.metrics != nil {
 				resolver.metrics.IncBridgeScopeFallbackTotal()
 			}
 			return result, nil
 		}
 	}
 	if len(externalFallbackCandidates) > 0 {
-		result, err := resolver.resolveExternalFallback(externalFallbackCandidates, request, requestScope, scopeChain)
+		result, err := resolver.resolveExternalFallback(externalFallbackCandidates, request)
 		if err == nil {
 			return result, nil
 		}
@@ -526,26 +542,194 @@ func shouldContinueScopeFallback(err error) bool {
 }
 
 type scopedRouteCandidate struct {
-	Route        pb.Route
-	MatchedScope pb.Scope
-	ScopeIndex   int
+	Route             pb.Route
+	MatchedScope      pb.Scope
+	ScopeIndex        int
+	RequestScope      pb.Scope
+	ScopeFallbackPath []pb.Scope
 }
 
-func partitionRouteCandidatesByTarget(routes []pb.Route) ([]pb.Route, []pb.Route) {
-	if len(routes) == 0 {
+func partitionScopedRouteCandidatesByTarget(candidates []scopedRouteCandidate) ([]scopedRouteCandidate, []scopedRouteCandidate) {
+	if len(candidates) == 0 {
 		return nil, nil
 	}
-	connectorRoutes := make([]pb.Route, 0, len(routes))
-	externalRoutes := make([]pb.Route, 0, len(routes))
-	for _, route := range routes {
-		switch normalizeRouteTargetType(route.Target) {
+	connectorRoutes := make([]scopedRouteCandidate, 0, len(candidates))
+	externalRoutes := make([]scopedRouteCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		switch normalizeRouteTargetType(candidate.Route.Target) {
 		case pb.RouteTargetTypeConnectorService:
-			connectorRoutes = append(connectorRoutes, route)
+			connectorRoutes = append(connectorRoutes, candidate)
 		case pb.RouteTargetTypeExternalService:
-			externalRoutes = append(externalRoutes, route)
+			externalRoutes = append(externalRoutes, candidate)
 		}
 	}
 	return connectorRoutes, externalRoutes
+}
+
+func (resolver *Resolver) buildScopedRouteCandidates(
+	request ingress.RouteLookupRequest,
+	routes []pb.Route,
+) []scopedRouteCandidate {
+	if len(routes) == 0 {
+		return nil
+	}
+	baseRequestScope := resolver.resolveRequestScope(request)
+	scopeHeadersComplete := resolveRequestScopeHeadersComplete(request)
+	candidates := make([]scopedRouteCandidate, 0, len(routes))
+	for _, route := range routes {
+		effectiveRequestScope := resolveEffectiveRequestScope(baseRequestScope, scopeHeadersComplete, route.ScopeInjection)
+		scopeChain := resolver.buildScopeChain(effectiveRequestScope)
+		scopeIndex, matched := findScopeIndex(scopeChain, route.Scope)
+		if !matched {
+			continue
+		}
+		candidates = append(candidates, scopedRouteCandidate{
+			Route:             route,
+			MatchedScope:      normalizeResolverScope(route.Scope),
+			ScopeIndex:        scopeIndex,
+			RequestScope:      effectiveRequestScope,
+			ScopeFallbackPath: append([]pb.Scope(nil), scopeChain[:scopeIndex+1]...),
+		})
+	}
+	return candidates
+}
+
+func resolveEffectiveRequestScope(
+	baseRequestScope pb.Scope,
+	scopeHeadersComplete bool,
+	scopeInjection pb.ScopeInjection,
+) pb.Scope {
+	normalizedBaseScope := normalizeResolverScope(baseRequestScope)
+	normalizedScopeInjection := normalizeScopeInjection(scopeInjection)
+	switch normalizedScopeInjection.InjectPolicy {
+	case pb.ScopeInjectPolicyAlways:
+		if isValidResolverScope(normalizedScopeInjection.InjectScope) {
+			return normalizedScopeInjection.InjectScope
+		}
+	case pb.ScopeInjectPolicyMissingOnly:
+		if scopeHeadersComplete {
+			return normalizedBaseScope
+		}
+		if isValidResolverScope(normalizedScopeInjection.InjectScope) {
+			return normalizedScopeInjection.InjectScope
+		}
+	}
+	return normalizedBaseScope
+}
+
+func normalizeScopeInjection(scopeInjection pb.ScopeInjection) pb.ScopeInjection {
+	return pb.ScopeInjection{
+		InjectScope:  normalizeResolverScope(scopeInjection.InjectScope),
+		InjectPolicy: normalizeScopeInjectPolicy(scopeInjection.InjectPolicy),
+	}
+}
+
+func normalizeScopeInjectPolicy(injectPolicy pb.ScopeInjectPolicy) pb.ScopeInjectPolicy {
+	switch strings.ToLower(strings.TrimSpace(string(injectPolicy))) {
+	case "", string(pb.ScopeInjectPolicyDisabled):
+		return pb.ScopeInjectPolicyDisabled
+	case string(pb.ScopeInjectPolicyAlways):
+		return pb.ScopeInjectPolicyAlways
+	case string(pb.ScopeInjectPolicyMissingOnly):
+		return pb.ScopeInjectPolicyMissingOnly
+	default:
+		return pb.ScopeInjectPolicyDisabled
+	}
+}
+
+func resolveRequestScopeHeadersComplete(request ingress.RouteLookupRequest) bool {
+	if len(request.Metadata) == 0 {
+		return strings.TrimSpace(request.Namespace) != "" && strings.TrimSpace(request.Environment) != ""
+	}
+	normalizedValue := strings.TrimSpace(request.Metadata[RouteLookupMetadataScopeHeadersCompleteKey])
+	if normalizedValue == "" {
+		return strings.TrimSpace(request.Namespace) != "" && strings.TrimSpace(request.Environment) != ""
+	}
+	parsed, err := strconv.ParseBool(normalizedValue)
+	if err != nil {
+		return false
+	}
+	return parsed
+}
+
+func findScopeIndex(scopes []pb.Scope, targetScope pb.Scope) (int, bool) {
+	normalizedTargetScope := normalizeResolverScope(targetScope)
+	if !isValidResolverScope(normalizedTargetScope) {
+		return -1, false
+	}
+	for index, scope := range scopes {
+		if scopesEqual(scope, normalizedTargetScope) {
+			return index, true
+		}
+	}
+	return -1, false
+}
+
+func isValidResolverScope(scope pb.Scope) bool {
+	return strings.TrimSpace(scope.Namespace) != "" && strings.TrimSpace(scope.Environment) != ""
+}
+
+func resolveMaxScopeIndex(candidates []scopedRouteCandidate) int {
+	maxScopeIndex := -1
+	for _, candidate := range candidates {
+		if candidate.ScopeIndex > maxScopeIndex {
+			maxScopeIndex = candidate.ScopeIndex
+		}
+	}
+	return maxScopeIndex
+}
+
+func filterScopedRouteCandidatesByIndex(candidates []scopedRouteCandidate, scopeIndex int) []scopedRouteCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	filtered := make([]scopedRouteCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.ScopeIndex != scopeIndex {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func extractRoutesFromScopedCandidates(candidates []scopedRouteCandidate) []pb.Route {
+	if len(candidates) == 0 {
+		return nil
+	}
+	routes := make([]pb.Route, 0, len(candidates))
+	for _, candidate := range candidates {
+		routes = append(routes, candidate.Route)
+	}
+	return routes
+}
+
+func findScopedRouteCandidateByRouteID(candidates []scopedRouteCandidate, routeID string) (scopedRouteCandidate, bool) {
+	normalizedRouteID := strings.TrimSpace(routeID)
+	if normalizedRouteID == "" {
+		return scopedRouteCandidate{}, false
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Route.RouteID) != normalizedRouteID {
+			continue
+		}
+		return candidate, true
+	}
+	return scopedRouteCandidate{}, false
+}
+
+func removeScopedRouteCandidateByID(candidates []scopedRouteCandidate, routeID string) []scopedRouteCandidate {
+	normalizedRouteID := strings.TrimSpace(routeID)
+	if normalizedRouteID == "" || len(candidates) == 0 {
+		return candidates
+	}
+	for index, candidate := range candidates {
+		if strings.TrimSpace(candidate.Route.RouteID) != normalizedRouteID {
+			continue
+		}
+		return append(candidates[:index], candidates[index+1:]...)
+	}
+	return candidates
 }
 
 func copyStringMap(source map[string]string) map[string]string {
@@ -780,22 +964,19 @@ func (resolver *Resolver) resolveLogicalServiceByLabels(selector pb.ServiceSelec
 func (resolver *Resolver) resolveExternalFallback(
 	candidates []scopedRouteCandidate,
 	request ingress.RouteLookupRequest,
-	requestScope pb.Scope,
-	scopeChain []pb.Scope,
 ) (ResolveResult, error) {
 	if len(candidates) == 0 {
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeIngressRouteMismatch, "no external fallback route candidates")
 	}
-	if !resolver.isExternalFallbackEnabled(requestScope) {
-		return ResolveResult{}, ltfperrors.New(
-			ltfperrors.CodeIngressRouteMismatch,
-			fmt.Sprintf(
-				"external fallback is disabled for namespace=%s",
-				strings.TrimSpace(requestScope.Namespace),
-			),
-		)
-	}
+	disabledNamespaceSet := make(map[string]struct{})
 	for _, candidate := range candidates {
+		if !resolver.isExternalFallbackEnabled(candidate.RequestScope) {
+			disabledNamespace := strings.TrimSpace(candidate.RequestScope.Namespace)
+			if disabledNamespace != "" {
+				disabledNamespaceSet[disabledNamespace] = struct{}{}
+			}
+			continue
+		}
 		result, err := resolver.resolveTarget(candidate.Route, request)
 		if err != nil {
 			if shouldContinueScopeFallback(err) {
@@ -806,13 +987,24 @@ func (resolver *Resolver) resolveExternalFallback(
 		result.Route = candidate.Route
 		result.IngressMode = resolveRouteIngressMode(candidate.Route)
 		result.IsExternalFallback = true
-		result.RequestScope = requestScope
+		result.RequestScope = candidate.RequestScope
 		result.MatchedScope = candidate.MatchedScope
-		result.ScopeFallbackPath = append([]pb.Scope(nil), scopeChain[:candidate.ScopeIndex+1]...)
+		result.ScopeFallbackPath = append([]pb.Scope(nil), candidate.ScopeFallbackPath...)
 		if candidate.ScopeIndex > 0 && resolver.metrics != nil {
 			resolver.metrics.IncBridgeScopeFallbackTotal()
 		}
 		return result, nil
+	}
+	if len(disabledNamespaceSet) > 0 {
+		disabledNamespaces := make([]string, 0, len(disabledNamespaceSet))
+		for disabledNamespace := range disabledNamespaceSet {
+			disabledNamespaces = append(disabledNamespaces, disabledNamespace)
+		}
+		sort.Strings(disabledNamespaces)
+		return ResolveResult{}, ltfperrors.New(
+			ltfperrors.CodeIngressRouteMismatch,
+			fmt.Sprintf("external fallback is disabled for namespace(s)=%s", strings.Join(disabledNamespaces, ",")),
+		)
 	}
 	return ResolveResult{}, ltfperrors.New(
 		ltfperrors.CodeIngressRouteMismatch,

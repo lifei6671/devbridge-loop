@@ -122,6 +122,18 @@ const (
 	IngressModeL4DedicatedPort IngressMode = "l4_dedicated_port"
 )
 
+// ScopeInjectPolicy 定义 Route 作用域注入策略。
+type ScopeInjectPolicy string
+
+const (
+	// ScopeInjectPolicyDisabled 表示不执行作用域注入。
+	ScopeInjectPolicyDisabled ScopeInjectPolicy = "disabled"
+	// ScopeInjectPolicyAlways 表示始终使用 inject_scope 覆盖请求作用域。
+	ScopeInjectPolicyAlways ScopeInjectPolicy = "always"
+	// ScopeInjectPolicyMissingOnly 表示仅在请求作用域未完整提供时注入。
+	ScopeInjectPolicyMissingOnly ScopeInjectPolicy = "missing_only"
+)
+
 // IsKnownControlMessageType 判断控制面消息类型是否在协议定义内。
 func IsKnownControlMessageType(messageType ControlMessageType) bool {
 	normalized := strings.TrimSpace(string(messageType))

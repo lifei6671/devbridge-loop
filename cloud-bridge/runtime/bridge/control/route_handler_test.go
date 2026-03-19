@@ -40,6 +40,10 @@ func TestRouteHandlerHandleAssignAndRevoke(t *testing.T) {
 			Namespace:   "dev",
 			Environment: "alice",
 		},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
@@ -69,6 +73,9 @@ func TestRouteHandlerHandleAssignAndRevoke(t *testing.T) {
 	}
 	if routeSnapshot.Scope.Namespace != "dev" || routeSnapshot.Scope.Environment != "alice" {
 		t.Fatalf("unexpected route scope: %+v", routeSnapshot.Scope)
+	}
+	if routeSnapshot.ScopeInjection.InjectPolicy != pb.ScopeInjectPolicyAlways {
+		t.Fatalf("unexpected route scope injection policy: %+v", routeSnapshot.ScopeInjection)
 	}
 
 	dupAck := handler.HandleAssign(pb.ControlEnvelope{
@@ -377,6 +384,132 @@ func TestRouteHandlerRejectsConflictingRoute(t *testing.T) {
 	}
 }
 
+// TestRouteHandlerRejectsConflictingRouteAcrossScopeWithAlwaysInjection 验证 always 注入下跨 scope 的相同入口也会冲突。
+func TestRouteHandlerRejectsConflictingRouteAcrossScopeWithAlwaysInjection(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-conflict-scope-injection",
+		ConnectorID: "connector-1",
+		Epoch:       3,
+		State:       registry.SessionActive,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-orders-prod",
+		ServiceName:      "orders",
+		Scope:            pb.Scope{Namespace: "prod", Environment: "main"},
+		Status:           pb.ServiceStatusActive,
+		ResourceVersion:  1,
+	}, pb.ServiceInstance{
+		InstanceID:       "inst-orders-prod",
+		LogicalServiceID: "ls-orders-prod",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-conflict-scope-injection",
+		SessionEpoch:     3,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  1,
+	})
+	serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-payments-dev",
+		ServiceName:      "payments",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+		ResourceVersion:  2,
+	}, pb.ServiceInstance{
+		InstanceID:       "inst-payments-dev",
+		LogicalServiceID: "ls-payments-dev",
+		ConnectorID:      "connector-2",
+		SessionID:        "session-conflict-scope-injection",
+		SessionEpoch:     3,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  2,
+	})
+	metrics := obs.NewMetrics()
+	handler := NewRouteHandler(RouteHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ServiceRegistry: serviceRegistry,
+		Metrics:         metrics,
+	})
+
+	firstAck := handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-conflict-scope-injection",
+		SessionEpoch:    3,
+		EventID:         "evt-route-prod-ok",
+		ResourceVersion: 1,
+		ResourceID:      "route-orders-prod",
+	}, pb.RouteAssign{
+		RouteID: "route-orders-prod",
+		Scope:   pb.Scope{Namespace: "prod", Environment: "main"},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.shared.example.com",
+			PathPrefix: "/orders",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	})
+	if !firstAck.Accepted {
+		t.Fatalf("expected first route accepted, got=%s", firstAck.ErrorCode)
+	}
+
+	conflictAck := handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-conflict-scope-injection",
+		SessionEpoch:    3,
+		EventID:         "evt-route-dev-conflict",
+		ResourceVersion: 2,
+		ResourceID:      "route-payments-dev",
+	}, pb.RouteAssign{
+		RouteID: "route-payments-dev",
+		Scope:   pb.Scope{Namespace: "dev", Environment: "alice"},
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "dev", Environment: "alice"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.shared.example.com",
+			PathPrefix: "/orders",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "payments"},
+			},
+		},
+	})
+	if conflictAck.Accepted {
+		t.Fatalf("expected conflicting route rejected")
+	}
+	if conflictAck.ErrorCode != ltfperrors.CodeIngressRouteMismatch {
+		t.Fatalf("unexpected conflict error code: got=%s want=%s", conflictAck.ErrorCode, ltfperrors.CodeIngressRouteMismatch)
+	}
+	if conflictAck.Metadata["conflict_route_id"] != "route-orders-prod" {
+		t.Fatalf("unexpected conflict metadata: %+v", conflictAck.Metadata)
+	}
+	if metrics.BridgeRouteConflictRejectionTotal() != 1 {
+		t.Fatalf("unexpected conflict rejection total: %d", metrics.BridgeRouteConflictRejectionTotal())
+	}
+}
+
 // TestRouteHandlerReturnsShadowWarningOnPriorityDifference 验证不同 priority 仅返回 warning，不阻断注册。
 func TestRouteHandlerReturnsShadowWarningOnPriorityDifference(t *testing.T) {
 	t.Parallel()
@@ -461,6 +594,125 @@ func TestRouteHandlerReturnsShadowWarningOnPriorityDifference(t *testing.T) {
 		Priority: 10,
 		Match:    pb.RouteMatch{Protocol: "http", Host: "api.dev.example.com", PathPrefix: "/orders"},
 		Target:   pb.RouteTarget{Type: pb.RouteTargetTypeConnectorService, ConnectorService: &pb.ConnectorServiceTarget{Selector: pb.ServiceSelector{ServiceName: "payments"}}},
+	})
+	if !shadowAck.Accepted {
+		t.Fatalf("expected lower priority route accepted with warning, got=%s", shadowAck.ErrorCode)
+	}
+	if len(shadowAck.Warnings) != 1 {
+		t.Fatalf("expected one warning, got=%v", shadowAck.Warnings)
+	}
+}
+
+// TestRouteHandlerReturnsShadowWarningAcrossScopeWithAlwaysInjection 验证 always 注入下跨 scope 且 priority 不同仅返回 warning。
+func TestRouteHandlerReturnsShadowWarningAcrossScopeWithAlwaysInjection(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-shadow-scope-injection",
+		ConnectorID: "connector-1",
+		Epoch:       3,
+		State:       registry.SessionActive,
+	})
+	serviceRegistry := registry.NewServiceRegistry()
+	serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-orders-prod",
+		ServiceName:      "orders",
+		Scope:            pb.Scope{Namespace: "prod", Environment: "main"},
+		Status:           pb.ServiceStatusActive,
+		ResourceVersion:  1,
+	}, pb.ServiceInstance{
+		InstanceID:       "inst-orders-prod",
+		LogicalServiceID: "ls-orders-prod",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-shadow-scope-injection",
+		SessionEpoch:     3,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  1,
+	})
+	serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-payments-dev",
+		ServiceName:      "payments",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+		ResourceVersion:  2,
+	}, pb.ServiceInstance{
+		InstanceID:       "inst-payments-dev",
+		LogicalServiceID: "ls-payments-dev",
+		ConnectorID:      "connector-2",
+		SessionID:        "session-shadow-scope-injection",
+		SessionEpoch:     3,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  2,
+	})
+	handler := NewRouteHandler(RouteHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		ServiceRegistry: serviceRegistry,
+	})
+
+	if !handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-shadow-scope-injection",
+		SessionEpoch:    3,
+		EventID:         "evt-shadow-scope-injection-1",
+		ResourceVersion: 1,
+		ResourceID:      "route-high-prod",
+	}, pb.RouteAssign{
+		RouteID:  "route-high-prod",
+		Scope:    pb.Scope{Namespace: "prod", Environment: "main"},
+		Priority: 100,
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "prod", Environment: "main"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.shared.example.com",
+			PathPrefix: "/orders",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	}).Accepted {
+		t.Fatalf("expected high priority route accepted")
+	}
+
+	shadowAck := handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-shadow-scope-injection",
+		SessionEpoch:    3,
+		EventID:         "evt-shadow-scope-injection-2",
+		ResourceVersion: 2,
+		ResourceID:      "route-low-dev",
+	}, pb.RouteAssign{
+		RouteID:  "route-low-dev",
+		Scope:    pb.Scope{Namespace: "dev", Environment: "alice"},
+		Priority: 10,
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  pb.Scope{Namespace: "dev", Environment: "alice"},
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.shared.example.com",
+			PathPrefix: "/orders",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "payments"},
+			},
+		},
 	})
 	if !shadowAck.Accepted {
 		t.Fatalf("expected lower priority route accepted with warning, got=%s", shadowAck.ErrorCode)
@@ -631,6 +883,60 @@ func TestRouteHandlerRejectsInvalidHeaderRegex(t *testing.T) {
 	}
 	if _, exists := handler.routeRegistry.Get("route-invalid-header-regex"); exists {
 		t.Fatalf("invalid header regex route should not be persisted")
+	}
+}
+
+// TestRouteHandlerRejectsReservedScopeHeaderMatcher 验证 RouteAssign 不允许匹配保留 scope header。
+func TestRouteHandlerRejectsReservedScopeHeaderMatcher(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:   "session-reserved-scope-header",
+		ConnectorID: "connector-1",
+		Epoch:       3,
+		State:       registry.SessionActive,
+	})
+	handler := NewRouteHandler(RouteHandlerOptions{
+		SessionRegistry: sessionRegistry,
+	})
+
+	assignAck := handler.HandleAssign(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessageRouteAssign,
+		SessionID:       "session-reserved-scope-header",
+		SessionEpoch:    3,
+		EventID:         "evt-reserved-scope-header",
+		ResourceVersion: 1,
+		ResourceID:      "route-reserved-scope-header",
+	}, pb.RouteAssign{
+		RouteID: "route-reserved-scope-header",
+		Scope:   pb.Scope{Namespace: "dev", Environment: "demo"},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.dev.example.com",
+			PathPrefix: "/orders",
+			Headers: []pb.HeaderMatcher{
+				{Name: "X-Bridge-Namespace", Exact: "dev"},
+			},
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{ServiceName: "orders"},
+			},
+		},
+	})
+	if assignAck.Accepted {
+		t.Fatalf("expected reserved scope header matcher route rejected")
+	}
+	if assignAck.ErrorCode != ltfperrors.CodeUnsupportedValue {
+		t.Fatalf("unexpected error code: got=%s want=%s", assignAck.ErrorCode, ltfperrors.CodeUnsupportedValue)
+	}
+	if _, exists := handler.routeRegistry.Get("route-reserved-scope-header"); exists {
+		t.Fatalf("reserved scope header matcher route should not be persisted")
 	}
 }
 

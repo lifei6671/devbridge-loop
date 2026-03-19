@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +71,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		writeIngressError(writer, http.StatusServiceUnavailable, "RUNTIME_DATAPLANE_UNAVAILABLE", "bridge runtime data plane unavailable", trafficID, traceID)
 		return
 	}
-	requestScope, resolveScopeErr := resolveIngressScope(request.Header, runtime.cfg.DefaultScope)
+	scopeResolution, resolveScopeErr := resolveIngressScope(request.Header, runtime.cfg.DefaultScope)
 	if resolveScopeErr != nil {
 		errorCode := ltfperrors.ExtractCode(resolveScopeErr)
 		if strings.TrimSpace(errorCode) == "" {
@@ -87,6 +88,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		)
 		return
 	}
+	requestScope := scopeResolution.Scope
 	authority := resolveIngressAuthority(request)
 
 	lookupRequest, lookupErr := runtime.dataPlane.grpcGateway.BuildRouteLookupRequest(ingress.GRPCGatewayRequest{
@@ -95,9 +97,10 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		Namespace:   requestScope.Namespace,
 		Environment: requestScope.Environment,
 		Metadata: map[string]string{
-			routing.RouteLookupMetadataTrafficIDKey: trafficID,
-			routing.RouteLookupMetadataClientIPKey:  appauth.NormalizeSourceIP(request.RemoteAddr),
-			"grpc_path":                             request.URL.Path,
+			routing.RouteLookupMetadataTrafficIDKey:            trafficID,
+			routing.RouteLookupMetadataClientIPKey:             appauth.NormalizeSourceIP(request.RemoteAddr),
+			routing.RouteLookupMetadataScopeHeadersCompleteKey: strconv.FormatBool(scopeResolution.HeaderScopeIsComplete),
+			"grpc_path": request.URL.Path,
 		},
 		Headers: cloneHTTPHeaderValues(request.Header),
 		Queries: cloneURLQueryValues(request.URL.Query()),
@@ -136,6 +139,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 	resolvedLogicalServiceID := resolveTrafficServiceIDFromResolution(resolution)
 	resolvedServiceKey := resolveTrafficServiceKeyFromResolution(resolution)
 	resolvedServiceInstanceID := resolveTrafficServiceInstanceIDFromResolution(resolution)
+	applyIngressScopeHeaders(request.Header, resolution.RequestScope)
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:        trafficID,
 		RouteID:          strings.TrimSpace(resolution.Route.RouteID),

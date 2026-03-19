@@ -98,22 +98,65 @@ func buildShadowWarning(routeID string, existingRouteID string) string {
 }
 
 func routesShareExactAdmissionMatch(left pb.Route, right pb.Route) bool {
-	return normalizeAdmissionScope(left.Scope) == normalizeAdmissionScope(right.Scope) &&
-		resolveAdmissionIngressMode(left) == resolveAdmissionIngressMode(right) &&
-		normalizeAdmissionProtocol(left.Match.Protocol) == normalizeAdmissionProtocol(right.Match.Protocol) &&
-		normalizeAdmissionHost(left.Match.Host) == normalizeAdmissionHost(right.Match.Host) &&
-		normalizeAdmissionAuthority(left.Match.Authority) == normalizeAdmissionAuthority(right.Match.Authority) &&
-		normalizeAdmissionPathPrefix(left.Match.PathPrefix) == normalizeAdmissionPathPrefix(right.Match.PathPrefix) &&
-		normalizeAdmissionSNI(left.Match.SNI) == normalizeAdmissionSNI(right.Match.SNI) &&
-		left.Match.ListenPort == right.Match.ListenPort &&
-		buildHeaderMatcherSignature(left.Match.Headers) == buildHeaderMatcherSignature(right.Match.Headers) &&
-		buildQueryMatcherSignature(left.Match.Queries) == buildQueryMatcherSignature(right.Match.Queries)
+	if resolveAdmissionIngressMode(left) != resolveAdmissionIngressMode(right) {
+		return false
+	}
+	if normalizeAdmissionProtocol(left.Match.Protocol) != normalizeAdmissionProtocol(right.Match.Protocol) {
+		return false
+	}
+	if normalizeAdmissionHost(left.Match.Host) != normalizeAdmissionHost(right.Match.Host) {
+		return false
+	}
+	if normalizeAdmissionAuthority(left.Match.Authority) != normalizeAdmissionAuthority(right.Match.Authority) {
+		return false
+	}
+	if normalizeAdmissionPathPrefix(left.Match.PathPrefix) != normalizeAdmissionPathPrefix(right.Match.PathPrefix) {
+		return false
+	}
+	if normalizeAdmissionSNI(left.Match.SNI) != normalizeAdmissionSNI(right.Match.SNI) {
+		return false
+	}
+	if left.Match.ListenPort != right.Match.ListenPort {
+		return false
+	}
+	if buildHeaderMatcherSignature(left.Match.Headers) != buildHeaderMatcherSignature(right.Match.Headers) {
+		return false
+	}
+	if buildQueryMatcherSignature(left.Match.Queries) != buildQueryMatcherSignature(right.Match.Queries) {
+		return false
+	}
+	return routesOverlapUnderScopeRules(left, right)
 }
 
-func normalizeAdmissionScope(scope pb.Scope) pb.Scope {
-	return pb.Scope{
-		Namespace:   strings.TrimSpace(scope.Namespace),
-		Environment: strings.TrimSpace(scope.Environment),
+func routesOverlapUnderScopeRules(left pb.Route, right pb.Route) bool {
+	leftPolicy := normalizeAdmissionScopeInjectPolicy(left.ScopeInjection.InjectPolicy)
+	rightPolicy := normalizeAdmissionScopeInjectPolicy(right.ScopeInjection.InjectPolicy)
+	if leftPolicy != pb.ScopeInjectPolicyDisabled || rightPolicy != pb.ScopeInjectPolicyDisabled {
+		// 一旦任一路由开启作用域注入，route.scope 不再是可靠隔离键，需按同入口冲突处理。
+		return true
+	}
+	return normalizeAdmissionScope(left.Scope) == normalizeAdmissionScope(right.Scope)
+}
+
+func normalizeAdmissionScopeInjectPolicy(injectPolicy pb.ScopeInjectPolicy) pb.ScopeInjectPolicy {
+	switch strings.ToLower(strings.TrimSpace(string(injectPolicy))) {
+	case "", string(pb.ScopeInjectPolicyDisabled):
+		return pb.ScopeInjectPolicyDisabled
+	case string(pb.ScopeInjectPolicyAlways):
+		return pb.ScopeInjectPolicyAlways
+	case string(pb.ScopeInjectPolicyMissingOnly):
+		return pb.ScopeInjectPolicyMissingOnly
+	default:
+		return pb.ScopeInjectPolicyDisabled
+	}
+}
+
+func normalizeAdmissionScopeInjection(scopeInjection pb.ScopeInjection) pb.ScopeInjection {
+	return pb.ScopeInjection{
+		InjectScope: normalizeAdmissionScope(scopeInjection.InjectScope),
+		InjectPolicy: normalizeAdmissionScopeInjectPolicy(
+			scopeInjection.InjectPolicy,
+		),
 	}
 }
 
@@ -124,6 +167,7 @@ func normalizeAdmissionRoute(route pb.Route) pb.Route {
 		Namespace:   strings.TrimSpace(route.Scope.Namespace),
 		Environment: strings.TrimSpace(route.Scope.Environment),
 	}
+	normalizedRoute.ScopeInjection = normalizeAdmissionScopeInjection(route.ScopeInjection)
 	normalizedRoute.Match.Protocol = normalizeAdmissionProtocol(route.Match.Protocol)
 	normalizedRoute.Match.Host = normalizeAdmissionHost(route.Match.Host)
 	normalizedRoute.Match.Authority = normalizeAdmissionAuthority(route.Match.Authority)
@@ -132,6 +176,13 @@ func normalizeAdmissionRoute(route pb.Route) pb.Route {
 	normalizedRoute.Match.Headers = normalizeAdmissionHeaderMatchers(route.Match.Headers)
 	normalizedRoute.Match.Queries = normalizeAdmissionQueryMatchers(route.Match.Queries)
 	return normalizedRoute
+}
+
+func normalizeAdmissionScope(scope pb.Scope) pb.Scope {
+	return pb.Scope{
+		Namespace:   strings.TrimSpace(scope.Namespace),
+		Environment: strings.TrimSpace(scope.Environment),
+	}
 }
 
 func normalizeAdmissionProtocol(protocol string) string {

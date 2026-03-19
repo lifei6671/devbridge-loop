@@ -223,6 +223,7 @@ Tauri 桌面端项目，包含：
 - `runtime/bridge` 中任何连接管理、认证、路由分配、会话绑定的改动，都属于高风险
 - 如果改动涉及 Agent/Bridge 配合，必须同步评估 Agent 侧影响
 - `config.example.yaml` 修改时要检查是否影响兼容性和默认行为
+- `RouteMatch.headers` 不得匹配保留 scope Header（`X-Bridge-Namespace` / `X-Bridge-Environment`）；应在 admission 阶段拒绝此类配置
 
 #### `cloud-bridge/web/`
 这是 Bridge 的前端管理界面与嵌入资源目录。  

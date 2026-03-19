@@ -322,6 +322,12 @@ func TestPublishHandlerAutoRegistersRouteFromPublishService(t *testing.T) {
 	if routeSnapshot.Priority != 23 {
 		t.Fatalf("unexpected route priority: %+v", routeSnapshot)
 	}
+	if routeSnapshot.ScopeInjection.InjectPolicy != pb.ScopeInjectPolicyAlways {
+		t.Fatalf("unexpected scope injection policy: %+v", routeSnapshot.ScopeInjection)
+	}
+	if routeSnapshot.ScopeInjection.InjectScope.Namespace != "dev" || routeSnapshot.ScopeInjection.InjectScope.Environment != "alice" {
+		t.Fatalf("unexpected scope injection scope: %+v", routeSnapshot.ScopeInjection)
+	}
 }
 
 // TestPublishHandlerAutoRegistersTLSSNIRoute 验证 tls_sni_shared 自动路由使用 TLS/SNI 维度匹配。

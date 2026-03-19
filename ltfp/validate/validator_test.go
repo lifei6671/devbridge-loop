@@ -191,6 +191,23 @@ func TestValidatePublishServiceRejectMissingRouteHintHeaderName(t *testing.T) {
 	}
 }
 
+// TestValidatePublishServiceRejectReservedRouteHintScopeHeader 验证 route_hint 不允许匹配保留 scope header。
+func TestValidatePublishServiceRejectReservedRouteHintScopeHeader(t *testing.T) {
+	t.Parallel()
+
+	message := testkit.GoldenPublishService()
+	message.RouteHint.MatchHeaders = []pb.HeaderMatcher{
+		{Name: "X-Bridge-Namespace", Exact: "dev"},
+	}
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedValue) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestValidateUnpublishService 验证下线消息支持实例或逻辑服务定位。
 func TestValidateUnpublishService(t *testing.T) {
 	t.Parallel()

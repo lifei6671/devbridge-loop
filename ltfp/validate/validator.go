@@ -10,6 +10,21 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
+const (
+	standardScopeNamespaceHeader   = "x-bridge-namespace"
+	standardScopeEnvironmentHeader = "x-bridge-environment"
+)
+
+// IsReservedScopeHeader 判断 header 名称是否属于 Bridge 入口保留 scope header。
+func IsReservedScopeHeader(headerName string) bool {
+	switch strings.ToLower(strings.TrimSpace(headerName)) {
+	case standardScopeNamespaceHeader, standardScopeEnvironmentHeader:
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidateControlEnvelope 校验控制面统一封装的基础合法性。
 func ValidateControlEnvelope(envelope pb.ControlEnvelope) error {
 	if !pb.IsKnownControlMessageType(envelope.MessageType) {
@@ -124,6 +139,12 @@ func ValidateRouteHint(routeHint pb.RouteHint) error {
 			return ltfperrors.New(
 				ltfperrors.CodeMissingRequiredField,
 				fmt.Sprintf("routeHint.matchHeaders[%d].name is required", matcherIndex),
+			)
+		}
+		if IsReservedScopeHeader(matcher.Name) {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				fmt.Sprintf("routeHint.matchHeaders[%d].name uses reserved scope header", matcherIndex),
 			)
 		}
 		normalizedPattern := strings.TrimSpace(matcher.Regex)

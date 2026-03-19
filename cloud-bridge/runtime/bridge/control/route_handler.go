@@ -117,6 +117,7 @@ func (handler *RouteHandler) HandleAssign(envelope pb.ControlEnvelope, message p
 		snapshot := pb.Route{
 			RouteID:         normalizedMessage.RouteID,
 			Scope:           normalizedMessage.Scope,
+			ScopeInjection:  normalizedMessage.ScopeInjection,
 			ResourceVersion: envelope.ResourceVersion,
 			Match:           normalizedMessage.Match,
 			Target:          normalizedMessage.Target,
@@ -255,10 +256,14 @@ func (handler *RouteHandler) normalizeAssignMessage(message pb.RouteAssign) (pb.
 	normalizedMessage := message
 	normalizedMessage.RouteID = strings.TrimSpace(message.RouteID)
 	normalizedMessage.Scope = normalizeScope(message.Scope)
+	normalizedMessage.ScopeInjection = normalizeScopeInjection(message.ScopeInjection)
 	normalizedMessage.Target.Type = pb.RouteTargetType(strings.TrimSpace(string(message.Target.Type)))
 	normalizedMessage.Match.Host = strings.ToLower(strings.TrimSpace(message.Match.Host))
 	normalizedMessage.Match.Authority = strings.ToLower(strings.TrimSpace(message.Match.Authority))
 	if err := validateRouteMatchRegex(normalizedMessage.Match); err != nil {
+		return pb.RouteAssign{}, err
+	}
+	if err := validateScopeInjection(normalizedMessage.ScopeInjection); err != nil {
 		return pb.RouteAssign{}, err
 	}
 	if err := validateRouteTarget(normalizedMessage.Target); err != nil {
@@ -331,6 +336,12 @@ func validateRouteTarget(target pb.RouteTarget) error {
 
 func validateRouteMatchRegex(match pb.RouteMatch) error {
 	for matcherIndex, matcher := range match.Headers {
+		if validate.IsReservedScopeHeader(matcher.Name) {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedValue,
+				fmt.Sprintf("route.match.headers[%d].name uses reserved scope header", matcherIndex),
+			)
+		}
 		normalizedPattern := strings.TrimSpace(matcher.Regex)
 		if normalizedPattern == "" {
 			continue
@@ -355,6 +366,53 @@ func validateRouteMatchRegex(match pb.RouteMatch) error {
 		}
 	}
 	return nil
+}
+
+func validateScopeInjection(scopeInjection pb.ScopeInjection) error {
+	switch scopeInjection.InjectPolicy {
+	case pb.ScopeInjectPolicyDisabled:
+		return nil
+	case pb.ScopeInjectPolicyAlways, pb.ScopeInjectPolicyMissingOnly:
+		if strings.TrimSpace(scopeInjection.InjectScope.Namespace) == "" {
+			return ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				"route.scopeInjection.injectScope.namespace is required",
+			)
+		}
+		if strings.TrimSpace(scopeInjection.InjectScope.Environment) == "" {
+			return ltfperrors.New(
+				ltfperrors.CodeMissingRequiredField,
+				"route.scopeInjection.injectScope.environment is required",
+			)
+		}
+		return nil
+	default:
+		return ltfperrors.New(
+			ltfperrors.CodeUnsupportedValue,
+			"route.scopeInjection.injectPolicy must be disabled/always/missing_only",
+		)
+	}
+}
+
+func normalizeScopeInjection(scopeInjection pb.ScopeInjection) pb.ScopeInjection {
+	normalizedPolicy := normalizeScopeInjectPolicy(scopeInjection.InjectPolicy)
+	return pb.ScopeInjection{
+		InjectScope:  normalizeScope(scopeInjection.InjectScope),
+		InjectPolicy: normalizedPolicy,
+	}
+}
+
+func normalizeScopeInjectPolicy(injectPolicy pb.ScopeInjectPolicy) pb.ScopeInjectPolicy {
+	switch strings.ToLower(strings.TrimSpace(string(injectPolicy))) {
+	case "", string(pb.ScopeInjectPolicyDisabled):
+		return pb.ScopeInjectPolicyDisabled
+	case string(pb.ScopeInjectPolicyAlways):
+		return pb.ScopeInjectPolicyAlways
+	case string(pb.ScopeInjectPolicyMissingOnly):
+		return pb.ScopeInjectPolicyMissingOnly
+	default:
+		return pb.ScopeInjectPolicy(strings.ToLower(strings.TrimSpace(string(injectPolicy))))
+	}
 }
 
 func shouldDeriveRouteHost(message pb.RouteAssign) bool {

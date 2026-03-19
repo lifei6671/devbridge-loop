@@ -122,11 +122,12 @@ Scope 是独立字段，不编码进任何 name 或 key，始终通过结构化�
       → 映射到第三方 Discovery 命名空间
 
 运行时（请求路由时）：
-  调用方在 Header 中携带 scope
-      → Bridge Route Resolver 读取 scope
+  调用方可携带 scope Header（也可不携带）
+      → Bridge 先做 RouteMatch
+      → 按 route.scope_injection 生成 effective request scope
       → 按 ScopeFallbackPolicy 执行降级链查找
       → 找到匹配的 LogicalService 后路由到 ServiceInstance
-      → scope Header 在整个链路透传，不修改
+      → 转发前按 effective scope 回写标准 Header
 ```
 
 **namespace/environment 的作用：**
@@ -155,29 +156,31 @@ Agent 发布时 `exposure.host` 留空则 Bridge 自动派生。Agent 也可以�
 
 ### 2.5 Scope 传递机制
 
-scope 由**第一个调用者**（浏览器、客户端、上游服务）在发起请求时携带，后续 Bridge 和 Agent 在转发时透传，不修改。
+scope 来源分为两类：
 
-**默认传递方式：HTTP Header**
+1. **调用方显式携带**（内部调用常见）  
+2. **Bridge 在命中 Route 后注入**（外网暴露服务推荐）
 
-```
-请求方设置：
-  X-Bridge-Namespace: dev
-  X-Bridge-Environment: alice
+Route 层新增 `scope_injection` 后，L7 请求的执行顺序固定为：
 
-Bridge 收到后：
-  → 解析 Header，得到 scope = {dev, alice}
-  → 执行 ScopeFallbackPolicy 驱动的降级查找
-  → 向 Agent 发 TrafficOpen 时在 metadata 中携带原始 scope
+1. `RouteMatch`（host/path/header/query）
+2. `ScopeInjection`（生成 `effective request scope`）
+3. `ScopeFallbackPolicy`（基于 effective scope 构建降级链）
+4. `ServiceSelector` / 实例选择
 
-Agent 向本地 upstream 转发时：
-  → 将 scope Header 原样透传给 upstream
-  → upstream 服务可感知调用方身份
-```
+**ScopeInjection 语义：**
 
-**透传规则：**
-- Bridge 和 Agent 只读取、透传 scope，不修改
-- scope 在整条链路上代表"第一个调用者的身份"，语义保持完整
-- 若请求未携带 scope Header，Bridge 使用默认 scope（`default/base`），可在 Bridge 全局配置中覆盖此默认值
+- `inject_policy=always`：始终用 `inject_scope` 覆盖请求 scope（用于公网入口防伪造）
+- `inject_policy=missing_only`：仅在请求 scope **未完整提供**时注入  
+  （完整提供定义：`X-Bridge-Namespace` 与 `X-Bridge-Environment` 两个 Header 均非空）
+- `inject_policy=disabled`：不注入，沿用请求 Header/`default_scope`
+
+**写回规则（关键）：**
+
+- Bridge 在解析出最终 `effective request scope` 后，向 Agent/upstream 转发前必须写回：
+  - `X-Bridge-Namespace=<effective.namespace>`
+  - `X-Bridge-Environment=<effective.environment>`
+- 当 `inject_policy=always` 时，客户端伪造的 scope Header 会被覆盖，upstream 看不到原值。
 
 ### 2.6 ScopeFallbackPolicy（管理员配置）
 
@@ -444,6 +447,7 @@ message QueryMatcher {
 **约束：**
 - `headers` 和 `queries` 中多个条件为 **AND 关系**（全部满足才匹配）
 - Header/Query 匹配仅对 `l7_shared` ingress mode 生效；`tls_sni_shared` 和 `l4_dedicated_port` 忽略这两个字段
+- `headers` 不允许匹配保留 scope Header：`X-Bridge-Namespace`、`X-Bridge-Environment`；Admission 在 Route 注册阶段直接拒绝
 - `regex` 匹配需限制复杂度，防止 ReDoS，建议使用 RE2 语法
 
 ### 3.6 host+path 多服务映射的四种场景
@@ -1063,10 +1067,13 @@ type StickySelector     struct{ hashFunc func(TrafficMeta) uint64 }
 | `host` | 完全相同，或通配符覆盖 | — |
 | `path_prefix` | **完全相同**（不是包含关系，是逐字符相同） | path_prefix 不同时，最长前缀规则保证确定性，不构成冲突 |
 | `headers` | 条件完全相同（均为空，或逐一相同） | headers 不同时，匹配条件可区分，不构成冲突 |
+| `scope_injection` | 若任一路由为 `always/missing_only`，则 `route.scope` 不能作为隔离条件 | 需按“同入口冲突”处理，避免跨 scope 抢占 |
 | `priority` | 完全相同 | priority 不同时，高优先级永远赢，不构成歧义冲突（但见下方 shadow warning） |
 | `target` | 指向**不同的 LogicalService** | 同一 LogicalService 的多条路径不冲突（HA 场景） |
 
 满足全部条件时，后注册的 Route 被拒绝，返回含冲突 `route_id` 的错误信息。
+
+补充：仅当两条 Route 都是 `scope_injection=disabled` 时，才允许继续使用 `route.scope` 作为隔离维度。
 
 ```go
 func (h *RouteConflictAdmissionHandler) Handle(ctx context.Context, op AdmissionOp, resource any) (any, error) {
@@ -1484,8 +1491,11 @@ Header 名称大小写不敏感，Header 值大小写敏感。本版不提供 `c
 **决策四：Admission Pipeline 模式**  
 本版采用**同步拦截**。Route 注册冲突在写入前即时拒绝；异步校验模式不在本版范围内。
 
-**决策五：scope Header 缺失默认行为**  
-当请求缺失 `X-Bridge-Namespace` / `X-Bridge-Environment` 时，使用 `default_scope`；本版不改为默认 400。
+**决策五：scope 来源优先级**  
+先按 Route 评估 `scope_injection`，再决定是否使用 Header/`default_scope`。其中：
+- `always`：无条件覆盖请求 Header
+- `missing_only`：仅在 Header 未完整提供时覆盖
+- `disabled`：回退到 Header/`default_scope`
 
 **决策六：ScopeFallbackPolicy 触发条件**  
 本版降级链保持“本级 miss 即降级”的无条件触发语义，不引入 `trigger` 条件表达式。

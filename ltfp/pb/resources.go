@@ -67,6 +67,7 @@ type ServiceInstance struct {
 type Route struct {
 	RouteID         string            `json:"routeId"`
 	Scope           Scope             `json:"scope,omitempty"`
+	ScopeInjection  ScopeInjection    `json:"scopeInjection,omitempty"`
 	ResourceVersion uint64            `json:"resourceVersion"`
 	Match           RouteMatch        `json:"match"`
 	Target          RouteTarget       `json:"target"`

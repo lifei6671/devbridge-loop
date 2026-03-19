@@ -158,6 +158,17 @@ message ExternalFallbackConfig {
   bool enabled = 1;
 }
 
+enum ScopeInjectPolicy {
+  SCOPE_INJECT_POLICY_DISABLED = 0;
+  SCOPE_INJECT_POLICY_ALWAYS = 1;
+  SCOPE_INJECT_POLICY_MISSING_ONLY = 2;
+}
+
+message ScopeInjection {
+  Scope inject_scope = 1;
+  ScopeInjectPolicy inject_policy = 2;
+}
+
 message RouteHint {
   // 自动派生 HTTP/HTTPS Route 时追加的 Header 匹配条件。
   repeated HeaderMatcher match_headers = 1;
@@ -273,6 +284,7 @@ message RouteAssign {
   uint32 priority = 5;
   string policy_json = 6;
   map<string, string> metadata = 7;
+  ScopeInjection scope_injection = 8;
 }
 
 message RouteAssignAck {

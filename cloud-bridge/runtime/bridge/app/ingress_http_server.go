@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -79,7 +80,7 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 	}
 	protocol := resolveIngressHTTPProtocol(request)
 	authority := resolveIngressAuthority(request)
-	requestScope, resolveScopeErr := resolveIngressScope(request.Header, runtime.cfg.DefaultScope)
+	scopeResolution, resolveScopeErr := resolveIngressScope(request.Header, runtime.cfg.DefaultScope)
 	if resolveScopeErr != nil {
 		errorCode := ltfperrors.ExtractCode(resolveScopeErr)
 		if strings.TrimSpace(errorCode) == "" {
@@ -97,6 +98,7 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 		)
 		return
 	}
+	requestScope := scopeResolution.Scope
 
 	if runtime.dataPlane == nil || runtime.dataPlane.httpGateway == nil || runtime.dataPlane.resolver == nil {
 		writeIngressError(writer, http.StatusServiceUnavailable, "RUNTIME_DATAPLANE_UNAVAILABLE", "bridge runtime data plane unavailable", trafficID, traceID)
@@ -114,11 +116,12 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 		Namespace:   requestScope.Namespace,
 		Environment: requestScope.Environment,
 		Metadata: map[string]string{
-			routing.RouteLookupMetadataTrafficIDKey: trafficID,
-			routing.RouteLookupMetadataClientIPKey:  appauth.NormalizeSourceIP(request.RemoteAddr),
-			"http_method":                           strings.TrimSpace(request.Method),
-			"http_request_uri":                      request.URL.RequestURI(),
-			"http_user_agent":                       strings.TrimSpace(request.UserAgent()),
+			routing.RouteLookupMetadataTrafficIDKey:            trafficID,
+			routing.RouteLookupMetadataClientIPKey:             appauth.NormalizeSourceIP(request.RemoteAddr),
+			routing.RouteLookupMetadataScopeHeadersCompleteKey: strconv.FormatBool(scopeResolution.HeaderScopeIsComplete),
+			"http_method":      strings.TrimSpace(request.Method),
+			"http_request_uri": request.URL.RequestURI(),
+			"http_user_agent":  strings.TrimSpace(request.UserAgent()),
 		},
 		Headers: cloneHTTPHeaderValues(request.Header),
 		Queries: cloneURLQueryValues(request.URL.Query()),
@@ -157,6 +160,7 @@ func (runtime *Runtime) handleHTTPIngress(writer http.ResponseWriter, request *h
 	resolvedLogicalServiceID := resolveTrafficServiceIDFromResolution(resolution)
 	resolvedServiceKey := resolveTrafficServiceKeyFromResolution(resolution)
 	resolvedServiceInstanceID := resolveTrafficServiceInstanceIDFromResolution(resolution)
+	applyIngressScopeHeaders(request.Header, resolution.RequestScope)
 
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:        trafficID,

@@ -647,8 +647,12 @@ func (handler *PublishHandler) buildAutoRoute(
 		return pb.Route{}, false, nil
 	}
 	return pb.Route{
-		RouteID:         routeID,
-		Scope:           logicalService.Scope,
+		RouteID: routeID,
+		Scope:   logicalService.Scope,
+		ScopeInjection: pb.ScopeInjection{
+			InjectScope:  logicalService.Scope,
+			InjectPolicy: pb.ScopeInjectPolicyAlways,
+		},
 		ResourceVersion: resourceVersion,
 		Match:           match,
 		Target: pb.RouteTarget{
