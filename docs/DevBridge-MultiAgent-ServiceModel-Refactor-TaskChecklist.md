@@ -12,6 +12,16 @@
 - 本次是**彻底重构**，不做 `service_key` 兼容路径，不做双栈。
 - Bridge 与 Agent 控制面、路由层、数据面、观测面一次性收敛到新语义。
 
+### 1.1 开工冻结决策（与 TechDesign 第12章一致）
+
+- `instance_id` 持久化：本版仅进程内持久化，跨进程重启不保证复用。
+- 全部实例不健康默认行为：`allow_degraded`，可通过策略改为 `reject`。
+- Header 匹配规则：Header 名称不区分大小写，值区分大小写；本版不引入 `case_insensitive`。
+- Admission 模式：同步拦截，不引入异步校验。
+- scope Header 缺失行为：使用 `default_scope`，本版不默认返回 400。
+- ScopeFallbackPolicy：本版为“本级 miss 即降级”，不引入条件触发器。
+- 范围边界：`match_labels`、高级 `sticky_by`、host 模板扩展均在 P2，不阻塞 P0/P1 开工。
+
 ## 2. 当前代码现状（项目实际情况）
 
 当前实现仍以旧模型为主，关键差距如下：
@@ -118,3 +128,134 @@
 | 日期 | 执行阶段 | 状态（NotStarted/InProgress/Done/Blocked） | 完成项 | 阻塞项 | 下一步 |
 |---|---|---|---|---|---|
 | YYYY-MM-DD | EXX | InProgress | - | - | - |
+
+---
+
+## 8. 子任务级拆分（WBS）
+
+本节将 `E00-E09` 进一步拆成可直接开工的子任务，建议每个子任务独立提交 PR，避免跨阶段混改。
+
+| 子任务ID | 所属阶段 | 具体改造点 | 主要文件/模块 | 前置依赖 | 完成定义（DoD） |
+|---|---|---|---|---|---|
+| W00-01 | E00 | 冻结字段词典（logical_service_id/instance_id/scope/selector） | `docs/DevBridge-MultiAgent-ServiceModel-TechDesign.md` | 无 | 词典章节冻结，评审结论记录 |
+| W00-02 | E00 | 输出“禁用兼容”决议与约束清单 | 本文档 + TechDesign | W00-01 | 明确写入“不接受 service_key 兼容路径” |
+| W01-01 | E01 | 修改 proto：替换核心字段模型 | `ltfp/proto/devbridge/loop/v2/ltfp.proto` | W00-02 | proto 字段切换完成、无 service_key 主路径 |
+| W01-02 | E01 | 重新生成 pb 并修正编译断点 | `ltfp/pb/gen/*`, `ltfp/pb/types.go` | W01-01 | `go build` 通过，pb 类型与 proto 一致 |
+| W01-03 | E01 | 资源模型同步（RouteMatch/ServiceSelector/Scope） | `ltfp/pb/resources.go` | W01-02 | 资源类型字段与设计文档一致 |
+| W02-01 | E02 | 新增错误码（legacy/instance/session） | `ltfp/errors/codes.go` | W01-03 | 新错误码可被桥与 agent 引用 |
+| W02-02 | E02 | 校验器拒绝旧字段请求 | `ltfp/validate/validator.go` | W02-01 | 旧字段请求返回明确错误码 |
+| W02-03 | E02 | 增加拒绝路径单测 | `ltfp/validate/*_test.go` | W02-02 | 单测覆盖旧请求拒绝与边界条件 |
+| W03-01 | E03 | 注册表拆分 logical/instance 结构 | `cloud-bridge/runtime/bridge/registry/*` | W02-03 | 支持 `(service_name,scope)->logical_service_id` 唯一索引 |
+| W03-02 | E03 | 发布处理改造（R1/R2/R3） | `control/publish_handler.go` | W03-01 | PublishAck 返回 `logical_service_id+instance_id` |
+| W03-03 | E03 | 健康处理改造（按 instance_id） | `control/health_handler.go` | W03-02 | HealthReport 按实例定位与更新 |
+| W04-01 | E04 | Resolver 接入 scope 解析与降级链 | `routing/resolver.go` | W03-03 | 支持可配置降级链且可禁用 |
+| W04-02 | E04 | Matcher 支持 headers/queries 四种操作符 | `routing/matcher.go` | W04-01 | exact/prefix/regex/present 全可用 |
+| W04-03 | E04 | Admission 冲突检测（相同 path_prefix 拒绝） | `routing/admission/*`, `control/route_handler.go` | W04-02 | 冲突 route 被拒绝并返回冲突标识 |
+| W04-04 | E04 | priority 差异仅告警 | 同 W04-03 | W04-03 | 生成 warning，不阻断发布 |
+| W05-01 | E05 | TrafficOpen 字段切换到 logical+instance | `connectorproxy/*`, `routing/executor.go` | W04-04 | 数据面下发字段完成替换 |
+| W05-02 | E05 | 处理 `INSTANCE_NOT_FOUND` 回传策略 | `connectorproxy/*`, `executor.go` | W05-01 | Bridge 对该错误的处理符合文档定义 |
+| W05-03 | E05 | ingress 不再依赖 service_key 元数据 | `app/ingress_http_server.go` | W05-02 | 链路中不再读取 service_key 路由 |
+| W06-01 | E06 | Agent catalog 持久化 instance_id | `agent-core/runtime/agent/app/runtime_bridge.go` | W05-03 | 重连复用 instance_id 生效 |
+| W06-02 | E06 | Agent TrafficOpen 按 instance_id 定位 | `agent-core/runtime/agent/traffic/*` | W06-01 | 非本 connector 返回 `INSTANCE_NOT_FOUND` |
+| W06-03 | E06 | 健康上报按 instance_id | `agent-core/runtime/agent/control/health_reporter.go` | W06-02 | 健康上报与实例绑定一致 |
+| W06-04 | E06 | 自动路由 payload 切换为 selector | `runtime_bridge.go` (`buildAutoRouteAssignPayload`) | W06-03 | 不再写 `connector_service.service_key` |
+| W07-01 | E07 | 清理 hybrid_group/pre_open_only 主路径 | `routing/hybrid.go`, `ltfp/fallback/*` | W06-04 | 主执行链不再引用旧语义 |
+| W07-02 | E07 | 新增边界回归用例（第10章） | `cloud-bridge/*_test.go`, `agent-core/*_test.go` | W07-01 | 边界用例齐全并稳定通过 |
+| W07-03 | E07 | 全仓测试收敛 | `cloud-bridge`, `agent-core`, `ltfp` | W07-02 | `go test ./...` 全绿 |
+| W08-01 | E08 | 配置模型落地（default_scope/fallback_policies） | `app/config/config.go`, `config_yaml.go` | W07-03 | 配置加载、校验、重载策略明确 |
+| W08-02 | E08 | 标准 scope header 接入与透传 | `app/ingress_http_server.go`, `ingress/*` | W08-01 | `X-Bridge-Namespace/Environment` 全链路可用 |
+| W08-03 | E08 | 外部 discovery 接口 scope 化 | `directproxy/discovery_adapter.go`, `ltfp/discovery/*` | W08-02 | 仅本地 miss 后触发外部查询 |
+| W08-04 | E08 | Admin Snapshot/API/UI 字段切换 | `adminview/snapshot.go`, `adminapi/server.go`, `web/src/App.tsx` | W08-03 | UI 展示 logical/instance/scope 新字段 |
+| W08-05 | E08 | 指标与审计字段切换 | `obs/metrics.go`, `obs/logs.go` | W08-04 | 可观测链路可按 logical+instance+scope 定位 |
+| W09-01 | E09 | Host 自动派生（模板化） | 新增 `host_deriver` 模块 | W08-05 | 空 host 可自动派生且冲突可拦截 |
+| W09-02 | E09 | Selector 增强（labels/sticky/weighted） | `routing/selector.go`, `instance_selector.go` | W09-01 | 增强策略可配置并通过验证 |
+
+### 8.1 建议 PR 拆分顺序（按可合并单元）
+
+| PR序号 | 建议包含子任务 | 目标 |
+|---|---|---|
+| PR-01 | W00-01, W00-02 | 冻结基线与执行约束 |
+| PR-02 | W01-01 ~ W01-03 | 协议与类型切换 |
+| PR-03 | W02-01 ~ W02-03 | 校验与错误码 |
+| PR-04 | W03-01 ~ W03-03 | Bridge 注册与控制面 |
+| PR-05 | W04-01 ~ W04-04 | 路由核心能力 |
+| PR-06 | W05-01 ~ W05-03 | 数据面全链路 |
+| PR-07 | W06-01 ~ W06-04 | Agent 侧能力 |
+| PR-08 | W07-01 ~ W07-03 | 旧语义清理与回归 |
+| PR-09 | W08-01 ~ W08-05 | 运维与管理面 |
+| PR-10 | W09-01, W09-02 | 增强能力 |
+
+### 8.2 每个子任务的执行闭环
+
+- 开工前：确认前置依赖子任务状态为 Done。
+- 开发中：仅修改子任务声明的文件范围，避免扩散改动。
+- 提交前：补充对应测试与文档，确保 DoD 可验证。
+- 合并前：在阶段看板标记状态与风险，更新阻塞项。
+
+---
+
+## 9. 按周执行排期（建议）
+
+说明：以下按 1-2 人并行开发估算，单位为“人天（PD）”。若单人推进，周数顺延。
+
+| 周次 | 目标阶段 | 计划子任务 | 预估PD | 周验收标准 |
+|---|---|---|---|---|
+| W1 | E00-E01 | W00-01, W00-02, W01-01, W01-02, W01-03 | 5-7 PD | 协议与 pb 类型切换完成，主干可编译 |
+| W2 | E02-E03 | W02-01, W02-02, W02-03, W03-01, W03-02, W03-03 | 6-8 PD | 旧字段拒绝生效，Publish/Health 改造可跑通 |
+| W3 | E04 | W04-01, W04-02, W04-03, W04-04 | 5-7 PD | scope 降级与冲突检测生效，匹配规则稳定 |
+| W4 | E05-E06 | W05-01, W05-02, W05-03, W06-01, W06-02, W06-03, W06-04 | 7-9 PD | 数据面与 Agent 全链路切换完成 |
+| W5 | E07-E08 | W07-01, W07-02, W07-03, W08-01, W08-02, W08-03, W08-04, W08-05 | 8-10 PD | 旧语义清理完成，测试全绿，管理面/观测收敛 |
+| W6 | E09 + 收尾 | W09-01, W09-02 + 缺陷修复 + 文档收口 | 4-6 PD | 增强能力可用，满足 Release Gate |
+
+### 9.1 周推进节奏（固定动作）
+
+- 周一：冻结本周子任务范围，确认依赖已满足。
+- 周三：中期检查，只处理阻塞项，不扩新范围。
+- 周五：完成周验收标准，更新阶段状态与风险台账。
+
+### 9.2 子任务优先执行顺序（当周内）
+
+1. 先做“字段与模型定义”（proto/pb/config）。
+2. 再做“控制面状态写入”（publish/health/registry）。
+3. 再做“路由与数据面消费字段”。
+4. 最后做“UI/观测/增强项”。
+
+---
+
+## 10. 人天估算与缓冲策略
+
+| 类型 | 建议比例 | 说明 |
+|---|---|---|
+| 开发实现 | 60% | 代码重构与联调 |
+| 测试与回归 | 25% | 单测、集成测试、边界场景 |
+| 文档与评审 | 10% | 设计同步、变更记录 |
+| 风险缓冲 | 5% | 处理跨模块耦合与返工 |
+
+| 风险ID | 风险描述 | 触发信号 | 应对策略 |
+|---|---|---|---|
+| R-01 | proto 切换导致大面积编译断点 | pb 生成后断点>20处 | 拆 PR，先过类型层再做行为层 |
+| R-02 | 路由新旧语义混用 | resolver/matcher 出现双字段判断 | 强制删除旧字段入口并加 lint 检查 |
+| R-03 | Agent/Bridge 字段不一致 | TrafficOpen/PublishAck 互认失败 | 增加端到端契约测试先行 |
+| R-04 | 观测字段滞后导致无法定位问题 | 指标/日志缺 logical+instance+scope | 每阶段完成即补观测字段，不后置 |
+| R-05 | 范围蔓延导致延期 | 同周出现跨阶段任务 | 执行“阶段出口未达成不得跳步” |
+
+---
+
+## 11. 开工即用清单（首周）
+
+| 序号 | 动作 | 输出物 | 完成判定 |
+|---|---|---|---|
+| D1 | 冻结词典与禁用兼容结论 | 文档变更记录 | 评审通过且已合并 |
+| D2 | 完成 proto 字段切换 | proto diff + 评审记录 | 不再出现控制面 `service_key` 主字段 |
+| D3 | 生成 pb 并修复类型编译 | pb 更新提交 | `go build` 通过 |
+| D4 | 补充基础拒绝测试样例 | `*_test.go` | 旧字段请求拒绝测试通过 |
+| D5 | 建立阶段看板状态 | 周报/看板快照 | E01 状态为 Done |
+
+### 11.1 每日站会最小模板
+
+| 项目 | 内容 |
+|---|---|
+| 昨日完成 | 完成的子任务ID（如 W01-01） |
+| 今日计划 | 今日要完成的子任务ID |
+| 当前阻塞 | 具体阻塞点与需要支持 |
+| 风险变化 | 新增风险或风险解除 |

@@ -1332,36 +1332,40 @@ TrafficClose → tunnel 关闭 → Agent 补池
 
 ---
 
-## 12. 评审关注点
+## 12. 评审结论（已冻结）
 
-以下是本方案的主要设计决策点，建议评审重点讨论：
+以下决策已冻结，作为本次重构（v1.5 基线）的强约束，开发按此执行，不再引入兼容分支。
 
-**决策点一：instance_id 的持久化范围**  
-当前方案要求 instance_id 进程内持久化，重连时带回。是否需要写入本地文件（跨进程重启复用）？这会影响 Agent 状态管理的复杂度。
+### 12.1 开工阻塞项结论（已确认）
 
-**决策点二：LogicalService 的全部实例不健康时的默认行为**  
-方案中默认为"降级可用"（allow_degraded）。是否应该反过来，默认为"硬拒绝"，降级作为可选配置？
+**决策一：instance_id 持久化范围**  
+本版仅要求**进程内持久化**。Agent 断线重连可复用内存中的 `instance_id`；跨进程重启不要求复用本地文件缓存。重启后如无可用 `instance_id`，按 `instance_id=""` 走 FIND_OR_CREATE。
 
-**决策点三：InstanceSelector 的 sticky 策略粒度**  
-Sticky 路由基于 client IP hash，是否足够？某些场景可能需要基于 HTTP Cookie 或 Header 的粘性，这会要求 Ingress 层提前解析 L7 信息并传递给 Route Resolver。
+**决策二：全部实例不健康时的默认行为**  
+默认策略固定为 `allow_degraded`。若业务需要硬拒绝，使用 `RoutePolicy.unhealthy_instance_policy=reject` 覆盖。
 
-**决策点四：label selector 的实现优先级**  
-ServiceSelector 中的 `match_labels` 在本版标注为"预留，不强制实现"。是否有立即需要该能力的场景，需要提前落地？
+**决策三：Header 匹配大小写规则**  
+Header 名称大小写不敏感，Header 值大小写敏感。本版不提供 `case_insensitive` 匹配选项。
 
-**决策点五：跨 scope 引用的时机**  
-当前方案仍然不允许跨 scope 引用（与现有文档保持一致），仅为此预留了 ServiceSelector 扩展点。如果有明确的跨 scope 需求，需在本版同时设计授权模型。
+**决策四：Admission Pipeline 模式**  
+本版采用**同步拦截**。Route 注册冲突在写入前即时拒绝；异步校验模式不在本版范围内。
 
-**决策点六：Header 匹配的大小写敏感性**  
-当前方案中 Header 名称大小写不敏感，Header 值大小写敏感。是否需要提供 `case_insensitive` 选项（特别是 `exact` 和 `prefix` 匹配），以支持某些业务系统传递大小写不一致的 Header 值的场景？
+**决策五：scope Header 缺失默认行为**  
+当请求缺失 `X-Bridge-Namespace` / `X-Bridge-Environment` 时，使用 `default_scope`；本版不改为默认 400。
 
-**决策点七：host 自动派生的模板是否支持自定义**  
-默认模板为 `{service_name}.{environment}.{namespace}.{base_domain}`。是否需要支持 namespace/environment 级别的自定义模板覆盖，以适配不同团队的命名规范？如果支持，模板配置的存储和同步需要额外设计。
+**决策六：ScopeFallbackPolicy 触发条件**  
+本版降级链保持“本级 miss 即降级”的无条件触发语义，不引入 `trigger` 条件表达式。
 
-**决策点八：Admission Pipeline 的同步/异步模式**  
-当前设计是同步拦截（注册时立即返回冲突错误）。对于大批量 Route 注册场景（如 Operator 批量同步 K8s Ingress），是否需要支持异步校验模式（先接受，后校验，结果通过 RouteStatusReport 回调）？
+### 12.2 范围边界（本版固定，不阻塞开工）
 
-**决策点九：scope Header 缺失时的默认行为**  
-当请求未携带 `X-Bridge-Namespace` / `X-Bridge-Environment` 时，当前方案使用管理员配置的全局默认 scope。是否应该改为直接返回 400（强制调用方声明 scope），以避免因遗漏 Header 导致意外路由到默认 scope 的服务？这两种默认行为对不同场景（纯内网服务 vs 对外 API）影响不同。
+**边界一：sticky 策略粒度**  
+P0/P1 仅要求 `client_ip` 粘性能力；基于 cookie/header 的 `sticky_by` 作为 P2 增强项。
 
-**决策点十：ScopeFallbackPolicy 的降级链是否需要支持条件触发**  
-当前降级链是无条件的（本级 miss 就降级）。某些场景可能需要"只有当服务 INACTIVE 时才降级，如果服务 ACTIVE 但 UNHEALTHY 则不降级"。是否需要在 `FallbackStep` 里增加触发条件字段（`trigger: service_not_found | service_inactive | service_unhealthy`）？
+**边界二：label selector 优先级**  
+`match_labels` 本版预留，不作为首批上线阻塞项；按 P2 能力项推进。
+
+**边界三：跨 scope 引用**  
+本版仍不允许跨 scope 引用，保持同 scope 路由约束不变。
+
+**边界四：host 自动派生模板**  
+本版使用默认模板 `{service_name}.{environment}.{namespace}.{base_domain}`；模板扩展能力按 P2 任务推进。
