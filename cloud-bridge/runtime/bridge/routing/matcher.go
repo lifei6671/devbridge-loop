@@ -2,9 +2,11 @@ package routing
 
 import (
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -18,7 +20,9 @@ type scoredRoute struct {
 }
 
 // Matcher 按入口模式和 RouteMatch 规则筛选候选路由。
-type Matcher struct{}
+type Matcher struct {
+	regexCache sync.Map
+}
 
 // NewMatcher 创建路由匹配器。
 func NewMatcher() *Matcher {
@@ -32,17 +36,13 @@ func (matcher *Matcher) Match(request ingress.RouteLookupRequest, routes []pb.Ro
 	candidates := make([]scoredRoute, 0, len(routes))
 	for _, route := range routes {
 		if resolveRouteIngressMode(route) != normalizedRequest.IngressMode {
-			// 入口模式不一致时直接跳过，避免三类入口串扰。
 			continue
 		}
-		score, matched := scoreRouteMatch(normalizedRequest, route.Match)
+		score, matched := matcher.scoreRouteMatch(normalizedRequest, route.Match)
 		if !matched {
 			continue
 		}
-		candidates = append(candidates, scoredRoute{
-			route: route,
-			score: score,
-		})
+		candidates = append(candidates, scoredRoute{route: route, score: score})
 	}
 	sort.Slice(candidates, func(leftIndex, rightIndex int) bool {
 		left := candidates[leftIndex]
@@ -75,10 +75,11 @@ func normalizeLookupRequest(request ingress.RouteLookupRequest) ingress.RouteLoo
 	normalized.Namespace = strings.TrimSpace(request.Namespace)
 	normalized.Environment = strings.TrimSpace(request.Environment)
 	normalized.Headers = normalizeLookupHeaders(request.Headers)
+	normalized.Queries = normalizeLookupQueryParams(request.Queries)
 	return normalized
 }
 
-func scoreRouteMatch(request ingress.RouteLookupRequest, match pb.RouteMatch) (int, bool) {
+func (matcher *Matcher) scoreRouteMatch(request ingress.RouteLookupRequest, match pb.RouteMatch) (int, bool) {
 	score := 0
 	if normalizedProtocol := strings.ToLower(strings.TrimSpace(match.Protocol)); normalizedProtocol != "" {
 		if normalizedProtocol != request.Protocol {
@@ -116,12 +117,17 @@ func scoreRouteMatch(request ingress.RouteLookupRequest, match pb.RouteMatch) (i
 		}
 		score += 10
 	}
-	if normalizedHeaderMatches := normalizeRouteHeaderMatches(match.HeaderMatches); len(normalizedHeaderMatches) > 0 {
-		if !matchLookupHeaders(normalizedHeaderMatches, request.Headers) {
+	if normalizedQueryMatchers := normalizeRouteQueryMatchers(match.Queries); len(normalizedQueryMatchers) > 0 {
+		if !matcher.matchLookupQueries(normalizedQueryMatchers, request.Queries) {
 			return 0, false
 		}
-		// header 条件越多，匹配特异性越高，优先级应更高。
-		score += len(normalizedHeaderMatches) * 6
+		score += len(normalizedQueryMatchers) * 5
+	}
+	if normalizedHeaderMatchers := normalizeRouteHeaderMatchers(match.Headers); len(normalizedHeaderMatchers) > 0 {
+		if !matcher.matchLookupHeaders(normalizedHeaderMatchers, request.Headers) {
+			return 0, false
+		}
+		score += len(normalizedHeaderMatchers) * 6
 	}
 	return score, true
 }
@@ -185,7 +191,6 @@ func normalizeRouteAuthorityValue(authority string) string {
 	}
 	host, port, splitErr := net.SplitHostPort(normalized)
 	if splitErr != nil {
-		// authority 可能是 host 或 host:port（非标准格式），统一返回 host 去尾点的小写串。
 		if rawHost, rawPort, found := strings.Cut(normalized, ":"); found && !strings.Contains(rawHost, ":") && isNumericPort(rawPort) {
 			return strings.TrimSuffix(strings.TrimSpace(rawHost), ".") + ":" + rawPort
 		}
@@ -241,7 +246,6 @@ func extractAuthorityPort(authority string) (string, bool) {
 	return strings.TrimSpace(port), true
 }
 
-// normalizeLookupHeaders 归一化请求头：header 名统一小写，value 去首尾空白。
 func normalizeLookupHeaders(headers map[string][]string) map[string][]string {
 	if len(headers) == 0 {
 		return nil
@@ -271,19 +275,23 @@ func normalizeLookupHeaders(headers map[string][]string) map[string][]string {
 	return normalized
 }
 
-// normalizeRouteHeaderMatches 归一化路由 header 条件，header 名小写，value 保持精确字符串（仅去空白）。
-func normalizeRouteHeaderMatches(headerMatches map[string]string) map[string]string {
-	if len(headerMatches) == 0 {
+func normalizeRouteHeaderMatchers(headerMatchers []pb.HeaderMatcher) []pb.HeaderMatcher {
+	if len(headerMatchers) == 0 {
 		return nil
 	}
-	normalized := make(map[string]string, len(headerMatches))
-	for headerName, headerValue := range headerMatches {
-		normalizedHeaderName := strings.ToLower(strings.TrimSpace(headerName))
-		normalizedHeaderValue := strings.TrimSpace(headerValue)
-		if normalizedHeaderName == "" || normalizedHeaderValue == "" {
+	normalized := make([]pb.HeaderMatcher, 0, len(headerMatchers))
+	for _, headerMatcher := range headerMatchers {
+		normalizedName := strings.ToLower(strings.TrimSpace(headerMatcher.Name))
+		if normalizedName == "" {
 			continue
 		}
-		normalized[normalizedHeaderName] = normalizedHeaderValue
+		normalized = append(normalized, pb.HeaderMatcher{
+			Name:    normalizedName,
+			Exact:   strings.TrimSpace(headerMatcher.Exact),
+			Prefix:  strings.TrimSpace(headerMatcher.Prefix),
+			Regex:   strings.TrimSpace(headerMatcher.Regex),
+			Present: headerMatcher.Present,
+		})
 	}
 	if len(normalized) == 0 {
 		return nil
@@ -291,30 +299,158 @@ func normalizeRouteHeaderMatches(headerMatches map[string]string) map[string]str
 	return normalized
 }
 
-// matchLookupHeaders 校验 route 的 header 条件是否全部命中请求头。
-func matchLookupHeaders(routeHeaderMatches map[string]string, requestHeaders map[string][]string) bool {
-	if len(routeHeaderMatches) == 0 {
+func normalizeLookupQueryParams(queries map[string][]string) map[string][]string {
+	if len(queries) == 0 {
+		return nil
+	}
+	normalized := make(map[string][]string, len(queries))
+	for queryName, queryValues := range queries {
+		normalizedQueryName := strings.TrimSpace(queryName)
+		if normalizedQueryName == "" {
+			continue
+		}
+		values := normalized[normalizedQueryName]
+		for _, queryValue := range queryValues {
+			values = append(values, strings.TrimSpace(queryValue))
+		}
+		normalized[normalizedQueryName] = values
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func normalizeRouteQueryMatchers(queryMatchers []pb.QueryMatcher) []pb.QueryMatcher {
+	if len(queryMatchers) == 0 {
+		return nil
+	}
+	normalized := make([]pb.QueryMatcher, 0, len(queryMatchers))
+	for _, queryMatcher := range queryMatchers {
+		normalizedName := strings.TrimSpace(queryMatcher.Name)
+		if normalizedName == "" {
+			continue
+		}
+		normalized = append(normalized, pb.QueryMatcher{
+			Name:    normalizedName,
+			Exact:   strings.TrimSpace(queryMatcher.Exact),
+			Prefix:  strings.TrimSpace(queryMatcher.Prefix),
+			Regex:   strings.TrimSpace(queryMatcher.Regex),
+			Present: queryMatcher.Present,
+		})
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func (matcher *Matcher) matchLookupHeaders(routeHeaderMatchers []pb.HeaderMatcher, requestHeaders map[string][]string) bool {
+	return matcher.matchLookupKeyValues(routeHeaderMatchers, requestHeaders, false)
+}
+
+func (matcher *Matcher) matchLookupQueries(routeQueryMatchers []pb.QueryMatcher, requestQueries map[string][]string) bool {
+	if len(routeQueryMatchers) == 0 {
 		return true
 	}
-	if len(requestHeaders) == 0 {
-		return false
+	adapted := make([]pb.HeaderMatcher, 0, len(routeQueryMatchers))
+	for _, queryMatcher := range routeQueryMatchers {
+		adapted = append(adapted, pb.HeaderMatcher{
+			Name:    queryMatcher.Name,
+			Exact:   queryMatcher.Exact,
+			Prefix:  queryMatcher.Prefix,
+			Regex:   queryMatcher.Regex,
+			Present: queryMatcher.Present,
+		})
 	}
-	for headerName, expectedValue := range routeHeaderMatches {
-		requestHeaderValues, exists := requestHeaders[headerName]
-		if !exists || len(requestHeaderValues) == 0 {
+	return matcher.matchLookupKeyValues(adapted, requestQueries, true)
+}
+
+func (matcher *Matcher) matchLookupKeyValues(routeMatchers []pb.HeaderMatcher, requestValues map[string][]string, caseSensitiveName bool) bool {
+	if len(routeMatchers) == 0 {
+		return true
+	}
+	if len(requestValues) == 0 {
+		for _, routeMatcher := range routeMatchers {
+			if routeMatcher.Present != nil && !*routeMatcher.Present {
+				continue
+			}
 			return false
 		}
-		matched := false
-		for _, requestHeaderValue := range requestHeaderValues {
-			// 值按精确匹配处理：只有完全相同才视为命中。
-			if requestHeaderValue == expectedValue {
-				matched = true
-				break
+		return true
+	}
+	for _, routeMatcher := range routeMatchers {
+		requestMatcherValues, exists := lookupKeyValues(requestValues, routeMatcher.Name, caseSensitiveName)
+		if !exists || len(requestMatcherValues) == 0 {
+			if routeMatcher.Present != nil && !*routeMatcher.Present {
+				continue
 			}
+			return false
 		}
-		if !matched {
+		if !matchLookupValue(matcher, routeMatcher, requestMatcherValues) {
 			return false
 		}
 	}
 	return true
+}
+
+func lookupKeyValues(values map[string][]string, key string, caseSensitiveName bool) ([]string, bool) {
+	if !caseSensitiveName {
+		requestValues, exists := values[key]
+		return requestValues, exists
+	}
+	for candidateKey, candidateValues := range values {
+		if strings.TrimSpace(candidateKey) == strings.TrimSpace(key) {
+			return candidateValues, true
+		}
+	}
+	return nil, false
+}
+
+func matchLookupValue(matcher *Matcher, routeMatcher pb.HeaderMatcher, requestValues []string) bool {
+	if routeMatcher.Present != nil {
+		return *routeMatcher.Present == (len(requestValues) > 0)
+	}
+	for _, requestValue := range requestValues {
+		switch {
+		case routeMatcher.Exact != "":
+			if requestValue == routeMatcher.Exact {
+				return true
+			}
+		case routeMatcher.Prefix != "":
+			if strings.HasPrefix(requestValue, routeMatcher.Prefix) {
+				return true
+			}
+		case routeMatcher.Regex != "":
+			if compiled := matcher.lookupCompiledRegex(routeMatcher.Regex); compiled != nil && compiled.MatchString(requestValue) {
+				return true
+			}
+		default:
+			if requestValue != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (matcher *Matcher) lookupCompiledRegex(pattern string) *regexp.Regexp {
+	if matcher == nil {
+		return nil
+	}
+	normalizedPattern := strings.TrimSpace(pattern)
+	if normalizedPattern == "" {
+		return nil
+	}
+	if cached, exists := matcher.regexCache.Load(normalizedPattern); exists {
+		compiled, _ := cached.(*regexp.Regexp)
+		return compiled
+	}
+	compiled, err := regexp.Compile(normalizedPattern)
+	if err != nil {
+		return nil
+	}
+	actual, _ := matcher.regexCache.LoadOrStore(normalizedPattern, compiled)
+	stored, _ := actual.(*regexp.Regexp)
+	return stored
 }

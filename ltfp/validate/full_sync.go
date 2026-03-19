@@ -44,13 +44,22 @@ func ValidateFullSyncSnapshot(snapshot pb.FullSyncSnapshot) error {
 		return ltfperrors.New(ltfperrors.CodeInvalidResourceVersion, "snapshotVersion must be greater than 0")
 	}
 
-	for index, service := range snapshot.Services {
-		// serviceId 与 serviceKey 都是快照定位关键字段。
-		if strings.TrimSpace(service.ServiceID) == "" {
-			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.services["+strconv.Itoa(index)+"].serviceId is required")
+	for index, logicalService := range snapshot.LogicalServices {
+		// logicalServiceId 与 serviceName 是逻辑服务快照定位关键字段。
+		if strings.TrimSpace(logicalService.LogicalServiceID) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.logicalServices["+strconv.Itoa(index)+"].logicalServiceId is required")
 		}
-		if strings.TrimSpace(service.ServiceKey) == "" {
-			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.services["+strconv.Itoa(index)+"].serviceKey is required")
+		if strings.TrimSpace(logicalService.ServiceName) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.logicalServices["+strconv.Itoa(index)+"].serviceName is required")
+		}
+	}
+	for index, instance := range snapshot.ServiceInstances {
+		// instanceId 与 logicalServiceId 是实例快照定位关键字段。
+		if strings.TrimSpace(instance.InstanceID) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.serviceInstances["+strconv.Itoa(index)+"].instanceId is required")
+		}
+		if strings.TrimSpace(instance.LogicalServiceID) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "snapshot.serviceInstances["+strconv.Itoa(index)+"].logicalServiceId is required")
 		}
 	}
 	for index, route := range snapshot.Routes {

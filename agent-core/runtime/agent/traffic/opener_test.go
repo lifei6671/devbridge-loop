@@ -149,8 +149,8 @@ func TestNilOpenerHandleReleasesLease(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-nil-opener", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-nil-opener",
-				ServiceID: "svc-nil-opener",
+				TrafficID:        "traffic-nil-opener",
+				LogicalServiceID: "ls-nil-opener",
 			},
 		},
 	})
@@ -197,18 +197,18 @@ func TestOpenerHandleInvalidTrafficOpenErrorCode(testingObject *testing.T) {
 		{
 			name: "empty_traffic_id",
 			trafficOpen: pb.TrafficOpen{
-				TrafficID: "",
-				ServiceID: "svc-1",
+				TrafficID:        "",
+				LogicalServiceID: "ls-1",
 			},
 			wantErrorCode: ltfperrors.CodeMissingRequiredField,
 		},
 		{
 			name: "empty_service_id",
 			trafficOpen: pb.TrafficOpen{
-				TrafficID: "traffic-1",
-				ServiceID: "   ",
+				TrafficID:        "traffic-1",
+				LogicalServiceID: "   ",
 			},
-			wantErrorCode: ltfperrors.CodeTrafficInvalidServiceID,
+			wantErrorCode: ltfperrors.CodeTrafficInvalidLogicalServiceID,
 		},
 	}
 
@@ -285,8 +285,8 @@ func TestOpenerHandleSuccessWithActualEndpointMetadata(testingObject *testing.T)
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-1", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-1",
-				ServiceID: "svc-1",
+				TrafficID:        "traffic-1",
+				LogicalServiceID: "ls-1",
 				EndpointSelectionHint: map[string]string{
 					"endpoint_id": "endpoint-1",
 				},
@@ -305,7 +305,7 @@ func TestOpenerHandleSuccessWithActualEndpointMetadata(testingObject *testing.T)
 	if result.Endpoint.ID != "endpoint-2" {
 		testingObject.Fatalf("unexpected endpoint id: %s", result.Endpoint.ID)
 	}
-	if selector.lastServiceID != "svc-1" {
+	if selector.lastServiceID != "ls-1" {
 		testingObject.Fatalf("unexpected selected service: %s", selector.lastServiceID)
 	}
 	if selector.lastHint["endpoint_id"] != "endpoint-1" {
@@ -365,8 +365,8 @@ func TestOpenerHandleDialCanceled(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-2", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-2",
-				ServiceID: "svc-2",
+				TrafficID:        "traffic-2",
+				LogicalServiceID: "ls-2",
 			},
 		},
 	})
@@ -432,8 +432,8 @@ func TestOpenerHandleTunnelDoneSignalCancelsDial(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-done-1", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-tunnel-done",
-				ServiceID: "svc-td",
+				TrafficID:        "traffic-tunnel-done",
+				LogicalServiceID: "ls-td",
 			},
 		},
 	})
@@ -501,8 +501,8 @@ func TestOpenerHandleCancelSignalDuringRelay(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-3", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-3",
-				ServiceID: "svc-3",
+				TrafficID:        "traffic-3",
+				LogicalServiceID: "ls-3",
 			},
 		},
 	})
@@ -572,8 +572,8 @@ func TestOpenerHandleRelayFailure(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-4", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-4",
-				ServiceID: "svc-4",
+				TrafficID:        "traffic-4",
+				LogicalServiceID: "ls-4",
 			},
 		},
 	})
@@ -629,8 +629,8 @@ func TestOpenerHandleRecordsLatencyMetrics(testingObject *testing.T) {
 	handoff, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-metric", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-metric",
-				ServiceID: "svc-metric",
+				TrafficID:        "traffic-metric",
+				LogicalServiceID: "ls-metric",
 			},
 		},
 	})

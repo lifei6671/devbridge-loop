@@ -43,8 +43,8 @@ func TestAcceptorReaderExclusive(testingObject *testing.T) {
 			wait: waitChannel,
 			payload: pb.StreamPayload{
 				OpenReq: &pb.TrafficOpen{
-					TrafficID: "traffic-1",
-					ServiceID: "svc-1",
+					TrafficID:        "traffic-1",
+					LogicalServiceID: "ls-1",
 				},
 			},
 		})
@@ -62,8 +62,8 @@ func TestAcceptorReaderExclusive(testingObject *testing.T) {
 	_, err := acceptor.WaitTrafficOpen(context.Background(), "tunnel-1", &acceptorTestReader{
 		payload: pb.StreamPayload{
 			OpenReq: &pb.TrafficOpen{
-				TrafficID: "traffic-2",
-				ServiceID: "svc-1",
+				TrafficID:        "traffic-2",
+				LogicalServiceID: "ls-1",
 			},
 		},
 	})

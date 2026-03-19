@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,15 +11,12 @@ import (
 
 // ValidateControlEnvelope 校验控制面统一封装的基础合法性。
 func ValidateControlEnvelope(envelope pb.ControlEnvelope) error {
-	// 控制面消息类型必须属于协议定义集合。
 	if !pb.IsKnownControlMessageType(envelope.MessageType) {
 		return ltfperrors.New(ltfperrors.CodeUnknownMessageType, fmt.Sprintf("unknown control message type: %s", envelope.MessageType))
 	}
-	// 主版本号用于不兼容升级判定，必须大于 0。
 	if envelope.VersionMajor == 0 {
 		return ltfperrors.New(ltfperrors.CodeUnsupportedValue, "versionMajor must be greater than 0")
 	}
-	// 资源级消息强制校验幂等元信息，普通消息不做硬限制。
 	if requiresResourceMeta(envelope.MessageType) {
 		if err := ValidateResourceMeta(envelope.SessionID, envelope.SessionEpoch, envelope.EventID, envelope.ResourceVersion); err != nil {
 			return err
@@ -29,19 +27,15 @@ func ValidateControlEnvelope(envelope pb.ControlEnvelope) error {
 
 // ValidateResourceMeta 校验资源级消息的幂等字段。
 func ValidateResourceMeta(sessionID string, sessionEpoch uint64, eventID string, resourceVersion uint64) error {
-	// sessionID 是会话隔离主键，缺失会导致跨会话事件串扰。
 	if strings.TrimSpace(sessionID) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "sessionID is required")
 	}
-	// sessionEpoch 是代际语义核心字段，必须为正数。
 	if sessionEpoch == 0 {
 		return ltfperrors.New(ltfperrors.CodeInvalidSessionEpoch, "sessionEpoch must be greater than 0")
 	}
-	// eventID 用于幂等去重，空值会破坏去重语义。
 	if strings.TrimSpace(eventID) == "" {
 		return ltfperrors.New(ltfperrors.CodeInvalidEventID, "eventID is required")
 	}
-	// resourceVersion 用于资源代际比较，必须为正数。
 	if resourceVersion == 0 {
 		return ltfperrors.New(ltfperrors.CodeInvalidResourceVersion, "resourceVersion must be greater than 0")
 	}
@@ -50,36 +44,34 @@ func ValidateResourceMeta(sessionID string, sessionEpoch uint64, eventID string,
 
 // ValidateConnectorHello 校验 ConnectorHello 消息字段。
 func ValidateConnectorHello(message pb.ConnectorHello) error {
-	// connectorId 是会话归属关键字段，缺失会导致状态串线。
 	if strings.TrimSpace(message.ConnectorID) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "connectorId is required")
 	}
-	// namespace/environment 在握手阶段为可选上下文字段，不作为认证成功条件。
-	// 这里不再对 namespace/environment 做必填校验。
+	return nil
+}
+
+// ValidateNoLegacyFields 校验原始负载中不包含已废弃字段。
+func ValidateNoLegacyFields(payload json.RawMessage, fieldNames ...string) error {
+	if len(payload) == 0 || len(fieldNames) == 0 {
+		return nil
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return nil
+	}
+	for _, fieldName := range fieldNames {
+		if _, exists := body[fieldName]; exists {
+			return ltfperrors.New(
+				ltfperrors.CodeUnsupportedLegacyProtocol,
+				fmt.Sprintf("legacy field %q is not supported", fieldName),
+			)
+		}
+	}
 	return nil
 }
 
 // ValidatePublishService 校验 PublishService 消息字段。
 func ValidatePublishService(message pb.PublishService) error {
-	// namespace/environment/sni 至少需要一个，避免完全无路由标识的服务进入注册表。
-	hasNamespace := strings.TrimSpace(message.Namespace) != ""
-	hasEnvironment := strings.TrimSpace(message.Environment) != ""
-	hasSNI := strings.TrimSpace(message.Exposure.SNIName) != ""
-	if !hasSNI {
-		for _, endpoint := range message.Endpoints {
-			if strings.TrimSpace(endpoint.ServerName) != "" {
-				hasSNI = true
-				break
-			}
-		}
-	}
-	if !hasNamespace && !hasEnvironment && !hasSNI {
-		return ltfperrors.New(
-			ltfperrors.CodeMissingRequiredField,
-			"at least one of namespace, environment or sni is required",
-		)
-	}
-	// serviceName 为空会导致无法建立 canonical identity 映射。
 	normalizedServiceName := strings.TrimSpace(message.ServiceName)
 	if normalizedServiceName == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "serviceName is required")
@@ -87,14 +79,18 @@ func ValidatePublishService(message pb.PublishService) error {
 	if strings.Contains(normalizedServiceName, "/") {
 		return ltfperrors.New(ltfperrors.CodeUnsupportedValue, "serviceName must not contain '/'")
 	}
-	// endpoints 至少需要一个，避免发布不可路由服务。
+	if strings.TrimSpace(message.Scope.Namespace) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "scope.namespace is required")
+	}
+	if strings.TrimSpace(message.Scope.Environment) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "scope.environment is required")
+	}
 	if len(message.Endpoints) == 0 {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "at least one endpoint is required")
 	}
 
 	normalizedServiceProtocol := ""
 	for index, endpoint := range message.Endpoints {
-		// endpoint 协议不能为空，否则无法匹配上游拨号逻辑。
 		normalizedEndpointProtocol := strings.ToLower(strings.TrimSpace(endpoint.Protocol))
 		if normalizedEndpointProtocol == "" {
 			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, fmt.Sprintf("endpoint[%d].protocol is required", index))
@@ -107,50 +103,62 @@ func ValidatePublishService(message pb.PublishService) error {
 				"all endpoints in one publish service must use the same protocol",
 			)
 		}
-		// endpoint host 不能为空，否则无法建立连接。
 		if strings.TrimSpace(endpoint.Host) == "" {
 			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, fmt.Sprintf("endpoint[%d].host is required", index))
 		}
-		// endpoint port 必须为正数。
 		if endpoint.Port == 0 {
 			return ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("endpoint[%d].port must be greater than 0", index))
 		}
 	}
-	normalizedServiceKey := strings.TrimSpace(message.ServiceKey)
-	if normalizedServiceKey != "" {
-		expectedServiceKey := normalizedServiceName + "/" + normalizedServiceProtocol
-		if normalizedServiceKey != expectedServiceKey {
-			// 显式上送 service_key 时必须命中 canonical 规则，避免同服务出现多 identity。
-			return ltfperrors.New(
-				ltfperrors.CodeUnsupportedValue,
-				fmt.Sprintf("serviceKey must equal canonical key %q", expectedServiceKey),
-			)
+	return nil
+}
+
+// ValidateUnpublishService 校验 UnpublishService 消息字段。
+func ValidateUnpublishService(message pb.UnpublishService) error {
+	if strings.TrimSpace(message.InstanceID) == "" && strings.TrimSpace(message.LogicalServiceID) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "instanceId or logicalServiceId is required")
+	}
+	if strings.TrimSpace(message.InstanceID) == "" {
+		if strings.TrimSpace(message.ServiceName) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "serviceName is required when instanceId is empty")
 		}
+		if strings.TrimSpace(message.Scope.Namespace) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "scope.namespace is required when instanceId is empty")
+		}
+		if strings.TrimSpace(message.Scope.Environment) == "" {
+			return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "scope.environment is required when instanceId is empty")
+		}
+	}
+	return nil
+}
+
+// ValidateServiceHealthReport 校验服务健康上报字段。
+func ValidateServiceHealthReport(message pb.ServiceHealthReport) error {
+	if strings.TrimSpace(message.InstanceID) == "" {
+		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "instanceId is required")
 	}
 	return nil
 }
 
 // ValidateTrafficOpen 校验 TrafficOpen 消息字段。
 func ValidateTrafficOpen(message pb.TrafficOpen) error {
-	// trafficID 是流量生命周期主键，不能为空。
 	if strings.TrimSpace(message.TrafficID) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "trafficId is required")
 	}
-	// serviceID 是数据面路由定位的关键字段，不能为空。
-	if strings.TrimSpace(message.ServiceID) == "" {
-		return ltfperrors.New(ltfperrors.CodeTrafficInvalidServiceID, "serviceId is required")
+	if strings.TrimSpace(message.LogicalServiceID) == "" {
+		return ltfperrors.New(ltfperrors.CodeTrafficInvalidLogicalServiceID, "logicalServiceId is required")
 	}
-	// endpointSelectionHint 允许为空，存在时仅做非权威提示。
+	if strings.TrimSpace(message.InstanceID) == "" {
+		return ltfperrors.New(ltfperrors.CodeTrafficInvalidInstanceID, "instanceId is required")
+	}
 	return nil
 }
 
 // ValidateStreamPayload 校验数据面 oneof 结构合法性。
 func ValidateStreamPayload(payload pb.StreamPayload) error {
-	// 数据面 oneof 必须严格只有一个字段生效。
 	if payload.ActivePayloadCount() != 1 {
 		return ltfperrors.New(ltfperrors.CodeTrafficInvalidOneof, "stream payload must contain exactly one active field")
 	}
-	// OpenReq 场景下继续复用 TrafficOpen 规则。
 	if payload.OpenReq != nil {
 		return ValidateTrafficOpen(*payload.OpenReq)
 	}
@@ -158,19 +166,15 @@ func ValidateStreamPayload(payload pb.StreamPayload) error {
 }
 
 // ValidateRouteScope 校验 route 与 target 的 scope 一致性。
-func ValidateRouteScope(routeNamespace, routeEnvironment, targetNamespace, targetEnvironment string) error {
-	normalizedRouteNamespace := strings.TrimSpace(routeNamespace)
-	normalizedTargetNamespace := strings.TrimSpace(targetNamespace)
-	// route/target 同时声明 namespace 时，必须保持一致；任一侧为空视为不约束。
+func ValidateRouteScope(routeScope pb.Scope, targetScope pb.Scope) error {
+	normalizedRouteNamespace := strings.TrimSpace(routeScope.Namespace)
+	normalizedTargetNamespace := strings.TrimSpace(targetScope.Namespace)
 	if normalizedRouteNamespace != "" && normalizedTargetNamespace != "" && normalizedRouteNamespace != normalizedTargetNamespace {
 		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route namespace must equal target namespace")
 	}
-	normalizedRouteEnvironment := strings.TrimSpace(routeEnvironment)
-	normalizedTargetEnvironment := strings.TrimSpace(targetEnvironment)
-	// route/target 同时声明 environment 时，必须保持一致；任一侧为空视为不约束。
-	if normalizedRouteEnvironment != "" &&
-		normalizedTargetEnvironment != "" &&
-		normalizedRouteEnvironment != normalizedTargetEnvironment {
+	normalizedRouteEnvironment := strings.TrimSpace(routeScope.Environment)
+	normalizedTargetEnvironment := strings.TrimSpace(targetScope.Environment)
+	if normalizedRouteEnvironment != "" && normalizedTargetEnvironment != "" && normalizedRouteEnvironment != normalizedTargetEnvironment {
 		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route environment must equal target environment")
 	}
 	return nil
@@ -178,11 +182,9 @@ func ValidateRouteScope(routeNamespace, routeEnvironment, targetNamespace, targe
 
 // ValidateControlError 校验控制面错误消息语义。
 func ValidateControlError(message pb.ControlError) error {
-	// code 为空会导致调用方无法按错误类型分支处理。
 	if strings.TrimSpace(message.Code) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "control error code is required")
 	}
-	// message 为空会导致错误排障信息丢失。
 	if strings.TrimSpace(message.Message) == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "control error message is required")
 	}
@@ -191,7 +193,6 @@ func ValidateControlError(message pb.ControlError) error {
 
 // requiresResourceMeta 判断消息类型是否需要强制幂等元信息。
 func requiresResourceMeta(messageType pb.ControlMessageType) bool {
-	// 资源级变更消息必须携带 sessionEpoch/eventID/resourceVersion。
 	switch messageType {
 	case pb.ControlMessagePublishService, pb.ControlMessageUnpublishService, pb.ControlMessageRouteAssign, pb.ControlMessageRouteRevoke:
 		return true

@@ -34,7 +34,6 @@ func TestValidateControlEnvelopeRejectUnknownType(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// 错误码断言确保调用方可以可靠分支。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeUnknownMessageType) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -48,13 +47,11 @@ func TestValidateControlEnvelopeRejectMissingSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build golden envelope failed: %v", err)
 	}
-	// 清空 sessionID，触发资源级元信息校验失败。
 	codecPayload.SessionID = ""
 	err = ValidateControlEnvelope(codecPayload)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// 缺失必填字段应返回统一错误码。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -65,7 +62,6 @@ func TestValidateConnectorHelloAcceptsOptionalScope(t *testing.T) {
 	t.Parallel()
 
 	hello := testkit.GoldenConnectorHello()
-	// 显式清空 scope 字段，验证握手校验不再将其视为必填。
 	hello.Namespace = ""
 	hello.Environment = ""
 	if err := ValidateConnectorHello(hello); err != nil {
@@ -78,13 +74,25 @@ func TestValidateConnectorHelloRejectMissingConnectorID(t *testing.T) {
 	t.Parallel()
 
 	hello := testkit.GoldenConnectorHello()
-	// connectorId 是接入主身份键，缺失时必须报错。
 	hello.ConnectorID = ""
 	err := ValidateConnectorHello(hello)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
 	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestValidateNoLegacyFieldsRejectServiceKey 验证原始负载携带旧字段时会被拒绝。
+func TestValidateNoLegacyFieldsRejectServiceKey(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateNoLegacyFields([]byte(`{"serviceKey":"dev/alice/order-service"}`), "serviceKey", "service_id")
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedLegacyProtocol) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -99,27 +107,18 @@ func TestValidatePublishService(t *testing.T) {
 	}
 }
 
-// TestValidatePublishServiceAcceptsEmptyServiceKey 验证 serviceKey 为空时允许由服务端按 canonical 规则补全。
-func TestValidatePublishServiceAcceptsEmptyServiceKey(t *testing.T) {
+// TestValidatePublishServiceRejectMissingScope 验证 scope 缺失会被拒绝。
+func TestValidatePublishServiceRejectMissingScope(t *testing.T) {
 	t.Parallel()
 
 	message := testkit.GoldenPublishService()
-	message.ServiceKey = ""
-	if err := ValidatePublishService(message); err != nil {
-		t.Fatalf("validate publish service with empty service key failed: %v", err)
+	message.Scope.Namespace = ""
+	err := ValidatePublishService(message)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
 	}
-}
-
-// TestValidatePublishServiceAcceptsSNIWithoutScope 验证无 namespace/environment 时，只要有 SNI 仍可发布。
-func TestValidatePublishServiceAcceptsSNIWithoutScope(t *testing.T) {
-	t.Parallel()
-
-	message := testkit.GoldenPublishService()
-	message.Namespace = ""
-	message.Environment = ""
-	message.Exposure.SNIName = "order.dev.example.com"
-	if err := ValidatePublishService(message); err != nil {
-		t.Fatalf("validate publish service with sni-only failed: %v", err)
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -133,7 +132,6 @@ func TestValidatePublishServiceRejectMissingEndpoint(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// 缺字段场景应返回缺失字段错误码。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -159,34 +157,36 @@ func TestValidatePublishServiceRejectMixedEndpointProtocol(t *testing.T) {
 	}
 }
 
-// TestValidatePublishServiceRejectNonCanonicalServiceKey 验证显式 service_key 不符合 canonical 规则时会被拒绝。
-func TestValidatePublishServiceRejectNonCanonicalServiceKey(t *testing.T) {
+// TestValidateUnpublishService 验证下线消息支持实例或逻辑服务定位。
+func TestValidateUnpublishService(t *testing.T) {
 	t.Parallel()
 
-	message := testkit.GoldenPublishService()
-	// 人为构造旧格式 key，验证新规则会拒绝非 canonical 值。
-	message.ServiceKey = "dev/alice/order-service"
-	err := ValidatePublishService(message)
+	message := pb.UnpublishService{
+		InstanceID: "si-001",
+	}
+	if err := ValidateUnpublishService(message); err != nil {
+		t.Fatalf("validate unpublish service failed: %v", err)
+	}
+}
+
+// TestValidateUnpublishServiceRejectMissingIdentifiers 验证缺失定位信息会被拒绝。
+func TestValidateUnpublishServiceRejectMissingIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateUnpublishService(pb.UnpublishService{})
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	if !ltfperrors.IsCode(err, ltfperrors.CodeUnsupportedValue) {
+	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-// TestValidatePublishServiceRejectMissingScopeAndSNI 验证 namespace/environment/sni 全空时会被拒绝。
-func TestValidatePublishServiceRejectMissingScopeAndSNI(t *testing.T) {
+// TestValidateServiceHealthReportRejectMissingInstanceID 验证健康上报缺少 instanceId 会被拒绝。
+func TestValidateServiceHealthReportRejectMissingInstanceID(t *testing.T) {
 	t.Parallel()
 
-	message := testkit.GoldenPublishService()
-	message.Namespace = ""
-	message.Environment = ""
-	message.Exposure.SNIName = ""
-	for index := range message.Endpoints {
-		message.Endpoints[index].ServerName = ""
-	}
-	err := ValidatePublishService(message)
+	err := ValidateServiceHealthReport(pb.ServiceHealthReport{})
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -199,7 +199,10 @@ func TestValidatePublishServiceRejectMissingScopeAndSNI(t *testing.T) {
 func TestValidateRouteScope(t *testing.T) {
 	t.Parallel()
 
-	if err := ValidateRouteScope("dev", "alice", "dev", "alice"); err != nil {
+	if err := ValidateRouteScope(
+		pb.Scope{Namespace: "dev", Environment: "alice"},
+		pb.Scope{Namespace: "dev", Environment: "alice"},
+	); err != nil {
 		t.Fatalf("validate route scope failed: %v", err)
 	}
 }
@@ -208,10 +211,16 @@ func TestValidateRouteScope(t *testing.T) {
 func TestValidateRouteScopeAllowsPartialScope(t *testing.T) {
 	t.Parallel()
 
-	if err := ValidateRouteScope("", "alice", "dev", "alice"); err != nil {
+	if err := ValidateRouteScope(
+		pb.Scope{Environment: "alice"},
+		pb.Scope{Namespace: "dev", Environment: "alice"},
+	); err != nil {
 		t.Fatalf("validate partial route scope failed: %v", err)
 	}
-	if err := ValidateRouteScope("dev", "", "dev", "prod"); err != nil {
+	if err := ValidateRouteScope(
+		pb.Scope{Namespace: "dev"},
+		pb.Scope{Namespace: "dev", Environment: "prod"},
+	); err != nil {
 		t.Fatalf("validate partial environment scope failed: %v", err)
 	}
 }
@@ -220,11 +229,13 @@ func TestValidateRouteScopeAllowsPartialScope(t *testing.T) {
 func TestValidateRouteScopeRejectMismatch(t *testing.T) {
 	t.Parallel()
 
-	err := ValidateRouteScope("dev", "alice", "prod", "alice")
+	err := ValidateRouteScope(
+		pb.Scope{Namespace: "dev", Environment: "alice"},
+		pb.Scope{Namespace: "prod", Environment: "alice"},
+	)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// 跨 scope 属于硬约束违规。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeInvalidScope) {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -236,8 +247,9 @@ func TestValidateStreamPayloadRejectInvalidOneof(t *testing.T) {
 
 	payload := pb.StreamPayload{
 		OpenReq: &pb.TrafficOpen{
-			TrafficID: "traffic-001",
-			ServiceID: "svc-001",
+			TrafficID:        "traffic-001",
+			LogicalServiceID: "ls-001",
+			InstanceID:       "si-001",
 		},
 		Close: &pb.TrafficClose{
 			TrafficID: "traffic-001",
@@ -247,8 +259,22 @@ func TestValidateStreamPayloadRejectInvalidOneof(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// oneof 冲突应返回数据面 oneof 错误码。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeTrafficInvalidOneof) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestValidateTrafficOpenRejectMissingLogicalServiceID 验证缺失 logicalServiceId 会被拒绝。
+func TestValidateTrafficOpenRejectMissingLogicalServiceID(t *testing.T) {
+	t.Parallel()
+
+	open := testkit.GoldenTrafficOpen()
+	open.LogicalServiceID = ""
+	err := ValidateTrafficOpen(open)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !ltfperrors.IsCode(err, ltfperrors.CodeTrafficInvalidLogicalServiceID) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -277,7 +303,6 @@ func TestValidateControlErrorRejectMissingCode(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
-	// code 缺失应返回 missing required 错误码。
 	if !ltfperrors.IsCode(err, ltfperrors.CodeMissingRequiredField) {
 		t.Fatalf("unexpected error: %v", err)
 	}

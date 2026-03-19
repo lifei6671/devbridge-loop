@@ -8,14 +8,14 @@ import (
 
 // TrafficDiagnosticFields 描述 traffic 维度的结构化日志字段。
 type TrafficDiagnosticFields struct {
-	TrafficID    string
-	ServiceID    string
-	SessionID    string
-	SessionEpoch uint64
-	TunnelID     string
-	Binding      string
-	FrameType    TrafficFrameType
-	LastError    string
+	TrafficID        string
+	LogicalServiceID string
+	SessionID        string
+	SessionEpoch     uint64
+	TunnelID         string
+	Binding          string
+	FrameType        TrafficFrameType
+	LastError        string
 }
 
 // BuildTrafficDiagnosticFields 构造 traffic 维度统一诊断字段。
@@ -26,11 +26,11 @@ func BuildTrafficDiagnosticFields(
 	lastError error,
 ) TrafficDiagnosticFields {
 	fields := TrafficDiagnosticFields{
-		TrafficID:    strings.TrimSpace(meta.TrafficID),
-		ServiceID:    strings.TrimSpace(meta.ServiceID),
-		SessionID:    strings.TrimSpace(meta.SessionID),
-		SessionEpoch: meta.SessionEpoch,
-		FrameType:    frameType,
+		TrafficID:        strings.TrimSpace(meta.TrafficID),
+		LogicalServiceID: strings.TrimSpace(meta.LogicalServiceID),
+		SessionID:        strings.TrimSpace(meta.SessionID),
+		SessionEpoch:     meta.SessionEpoch,
+		FrameType:        frameType,
 	}
 	if tunnel != nil {
 		tunnelMeta := tunnel.Meta()
@@ -52,13 +52,13 @@ func BuildTrafficDiagnosticFields(
 // Fields 返回适合结构化日志输出的字段映射。
 func (fields TrafficDiagnosticFields) Fields() map[string]any {
 	return map[string]any{
-		"traffic_id":    fields.TrafficID,
-		"service_id":    fields.ServiceID,
-		"session_id":    fields.SessionID,
-		"session_epoch": fields.SessionEpoch,
-		"tunnel_id":     fields.TunnelID,
-		"binding":       fields.Binding,
-		"frame_type":    fields.FrameType,
-		"last_error":    fields.LastError,
+		"traffic_id":         fields.TrafficID,
+		"logical_service_id": fields.LogicalServiceID,
+		"session_id":         fields.SessionID,
+		"session_epoch":      fields.SessionEpoch,
+		"tunnel_id":          fields.TunnelID,
+		"binding":            fields.Binding,
+		"frame_type":         fields.FrameType,
+		"last_error":         fields.LastError,
 	}
 }

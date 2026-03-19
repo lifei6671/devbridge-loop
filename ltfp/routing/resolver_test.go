@@ -31,26 +31,32 @@ func TestResolveConnectorSuccess(t *testing.T) {
 		SessionEpoch: 7,
 		State:        pb.SessionStateActive,
 	})
-	canonical.UpsertService(pb.Service{
-		ServiceID:    "svc-001",
-		ServiceKey:   "dev/alice/order-service",
-		Namespace:    "dev",
-		Environment:  "alice",
-		ConnectorID:  "conn-001",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	canonical.UpsertLogicalService(pb.LogicalService{
+		LogicalServiceID: "ls-001",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+	})
+	canonical.UpsertServiceInstance(pb.ServiceInstance{
+		InstanceID:       "si-001",
+		LogicalServiceID: "ls-001",
+		ConnectorID:      "conn-001",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
 	})
 
 	result, err := resolver.Resolve(context.Background(), ResolveRequest{
 		Route: pb.Route{
 			RouteID:         "route-001",
-			Namespace:       "dev",
-			Environment:     "alice",
+			Scope:           pb.Scope{Namespace: "dev", Environment: "alice"},
 			ResourceVersion: 3,
 			Target: pb.RouteTarget{
 				Type: pb.RouteTargetTypeConnectorService,
 				ConnectorService: &pb.ConnectorServiceTarget{
-					ServiceKey: "dev/alice/order-service",
+					Selector: pb.ServiceSelector{
+						ServiceName: "order-service",
+						Scope:       pb.Scope{Namespace: "dev", Environment: "alice"},
+					},
 				},
 			},
 		},
@@ -69,8 +75,7 @@ func TestResolveConnectorSuccess(t *testing.T) {
 	if result.TrafficOpen == nil {
 		t.Fatalf("expected traffic open")
 	}
-	// TrafficOpen 不应携带权威 target_addr，仅保留 service 级信息与 hint。
-	if result.TrafficOpen.ServiceID != "svc-001" || result.TrafficOpen.RouteID != "route-001" || result.TrafficOpen.TraceID != "trace-001" {
+	if result.TrafficOpen.LogicalServiceID != "ls-001" || result.TrafficOpen.InstanceID != "si-001" || result.TrafficOpen.RouteID != "route-001" || result.TrafficOpen.TraceID != "trace-001" {
 		t.Fatalf("unexpected traffic open: %+v", result.TrafficOpen)
 	}
 }
@@ -80,25 +85,24 @@ func TestResolveConnectorRejectScopeMismatch(t *testing.T) {
 	t.Parallel()
 
 	resolver, canonical := buildResolverWithRegistry()
-	canonical.UpsertService(pb.Service{
-		ServiceID:    "svc-001",
-		ServiceKey:   "dev/prod/order-service",
-		Namespace:    "dev",
-		Environment:  "prod",
-		ConnectorID:  "conn-001",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	canonical.UpsertLogicalService(pb.LogicalService{
+		LogicalServiceID: "ls-001",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "prod"},
+		Status:           pb.ServiceStatusActive,
 	})
 
 	_, err := resolver.Resolve(context.Background(), ResolveRequest{
 		Route: pb.Route{
-			RouteID:     "route-001",
-			Namespace:   "dev",
-			Environment: "alice",
+			RouteID: "route-001",
+			Scope:   pb.Scope{Namespace: "dev", Environment: "alice"},
 			Target: pb.RouteTarget{
 				Type: pb.RouteTargetTypeConnectorService,
 				ConnectorService: &pb.ConnectorServiceTarget{
-					ServiceKey: "dev/prod/order-service",
+					Selector: pb.ServiceSelector{
+						ServiceName: "order-service",
+						Scope:       pb.Scope{Namespace: "dev", Environment: "prod"},
+					},
 				},
 			},
 		},
@@ -115,9 +119,8 @@ func TestResolveExternalSuccess(t *testing.T) {
 	resolver, _ := buildResolverWithRegistry()
 	result, err := resolver.Resolve(context.Background(), ResolveRequest{
 		Route: pb.Route{
-			RouteID:     "route-002",
-			Namespace:   "dev",
-			Environment: "alice",
+			RouteID: "route-002",
+			Scope:   pb.Scope{Namespace: "dev", Environment: "alice"},
 			Target: pb.RouteTarget{
 				Type: pb.RouteTargetTypeExternalService,
 				ExternalService: &pb.ExternalServiceTarget{
@@ -137,75 +140,7 @@ func TestResolveExternalSuccess(t *testing.T) {
 	if result.ExternalQuery == nil {
 		t.Fatalf("expected external query")
 	}
-	// target scope 未设置时应继承 route scope。
 	if result.ExternalQuery.Namespace != "dev" || result.ExternalQuery.Environment != "alice" {
 		t.Fatalf("unexpected query scope: %+v", result.ExternalQuery)
-	}
-}
-
-// TestResolveHybridFallbackOnResolveMiss 验证 hybrid 在 pre-open resolve miss 时回退 external。
-func TestResolveHybridFallbackOnResolveMiss(t *testing.T) {
-	t.Parallel()
-
-	resolver, _ := buildResolverWithRegistry()
-	result, err := resolver.Resolve(context.Background(), ResolveRequest{
-		Route: pb.Route{
-			RouteID:     "route-003",
-			Namespace:   "dev",
-			Environment: "alice",
-			Target: pb.RouteTarget{
-				Type: pb.RouteTargetTypeHybridGroup,
-				HybridGroup: &pb.HybridGroupTarget{
-					PrimaryConnectorService: pb.ConnectorServiceTarget{
-						ServiceKey: "dev/alice/missing-service",
-					},
-					FallbackExternalService: pb.ExternalServiceTarget{
-						Provider:    "nacos",
-						ServiceName: "fallback-payment",
-					},
-					FallbackPolicy: pb.FallbackPolicyPreOpenOnly,
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("resolve failed: %v", err)
-	}
-	if !result.FallbackUsed || result.PathKind != pb.RouteTargetTypeExternalService {
-		t.Fatalf("unexpected fallback result: %+v", result)
-	}
-	if result.FallbackReason != "resolve_miss" || result.PrimaryErrorCode != ltfperrors.CodeResolveServiceNotFound {
-		t.Fatalf("unexpected fallback metadata: %+v", result)
-	}
-}
-
-// TestResolveHybridRejectUnsupportedPolicy 验证 hybrid 非 pre_open_only 策略会拒绝。
-func TestResolveHybridRejectUnsupportedPolicy(t *testing.T) {
-	t.Parallel()
-
-	resolver, _ := buildResolverWithRegistry()
-	_, err := resolver.Resolve(context.Background(), ResolveRequest{
-		Route: pb.Route{
-			RouteID:     "route-004",
-			Namespace:   "dev",
-			Environment: "alice",
-			Target: pb.RouteTarget{
-				Type: pb.RouteTargetTypeHybridGroup,
-				HybridGroup: &pb.HybridGroupTarget{
-					PrimaryConnectorService: pb.ConnectorServiceTarget{
-						ServiceKey: "dev/alice/missing-service",
-					},
-					FallbackExternalService: pb.ExternalServiceTarget{
-						Provider:    "nacos",
-						ServiceName: "fallback-payment",
-					},
-					FallbackPolicy: "",
-				},
-			},
-		},
-	})
-	if !ltfperrors.IsCode(err, ltfperrors.CodeResolveServiceNotFound) {
-		// policy 不合法时 resolver 不应静默 fallback，应该保留 primary 失败信号。
-		t.Fatalf("unexpected error: %v", err)
 	}
 }

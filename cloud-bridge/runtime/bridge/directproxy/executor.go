@@ -19,8 +19,12 @@ var (
 
 // ExecuteRequest 描述 external_service 执行请求。
 type ExecuteRequest struct {
-	TrafficID string
-	Target    pb.ExternalServiceTarget
+	TrafficID          string
+	Target             pb.ExternalServiceTarget
+	RequestScope       pb.Scope
+	MatchedScope       pb.Scope
+	RouteID            string
+	IsExternalFallback bool
 }
 
 // ExecuteResult 描述 external_service 执行结果。
@@ -95,17 +99,21 @@ func (executor *Executor) Execute(ctx context.Context, request ExecuteRequest) (
 		normalizedContext = context.Background()
 	}
 	baseLogFields := obs.LogFields{
-		TrafficID: strings.TrimSpace(request.TrafficID),
-		ServiceID: strings.TrimSpace(request.Target.ServiceName),
+		TrafficID:          strings.TrimSpace(request.TrafficID),
+		RouteID:            strings.TrimSpace(request.RouteID),
+		ServiceName:        strings.TrimSpace(request.Target.ServiceName),
+		RequestScope:       formatScopeForLogs(request.RequestScope),
+		MatchedScope:       formatScopeForLogs(request.MatchedScope),
+		IsExternalFallback: request.IsExternalFallback,
 	}
 
-	cacheLookup := executor.cache.Get(request.Target)
+	cacheLookup := executor.cache.Get(request.Target, request.RequestScope)
 	candidates := cacheLookup.Endpoints
 	fromCache := cacheLookup.Hit
 	usedStale := cacheLookup.Stale && len(cacheLookup.Endpoints) > 0
 
 	if len(candidates) == 0 {
-		discovered, discoveryErr := executor.discovery.Discover(normalizedContext, request.Target)
+		discovered, discoveryErr := executor.discovery.Discover(normalizedContext, request.Target, request.RequestScope)
 		if discoveryErr != nil {
 			mappedFailure := executor.failureMapper.Map(discoveryErr, FailureKindDiscoveryMiss)
 			log.Printf(
@@ -120,14 +128,14 @@ func (executor *Executor) Execute(ctx context.Context, request ExecuteRequest) (
 				ErrorCode:  mappedFailure.Code,
 			}, fmt.Errorf("direct execute: discovery: %w", discoveryErr)
 		}
-		executor.cache.Put(request.Target, discovered)
+		executor.cache.Put(request.Target, request.RequestScope, discovered)
 		candidates = discovered
 		fromCache = false
 		usedStale = false
 	} else if cacheLookup.Stale {
-		discovered, discoveryErr := executor.discovery.Discover(normalizedContext, request.Target)
+		discovered, discoveryErr := executor.discovery.Discover(normalizedContext, request.Target, request.RequestScope)
 		if discoveryErr == nil && len(discovered) > 0 {
-			executor.cache.Put(request.Target, discovered)
+			executor.cache.Put(request.Target, request.RequestScope, discovered)
 			candidates = discovered
 			fromCache = false
 			usedStale = false
@@ -172,9 +180,13 @@ func (executor *Executor) Execute(ctx context.Context, request ExecuteRequest) (
 			mappedFailure.Code,
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          strings.TrimSpace(request.TrafficID),
-				ServiceID:          strings.TrimSpace(request.Target.ServiceName),
+				RouteID:            strings.TrimSpace(request.RouteID),
+				ServiceName:        strings.TrimSpace(request.Target.ServiceName),
 				ActualEndpointID:   strings.TrimSpace(dialResult.Endpoint.EndpointID),
 				ActualEndpointAddr: strings.TrimSpace(dialResult.Endpoint.Address),
+				RequestScope:       formatScopeForLogs(request.RequestScope),
+				MatchedScope:       formatScopeForLogs(request.MatchedScope),
+				IsExternalFallback: request.IsExternalFallback,
 			}),
 			err,
 		)
@@ -192,9 +204,13 @@ func (executor *Executor) Execute(ctx context.Context, request ExecuteRequest) (
 				mappedFailure.Code,
 				obs.FormatLogFields(obs.LogFields{
 					TrafficID:          strings.TrimSpace(request.TrafficID),
-					ServiceID:          strings.TrimSpace(request.Target.ServiceName),
+					RouteID:            strings.TrimSpace(request.RouteID),
+					ServiceName:        strings.TrimSpace(request.Target.ServiceName),
 					ActualEndpointID:   strings.TrimSpace(dialResult.Endpoint.EndpointID),
 					ActualEndpointAddr: strings.TrimSpace(dialResult.Endpoint.Address),
+					RequestScope:       formatScopeForLogs(request.RequestScope),
+					MatchedScope:       formatScopeForLogs(request.MatchedScope),
+					IsExternalFallback: request.IsExternalFallback,
 				}),
 				closeErr,
 			)
@@ -210,4 +226,13 @@ func (executor *Executor) Execute(ctx context.Context, request ExecuteRequest) (
 		UsedStale:  usedStale,
 		HTTPStatus: 200,
 	}, nil
+}
+
+func formatScopeForLogs(scope pb.Scope) string {
+	namespace := strings.TrimSpace(scope.Namespace)
+	environment := strings.TrimSpace(scope.Environment)
+	if namespace == "" && environment == "" {
+		return ""
+	}
+	return namespace + "/" + environment
 }

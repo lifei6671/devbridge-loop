@@ -6,26 +6,24 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-// TestCanonicalRegistryServiceLookup 验证 service_key 到 service_id 映射查询。
-func TestCanonicalRegistryServiceLookup(t *testing.T) {
+// TestCanonicalRegistryLogicalServiceLookup 验证 service_name + scope 到 logical_service_id 映射查询。
+func TestCanonicalRegistryLogicalServiceLookup(t *testing.T) {
 	t.Parallel()
 
 	registry := NewCanonicalRegistry()
-	service := pb.Service{
-		ServiceID:   "svc-001",
-		ServiceKey:  "dev/alice/order-service",
-		Namespace:   "dev",
-		Environment: "alice",
+	service := pb.LogicalService{
+		LogicalServiceID: "ls-001",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
 	}
-	registry.UpsertService(service)
+	registry.UpsertLogicalService(service)
 
-	loaded, exists := registry.GetServiceByKey("dev/alice/order-service")
+	loaded, exists := registry.FindLogicalServiceByNameScope("order-service", pb.Scope{Namespace: "dev", Environment: "alice"})
 	if !exists {
-		t.Fatalf("expected service exists")
+		t.Fatalf("expected logical service exists")
 	}
-	// 通过 service_key 查询应返回同一 identity。
-	if loaded.ServiceID != "svc-001" {
-		t.Fatalf("unexpected service id: %s", loaded.ServiceID)
+	if loaded.LogicalServiceID != "ls-001" {
+		t.Fatalf("unexpected logical service id: %s", loaded.LogicalServiceID)
 	}
 }
 
@@ -45,7 +43,6 @@ func TestRuntimeTrafficRegistryRecordBytes(t *testing.T) {
 	if !exists {
 		t.Fatalf("expected traffic exists")
 	}
-	// 字节统计应按增量累加。
 	if loaded.UpstreamBytes != 15 || loaded.DownstreamBytes != 28 {
 		t.Fatalf("unexpected bytes: up=%d down=%d", loaded.UpstreamBytes, loaded.DownstreamBytes)
 	}
@@ -67,63 +64,69 @@ func TestCanonicalRegistryIndexesAndSnapshot(t *testing.T) {
 		SessionEpoch: 1,
 		State:        pb.SessionStateActive,
 	}, "evt-sess-1", 22)
-	registry.UpsertServiceWithAudit(pb.Service{
-		ServiceID:       "svc-001",
-		ServiceKey:      "dev/alice/order-service",
-		Namespace:       "dev",
-		Environment:     "alice",
-		ConnectorID:     "conn-001",
-		Status:          pb.ServiceStatusActive,
-		HealthStatus:    pb.HealthStatusHealthy,
-		ResourceVersion: 33,
-	}, "evt-svc-1", 33)
+	registry.UpsertLogicalServiceWithAudit(pb.LogicalService{
+		LogicalServiceID: "ls-001",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+		ResourceVersion:  33,
+	}, "evt-ls-1", 33)
+	registry.UpsertServiceInstanceWithAudit(pb.ServiceInstance{
+		InstanceID:       "si-001",
+		LogicalServiceID: "ls-001",
+		ConnectorID:      "conn-001",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  34,
+	}, "evt-si-1", 34)
 	registry.UpsertRouteWithAudit(pb.Route{
 		RouteID:         "route-001",
-		Namespace:       "dev",
-		Environment:     "alice",
+		Scope:           pb.Scope{Namespace: "dev", Environment: "alice"},
 		ResourceVersion: 44,
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/alice/order-service",
+				Selector: pb.ServiceSelector{
+					LogicalServiceID: "ls-001",
+				},
 			},
 		},
 	}, "evt-route-1", 44)
 	registry.UpsertProjectionWithAudit(pb.DiscoveryProjection{
-		ProjectionID: "proj-001",
-		ServiceID:    "svc-001",
-		Provider:     "nacos",
+		ProjectionID:     "proj-001",
+		LogicalServiceID: "ls-001",
+		InstanceID:       "si-001",
+		Provider:         "nacos",
 	}, "evt-proj-1", 55)
 
-	serviceID, exists := registry.GetServiceIDByKey("dev/alice/order-service")
-	if !exists || serviceID != "svc-001" {
-		t.Fatalf("unexpected service id mapping: id=%s exists=%v", serviceID, exists)
+	service, exists := registry.FindLogicalServiceByNameScope("order-service", pb.Scope{Namespace: "dev", Environment: "alice"})
+	if !exists || service.LogicalServiceID != "ls-001" {
+		t.Fatalf("unexpected logical service mapping: service=%+v exists=%v", service, exists)
 	}
 
 	sessions := registry.ListSessionsByConnector("conn-001")
 	if len(sessions) != 1 {
 		t.Fatalf("unexpected session count: %d", len(sessions))
 	}
-	services := registry.ListServicesByConnector("conn-001")
-	if len(services) != 1 {
-		t.Fatalf("unexpected service count: %d", len(services))
+	instances := registry.ListServiceInstancesByConnector("conn-001")
+	if len(instances) != 1 {
+		t.Fatalf("unexpected instance count: %d", len(instances))
 	}
-	routes := registry.ListRoutesByServiceKey("dev/alice/order-service")
+	routes := registry.ListRoutesByLogicalService("ls-001")
 	if len(routes) != 1 || routes[0].RouteID != "route-001" {
 		t.Fatalf("unexpected route list: %+v", routes)
 	}
 
-	audit, exists := registry.GetAuditInfo("service", "svc-001")
+	audit, exists := registry.GetAuditInfo("logical_service", "ls-001")
 	if !exists {
-		t.Fatalf("expected service audit exists")
+		t.Fatalf("expected logical service audit exists")
 	}
-	// 资源版本应落到审计元数据中，便于管理面追溯。
-	if audit.LastResourceVersion != 33 || audit.LastEventID != "evt-svc-1" {
+	if audit.LastResourceVersion != 33 || audit.LastEventID != "evt-ls-1" {
 		t.Fatalf("unexpected audit info: %+v", audit)
 	}
 
 	snapshot := registry.Snapshot()
-	if len(snapshot.Connectors) != 1 || len(snapshot.Sessions) != 1 || len(snapshot.Services) != 1 || len(snapshot.Routes) != 1 || len(snapshot.Projections) != 1 {
+	if len(snapshot.Connectors) != 1 || len(snapshot.Sessions) != 1 || len(snapshot.LogicalServices) != 1 || len(snapshot.ServiceInstances) != 1 || len(snapshot.Routes) != 1 || len(snapshot.Projections) != 1 {
 		t.Fatalf("unexpected snapshot sizes: %+v", snapshot)
 	}
 }

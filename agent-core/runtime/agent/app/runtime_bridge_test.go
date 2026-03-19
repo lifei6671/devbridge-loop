@@ -790,10 +790,12 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	serviceCatalog := service.NewCatalog()
 	now := time.Unix(1700000000, 0).UTC()
 	serviceCatalog.Upsert(now, adapter.LocalRegistration{
-		ServiceID:   "svc-5001",
-		ServiceKey:  "dev/demo/order-service",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "svc-5001",
+		InstanceID:       "inst-5001",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "order-service",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
@@ -859,7 +861,17 @@ func TestSyncServiceControlState(testingObject *testing.T) {
 	if routeAssignPayload.Match.PathPrefix != "/" {
 		testingObject.Fatalf("unexpected route path prefix: got=%s want=%s", routeAssignPayload.Match.PathPrefix, "/")
 	}
-	if routeAssignPayload.Target.ConnectorService == nil || routeAssignPayload.Target.ConnectorService.ServiceKey != "dev/demo/order-service" {
+	if routeAssignPayload.Target.ConnectorService == nil {
+		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
+	}
+	if routeAssignPayload.Target.ConnectorService.Selector.LogicalServiceID != "svc-5001" {
+		testingObject.Fatalf("unexpected route selector logical_service_id: %+v", routeAssignPayload.Target.ConnectorService.Selector)
+	}
+	if routeAssignPayload.Target.ConnectorService.Selector.ServiceName != "order-service" {
+		testingObject.Fatalf("unexpected route selector service_name: %+v", routeAssignPayload.Target.ConnectorService.Selector)
+	}
+	if routeAssignPayload.Target.ConnectorService.Selector.Scope.Namespace != "dev" ||
+		routeAssignPayload.Target.ConnectorService.Selector.Scope.Environment != "demo" {
 		testingObject.Fatalf("unexpected route target: %+v", routeAssignPayload.Target)
 	}
 	fourthEnvelope, err := transport.DecodeBusinessControlEnvelopeFrame(frames[3].Frame)
@@ -934,10 +946,9 @@ func TestAddOrUpdateServiceSyncsDuringSessionWarmup(testingObject *testing.T) {
 	}
 
 	if _, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		ServiceID:   "svc-8101",
+		InstanceID:  "inst-8101",
+		Scope:       pb.Scope{Namespace: "dev", Environment: "demo"},
 		ServiceName: "inventory-service",
-		Namespace:   "dev",
-		Environment: "demo",
 		Protocol:    "http",
 		Host:        "127.0.0.1",
 		Port:        18081,
@@ -978,10 +989,9 @@ func TestAddOrUpdateServiceUsesDefaultHealthCheckConfig(testingObject *testing.T
 		serviceCatalog: service.NewCatalog(),
 	}
 	addedPayload, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		ServiceID:   "svc-default-health",
+		InstanceID:  "inst-default-health",
+		Scope:       pb.Scope{Namespace: "dev", Environment: "demo"},
 		ServiceName: "payment-service",
-		Namespace:   "dev",
-		Environment: "demo",
 		Protocol:    "http",
 		Host:        "127.0.0.1",
 		Port:        18090,
@@ -1027,21 +1037,21 @@ func TestAddOrUpdateServiceRejectsMissingScopeAndSNI(testingObject *testing.T) {
 		serviceCatalog: service.NewCatalog(),
 	}
 	_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		ServiceID:   "svc-missing-scope",
+		InstanceID:  "inst-missing-scope",
 		ServiceName: "payment-service",
 		Protocol:    "http",
 		Host:        "127.0.0.1",
 		Port:        18090,
 	})
 	if err == nil {
-		testingObject.Fatalf("expected add service to reject empty namespace/environment/sni")
+		testingObject.Fatalf("expected add service to reject empty scope/sni")
 	}
 	if !strings.Contains(err.Error(), "至少填写一个") {
-		testingObject.Fatalf("unexpected error for missing namespace/environment/sni: %v", err)
+		testingObject.Fatalf("unexpected error for missing scope/sni: %v", err)
 	}
 }
 
-// TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided 验证仅 SNI 注册时不会补齐 namespace/environment 默认值。
+// TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided 验证仅 SNI 注册时不会补齐 scope 默认值。
 func TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided(testingObject *testing.T) {
 	testingObject.Parallel()
 
@@ -1049,7 +1059,7 @@ func TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided(testingObject *testing
 		serviceCatalog: service.NewCatalog(),
 	}
 	addedPayload, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		ServiceID:   "svc-sni-only",
+		InstanceID:  "inst-sni-only",
 		ServiceName: "payment-service",
 		Protocol:    "http",
 		Host:        "127.0.0.1",
@@ -1059,21 +1069,22 @@ func TestAddOrUpdateServiceKeepsEmptyScopeWhenSNIProvided(testingObject *testing
 	if err != nil {
 		testingObject.Fatalf("add service with sni-only failed: %v", err)
 	}
-	if addedPayload["namespace"] != "" {
-		testingObject.Fatalf("unexpected namespace defaulted: %+v", addedPayload["namespace"])
+	scopePayload, ok := addedPayload["scope"].(pb.Scope)
+	if !ok {
+		testingObject.Fatalf("unexpected scope payload type: %T", addedPayload["scope"])
 	}
-	if addedPayload["environment"] != "" {
-		testingObject.Fatalf("unexpected environment defaulted: %+v", addedPayload["environment"])
+	if scopePayload.Namespace != "" || scopePayload.Environment != "" {
+		testingObject.Fatalf("unexpected scope defaulted: %+v", scopePayload)
 	}
 	records := runtime.serviceCatalog.List()
 	if len(records) != 1 {
 		testingObject.Fatalf("unexpected service catalog count: got=%d want=1", len(records))
 	}
-	if records[0].Registration.Namespace != "" || records[0].Registration.Environment != "" {
+	if records[0].Registration.Scope.Namespace != "" || records[0].Registration.Scope.Environment != "" {
 		testingObject.Fatalf(
 			"unexpected catalog scope defaulted: namespace=%q environment=%q",
-			records[0].Registration.Namespace,
-			records[0].Registration.Environment,
+			records[0].Registration.Scope.Namespace,
+			records[0].Registration.Scope.Environment,
 		)
 	}
 }
@@ -1086,10 +1097,9 @@ func TestAddOrUpdateServiceValidatesHealthCheckMode(testingObject *testing.T) {
 		serviceCatalog: service.NewCatalog(),
 	}
 	_, err := runtime.addOrUpdateService(runtimeServiceAddInput{
-		ServiceID:              "svc-invalid-mode",
+		InstanceID:             "inst-invalid-mode",
+		Scope:                  pb.Scope{Namespace: "dev", Environment: "demo"},
 		ServiceName:            "payment-service",
-		Namespace:              "dev",
-		Environment:            "demo",
 		Protocol:               "http",
 		Host:                   "127.0.0.1",
 		Port:                   18090,
@@ -1113,10 +1123,12 @@ func TestReportCatalogHealthByIntervalRespectsServiceInterval(testingObject *tes
 	serviceCatalog := service.NewCatalog()
 	now := time.Now().UTC()
 	serviceCatalog.Upsert(now.Add(-40*time.Second), adapter.LocalRegistration{
-		ServiceID:   "svc-due",
-		ServiceKey:  "dev/demo/svc-due",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "svc-due",
+		InstanceID:       "inst-due",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "svc-due",
 		ServiceType: "tcp",
 		HealthCheck: pb.HealthCheckConfig{
@@ -1128,10 +1140,12 @@ func TestReportCatalogHealthByIntervalRespectsServiceInterval(testingObject *tes
 		},
 	})
 	serviceCatalog.Upsert(now.Add(-5*time.Second), adapter.LocalRegistration{
-		ServiceID:   "svc-not-due",
-		ServiceKey:  "dev/demo/svc-not-due",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "svc-not-due",
+		InstanceID:       "inst-not-due",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "svc-not-due",
 		ServiceType: "tcp",
 		HealthCheck: pb.HealthCheckConfig{
@@ -1166,8 +1180,11 @@ func TestReportCatalogHealthByIntervalRespectsServiceInterval(testingObject *tes
 	if err := json.Unmarshal(envelope.Payload, &healthReport); err != nil {
 		testingObject.Fatalf("unmarshal health report payload failed: %v", err)
 	}
-	if healthReport.ServiceID != "svc-due" {
-		testingObject.Fatalf("unexpected due service reported: %+v", healthReport.ServiceID)
+	if healthReport.LogicalServiceID != "svc-due" {
+		testingObject.Fatalf("unexpected due logical_service_id: %+v", healthReport.LogicalServiceID)
+	}
+	if healthReport.InstanceID != "inst-due" {
+		testingObject.Fatalf("unexpected due instance_id: %+v", healthReport.InstanceID)
 	}
 
 	if err := runtime.reportCatalogHealthByInterval(context.Background()); err != nil {
@@ -1189,10 +1206,12 @@ func TestWaitForActiveExitKeepsCommandResponsiveDuringHealthScan(testingObject *
 
 	serviceCatalog := service.NewCatalog()
 	serviceCatalog.Upsert(time.Now().UTC().Add(-2*time.Minute), adapter.LocalRegistration{
-		ServiceID:   "svc-blocking-scan",
-		ServiceKey:  "dev/demo/svc-blocking-scan",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "svc-blocking-scan",
+		InstanceID:       "inst-blocking-scan",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "svc-blocking-scan",
 		ServiceType: "tcp",
 		HealthCheck: pb.HealthCheckConfig{
@@ -1255,10 +1274,12 @@ func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing
 	controlChannel := newTestPrioritizedControlChannel()
 	serviceCatalog := service.NewCatalog()
 	serviceCatalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
-		ServiceID:   "svc-7001",
-		ServiceKey:  "dev/demo/order-service",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "svc-7001",
+		InstanceID:       "inst-7001",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "order-service",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
@@ -1275,7 +1296,7 @@ func TestRemoveServicePublishesUnpublishWhenSessionActive(testingObject *testing
 		bridgeSessionReady: false,
 	}
 
-	payload, err := runtime.removeService(runtimeServiceDeleteInput{ServiceID: "svc-7001"})
+	payload, err := runtime.removeService(runtimeServiceDeleteInput{LogicalServiceID: "svc-7001"})
 	if err != nil {
 		testingObject.Fatalf("remove service failed: %v", err)
 	}
@@ -1401,7 +1422,8 @@ func TestTunnelListPayloadUsesRuntimeAssociation(testingObject *testing.T) {
 	runtime.upsertTunnelAssociation(tunnelAssociation{
 		TunnelID:              "tunnel-1",
 		TrafficID:             "traffic-1",
-		ServiceID:             "svc-1",
+		LogicalServiceID:      "ls-1",
+		InstanceID:            "inst-1",
 		LocalAddr:             "127.0.0.1:18080",
 		OpenAckLatencyMS:      23,
 		UpstreamDialLatencyMS: 7,
@@ -1417,8 +1439,11 @@ func TestTunnelListPayloadUsesRuntimeAssociation(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected tunnel list size: got=%d want=1", len(tunnels))
 	}
 	item := tunnels[0]
-	if item["service_id"] != "svc-1" {
-		testingObject.Fatalf("unexpected service_id: %+v", item["service_id"])
+	if item["logical_service_id"] != "ls-1" {
+		testingObject.Fatalf("unexpected logical_service_id: %+v", item["logical_service_id"])
+	}
+	if item["instance_id"] != "inst-1" {
+		testingObject.Fatalf("unexpected instance_id: %+v", item["instance_id"])
 	}
 	if item["local_addr"] != "127.0.0.1:18080" {
 		testingObject.Fatalf("unexpected local_addr: %+v", item["local_addr"])

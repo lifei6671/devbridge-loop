@@ -21,13 +21,14 @@ func TestEndpointCacheRecheckKeepsRefreshedRecord(testingObject *testing.T) {
 		CacheTTLSeconds: 1,
 		StaleIfErrorSec: 1,
 	}
-	cacheKey := BuildCacheKey(target)
+	requestScope := pb.Scope{Namespace: "tenant", Environment: "demo"}
+	cacheKey := BuildCacheKey(target, requestScope)
 
-	cache.Put(target, []ExternalEndpoint{
+	cache.Put(target, requestScope, []ExternalEndpoint{
 		{EndpointID: "ep-old", Address: "10.0.0.1:443"},
 	})
 	nowTime = nowTime.Add(3 * time.Second)
-	cache.Put(target, []ExternalEndpoint{
+	cache.Put(target, requestScope, []ExternalEndpoint{
 		{EndpointID: "ep-new", Address: "10.0.0.2:443"},
 	})
 
@@ -54,9 +55,10 @@ func TestEndpointCacheRecheckEvictsExpiredRecord(testingObject *testing.T) {
 		CacheTTLSeconds: 1,
 		StaleIfErrorSec: 1,
 	}
-	cacheKey := BuildCacheKey(target)
+	requestScope := pb.Scope{Namespace: "tenant", Environment: "demo"}
+	cacheKey := BuildCacheKey(target, requestScope)
 
-	cache.Put(target, []ExternalEndpoint{
+	cache.Put(target, requestScope, []ExternalEndpoint{
 		{EndpointID: "ep-1", Address: "10.0.0.1:443"},
 	})
 	nowTime = nowTime.Add(3 * time.Second)
@@ -70,5 +72,21 @@ func TestEndpointCacheRecheckEvictsExpiredRecord(testingObject *testing.T) {
 	cache.mutex.RUnlock()
 	if exists {
 		testingObject.Fatalf("expected expired record removed from cache map")
+	}
+}
+
+func TestBuildCacheKeyIncludesRequestScope(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	target := pb.ExternalServiceTarget{
+		Provider:    "k8s",
+		Namespace:   "route-ns",
+		Environment: "route-env",
+		ServiceName: "pay",
+	}
+	leftKey := BuildCacheKey(target, pb.Scope{Namespace: "tenant-a", Environment: "demo"})
+	rightKey := BuildCacheKey(target, pb.Scope{Namespace: "tenant-b", Environment: "demo"})
+	if leftKey == rightKey {
+		testingObject.Fatalf("expected cache key to vary by request scope")
 	}
 }

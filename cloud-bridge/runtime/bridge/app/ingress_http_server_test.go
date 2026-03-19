@@ -57,7 +57,9 @@ func TestBootstrapSkipsIngressHTTPServerWhenHTTPAddrEmpty(testingObject *testing
 func TestIngressHTTPHandlerReturnsRouteMismatch(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	if runtime.ingressHTTPServer == nil {
 		testingObject.Fatalf("expected ingress http server initialized")
@@ -103,16 +105,20 @@ func TestIngressHTTPHandlerRetriesRouteResolveOnTransientMismatch(testingObject 
 	defer externalServer.Close()
 	externalEndpoint := strings.TrimPrefix(externalServer.URL, "http://")
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-			RouteID:     "route-retry-ready",
-			Namespace:   "dev",
-			Environment: "demo",
+			RouteID: "route-retry-ready",
+			Scope: pb.Scope{
+				Namespace:   "dev",
+				Environment: "demo",
+			},
 			Match: pb.RouteMatch{
 				Protocol:   "http",
 				Host:       "api.retry.local",
@@ -134,8 +140,8 @@ func TestIngressHTTPHandlerRetriesRouteResolveOnTransientMismatch(testingObject 
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/ready", nil)
 	request.Host = "api.retry.local:8080"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -157,13 +163,17 @@ func TestIngressHTTPHandlerUsesScopeHeaders(testingObject *testing.T) {
 	defer externalServer.Close()
 	externalEndpoint := strings.TrimPrefix(externalServer.URL, "http://")
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-ingress-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-ingress-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.dev.local",
@@ -184,8 +194,8 @@ func TestIngressHTTPHandlerUsesScopeHeaders(testingObject *testing.T) {
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.dev.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -210,15 +220,19 @@ func TestIngressHTTPHandlerUsesScopeHeaders(testingObject *testing.T) {
 func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-connector-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-connector-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.dev.local",
@@ -227,7 +241,9 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -269,8 +285,8 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.dev.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	request.Header.Set("X-Request-Id", "trace-connector-1")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
@@ -341,16 +357,20 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 func TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	runtime.cfg.TunnelReuse.CloseAckTimeout = 20 * time.Millisecond
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-close-timeout-close",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-close-timeout-close",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.close-timeout.local",
@@ -359,7 +379,9 @@ func TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose(testingObject *testin
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -388,8 +410,8 @@ func TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose(testingObject *testin
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.close-timeout.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -430,15 +452,19 @@ func TestIngressHTTPHandlerCloseAckTimeoutFallsBackToClose(testingObject *testin
 func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-grpc-tunnel-close-first",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-grpc-tunnel-close-first",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.grpc-tunnel.local",
@@ -447,7 +473,9 @@ func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingOb
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -493,8 +521,8 @@ func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingOb
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.grpc-tunnel.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -531,15 +559,19 @@ func TestIngressHTTPHandlerConnectorGRPCTunnelWritesCloseBeforeRecycle(testingOb
 func TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-connector-reuse",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-connector-reuse",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.reuse.local",
@@ -548,7 +580,9 @@ func TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests(testing
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -617,8 +651,8 @@ func TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests(testing
 	for requestIndex := 1; requestIndex <= expectedRequests; requestIndex++ {
 		request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1/v1/orders?req=%d", requestIndex), nil)
 		request.Host = "api.reuse.local"
-		request.Header.Set("X-Namespace", "dev")
-		request.Header.Set("X-Env", "demo")
+		request.Header.Set("X-Bridge-Namespace", "dev")
+		request.Header.Set("X-Bridge-Environment", "demo")
 		recorder := httptest.NewRecorder()
 
 		doneChannel := make(chan struct{})
@@ -694,15 +728,19 @@ func TestIngressHTTPHandlerConnectorReusesTunnelAcrossSequentialRequests(testing
 func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-connector-retry",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-connector-retry",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.retry-eof.local",
@@ -711,7 +749,9 @@ func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -774,8 +814,8 @@ func TestIngressHTTPHandlerConnectorRetriesUnexpectedEOF(testingObject *testing.
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.retry-eof.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -807,9 +847,11 @@ func TestIngressHTTPHandlerConnectorNoRetryAfterCommittedEOF(testingObject *test
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-http-connector-committed-eof",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-http-connector-committed-eof",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.committed-eof.local",
@@ -818,7 +860,9 @@ func TestIngressHTTPHandlerConnectorNoRetryAfterCommittedEOF(testingObject *test
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 	})
@@ -892,8 +936,8 @@ func TestIngressHTTPHandlerConnectorNoRetryAfterCommittedEOF(testingObject *test
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.committed-eof.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -968,43 +1012,41 @@ func TestIngressHTTPHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 	defer externalServer.Close()
 	externalEndpoint := strings.TrimPrefix(externalServer.URL, "http://")
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-hybrid-http-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-hybrid-http-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.hybrid.local",
 			PathPrefix: "/",
 		},
 		Target: pb.RouteTarget{
-			Type: pb.RouteTargetTypeHybridGroup,
-			HybridGroup: &pb.HybridGroupTarget{
-				PrimaryConnectorService: pb.ConnectorServiceTarget{
-					ServiceKey: "dev/demo/order-service",
+			Type: pb.RouteTargetTypeExternalService,
+			ExternalService: &pb.ExternalServiceTarget{
+				Namespace:   "dev",
+				Environment: "demo",
+				ServiceName: "order-fallback",
+				Selector: map[string]string{
+					"endpoint": externalEndpoint,
 				},
-				FallbackExternalService: pb.ExternalServiceTarget{
-					Namespace:   "dev",
-					Environment: "demo",
-					ServiceName: "order-fallback",
-					Selector: map[string]string{
-						"endpoint": externalEndpoint,
-					},
-				},
-				FallbackPolicy: pb.FallbackPolicyPreOpenOnly,
 			},
 		},
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.hybrid.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 
@@ -1012,16 +1054,10 @@ func TestIngressHTTPHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected hybrid status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	if recorder.Body.String() != "hybrid-fallback-ok" {
-		testingObject.Fatalf("unexpected hybrid fallback body: %s", recorder.Body.String())
+		testingObject.Fatalf("unexpected external fallback body: %s", recorder.Body.String())
 	}
-	if recorder.Header().Get("X-DevBridge-Target-Kind") != string(pb.RouteTargetTypeHybridGroup) {
-		testingObject.Fatalf("unexpected hybrid target kind header: %s", recorder.Header().Get("X-DevBridge-Target-Kind"))
-	}
-	if recorder.Header().Get("X-DevBridge-Hybrid-Path") != "fallback" {
-		testingObject.Fatalf("unexpected hybrid path header: %s", recorder.Header().Get("X-DevBridge-Hybrid-Path"))
-	}
-	if recorder.Header().Get("X-DevBridge-Hybrid-Fallback-Stage") == "" {
-		testingObject.Fatalf("expected non-empty hybrid fallback stage")
+	if recorder.Header().Get("X-DevBridge-Target-Kind") != string(pb.RouteTargetTypeExternalService) {
+		testingObject.Fatalf("unexpected external target kind header: %s", recorder.Header().Get("X-DevBridge-Target-Kind"))
 	}
 }
 
@@ -1029,14 +1065,18 @@ func TestIngressHTTPHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 func TestIngressHTTPHandlerExternalMissingEndpointReturnsStructuredError(testingObject *testing.T) {
 	testingObject.Parallel()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
 	now := time.Now().UTC()
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-external-missing-endpoint",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-external-missing-endpoint",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.external.local",
@@ -1055,8 +1095,8 @@ func TestIngressHTTPHandlerExternalMissingEndpointReturnsStructuredError(testing
 
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
 	request.Host = "api.external.local"
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
 

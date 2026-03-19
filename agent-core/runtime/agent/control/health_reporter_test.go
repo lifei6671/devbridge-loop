@@ -45,18 +45,23 @@ func TestHealthReporterBuildServiceReport(t *testing.T) {
 		Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
 	})
 	report := reporter.BuildServiceReport(context.Background(), adapter.LocalRegistration{
-		ServiceID:   "svc-3001",
-		ServiceKey:  "dev/demo/order-service",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "ls-3001",
+		InstanceID:       "inst-3001",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "order-service",
 		Endpoints: []pb.ServiceEndpoint{
 			{EndpointID: "ep-1", Protocol: "http", Host: "127.0.0.1", Port: 18080},
 			{EndpointID: "ep-2", Protocol: "http", Host: "127.0.0.1", Port: 18081},
 		},
 	})
-	if report.ServiceID != "svc-3001" {
-		t.Fatalf("unexpected service_id: %s", report.ServiceID)
+	if report.InstanceID != "inst-3001" {
+		t.Fatalf("unexpected instance_id: %s", report.InstanceID)
+	}
+	if report.LogicalServiceID != "ls-3001" {
+		t.Fatalf("unexpected logical_service_id: %s", report.LogicalServiceID)
 	}
 	if report.ServiceHealthStatus != pb.HealthStatusHealthy {
 		t.Fatalf("unexpected aggregated health: got=%s want=%s", report.ServiceHealthStatus, pb.HealthStatusHealthy)
@@ -81,20 +86,24 @@ func TestHealthReporterBuildReports(t *testing.T) {
 	})
 	reports := reporter.BuildReports(context.Background(), []adapter.LocalRegistration{
 		{
-			ServiceID:   "svc-1",
-			ServiceKey:  "dev/demo/s1",
-			Namespace:   "dev",
-			Environment: "demo",
+			LogicalServiceID: "ls-1",
+			InstanceID:       "inst-1",
+			Scope: pb.Scope{
+				Namespace:   "dev",
+				Environment: "demo",
+			},
 			ServiceName: "s1",
 			Endpoints: []pb.ServiceEndpoint{
 				{EndpointID: "ep-1", Protocol: "tcp", Host: "127.0.0.1", Port: 18080},
 			},
 		},
 		{
-			ServiceID:   "svc-2",
-			ServiceKey:  "dev/demo/s2",
-			Namespace:   "dev",
-			Environment: "demo",
+			LogicalServiceID: "ls-2",
+			InstanceID:       "inst-2",
+			Scope: pb.Scope{
+				Namespace:   "dev",
+				Environment: "demo",
+			},
 			ServiceName: "s2",
 			Endpoints: []pb.ServiceEndpoint{
 				{EndpointID: "ep-2", Protocol: "tcp", Host: "127.0.0.1", Port: 18081},
@@ -104,11 +113,11 @@ func TestHealthReporterBuildReports(t *testing.T) {
 	if len(reports) != 2 {
 		t.Fatalf("unexpected report count: got=%d want=2", len(reports))
 	}
-	if reports[0].ServiceID != "svc-1" {
-		t.Fatalf("unexpected first report service_id: %s", reports[0].ServiceID)
+	if reports[0].InstanceID != "inst-1" {
+		t.Fatalf("unexpected first report instance_id: %s", reports[0].InstanceID)
 	}
-	if reports[1].ServiceID != "svc-2" {
-		t.Fatalf("unexpected second report service_id: %s", reports[1].ServiceID)
+	if reports[1].InstanceID != "inst-2" {
+		t.Fatalf("unexpected second report instance_id: %s", reports[1].InstanceID)
 	}
 }
 
@@ -141,10 +150,10 @@ func TestHealthReporterHTTPProbeAccepts4xx(t *testing.T) {
 
 	reporter := NewHealthReporter(HealthReporterOptions{})
 	report := reporter.BuildServiceReport(context.Background(), adapter.LocalRegistration{
-		ServiceID:   "svc-http",
-		ServiceKey:  "dev/demo/http-service",
-		ServiceName: "http-service",
-		ServiceType: "http",
+		LogicalServiceID: "ls-http",
+		InstanceID:       "inst-http",
+		ServiceName:      "http-service",
+		ServiceType:      "http",
 		HealthCheck: pb.HealthCheckConfig{
 			Type:     "http",
 			Endpoint: "healthz",
@@ -194,10 +203,10 @@ func TestHealthReporterHTTPProbeUsesDefaultPath(t *testing.T) {
 
 	reporter := NewHealthReporter(HealthReporterOptions{})
 	report := reporter.BuildServiceReport(context.Background(), adapter.LocalRegistration{
-		ServiceID:   "svc-http-default-path",
-		ServiceKey:  "dev/demo/http-default-path",
-		ServiceName: "http-default-path",
-		ServiceType: "http",
+		LogicalServiceID: "ls-http-default-path",
+		InstanceID:       "inst-http-default-path",
+		ServiceName:      "http-default-path",
+		ServiceType:      "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{
 				EndpointID: "ep-http-default-path",

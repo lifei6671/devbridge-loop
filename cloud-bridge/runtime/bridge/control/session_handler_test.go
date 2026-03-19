@@ -50,11 +50,27 @@ func TestSessionHandlerApplyFullSyncSnapshot(t *testing.T) {
 		RequestID:       "full-sync-1",
 		SessionEpoch:    3,
 		SnapshotVersion: 11,
-		Services: []pb.Service{
+		LogicalServices: []pb.LogicalService{
 			{
-				ServiceID:       "svc-1",
-				ServiceKey:      "dev/alice/order-service",
+				LogicalServiceID: "ls-1",
+				ServiceName:      "order-service",
+				Scope: pb.Scope{
+					Namespace:   "dev",
+					Environment: "alice",
+				},
 				ResourceVersion: 10,
+			},
+		},
+		ServiceInstances: []pb.ServiceInstance{
+			{
+				InstanceID:       "inst-1",
+				LogicalServiceID: "ls-1",
+				ConnectorID:      "connector-1",
+				SessionID:        "session-1",
+				SessionEpoch:     3,
+				InstanceStatus:   pb.ServiceStatusActive,
+				HealthStatus:     pb.HealthStatusHealthy,
+				ResourceVersion:  10,
 			},
 		},
 		Routes: []pb.Route{
@@ -69,14 +85,21 @@ func TestSessionHandlerApplyFullSyncSnapshot(t *testing.T) {
 	handler.ApplyFullSyncSnapshot(snapshot)
 
 	if services := serviceRegistry.List(); len(services) != 1 {
-		t.Fatalf("unexpected service size: got=%d want=1", len(services))
+		t.Fatalf("unexpected logical service size: got=%d want=1", len(services))
+	}
+	if instances := serviceRegistry.ListInstancesByLogicalServiceID("ls-1"); len(instances) != 1 {
+		t.Fatalf("unexpected service instance size: got=%d want=1", len(instances))
 	}
 	if routes := routeRegistry.List(); len(routes) != 1 {
 		t.Fatalf("unexpected route size: got=%d want=1", len(routes))
 	}
+
 	versions := guard.SnapshotVersions()
-	if versions["service:svc-1"] != 10 {
-		t.Fatalf("unexpected service version: got=%d want=10", versions["service:svc-1"])
+	if versions["logical_service:ls-1"] != 10 {
+		t.Fatalf("unexpected logical service version: got=%d want=10", versions["logical_service:ls-1"])
+	}
+	if versions["service_instance:inst-1"] != 10 {
+		t.Fatalf("unexpected service instance version: got=%d want=10", versions["service_instance:inst-1"])
 	}
 	if versions["route:route-1"] != 11 {
 		t.Fatalf("unexpected route version: got=%d want=11", versions["route:route-1"])

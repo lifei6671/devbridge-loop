@@ -91,11 +91,14 @@ const pageCatalog: Array<{
 ];
 
 const configPatchKeyOptions = [
+  "default_scope.namespace",
+  "default_scope.environment",
   "ingress.http_addr",
   "ingress.grpc_addr",
   "ingress.https_addr",
   "ingress.tls_sni_addr",
   "ingress.tcp_port_range",
+  "ingress.base_domain",
   "admin.enabled",
   "admin.listen_addr",
   "admin.allow_shared_listener",
@@ -200,6 +203,22 @@ function readText(record: ApiRecord, key: string, fallback = "-"): string {
     return rawValue ? "true" : "false";
   }
   return fallback;
+}
+
+function readScopeText(record: ApiRecord, key = "scope", fallback = "-"): string {
+  const rawValue = record[key];
+  if (!isRecord(rawValue)) {
+    return fallback;
+  }
+  const namespaceValue = readText(rawValue, "namespace", "").trim();
+  const environmentValue = readText(rawValue, "environment", "").trim();
+  if (namespaceValue === "" && environmentValue === "") {
+    return fallback;
+  }
+  if (namespaceValue !== "" && environmentValue !== "") {
+    return `${namespaceValue}/${environmentValue}`;
+  }
+  return namespaceValue || environmentValue;
 }
 
 const bridgeTunnelIDPrefix = "tcp-bridge-tunnel-";
@@ -531,7 +550,10 @@ function pickMetricLabel(metricKey: string): string {
     open_timeout_total: "Open Timeout",
     open_reject_total: "Open Reject",
     open_ack_late_total: "Open Ack Late",
-    hybrid_fallback_total: "Hybrid Fallback",
+    scope_fallback_total: "Scope Fallback",
+    route_conflict_rejection_total: "Route Conflict Reject",
+    host_derive_success_total: "Host Derive OK",
+    host_derive_failure_total: "Host Derive Fail",
     endpoint_override_total: "Endpoint Override",
   };
   return metricLabelMap[metricKey] ?? metricKey;
@@ -546,7 +568,8 @@ function summarizeMetricBars(point: ApiRecord): ChartDatum[] {
     "open_reject_total",
     "open_ack_late_total",
     "acquire_wait_count",
-    "hybrid_fallback_total",
+    "scope_fallback_total",
+    "route_conflict_rejection_total",
     "endpoint_override_total",
   ];
   return metricKeys.map((key) => {
@@ -653,6 +676,10 @@ export default function App() {
   const [drainSessionID, setDrainSessionID] = useState("");
   const [drainConnectorID, setDrainConnectorID] = useState("");
   const [drainReason, setDrainReason] = useState("manual_ops");
+  const [trafficLookupID, setTrafficLookupID] = useState("");
+  const [trafficOwnership, setTrafficOwnership] = useState<ApiRecord | null>(null);
+  const [trafficOwnershipError, setTrafficOwnershipError] = useState("");
+  const [isTrafficOwnershipLoading, setIsTrafficOwnershipLoading] = useState(false);
   const [patchKey, setPatchKey] = useState("observability.log_level");
   const [patchValue, setPatchValue] = useState("debug");
   const [exportDownloadURL, setExportDownloadURL] = useState("");
@@ -1534,6 +1561,44 @@ export default function App() {
     }
   }, [requestAdmin]);
 
+  /**
+   * lookupTrafficOwnership 按 traffic_id 反查命中的服务归属与 scope 命中结果。
+   */
+  const lookupTrafficOwnership = useCallback(
+    async (trafficID: string) => {
+      const normalizedTrafficID = trafficID.trim();
+      if (normalizedTrafficID === "") {
+        setTrafficOwnership(null);
+        setTrafficOwnershipError("请先输入 Traffic ID");
+        return;
+      }
+      setIsTrafficOwnershipLoading(true);
+      setTrafficOwnershipError("");
+      try {
+        const response = await requestAdmin(
+          `/api/admin/traffic/ownership${encodeQuery({ traffic_id: normalizedTrafficID })}`
+        );
+        setTrafficOwnership(asRecord(response.ownership));
+      } catch (error) {
+        setTrafficOwnership(null);
+        setTrafficOwnershipError(normalizeOperationError(error));
+      } finally {
+        setIsTrafficOwnershipLoading(false);
+      }
+    },
+    [requestAdmin]
+  );
+
+  /**
+   * clearTrafficOwnershipLookup 清理 traffic ownership 查询上下文，避免旧结果误导排障。
+   */
+  const clearTrafficOwnershipLookup = useCallback(() => {
+    setTrafficLookupID("");
+    setTrafficOwnership(null);
+    setTrafficOwnershipError("");
+    setIsTrafficOwnershipLoading(false);
+  }, []);
+
   const activeMeta = pickPageMeta(activePage);
 
   const dashboardCards = useMemo(
@@ -1545,7 +1610,7 @@ export default function App() {
       { label: "Open Timeout", value: readNumber(trafficSummary, "open_timeout_total", 0) },
       {
         label: "Fallback",
-        value: readNumber(trafficSummary, "hybrid_fallback_total", 0),
+        value: readNumber(trafficSummary, "scope_fallback_total", 0),
       },
     ],
     [overview, trafficSummary]
@@ -1567,7 +1632,10 @@ export default function App() {
       "open_ack_late_total",
       "acquire_wait_count",
       "acquire_wait_total_ms",
-      "hybrid_fallback_total",
+      "scope_fallback_total",
+      "route_conflict_rejection_total",
+      "host_derive_success_total",
+      "host_derive_failure_total",
       "endpoint_override_total",
     ];
     const keySet = new Set<string>(defaultKeys);
@@ -1770,8 +1838,9 @@ export default function App() {
         <table>
           <thead>
             <tr>
-              <th>Service ID</th>
-              <th>Service Key</th>
+              <th>Logical Service ID</th>
+              <th>Instance ID</th>
+              <th>Scope</th>
               <th>服务名</th>
               <th>Agent</th>
               <th>Session</th>
@@ -1783,9 +1852,10 @@ export default function App() {
           </thead>
           <tbody>
             {serviceItems.map((item, index) => (
-              <tr key={`${readText(item, "service_id", "service")}-${index}`}>
-                <td>{readText(item, "service_id")}</td>
-                <td>{readText(item, "service_key")}</td>
+              <tr key={`${readText(item, "logical_service_id", "service")}-${readText(item, "instance_id", String(index))}`}>
+                <td>{readText(item, "logical_service_id")}</td>
+                <td>{readText(item, "instance_id")}</td>
+                <td>{readScopeText(item)}</td>
                 <td>{readText(item, "service_name")}</td>
                 <td>{readText(item, "connector_id", "--")}</td>
                 <td>
@@ -2145,6 +2215,103 @@ export default function App() {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section className="panel">
+        <header className="panel-head">
+          <h3>Traffic Ownership</h3>
+          <span className="panel-sub">按 traffic_id 反查命中的服务归属与 scope 路径</span>
+        </header>
+        <p className="panel-note">
+          用于确认当前流量最终命中了哪个 logical service / instance，以及是否走了 external
+          fallback。
+        </p>
+        <form
+          className="patch-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void lookupTrafficOwnership(trafficLookupID);
+          }}
+        >
+          <label>
+            <span>Traffic ID</span>
+            <input
+              value={trafficLookupID}
+              onChange={(event) => setTrafficLookupID(event.target.value)}
+              placeholder="traffic-xxx"
+            />
+          </label>
+          <div className="inline-actions">
+            <button type="submit" className="solid-btn" disabled={isTrafficOwnershipLoading}>
+              {isTrafficOwnershipLoading ? "查询中..." : "查询归属"}
+            </button>
+            <button type="button" className="ghost-btn" onClick={clearTrafficOwnershipLookup}>
+              清空
+            </button>
+          </div>
+        </form>
+        {trafficOwnershipError !== "" && <p className="listener-empty">{trafficOwnershipError}</p>}
+        {trafficOwnership !== null ? (
+          <div className="detail-grid">
+            <article className="detail-kv">
+              <p>Traffic ID</p>
+              <strong>{readText(trafficOwnership, "traffic_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Logical Service</p>
+              <strong>{readText(trafficOwnership, "logical_service_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Service Name</p>
+              <strong>{readText(trafficOwnership, "service_name", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Instance ID</p>
+              <strong>{readText(trafficOwnership, "instance_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Connector</p>
+              <strong>{readText(trafficOwnership, "connector_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Session</p>
+              <strong>{readText(trafficOwnership, "session_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Route ID</p>
+              <strong>{readText(trafficOwnership, "route_id", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Target Kind</p>
+              <strong>{readText(trafficOwnership, "target_kind", "--")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Scope</p>
+              <strong>{readScopeText(trafficOwnership)}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Request Scope</p>
+              <strong>{readScopeText(trafficOwnership, "request_scope")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Matched Scope</p>
+              <strong>{readScopeText(trafficOwnership, "matched_scope")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>External Fallback</p>
+              <strong>{readText(trafficOwnership, "is_external_fallback", "false")}</strong>
+            </article>
+            <article className="detail-kv">
+              <p>Updated</p>
+              <strong>{asPrettyTime(readNumber(trafficOwnership, "updated_at_ms"))}</strong>
+            </article>
+          </div>
+        ) : (
+          <p className="listener-empty">
+            输入 traffic_id 后可查看 `request_scope / matched_scope / is_external_fallback`
+            的运行态结果。
+          </p>
+        )}
       </section>
     </div>
   );

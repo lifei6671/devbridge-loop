@@ -84,16 +84,20 @@ type AgentTunnelPoolSummary struct {
 
 // TrafficOwnershipRecord 定义按 traffic_id 反查得到的服务归属快照。
 type TrafficOwnershipRecord struct {
-	TrafficID         string `json:"traffic_id"`
-	RouteID           string `json:"route_id"`
-	TargetKind        string `json:"target_kind"`
-	IngressMode       string `json:"ingress_mode"`
-	ServiceID         string `json:"service_id"`
-	ServiceKey        string `json:"service_key"`
-	ServiceInstanceID string `json:"service_instance_id"`
-	ConnectorID       string `json:"connector_id"`
-	SessionID         string `json:"session_id"`
-	UpdatedAtMS       uint64 `json:"updated_at_ms"`
+	TrafficID          string   `json:"traffic_id"`
+	RouteID            string   `json:"route_id"`
+	TargetKind         string   `json:"target_kind"`
+	IngressMode        string   `json:"ingress_mode"`
+	LogicalServiceID   string   `json:"logical_service_id"`
+	ServiceName        string   `json:"service_name"`
+	Scope              pb.Scope `json:"scope"`
+	RequestScope       pb.Scope `json:"request_scope"`
+	MatchedScope       pb.Scope `json:"matched_scope"`
+	IsExternalFallback bool     `json:"is_external_fallback"`
+	InstanceID         string   `json:"instance_id"`
+	ConnectorID        string   `json:"connector_id"`
+	SessionID          string   `json:"session_id"`
+	UpdatedAtMS        uint64   `json:"updated_at_ms"`
 }
 
 // Dependencies 定义管理后台只读 API 所需依赖。
@@ -102,8 +106,10 @@ type Dependencies struct {
 	Now func() time.Time
 	// ListRoutes 返回当前路由快照列表。
 	ListRoutes func() []pb.Route
-	// ListServices 返回当前服务快照列表。
-	ListServices func() []pb.Service
+	// ListLogicalServices 返回当前逻辑服务快照列表。
+	ListLogicalServices func() []pb.LogicalService
+	// ListServiceInstances 返回当前服务实例快照列表。
+	ListServiceInstances func() []pb.ServiceInstance
 	// ListSessions 返回当前会话快照列表。
 	ListSessions func() []registry.SessionRuntime
 	// ListTunnels 返回当前 tunnel 运行态列表。
@@ -571,13 +577,13 @@ func (server *Server) handleBridgeOverview(writer http.ResponseWriter, request *
 		return
 	}
 	sessions := safeListSessions(server.dependencies)
-	services := safeListServices(server.dependencies)
+	logicalServices := safeListLogicalServices(server.dependencies)
 	routes := safeListRoutes(server.dependencies)
 	tunnelSnapshot := safeTunnelSnapshot(server.dependencies)
 	overview := adminview.BuildBridgeOverview(
 		server.now(),
 		sessions,
-		services,
+		logicalServices,
 		routes,
 		tunnelSnapshot,
 		safeBuildConfigSnapshot(server.dependencies),
@@ -640,7 +646,8 @@ func (server *Server) handleServicesList(writer http.ResponseWriter, request *ht
 
 	items := adminview.BuildServiceItems(
 		server.now(),
-		safeListServices(server.dependencies),
+		safeListLogicalServices(server.dependencies),
+		safeListServiceInstances(server.dependencies),
 		safeListSessions(server.dependencies),
 	)
 	if connectorFilter != "" ||
@@ -669,8 +676,8 @@ func (server *Server) handleServicesList(writer http.ResponseWriter, request *ht
 			if queryText != "" {
 				searchText := strings.ToLower(
 					strings.Join([]string{
-						item.ServiceID,
-						item.ServiceKey,
+						item.LogicalServiceID,
+						item.InstanceID,
 						item.ServiceName,
 						item.ConnectorID,
 						item.SessionID,
@@ -714,7 +721,7 @@ func (server *Server) handleConnectorsList(writer http.ResponseWriter, request *
 	}
 	items := adminview.BuildConnectorItems(
 		safeListSessions(server.dependencies),
-		safeListServices(server.dependencies),
+		safeListServiceInstances(server.dependencies),
 	)
 	pagedItems, nextCursor := paginate(items, page)
 	writeJSON(writer, http.StatusOK, map[string]any{
@@ -915,14 +922,17 @@ func (server *Server) handleMetricsQuery(writer http.ResponseWriter, request *ht
 		"to_ms":   timeRange.toMS,
 		"points": []map[string]any{
 			{
-				"ts_ms":                   uint64(server.now().UnixMilli()),
-				"acquire_wait_count":      trafficSummary.AcquireWaitCount,
-				"acquire_wait_total_ms":   trafficSummary.AcquireWaitTotalMS,
-				"open_timeout_total":      trafficSummary.OpenTimeoutTotal,
-				"open_reject_total":       trafficSummary.OpenRejectTotal,
-				"open_ack_late_total":     trafficSummary.OpenAckLateTotal,
-				"hybrid_fallback_total":   trafficSummary.HybridFallbackTotal,
-				"endpoint_override_total": trafficSummary.EndpointOverrideTotal,
+				"ts_ms":                          uint64(server.now().UnixMilli()),
+				"acquire_wait_count":             trafficSummary.AcquireWaitCount,
+				"acquire_wait_total_ms":          trafficSummary.AcquireWaitTotalMS,
+				"open_timeout_total":             trafficSummary.OpenTimeoutTotal,
+				"open_reject_total":              trafficSummary.OpenRejectTotal,
+				"open_ack_late_total":            trafficSummary.OpenAckLateTotal,
+				"scope_fallback_total":           trafficSummary.ScopeFallbackTotal,
+				"route_conflict_rejection_total": trafficSummary.RouteConflictRejectionTotal,
+				"host_derive_success_total":      trafficSummary.HostDeriveSuccessTotal,
+				"host_derive_failure_total":      trafficSummary.HostDeriveFailureTotal,
+				"endpoint_override_total":        trafficSummary.EndpointOverrideTotal,
 			},
 		},
 		"source": "bridge.adminapi.readonly",
@@ -1168,11 +1178,18 @@ func safeListRoutes(dependencies Dependencies) []pb.Route {
 	return dependencies.ListRoutes()
 }
 
-func safeListServices(dependencies Dependencies) []pb.Service {
-	if dependencies.ListServices == nil {
-		return []pb.Service{}
+func safeListLogicalServices(dependencies Dependencies) []pb.LogicalService {
+	if dependencies.ListLogicalServices == nil {
+		return []pb.LogicalService{}
 	}
-	return dependencies.ListServices()
+	return dependencies.ListLogicalServices()
+}
+
+func safeListServiceInstances(dependencies Dependencies) []pb.ServiceInstance {
+	if dependencies.ListServiceInstances == nil {
+		return []pb.ServiceInstance{}
+	}
+	return dependencies.ListServiceInstances()
 }
 
 func safeListSessions(dependencies Dependencies) []registry.SessionRuntime {

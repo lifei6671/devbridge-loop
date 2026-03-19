@@ -42,12 +42,12 @@ const (
 	defaultBridgeLateAckDrainTimeout = 250 * time.Millisecond
 	// defaultBridgeDirectDialTimeout 定义 direct path 拨号超时。
 	defaultBridgeDirectDialTimeout = 3 * time.Second
-	// trafficMetadataServiceIDKey 定义 traffic 元数据中的 service_id 键。
-	trafficMetadataServiceIDKey = "service_id"
-	// trafficMetadataServiceKeyKey 定义 traffic 元数据中的 service_key 键。
-	trafficMetadataServiceKeyKey = "service_key"
-	// trafficMetadataServiceInstanceIDKey 定义 traffic 元数据中的 service_instance_id 键。
-	trafficMetadataServiceInstanceIDKey = "service_instance_id"
+	// trafficMetadataLogicalServiceIDKey 定义 traffic 元数据中的 logical_service_id 键。
+	trafficMetadataLogicalServiceIDKey = "logical_service_id"
+	// trafficMetadataServiceNameKey 定义 traffic 元数据中的 service_name 键。
+	trafficMetadataServiceNameKey = "service_name"
+	// trafficMetadataInstanceIDKey 定义 traffic 元数据中的 instance_id 键。
+	trafficMetadataInstanceIDKey = "instance_id"
 )
 
 // runtimeDataPlaneDependencies 描述 app 层数据面可注入依赖。
@@ -132,10 +132,12 @@ func newRuntimeDataPlaneWithDependencies(
 	dependencies.connectorMetrics = connectorMetrics
 
 	resolver := routing.NewResolver(routing.ResolverOptions{
-		RouteRegistry:   routeRegistry,
-		ServiceRegistry: serviceRegistry,
-		SessionRegistry: sessionRegistry,
-		Metrics:         connectorMetrics,
+		RouteRegistry:    routeRegistry,
+		ServiceRegistry:  serviceRegistry,
+		SessionRegistry:  sessionRegistry,
+		Metrics:          connectorMetrics,
+		DefaultScope:     cfg.DefaultScope,
+		FallbackPolicies: cfg.FallbackPolicies,
 	})
 	pathExecutor, err := newRuntimePathExecutor(cfg, tunnelRegistry, dependencies)
 	if err != nil {
@@ -398,12 +400,13 @@ func (runtime *Runtime) DispatchRouteLookup(
 		return DispatchRouteLookupResult{}, fmt.Errorf("dispatch route lookup: resolve route: %w", err)
 	}
 	// 统一从解析结果提取服务身份，避免后续日志/审计字段口径不一致。
-	resolvedServiceID, resolvedServiceKey, resolvedServiceInstanceID := resolveTrafficServiceIdentityFromResolution(resolution)
+	resolvedLogicalServiceID, resolvedServiceName, resolvedInstanceID := resolveTrafficServiceIdentityFromResolution(resolution)
 
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:             normalizedTrafficID,
 		RouteID:               strings.TrimSpace(request.TrafficOpen.RouteID),
-		ServiceID:             strings.TrimSpace(request.TrafficOpen.ServiceID),
+		LogicalServiceID:      strings.TrimSpace(request.TrafficOpen.LogicalServiceID),
+		InstanceID:            strings.TrimSpace(request.TrafficOpen.InstanceID),
 		SourceAddr:            strings.TrimSpace(request.TrafficOpen.SourceAddr),
 		ProtocolHint:          strings.TrimSpace(request.TrafficOpen.ProtocolHint),
 		TraceID:               strings.TrimSpace(request.TrafficOpen.TraceID),
@@ -414,9 +417,13 @@ func (runtime *Runtime) DispatchRouteLookup(
 		// 调用方未显式透传 route_id 时，使用 resolver 命中的 route 作为权威值。
 		trafficOpen.RouteID = strings.TrimSpace(resolution.Route.RouteID)
 	}
-	if trafficOpen.ServiceID == "" {
-		// 调用方未显式透传 service_id 时，按解析结果补齐 connector 服务标识。
-		trafficOpen.ServiceID = resolvedServiceID
+	if trafficOpen.LogicalServiceID == "" {
+		// 调用方未显式透传 logical_service_id 时，按解析结果补齐。
+		trafficOpen.LogicalServiceID = resolvedLogicalServiceID
+	}
+	if trafficOpen.InstanceID == "" {
+		// 调用方未显式透传 instance_id 时，按解析结果补齐。
+		trafficOpen.InstanceID = resolvedInstanceID
 	}
 	if trafficOpen.ProtocolHint == "" {
 		// protocolHint 缺失时回填 ingress 归一化后的协议，便于 Agent 侧选择本地处理策略。
@@ -425,9 +432,9 @@ func (runtime *Runtime) DispatchRouteLookup(
 	// 默认写入统一服务身份元数据，便于运行时日志与审计链路直接复用。
 	enrichTrafficOpenServiceIdentity(
 		&trafficOpen,
-		resolvedServiceID,
-		resolvedServiceKey,
-		resolvedServiceInstanceID,
+		resolvedLogicalServiceID,
+		resolvedServiceName,
+		resolvedInstanceID,
 	)
 	// 路由命中后写入 traffic 归属索引，支撑管理面按 traffic_id 反查服务归属。
 	runtime.observeTrafficOwnership(resolution, trafficOpen)
@@ -548,13 +555,13 @@ func copyStringMap(source map[string]string) map[string]string {
 	return copied
 }
 
-// resolveTrafficServiceIDFromResolution 从解析结果补齐 connector 路径必需的 service_id。
+// resolveTrafficServiceIDFromResolution 从解析结果补齐 connector 路径必需的 logical_service_id。
 func resolveTrafficServiceIDFromResolution(result routing.ResolveResult) string {
 	serviceID, _, _ := resolveTrafficServiceIdentityFromResolution(result)
 	return serviceID
 }
 
-// resolveTrafficServiceKeyFromResolution 从解析结果提取服务 key，供日志与审计复用。
+// resolveTrafficServiceKeyFromResolution 从解析结果提取服务名，供日志与审计复用。
 func resolveTrafficServiceKeyFromResolution(result routing.ResolveResult) string {
 	_, serviceKey, _ := resolveTrafficServiceIdentityFromResolution(result)
 	return serviceKey
@@ -566,20 +573,14 @@ func resolveTrafficServiceInstanceIDFromResolution(result routing.ResolveResult)
 	return serviceInstanceID
 }
 
-// resolveTrafficServiceIdentityFromResolution 统一提取 service_id/service_key/service_instance_id。
+// resolveTrafficServiceIdentityFromResolution 统一提取 logical_service_id/service_name/instance_id。
 func resolveTrafficServiceIdentityFromResolution(result routing.ResolveResult) (string, string, string) {
 	switch result.TargetKind {
 	case pb.RouteTargetTypeConnectorService:
 		if result.Connector != nil {
-			return strings.TrimSpace(result.Connector.Service.ServiceID),
-				strings.TrimSpace(result.Connector.Service.ServiceKey),
-				strings.TrimSpace(result.Connector.ServiceInstanceID)
-		}
-	case pb.RouteTargetTypeHybridGroup:
-		if result.Hybrid != nil {
-			return strings.TrimSpace(result.Hybrid.Primary.Service.ServiceID),
-				strings.TrimSpace(result.Hybrid.Primary.Service.ServiceKey),
-				strings.TrimSpace(result.Hybrid.Primary.ServiceInstanceID)
+			return strings.TrimSpace(result.Connector.LogicalService.LogicalServiceID),
+				strings.TrimSpace(result.Connector.LogicalService.ServiceName),
+				strings.TrimSpace(result.Connector.Instance.InstanceID)
 		}
 	}
 	return "", "", ""
@@ -588,32 +589,34 @@ func resolveTrafficServiceIdentityFromResolution(result routing.ResolveResult) (
 // enrichTrafficOpenServiceIdentity 把服务身份补齐到 traffic open，确保下游日志字段默认可用。
 func enrichTrafficOpenServiceIdentity(
 	trafficOpen *pb.TrafficOpen,
-	serviceID string,
-	serviceKey string,
-	serviceInstanceID string,
+	logicalServiceID string,
+	serviceName string,
+	instanceID string,
 ) {
 	if trafficOpen == nil {
 		return
 	}
-	normalizedServiceID := strings.TrimSpace(serviceID)
-	normalizedServiceKey := strings.TrimSpace(serviceKey)
-	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
-	if strings.TrimSpace(trafficOpen.ServiceID) == "" && normalizedServiceID != "" {
-		trafficOpen.ServiceID = normalizedServiceID
+	normalizedLogicalServiceID := strings.TrimSpace(logicalServiceID)
+	normalizedServiceName := strings.TrimSpace(serviceName)
+	normalizedInstanceID := strings.TrimSpace(instanceID)
+	if strings.TrimSpace(trafficOpen.LogicalServiceID) == "" && normalizedLogicalServiceID != "" {
+		trafficOpen.LogicalServiceID = normalizedLogicalServiceID
+	}
+	if strings.TrimSpace(trafficOpen.InstanceID) == "" && normalizedInstanceID != "" {
+		trafficOpen.InstanceID = normalizedInstanceID
 	}
 	if trafficOpen.Metadata == nil {
 		trafficOpen.Metadata = make(map[string]string, 3)
 	}
-	// 仅在调用方未显式覆写时补默认值，兼容上层自定义元数据。
-	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceIDKey]) == "" && normalizedServiceID != "" {
-		trafficOpen.Metadata[trafficMetadataServiceIDKey] = normalizedServiceID
+	// 仅在调用方未显式覆写时补默认值。
+	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataLogicalServiceIDKey]) == "" && normalizedLogicalServiceID != "" {
+		trafficOpen.Metadata[trafficMetadataLogicalServiceIDKey] = normalizedLogicalServiceID
 	}
-	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceKeyKey]) == "" && normalizedServiceKey != "" {
-		trafficOpen.Metadata[trafficMetadataServiceKeyKey] = normalizedServiceKey
+	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceNameKey]) == "" && normalizedServiceName != "" {
+		trafficOpen.Metadata[trafficMetadataServiceNameKey] = normalizedServiceName
 	}
-	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]) == "" &&
-		normalizedServiceInstanceID != "" {
-		trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey] = normalizedServiceInstanceID
+	if strings.TrimSpace(trafficOpen.Metadata[trafficMetadataInstanceIDKey]) == "" && normalizedInstanceID != "" {
+		trafficOpen.Metadata[trafficMetadataInstanceIDKey] = normalizedInstanceID
 	}
 }
 
@@ -637,51 +640,44 @@ func (dataPlane *runtimeDataPlane) resolveTrafficOwnership(trafficID string) (tr
 // buildTrafficOwnershipRecord 从路由解析与 traffic_open 构造服务归属记录。
 func buildTrafficOwnershipRecord(resolution routing.ResolveResult, trafficOpen pb.TrafficOpen) trafficOwnershipRecord {
 	record := trafficOwnershipRecord{
-		TrafficID:         strings.TrimSpace(trafficOpen.TrafficID),
-		RouteID:           strings.TrimSpace(trafficOpen.RouteID),
-		TargetKind:        strings.TrimSpace(string(resolution.TargetKind)),
-		IngressMode:       strings.TrimSpace(string(resolution.IngressMode)),
-		ServiceID:         strings.TrimSpace(trafficOpen.ServiceID),
-		ServiceKey:        strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceKeyKey]),
-		ServiceInstanceID: strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]),
+		TrafficID:          strings.TrimSpace(trafficOpen.TrafficID),
+		RouteID:            strings.TrimSpace(trafficOpen.RouteID),
+		TargetKind:         strings.TrimSpace(string(resolution.TargetKind)),
+		IngressMode:        strings.TrimSpace(string(resolution.IngressMode)),
+		LogicalServiceID:   strings.TrimSpace(trafficOpen.LogicalServiceID),
+		ServiceName:        strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceNameKey]),
+		RequestScope:       resolution.RequestScope,
+		MatchedScope:       resolution.MatchedScope,
+		IsExternalFallback: resolution.IsExternalFallback,
+		InstanceID: firstNonEmptyTrimmed(
+			strings.TrimSpace(trafficOpen.InstanceID),
+			strings.TrimSpace(trafficOpen.Metadata[trafficMetadataInstanceIDKey]),
+		),
 	}
 	switch resolution.TargetKind {
 	case pb.RouteTargetTypeConnectorService:
 		if resolution.Connector != nil {
-			// connector 路径优先采用 resolver 结果，避免上游透传字段不一致。
-			record.ServiceID = firstNonEmptyTrimmed(
-				record.ServiceID,
-				resolution.Connector.Service.ServiceID,
+			record.LogicalServiceID = firstNonEmptyTrimmed(
+				record.LogicalServiceID,
+				resolution.Connector.LogicalService.LogicalServiceID,
 			)
-			record.ServiceKey = firstNonEmptyTrimmed(
-				record.ServiceKey,
-				resolution.Connector.Service.ServiceKey,
+			record.ServiceName = firstNonEmptyTrimmed(
+				record.ServiceName,
+				resolution.Connector.LogicalService.ServiceName,
 			)
-			record.ServiceInstanceID = firstNonEmptyTrimmed(
-				record.ServiceInstanceID,
-				resolution.Connector.ServiceInstanceID,
+			record.Scope = pb.Scope{
+				Namespace:   strings.TrimSpace(resolution.Connector.LogicalService.Scope.Namespace),
+				Environment: strings.TrimSpace(resolution.Connector.LogicalService.Scope.Environment),
+			}
+			record.InstanceID = firstNonEmptyTrimmed(
+				record.InstanceID,
+				resolution.Connector.Instance.InstanceID,
 			)
 			record.ConnectorID = strings.TrimSpace(resolution.Connector.Session.ConnectorID)
 			record.SessionID = strings.TrimSpace(resolution.Connector.Session.SessionID)
 		}
-	case pb.RouteTargetTypeHybridGroup:
-		if resolution.Hybrid != nil {
-			// hybrid 路径归属到 primary connector 实例，便于统一排障口径。
-			record.ServiceID = firstNonEmptyTrimmed(
-				record.ServiceID,
-				resolution.Hybrid.Primary.Service.ServiceID,
-			)
-			record.ServiceKey = firstNonEmptyTrimmed(
-				record.ServiceKey,
-				resolution.Hybrid.Primary.Service.ServiceKey,
-			)
-			record.ServiceInstanceID = firstNonEmptyTrimmed(
-				record.ServiceInstanceID,
-				resolution.Hybrid.Primary.ServiceInstanceID,
-			)
-			record.ConnectorID = strings.TrimSpace(resolution.Hybrid.Primary.Session.ConnectorID)
-			record.SessionID = strings.TrimSpace(resolution.Hybrid.Primary.Session.SessionID)
-		}
+	case pb.RouteTargetTypeExternalService:
+		record.Scope = resolution.MatchedScope
 	}
 	return record
 }

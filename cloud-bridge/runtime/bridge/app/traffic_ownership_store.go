@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 const (
@@ -15,16 +17,20 @@ const (
 
 // trafficOwnershipRecord 描述一条 traffic 的服务归属快照。
 type trafficOwnershipRecord struct {
-	TrafficID         string
-	RouteID           string
-	TargetKind        string
-	IngressMode       string
-	ServiceID         string
-	ServiceKey        string
-	ServiceInstanceID string
-	ConnectorID       string
-	SessionID         string
-	UpdatedAt         time.Time
+	TrafficID          string
+	RouteID            string
+	TargetKind         string
+	IngressMode        string
+	LogicalServiceID   string
+	ServiceName        string
+	Scope              pb.Scope
+	RequestScope       pb.Scope
+	MatchedScope       pb.Scope
+	IsExternalFallback bool
+	InstanceID         string
+	ConnectorID        string
+	SessionID          string
+	UpdatedAt          time.Time
 }
 
 // trafficOwnershipEntry 表示索引中的版本化记录，用于处理同 traffic_id 的覆盖写入。
@@ -190,9 +196,21 @@ func normalizeTrafficOwnershipRecord(record trafficOwnershipRecord) trafficOwner
 	record.RouteID = strings.TrimSpace(record.RouteID)
 	record.TargetKind = strings.TrimSpace(record.TargetKind)
 	record.IngressMode = strings.TrimSpace(record.IngressMode)
-	record.ServiceID = strings.TrimSpace(record.ServiceID)
-	record.ServiceKey = strings.TrimSpace(record.ServiceKey)
-	record.ServiceInstanceID = strings.TrimSpace(record.ServiceInstanceID)
+	record.LogicalServiceID = strings.TrimSpace(record.LogicalServiceID)
+	record.ServiceName = strings.TrimSpace(record.ServiceName)
+	record.Scope = pb.Scope{
+		Namespace:   strings.TrimSpace(record.Scope.Namespace),
+		Environment: strings.TrimSpace(record.Scope.Environment),
+	}
+	record.RequestScope = pb.Scope{
+		Namespace:   strings.TrimSpace(record.RequestScope.Namespace),
+		Environment: strings.TrimSpace(record.RequestScope.Environment),
+	}
+	record.MatchedScope = pb.Scope{
+		Namespace:   strings.TrimSpace(record.MatchedScope.Namespace),
+		Environment: strings.TrimSpace(record.MatchedScope.Environment),
+	}
+	record.InstanceID = strings.TrimSpace(record.InstanceID)
 	record.ConnectorID = strings.TrimSpace(record.ConnectorID)
 	record.SessionID = strings.TrimSpace(record.SessionID)
 	return record

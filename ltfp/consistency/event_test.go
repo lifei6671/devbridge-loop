@@ -68,7 +68,17 @@ func TestValidateResourceVersionAdvanceRejectRollback(t *testing.T) {
 func TestBuildAckHelpers(t *testing.T) {
 	t.Parallel()
 
-	ack := BuildPublishServiceAck(pb.EventStatusDuplicate, "svc-001", "dev/alice/order", 3, 3, "", "")
+	ack := BuildPublishServiceAck(
+		pb.EventStatusDuplicate,
+		"ls-001",
+		"si-001",
+		"order-service",
+		pb.Scope{Namespace: "dev", Environment: "alice"},
+		3,
+		3,
+		"",
+		"",
+	)
 	// duplicate 应按幂等成功视为 accepted=true。
 	if !ack.Accepted {
 		t.Fatalf("expected accepted=true for duplicate status")

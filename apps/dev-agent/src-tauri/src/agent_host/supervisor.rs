@@ -140,10 +140,12 @@ fn replay_manual_services_after_connect(
         let request_result = rpc_client.request(
             "service.add",
             json!({
-                "service_id": service.service_id,
+                "instance_id": service.instance_id,
                 "service_name": service.service_name,
-                "namespace": service.namespace,
-                "environment": service.environment,
+                "scope": {
+                    "namespace": service.namespace,
+                    "environment": service.environment,
+                },
                 "protocol": service.protocol,
                 "host": service.host,
                 "port": service.port,

@@ -75,6 +75,7 @@ func buildAdminConfigSnapshot(
 			"https_addr":     configCopy.Ingress.HTTPSAddr,
 			"tls_sni_addr":   configCopy.Ingress.TLSSNIAddr,
 			"tcp_port_range": configCopy.Ingress.TCPPortRange,
+			"base_domain":    strings.TrimSpace(configCopy.Ingress.BaseDomain),
 		},
 		"admin": map[string]any{
 			"enabled":               configCopy.Admin.Enabled,
@@ -109,8 +110,13 @@ func buildAdminConfigSnapshot(
 			"log_level":    configCopy.Observability.LogLevel,
 			"metrics_addr": configCopy.Observability.MetricsAddr,
 		},
-		"updated_at_ms": uint64(lastUpdatedAt.UnixMilli()),
-		"updated_by":    strings.TrimSpace(lastOperatorID),
+		"default_scope": map[string]any{
+			"namespace":   strings.TrimSpace(configCopy.DefaultScope.Namespace),
+			"environment": strings.TrimSpace(configCopy.DefaultScope.Environment),
+		},
+		"fallback_policies": buildAdminFallbackPolicySnapshot(configCopy.FallbackPolicies),
+		"updated_at_ms":     uint64(lastUpdatedAt.UnixMilli()),
+		"updated_by":        strings.TrimSpace(lastOperatorID),
 	}
 }
 
@@ -232,6 +238,12 @@ func (store *adminRuntimeConfigStore) update(
 				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 			}
 			configCandidate.Admin.BasePath = normalizeAdminUIBasePath(basePath)
+		case "ingress.base_domain":
+			baseDomain, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.Ingress.BaseDomain = baseDomain
 		case "control_plane.listen_addr":
 			listenAddr, err := parsePatchString(patchValue)
 			if err != nil {
@@ -268,6 +280,18 @@ func (store *adminRuntimeConfigStore) update(
 				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 			}
 			configCandidate.Observability.MetricsAddr = metricsAddr
+		case "default_scope.namespace":
+			namespace, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.DefaultScope.Namespace = namespace
+		case "default_scope.environment":
+			environment, err := parsePatchString(patchValue)
+			if err != nil {
+				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+			}
+			configCandidate.DefaultScope.Environment = environment
 		default:
 			return adminapi.ConfigUpdateResult{}, fmt.Errorf(
 				"%w: unsupported patch key=%s",
@@ -348,7 +372,7 @@ func drainSessionForAdmin(
 
 	updatedServiceCount := 0
 	if shouldDrainConnectorServices(dataPlane.sessionRegistry, sessionRuntime) && dataPlane.serviceRegistry != nil {
-		affectedServiceIDs := dataPlane.serviceRegistry.ListServiceIDsByRuntime(
+		affectedServiceIDs := dataPlane.serviceRegistry.ListLogicalServiceIDsByRuntime(
 			sessionRuntime.ConnectorID,
 			"",
 		)
@@ -519,6 +543,34 @@ func parsePatchDurationMillis(rawValue any) (time.Duration, error) {
 	default:
 		return 0, fmt.Errorf("expect number/string duration_ms, got=%T", rawValue)
 	}
+}
+
+func buildAdminFallbackPolicySnapshot(policies []pb.ScopeFallbackPolicy) []map[string]any {
+	if len(policies) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(policies))
+	for _, policy := range policies {
+		chain := make([]map[string]any, 0, len(policy.Chain))
+		for _, step := range policy.Chain {
+			chain = append(chain, map[string]any{
+				"target_scope": map[string]any{
+					"namespace":   strings.TrimSpace(step.TargetScope.Namespace),
+					"environment": strings.TrimSpace(step.TargetScope.Environment),
+				},
+			})
+		}
+		result = append(result, map[string]any{
+			"policy_id": strings.TrimSpace(policy.PolicyID),
+			"namespace": strings.TrimSpace(policy.Namespace),
+			"enabled":   policy.Enabled,
+			"chain":     chain,
+			"external": map[string]any{
+				"enabled": policy.External.Enabled,
+			},
+		})
+	}
+	return result
 }
 
 // sortedPatchKeys 返回排序后的 patch key，保证处理顺序可预测。

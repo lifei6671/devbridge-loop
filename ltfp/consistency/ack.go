@@ -3,13 +3,25 @@ package consistency
 import "github.com/lifei6671/devbridge-loop/ltfp/pb"
 
 // BuildPublishServiceAck 构造 PublishServiceAck 的统一语义响应。
-func BuildPublishServiceAck(status pb.EventStatus, serviceID string, serviceKey string, acceptedVersion uint64, currentVersion uint64, errorCode string, errorMessage string) pb.PublishServiceAck {
+func BuildPublishServiceAck(
+	status pb.EventStatus,
+	logicalServiceID string,
+	instanceID string,
+	serviceName string,
+	scope pb.Scope,
+	acceptedVersion uint64,
+	currentVersion uint64,
+	errorCode string,
+	errorMessage string,
+) pb.PublishServiceAck {
 	// accepted 字段由事件状态派生，duplicate 也视为幂等成功。
 	accepted := status == pb.EventStatusAccepted || status == pb.EventStatusDuplicate
 	return pb.PublishServiceAck{
 		Accepted:                accepted,
-		ServiceID:               serviceID,
-		ServiceKey:              serviceKey,
+		LogicalServiceID:        logicalServiceID,
+		InstanceID:              instanceID,
+		ServiceName:             serviceName,
+		Scope:                   scope,
 		AcceptedResourceVersion: acceptedVersion,
 		CurrentResourceVersion:  currentVersion,
 		ErrorCode:               errorCode,
@@ -18,13 +30,21 @@ func BuildPublishServiceAck(status pb.EventStatus, serviceID string, serviceKey 
 }
 
 // BuildUnpublishServiceAck 构造 UnpublishServiceAck 的统一语义响应。
-func BuildUnpublishServiceAck(status pb.EventStatus, serviceID string, serviceKey string, acceptedVersion uint64, currentVersion uint64, errorCode string, errorMessage string) pb.UnpublishServiceAck {
+func BuildUnpublishServiceAck(
+	status pb.EventStatus,
+	logicalServiceID string,
+	instanceID string,
+	acceptedVersion uint64,
+	currentVersion uint64,
+	errorCode string,
+	errorMessage string,
+) pb.UnpublishServiceAck {
 	// accepted 字段由事件状态派生，duplicate 也视为幂等成功。
 	accepted := status == pb.EventStatusAccepted || status == pb.EventStatusDuplicate
 	return pb.UnpublishServiceAck{
 		Accepted:                accepted,
-		ServiceID:               serviceID,
-		ServiceKey:              serviceKey,
+		LogicalServiceID:        logicalServiceID,
+		InstanceID:              instanceID,
 		AcceptedResourceVersion: acceptedVersion,
 		CurrentResourceVersion:  currentVersion,
 		ErrorCode:               errorCode,

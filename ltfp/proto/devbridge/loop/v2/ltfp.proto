@@ -4,6 +4,11 @@ package devbridge.loop.v2;
 
 option go_package = "github.com/lifei6671/devbridge-loop/ltfp/pb/gen;ltfpgen";
 
+message Scope {
+  string namespace = 1;
+  string environment = 2;
+}
+
 message ControlEnvelope {
   uint32 version_major = 1;
   uint32 version_minor = 2;
@@ -109,43 +114,87 @@ message DiscoveryPolicy {
   map<string, string> metadata = 7;
 }
 
+message ServiceSelector {
+  string logical_service_id = 1;
+  string service_name = 2;
+  Scope scope = 3;
+  map<string, string> match_labels = 4;
+  map<string, string> instance_labels = 5;
+}
+
+message HeaderMatcher {
+  string name = 1;
+  oneof match {
+    string exact = 2;
+    string prefix = 3;
+    string regex = 4;
+    bool present = 5;
+  }
+}
+
+message QueryMatcher {
+  string name = 1;
+  oneof match {
+    string exact = 2;
+    string prefix = 3;
+    string regex = 4;
+    bool present = 5;
+  }
+}
+
+message ScopeFallbackPolicy {
+  string policy_id = 1;
+  string namespace = 2;
+  bool enabled = 3;
+  repeated FallbackStep chain = 4;
+  ExternalFallbackConfig external = 5;
+}
+
+message FallbackStep {
+  Scope target_scope = 1;
+}
+
+message ExternalFallbackConfig {
+  bool enabled = 1;
+}
+
 message PublishService {
-  string service_id = 1;
-  string service_key = 2;
-  string namespace = 3;
-  string environment = 4;
-  string service_name = 5;
+  string instance_id = 1;
+  string service_name = 2;
+  Scope scope = 3;
+  map<string, string> labels = 4;
+  map<string, string> metadata = 5;
   string service_type = 6;
   repeated ServiceEndpoint endpoints = 7;
   ServiceExposure exposure = 8;
   HealthCheckConfig health_check = 9;
   DiscoveryPolicy discovery_policy = 10;
-  map<string, string> labels = 11;
-  map<string, string> metadata = 12;
 }
 
 message PublishServiceAck {
   bool accepted = 1;
-  string service_id = 2;
-  string service_key = 3;
-  uint64 accepted_resource_version = 4;
-  uint64 current_resource_version = 5;
-  string error_code = 6;
-  string error_message = 7;
+  string logical_service_id = 2;
+  string instance_id = 3;
+  string service_name = 4;
+  Scope scope = 5;
+  uint64 accepted_resource_version = 6;
+  uint64 current_resource_version = 7;
+  string error_code = 8;
+  string error_message = 9;
 }
 
 message UnpublishService {
-  string service_id = 1;
-  string service_key = 2;
-  string namespace = 3;
-  string environment = 4;
+  string instance_id = 1;
+  string logical_service_id = 2;
+  string service_name = 3;
+  Scope scope = 4;
   string reason = 5;
 }
 
 message UnpublishServiceAck {
   bool accepted = 1;
-  string service_id = 2;
-  string service_key = 3;
+  string logical_service_id = 2;
+  string instance_id = 3;
   uint64 accepted_resource_version = 4;
   uint64 current_resource_version = 5;
   string error_code = 6;
@@ -159,8 +208,8 @@ message EndpointHealthStatus {
 }
 
 message ServiceHealthReport {
-  string service_id = 1;
-  string service_key = 2;
+  string instance_id = 1;
+  string logical_service_id = 2;
   string service_health_status = 3;
   repeated EndpointHealthStatus endpoint_statuses = 4;
   int64 check_time_unix = 5;
@@ -169,8 +218,9 @@ message ServiceHealthReport {
 }
 
 message ConnectorServiceTarget {
-  string service_key = 1;
-  map<string, string> selector = 2;
+  ServiceSelector selector = 1;
+  map<string, string> instance_selector = 2;
+  string load_balance_policy = 3;
 }
 
 message ExternalServiceTarget {
@@ -184,17 +234,10 @@ message ExternalServiceTarget {
   uint32 stale_if_error_sec = 8;
 }
 
-message HybridGroupTarget {
-  ConnectorServiceTarget primary_connector_service = 1;
-  ExternalServiceTarget fallback_external_service = 2;
-  string fallback_policy = 3;
-}
-
 message RouteTarget {
   string type = 1;
   ConnectorServiceTarget connector_service = 2;
   ExternalServiceTarget external_service = 3;
-  HybridGroupTarget hybrid_group = 4;
 }
 
 message RouteMatch {
@@ -204,17 +247,18 @@ message RouteMatch {
   uint32 listen_port = 4;
   string path_prefix = 5;
   string sni = 6;
+  repeated HeaderMatcher headers = 7;
+  repeated QueryMatcher queries = 8;
 }
 
 message RouteAssign {
   string route_id = 1;
-  string namespace = 2;
-  string environment = 3;
-  RouteMatch match = 4;
-  RouteTarget target = 5;
-  uint32 priority = 6;
-  string policy_json = 7;
-  map<string, string> metadata = 8;
+  Scope scope = 2;
+  RouteMatch match = 3;
+  RouteTarget target = 4;
+  uint32 priority = 5;
+  string policy_json = 6;
+  map<string, string> metadata = 7;
 }
 
 message RouteAssignAck {
@@ -224,13 +268,13 @@ message RouteAssignAck {
   uint64 current_resource_version = 4;
   string error_code = 5;
   string error_message = 6;
+  repeated string warnings = 7;
 }
 
 message RouteRevoke {
   string route_id = 1;
-  string namespace = 2;
-  string environment = 3;
-  string reason = 4;
+  Scope scope = 2;
+  string reason = 3;
 }
 
 message RouteRevokeAck {
@@ -303,12 +347,13 @@ message ControlError {
 message TrafficOpen {
   string traffic_id = 1;
   string route_id = 2;
-  string service_id = 3;
-  string source_addr = 4;
-  string protocol_hint = 5;
-  string trace_id = 6;
-  map<string, string> endpoint_selection_hint = 7;
-  map<string, string> metadata = 8;
+  string logical_service_id = 3;
+  string instance_id = 4;
+  string source_addr = 5;
+  string protocol_hint = 6;
+  string trace_id = 7;
+  map<string, string> endpoint_selection_hint = 8;
+  map<string, string> metadata = 9;
 }
 
 message TrafficOpenAck {

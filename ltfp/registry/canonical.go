@@ -19,28 +19,31 @@ type AuditInfo struct {
 
 // CanonicalSnapshot 描述 canonical registry 的只读快照视图。
 type CanonicalSnapshot struct {
-	Connectors  []pb.Connector
-	Sessions    []pb.Session
-	Services    []pb.Service
-	Routes      []pb.Route
-	Projections []pb.DiscoveryProjection
-	GeneratedAt time.Time
+	Connectors       []pb.Connector
+	Sessions         []pb.Session
+	LogicalServices  []pb.LogicalService
+	ServiceInstances []pb.ServiceInstance
+	Routes           []pb.Route
+	Projections      []pb.DiscoveryProjection
+	GeneratedAt      time.Time
 }
 
 // CanonicalRegistry 维护低频一致性配置对象。
 type CanonicalRegistry struct {
 	mu sync.RWMutex
 
-	connectors  map[string]pb.Connector
-	sessions    map[string]pb.Session
-	services    map[string]pb.Service
-	routes      map[string]pb.Route
-	projections map[string]pb.DiscoveryProjection
+	connectors       map[string]pb.Connector
+	sessions         map[string]pb.Session
+	logicalServices  map[string]pb.LogicalService
+	serviceInstances map[string]pb.ServiceInstance
+	routes           map[string]pb.Route
+	projections      map[string]pb.DiscoveryProjection
 
-	serviceKeyToID        map[string]string
-	sessionIDsByConnector map[string]map[string]struct{}
-	serviceIDsByConnector map[string]map[string]struct{}
-	routeIDsByServiceKey  map[string]map[string]struct{}
+	logicalServiceIDByScopeName map[string]string
+	sessionIDsByConnector       map[string]map[string]struct{}
+	instanceIDsByConnector      map[string]map[string]struct{}
+	instanceIDsByLogicalService map[string]map[string]struct{}
+	routeIDsByLogicalService    map[string]map[string]struct{}
 
 	audits map[string]AuditInfo
 }
@@ -48,22 +51,23 @@ type CanonicalRegistry struct {
 // NewCanonicalRegistry 创建 canonical registry 实例。
 func NewCanonicalRegistry() *CanonicalRegistry {
 	return &CanonicalRegistry{
-		connectors:            make(map[string]pb.Connector),
-		sessions:              make(map[string]pb.Session),
-		services:              make(map[string]pb.Service),
-		routes:                make(map[string]pb.Route),
-		projections:           make(map[string]pb.DiscoveryProjection),
-		serviceKeyToID:        make(map[string]string),
-		sessionIDsByConnector: make(map[string]map[string]struct{}),
-		serviceIDsByConnector: make(map[string]map[string]struct{}),
-		routeIDsByServiceKey:  make(map[string]map[string]struct{}),
-		audits:                make(map[string]AuditInfo),
+		connectors:                  make(map[string]pb.Connector),
+		sessions:                    make(map[string]pb.Session),
+		logicalServices:             make(map[string]pb.LogicalService),
+		serviceInstances:            make(map[string]pb.ServiceInstance),
+		routes:                      make(map[string]pb.Route),
+		projections:                 make(map[string]pb.DiscoveryProjection),
+		logicalServiceIDByScopeName: make(map[string]string),
+		sessionIDsByConnector:       make(map[string]map[string]struct{}),
+		instanceIDsByConnector:      make(map[string]map[string]struct{}),
+		instanceIDsByLogicalService: make(map[string]map[string]struct{}),
+		routeIDsByLogicalService:    make(map[string]map[string]struct{}),
+		audits:                      make(map[string]AuditInfo),
 	}
 }
 
 // UpsertConnector 写入或更新 connector 对象。
 func (registry *CanonicalRegistry) UpsertConnector(connector pb.Connector) {
-	// 兼容旧调用方，未提供 event 元信息时仅更新时间戳。
 	registry.UpsertConnectorWithAudit(connector, "", 0)
 }
 
@@ -72,14 +76,12 @@ func (registry *CanonicalRegistry) UpsertConnectorWithAudit(connector pb.Connect
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	connectorID := strings.TrimSpace(connector.ConnectorID)
-	// 以 connectorId 作为主键写入，覆盖旧值。
 	registry.connectors[connectorID] = connector
 	registry.touchAudit("connector", connectorID, eventID, resourceVersion)
 }
 
 // UpsertSession 写入或更新 session 对象。
 func (registry *CanonicalRegistry) UpsertSession(session pb.Session) {
-	// 兼容旧调用方，未提供 event 元信息时仅更新时间戳。
 	registry.UpsertSessionWithAudit(session, "", 0)
 }
 
@@ -90,75 +92,70 @@ func (registry *CanonicalRegistry) UpsertSessionWithAudit(session pb.Session, ev
 	sessionID := strings.TrimSpace(session.SessionID)
 	connectorID := strings.TrimSpace(session.ConnectorID)
 	if old, exists := registry.sessions[sessionID]; exists {
-		// session 迁移 connector 时先清理旧索引，避免脏引用。
 		oldConnectorID := strings.TrimSpace(old.ConnectorID)
 		if oldConnectorID != "" && oldConnectorID != connectorID {
 			registry.removeIndex(registry.sessionIDsByConnector, oldConnectorID, sessionID)
 		}
 	}
-	// 以 sessionId 作为主键写入，覆盖旧值。
 	registry.sessions[sessionID] = session
 	registry.addIndex(registry.sessionIDsByConnector, connectorID, sessionID)
 	registry.touchAudit("session", sessionID, eventID, resourceVersion)
 }
 
-// UpsertService 写入或更新 service 对象。
-func (registry *CanonicalRegistry) UpsertService(service pb.Service) {
-	// 兼容旧调用方，未提供 event 元信息时仅更新时间戳。
-	registry.UpsertServiceWithAudit(service, "", service.ResourceVersion)
+// UpsertLogicalService 写入或更新 logical service 对象。
+func (registry *CanonicalRegistry) UpsertLogicalService(service pb.LogicalService) {
+	registry.UpsertLogicalServiceWithAudit(service, "", service.ResourceVersion)
 }
 
-// UpsertServiceWithAudit 写入 service 并更新 service_key 索引与审计元数据。
-func (registry *CanonicalRegistry) UpsertServiceWithAudit(service pb.Service, eventID string, resourceVersion uint64) {
+// UpsertLogicalServiceWithAudit 写入 logical service 并更新索引与审计元数据。
+func (registry *CanonicalRegistry) UpsertLogicalServiceWithAudit(service pb.LogicalService, eventID string, resourceVersion uint64) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	serviceID := strings.TrimSpace(service.ServiceID)
-	serviceKey := strings.TrimSpace(service.ServiceKey)
-	connectorID := strings.TrimSpace(service.ConnectorID)
-	if old, exists := registry.services[serviceID]; exists {
-		// service 变更 serviceKey 时清理旧映射，避免 lookup 错指。
-		oldKey := strings.TrimSpace(old.ServiceKey)
-		if oldKey != "" && oldKey != serviceKey {
-			delete(registry.serviceKeyToID, oldKey)
+	logicalServiceID := strings.TrimSpace(service.LogicalServiceID)
+	scopeNameKey := logicalServiceScopeNameKey(service.ServiceName, service.Scope)
+	if old, exists := registry.logicalServices[logicalServiceID]; exists {
+		oldKey := logicalServiceScopeNameKey(old.ServiceName, old.Scope)
+		if oldKey != "" && oldKey != scopeNameKey {
+			delete(registry.logicalServiceIDByScopeName, oldKey)
 		}
-		// service 迁移 connector 时清理旧索引，避免脏引用。
+	}
+	registry.logicalServices[logicalServiceID] = service
+	if logicalServiceID != "" && scopeNameKey != "" {
+		registry.logicalServiceIDByScopeName[scopeNameKey] = logicalServiceID
+	}
+	registry.touchAudit("logical_service", logicalServiceID, eventID, resourceVersion)
+}
+
+// UpsertServiceInstance 写入或更新 service instance 对象。
+func (registry *CanonicalRegistry) UpsertServiceInstance(instance pb.ServiceInstance) {
+	registry.UpsertServiceInstanceWithAudit(instance, "", instance.ResourceVersion)
+}
+
+// UpsertServiceInstanceWithAudit 写入 service instance 并更新索引与审计元数据。
+func (registry *CanonicalRegistry) UpsertServiceInstanceWithAudit(instance pb.ServiceInstance, eventID string, resourceVersion uint64) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	instanceID := strings.TrimSpace(instance.InstanceID)
+	connectorID := strings.TrimSpace(instance.ConnectorID)
+	logicalServiceID := strings.TrimSpace(instance.LogicalServiceID)
+	if old, exists := registry.serviceInstances[instanceID]; exists {
 		oldConnectorID := strings.TrimSpace(old.ConnectorID)
 		if oldConnectorID != "" && oldConnectorID != connectorID {
-			registry.removeIndex(registry.serviceIDsByConnector, oldConnectorID, serviceID)
+			registry.removeIndex(registry.instanceIDsByConnector, oldConnectorID, instanceID)
+		}
+		oldLogicalServiceID := strings.TrimSpace(old.LogicalServiceID)
+		if oldLogicalServiceID != "" && oldLogicalServiceID != logicalServiceID {
+			registry.removeIndex(registry.instanceIDsByLogicalService, oldLogicalServiceID, instanceID)
 		}
 	}
-	// 以 serviceId 作为主键存储，确保 identity 稳定。
-	registry.services[serviceID] = service
-	if serviceID != "" && serviceKey != "" {
-		// 同步维护 lookup key 到 identity 的映射。
-		registry.serviceKeyToID[serviceKey] = serviceID
-	}
-	registry.addIndex(registry.serviceIDsByConnector, connectorID, serviceID)
-	registry.touchAudit("service", serviceID, eventID, resourceVersion)
-}
-
-// DeleteService 删除 service 对象及其映射关系。
-func (registry *CanonicalRegistry) DeleteService(serviceID string) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	normalizedServiceID := strings.TrimSpace(serviceID)
-	service, exists := registry.services[normalizedServiceID]
-	if !exists {
-		return
-	}
-	delete(registry.services, normalizedServiceID)
-	if key := strings.TrimSpace(service.ServiceKey); key != "" {
-		delete(registry.serviceKeyToID, key)
-	}
-	if connectorID := strings.TrimSpace(service.ConnectorID); connectorID != "" {
-		registry.removeIndex(registry.serviceIDsByConnector, connectorID, normalizedServiceID)
-	}
-	delete(registry.audits, registry.auditKey("service", normalizedServiceID))
+	registry.serviceInstances[instanceID] = instance
+	registry.addIndex(registry.instanceIDsByConnector, connectorID, instanceID)
+	registry.addIndex(registry.instanceIDsByLogicalService, logicalServiceID, instanceID)
+	registry.touchAudit("service_instance", instanceID, eventID, resourceVersion)
 }
 
 // UpsertRoute 写入或更新 route 对象。
 func (registry *CanonicalRegistry) UpsertRoute(route pb.Route) {
-	// 兼容旧调用方，未提供 event 元信息时仅更新时间戳。
 	registry.UpsertRouteWithAudit(route, "", route.ResourceVersion)
 }
 
@@ -168,24 +165,20 @@ func (registry *CanonicalRegistry) UpsertRouteWithAudit(route pb.Route, eventID 
 	defer registry.mu.Unlock()
 	routeID := strings.TrimSpace(route.RouteID)
 	if old, exists := registry.routes[routeID]; exists {
-		// route 目标 serviceKey 变更时需要清理旧索引。
-		oldServiceKey := routeServiceKey(old)
-		if oldServiceKey != "" {
-			registry.removeIndex(registry.routeIDsByServiceKey, oldServiceKey, routeID)
+		oldLogicalServiceID := routeLogicalServiceID(old)
+		if oldLogicalServiceID != "" {
+			registry.removeIndex(registry.routeIDsByLogicalService, oldLogicalServiceID, routeID)
 		}
 	}
-	// 以 routeId 作为主键写入，覆盖旧值。
 	registry.routes[routeID] = route
-	if serviceKey := routeServiceKey(route); serviceKey != "" {
-		// route 到 serviceKey 的索引用于快速反查受影响 route。
-		registry.addIndex(registry.routeIDsByServiceKey, serviceKey, routeID)
+	if logicalServiceID := routeLogicalServiceID(route); logicalServiceID != "" {
+		registry.addIndex(registry.routeIDsByLogicalService, logicalServiceID, routeID)
 	}
 	registry.touchAudit("route", routeID, eventID, resourceVersion)
 }
 
 // UpsertProjection 写入或更新 discovery projection 对象。
 func (registry *CanonicalRegistry) UpsertProjection(projection pb.DiscoveryProjection) {
-	// 兼容旧调用方，未提供 event 元信息时仅更新时间戳。
 	registry.UpsertProjectionWithAudit(projection, "", 0)
 }
 
@@ -194,37 +187,28 @@ func (registry *CanonicalRegistry) UpsertProjectionWithAudit(projection pb.Disco
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	projectionID := strings.TrimSpace(projection.ProjectionID)
-	// 以 projectionId 作为主键写入，覆盖旧值。
 	registry.projections[projectionID] = projection
 	registry.touchAudit("projection", projectionID, eventID, resourceVersion)
 }
 
-// GetServiceByID 按 serviceId 查询 service。
-func (registry *CanonicalRegistry) GetServiceByID(serviceID string) (pb.Service, bool) {
+// GetLogicalServiceByID 按 logicalServiceId 查询 logical service。
+func (registry *CanonicalRegistry) GetLogicalServiceByID(logicalServiceID string) (pb.LogicalService, bool) {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	service, exists := registry.services[strings.TrimSpace(serviceID)]
+	service, exists := registry.logicalServices[strings.TrimSpace(logicalServiceID)]
 	return service, exists
 }
 
-// GetServiceByKey 按 serviceKey 查询 service。
-func (registry *CanonicalRegistry) GetServiceByKey(serviceKey string) (pb.Service, bool) {
+// FindLogicalServiceByNameScope 按 serviceName + scope 查询 logical service。
+func (registry *CanonicalRegistry) FindLogicalServiceByNameScope(serviceName string, scope pb.Scope) (pb.LogicalService, bool) {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	serviceID, exists := registry.serviceKeyToID[strings.TrimSpace(serviceKey)]
+	logicalServiceID, exists := registry.logicalServiceIDByScopeName[logicalServiceScopeNameKey(serviceName, scope)]
 	if !exists {
-		return pb.Service{}, false
+		return pb.LogicalService{}, false
 	}
-	service, exists := registry.services[serviceID]
+	service, exists := registry.logicalServices[logicalServiceID]
 	return service, exists
-}
-
-// GetServiceIDByKey 按 serviceKey 查询 serviceId。
-func (registry *CanonicalRegistry) GetServiceIDByKey(serviceKey string) (string, bool) {
-	registry.mu.RLock()
-	defer registry.mu.RUnlock()
-	serviceID, exists := registry.serviceKeyToID[strings.TrimSpace(serviceKey)]
-	return serviceID, exists
 }
 
 // GetConnectorByID 按 connectorId 查询 connector。
@@ -252,7 +236,6 @@ func (registry *CanonicalRegistry) ListSessionsByConnector(connectorID string) [
 	result := make([]pb.Session, 0, len(sessionIDs))
 	for sessionID := range sessionIDs {
 		if session, exists := registry.sessions[sessionID]; exists {
-			// 只返回当前仍在 registry 中存在的 session。
 			result = append(result, session)
 		}
 	}
@@ -265,7 +248,6 @@ func (registry *CanonicalRegistry) FindActiveSessionByConnector(connectorID stri
 	defer registry.mu.RUnlock()
 	normalizedConnectorID := strings.TrimSpace(connectorID)
 	for _, session := range registry.sessions {
-		// 仅返回同 connector 且状态为 ACTIVE 的会话。
 		if session.ConnectorID == normalizedConnectorID && session.State == pb.SessionStateActive {
 			return session, true
 		}
@@ -273,36 +255,47 @@ func (registry *CanonicalRegistry) FindActiveSessionByConnector(connectorID stri
 	return pb.Session{}, false
 }
 
-// ListServicesByConnector 返回 connector 关联的全部 service。
-func (registry *CanonicalRegistry) ListServicesByConnector(connectorID string) []pb.Service {
+// ListServiceInstancesByConnector 返回 connector 关联的全部 service instance。
+func (registry *CanonicalRegistry) ListServiceInstancesByConnector(connectorID string) []pb.ServiceInstance {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	normalizedConnectorID := strings.TrimSpace(connectorID)
-	serviceIDs := registry.serviceIDsByConnector[normalizedConnectorID]
-	result := make([]pb.Service, 0, len(serviceIDs))
-	for serviceID := range serviceIDs {
-		if service, exists := registry.services[serviceID]; exists {
-			// 只返回当前仍在 registry 中存在的 service。
-			result = append(result, service)
+	instanceIDs := registry.instanceIDsByConnector[normalizedConnectorID]
+	result := make([]pb.ServiceInstance, 0, len(instanceIDs))
+	for instanceID := range instanceIDs {
+		if instance, exists := registry.serviceInstances[instanceID]; exists {
+			result = append(result, instance)
 		}
 	}
 	return result
 }
 
-// ListServicesByScope 返回指定 scope 下的服务集合。
-func (registry *CanonicalRegistry) ListServicesByScope(namespace string, environment string) []pb.Service {
+// ListServiceInstancesByLogicalService 返回 logical service 关联的全部 service instance。
+func (registry *CanonicalRegistry) ListServiceInstancesByLogicalService(logicalServiceID string) []pb.ServiceInstance {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	normalizedNamespace := strings.TrimSpace(namespace)
-	normalizedEnvironment := strings.TrimSpace(environment)
-	services := make([]pb.Service, 0)
-	for _, service := range registry.services {
-		// 仅返回同 scope 的 service，供 route resolve 使用。
-		if strings.TrimSpace(service.Namespace) == normalizedNamespace && strings.TrimSpace(service.Environment) == normalizedEnvironment {
-			services = append(services, service)
+	normalizedLogicalServiceID := strings.TrimSpace(logicalServiceID)
+	instanceIDs := registry.instanceIDsByLogicalService[normalizedLogicalServiceID]
+	result := make([]pb.ServiceInstance, 0, len(instanceIDs))
+	for instanceID := range instanceIDs {
+		if instance, exists := registry.serviceInstances[instanceID]; exists {
+			result = append(result, instance)
 		}
 	}
-	return services
+	return result
+}
+
+// ListLogicalServicesByScope 返回指定 scope 下的逻辑服务集合。
+func (registry *CanonicalRegistry) ListLogicalServicesByScope(scope pb.Scope) []pb.LogicalService {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	result := make([]pb.LogicalService, 0)
+	for _, service := range registry.logicalServices {
+		if sameScope(service.Scope, scope) {
+			result = append(result, service)
+		}
+	}
+	return result
 }
 
 // GetRouteByID 按 routeId 查询 route。
@@ -314,31 +307,27 @@ func (registry *CanonicalRegistry) GetRouteByID(routeID string) (pb.Route, bool)
 }
 
 // ListRoutesByScope 返回指定 scope 下的路由集合。
-func (registry *CanonicalRegistry) ListRoutesByScope(namespace string, environment string) []pb.Route {
+func (registry *CanonicalRegistry) ListRoutesByScope(scope pb.Scope) []pb.Route {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	normalizedNamespace := strings.TrimSpace(namespace)
-	normalizedEnvironment := strings.TrimSpace(environment)
 	routes := make([]pb.Route, 0)
 	for _, route := range registry.routes {
-		// 仅返回同 scope route，供 ingress 和 resolver 消费。
-		if strings.TrimSpace(route.Namespace) == normalizedNamespace && strings.TrimSpace(route.Environment) == normalizedEnvironment {
+		if sameScope(route.Scope, scope) {
 			routes = append(routes, route)
 		}
 	}
 	return routes
 }
 
-// ListRoutesByServiceKey 返回指向指定 serviceKey 的路由集合。
-func (registry *CanonicalRegistry) ListRoutesByServiceKey(serviceKey string) []pb.Route {
+// ListRoutesByLogicalService 返回指向指定 logical service 的路由集合。
+func (registry *CanonicalRegistry) ListRoutesByLogicalService(logicalServiceID string) []pb.Route {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	normalizedServiceKey := strings.TrimSpace(serviceKey)
-	routeIDs := registry.routeIDsByServiceKey[normalizedServiceKey]
+	normalizedLogicalServiceID := strings.TrimSpace(logicalServiceID)
+	routeIDs := registry.routeIDsByLogicalService[normalizedLogicalServiceID]
 	routes := make([]pb.Route, 0, len(routeIDs))
 	for routeID := range routeIDs {
 		if route, exists := registry.routes[routeID]; exists {
-			// 仅返回当前仍在 registry 中存在的 route。
 			routes = append(routes, route)
 		}
 	}
@@ -366,12 +355,13 @@ func (registry *CanonicalRegistry) Snapshot() CanonicalSnapshot {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	snapshot := CanonicalSnapshot{
-		Connectors:  make([]pb.Connector, 0, len(registry.connectors)),
-		Sessions:    make([]pb.Session, 0, len(registry.sessions)),
-		Services:    make([]pb.Service, 0, len(registry.services)),
-		Routes:      make([]pb.Route, 0, len(registry.routes)),
-		Projections: make([]pb.DiscoveryProjection, 0, len(registry.projections)),
-		GeneratedAt: time.Now().UTC(),
+		Connectors:       make([]pb.Connector, 0, len(registry.connectors)),
+		Sessions:         make([]pb.Session, 0, len(registry.sessions)),
+		LogicalServices:  make([]pb.LogicalService, 0, len(registry.logicalServices)),
+		ServiceInstances: make([]pb.ServiceInstance, 0, len(registry.serviceInstances)),
+		Routes:           make([]pb.Route, 0, len(registry.routes)),
+		Projections:      make([]pb.DiscoveryProjection, 0, len(registry.projections)),
+		GeneratedAt:      time.Now().UTC(),
 	}
 	for _, connector := range registry.connectors {
 		snapshot.Connectors = append(snapshot.Connectors, connector)
@@ -379,8 +369,11 @@ func (registry *CanonicalRegistry) Snapshot() CanonicalSnapshot {
 	for _, session := range registry.sessions {
 		snapshot.Sessions = append(snapshot.Sessions, session)
 	}
-	for _, service := range registry.services {
-		snapshot.Services = append(snapshot.Services, service)
+	for _, service := range registry.logicalServices {
+		snapshot.LogicalServices = append(snapshot.LogicalServices, service)
+	}
+	for _, instance := range registry.serviceInstances {
+		snapshot.ServiceInstances = append(snapshot.ServiceInstances, instance)
 	}
 	for _, route := range registry.routes {
 		snapshot.Routes = append(snapshot.Routes, route)
@@ -400,7 +393,6 @@ func (registry *CanonicalRegistry) addIndex(index map[string]map[string]struct{}
 	}
 	values, exists := index[normalizedKey]
 	if !exists {
-		// 索引桶不存在时先创建，避免 map nil 写入 panic。
 		values = make(map[string]struct{})
 		index[normalizedKey] = values
 	}
@@ -419,7 +411,6 @@ func (registry *CanonicalRegistry) removeIndex(index map[string]map[string]struc
 	}
 	normalizedValue := strings.TrimSpace(value)
 	if normalizedValue == "" {
-		// value 为空表示清理整个索引桶。
 		delete(index, normalizedKey)
 		return
 	}
@@ -435,7 +426,6 @@ func (registry *CanonicalRegistry) touchAudit(resourceType string, resourceID st
 	now := time.Now().UTC()
 	current, exists := registry.audits[key]
 	if !exists {
-		// 首次写入时同时记录创建与更新时间。
 		current.CreatedAt = now
 	}
 	current.UpdatedAt = now
@@ -449,20 +439,30 @@ func (registry *CanonicalRegistry) auditKey(resourceType string, resourceID stri
 	return fmt.Sprintf("%s|%s", strings.TrimSpace(resourceType), strings.TrimSpace(resourceID))
 }
 
-// routeServiceKey 提取 route 目标对应的 connector serviceKey。
-func routeServiceKey(route pb.Route) string {
+// logicalServiceScopeNameKey 构造逻辑服务唯一索引键。
+func logicalServiceScopeNameKey(serviceName string, scope pb.Scope) string {
+	return strings.Join([]string{
+		strings.TrimSpace(scope.Namespace),
+		strings.TrimSpace(scope.Environment),
+		strings.TrimSpace(serviceName),
+	}, "|")
+}
+
+// routeLogicalServiceID 提取 route 目标对应的 logical service ID。
+func routeLogicalServiceID(route pb.Route) string {
 	switch route.Target.Type {
 	case pb.RouteTargetTypeConnectorService:
 		if route.Target.ConnectorService == nil {
 			return ""
 		}
-		return strings.TrimSpace(route.Target.ConnectorService.ServiceKey)
-	case pb.RouteTargetTypeHybridGroup:
-		if route.Target.HybridGroup == nil {
-			return ""
-		}
-		return strings.TrimSpace(route.Target.HybridGroup.PrimaryConnectorService.ServiceKey)
+		return strings.TrimSpace(route.Target.ConnectorService.Selector.LogicalServiceID)
 	default:
 		return ""
 	}
+}
+
+// sameScope 判断两个 scope 是否完全一致。
+func sameScope(left pb.Scope, right pb.Scope) bool {
+	return strings.TrimSpace(left.Namespace) == strings.TrimSpace(right.Namespace) &&
+		strings.TrimSpace(left.Environment) == strings.TrimSpace(right.Environment)
 }

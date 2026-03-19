@@ -18,9 +18,12 @@ func newSSETestServer(testingObject *testing.T) *Server {
 	testingObject.Helper()
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
-			Now:          func() time.Time { return time.Unix(1773491430, 0).UTC() },
-			ListRoutes:   func() []pb.Route { return []pb.Route{{RouteID: "route-1"}} },
-			ListServices: func() []pb.Service { return []pb.Service{{ServiceID: "svc-1", ConnectorID: "connector-1"}} },
+			Now:                 func() time.Time { return time.Unix(1773491430, 0).UTC() },
+			ListRoutes:          func() []pb.Route { return []pb.Route{{RouteID: "route-1"}} },
+			ListLogicalServices: func() []pb.LogicalService { return []pb.LogicalService{{LogicalServiceID: "ls-1"}} },
+			ListServiceInstances: func() []pb.ServiceInstance {
+				return []pb.ServiceInstance{{InstanceID: "inst-1", ConnectorID: "connector-1"}}
+			},
 			ListSessions: func() []registry.SessionRuntime {
 				return []registry.SessionRuntime{{
 					SessionID:   "session-1",
@@ -146,10 +149,11 @@ func TestBuildTrafficSnapshotHonorsConnectorFilter(testingObject *testing.T) {
 	now := time.Unix(1773491430, 0).UTC()
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
-			Now:        func() time.Time { return now },
-			ListRoutes: func() []pb.Route { return nil },
-			ListServices: func() []pb.Service {
-				return []pb.Service{{ServiceID: "svc-a", ConnectorID: "agent-a"}}
+			Now:                 func() time.Time { return now },
+			ListRoutes:          func() []pb.Route { return nil },
+			ListLogicalServices: func() []pb.LogicalService { return []pb.LogicalService{{LogicalServiceID: "ls-a"}} },
+			ListServiceInstances: func() []pb.ServiceInstance {
+				return []pb.ServiceInstance{{InstanceID: "inst-a", ConnectorID: "agent-a"}}
 			},
 			ListSessions: func() []registry.SessionRuntime {
 				return []registry.SessionRuntime{{

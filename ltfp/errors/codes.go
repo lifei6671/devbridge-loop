@@ -52,8 +52,6 @@ const (
 	CodeResolveSessionNotActive = "RESOLVE_SESSION_NOT_ACTIVE"
 	// CodeExportNotEligible 表示 export 条件不满足。
 	CodeExportNotEligible = "EXPORT_NOT_ELIGIBLE"
-	// CodeHybridFallbackForbidden 表示 hybrid fallback 被策略禁止。
-	CodeHybridFallbackForbidden = "HYBRID_FALLBACK_FORBIDDEN"
 	// CodeDirectProxyTimeout 表示 direct proxy 拨号超时。
 	CodeDirectProxyTimeout = "DIRECT_PROXY_TIMEOUT"
 	// CodeDirectProxyConcurrencyLimit 表示 direct proxy 并发达到上限。
@@ -64,6 +62,14 @@ const (
 	CodeIngressPortConflict = "INGRESS_PORT_CONFLICT"
 	// CodeIngressRouteMismatch 表示 ingress 路由匹配条件冲突。
 	CodeIngressRouteMismatch = "INGRESS_ROUTE_MISMATCH"
+	// CodeUnsupportedLegacyProtocol 表示请求仍携带已废弃的旧协议字段。
+	CodeUnsupportedLegacyProtocol = "UNSUPPORTED_LEGACY_PROTOCOL"
+	// CodeInstanceOwnershipMismatch 表示 instance_id 与当前 connector 归属不一致。
+	CodeInstanceOwnershipMismatch = "INSTANCE_OWNERSHIP_MISMATCH"
+	// CodeStaleSessionEpoch 表示收到旧 session epoch 的实例级请求。
+	CodeStaleSessionEpoch = "STALE_SESSION_EPOCH"
+	// CodeInstanceNotFound 表示目标实例不存在或不归属于当前 connector。
+	CodeInstanceNotFound = "INSTANCE_NOT_FOUND"
 )
 
 // 协商相关错误码定义。
@@ -106,8 +112,10 @@ const (
 	CodeConnectorDialFailed = "CONNECTOR_DIAL_FAILED"
 	// CodeDirectProxyRelayFailed 表示 direct proxy relay 过程失败。
 	CodeDirectProxyRelayFailed = "DIRECT_PROXY_RELAY_FAILED"
-	// CodeTrafficInvalidServiceID 表示 TrafficOpen 缺少 service_id。
-	CodeTrafficInvalidServiceID = "TRAFFIC_INVALID_SERVICE_ID"
+	// CodeTrafficInvalidLogicalServiceID 表示 TrafficOpen 缺少 logical_service_id。
+	CodeTrafficInvalidLogicalServiceID = "TRAFFIC_INVALID_LOGICAL_SERVICE_ID"
+	// CodeTrafficInvalidInstanceID 表示 TrafficOpen 缺少 instance_id。
+	CodeTrafficInvalidInstanceID = "TRAFFIC_INVALID_INSTANCE_ID"
 )
 
 // Tunnel recycle 握手相关错误码定义。

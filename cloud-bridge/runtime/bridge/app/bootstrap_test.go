@@ -449,11 +449,24 @@ func TestAdminSessionDrainEndpointAppliesLifecycleEffects(testingObject *testing
 		LastHeartbeat: now,
 		UpdatedAt:     now,
 	})
-	runtime.dataPlane.serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "service-1",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	runtime.dataPlane.serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "service-1",
+		ServiceName:      "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Status:               pb.ServiceStatusActive,
+		ActiveInstanceCount:  1,
+		HealthyInstanceCount: 1,
+	}, pb.ServiceInstance{
+		InstanceID:       "instance-1",
+		LogicalServiceID: "service-1",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-1",
+		SessionEpoch:     1,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
 	})
 	if _, err := runtime.dataPlane.tunnelRegistry.UpsertIdle(
 		now,
@@ -485,12 +498,23 @@ func TestAdminSessionDrainEndpointAppliesLifecycleEffects(testingObject *testing
 		testingObject.Fatalf("unexpected session state: got=%s want=%s", sessionSnapshot.State, registry.SessionDraining)
 	}
 
-	serviceSnapshot, exists := runtime.dataPlane.serviceRegistry.GetByServiceID("service-1")
+	logicalServiceSnapshot, exists := runtime.dataPlane.serviceRegistry.GetLogicalServiceByID("service-1")
 	if !exists {
 		testingObject.Fatalf("expected service exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusInactive {
-		testingObject.Fatalf("unexpected service status: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusInactive)
+	if logicalServiceSnapshot.Status != pb.ServiceStatusInactive {
+		testingObject.Fatalf("unexpected service status: got=%s want=%s", logicalServiceSnapshot.Status, pb.ServiceStatusInactive)
+	}
+	instanceSnapshot, exists := runtime.dataPlane.serviceRegistry.GetInstanceByID("instance-1")
+	if !exists {
+		testingObject.Fatalf("expected instance exists")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusInactive {
+		testingObject.Fatalf(
+			"unexpected instance status: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusInactive,
+		)
 	}
 	if _, exists := runtime.dataPlane.tunnelRegistry.Get("tunnel-1"); exists {
 		testingObject.Fatalf("expected tunnel purged after drain")
@@ -577,7 +601,7 @@ func TestAdminConfigUpdatePersistsToRuntimeConfigFile(testingObject *testing.T) 
 	updateRequest := httptest.NewRequest(
 		http.MethodPut,
 		"/api/admin/config",
-		strings.NewReader(`{"if_match_version":1,"patch":{"ingress.http_addr":":18080","control_plane.heartbeat_timeout_ms":45000}}`),
+		strings.NewReader(`{"if_match_version":1,"patch":{"ingress.http_addr":":18080","ingress.base_domain":"svc.dev.internal","control_plane.heartbeat_timeout_ms":45000}}`),
 	)
 	updateRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
 	updateRequest.Header.Set("Content-Type", "application/json")
@@ -592,6 +616,9 @@ func TestAdminConfigUpdatePersistsToRuntimeConfigFile(testingObject *testing.T) 
 	}
 	if savedConfig.Ingress.HTTPAddr != ":18080" {
 		testingObject.Fatalf("unexpected persisted ingress.http_addr: got=%s want=%s", savedConfig.Ingress.HTTPAddr, ":18080")
+	}
+	if savedConfig.Ingress.BaseDomain != "svc.dev.internal" {
+		testingObject.Fatalf("unexpected persisted ingress.base_domain: got=%s want=%s", savedConfig.Ingress.BaseDomain, "svc.dev.internal")
 	}
 	if savedConfig.ControlPlane.HeartbeatTimeout != 45*time.Second {
 		testingObject.Fatalf(

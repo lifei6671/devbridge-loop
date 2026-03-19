@@ -18,12 +18,13 @@ func TestOverviewRequiresBearerToken(testingObject *testing.T) {
 
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
-			ListRoutes:          func() []pb.Route { return nil },
-			ListServices:        func() []pb.Service { return nil },
-			ListSessions:        func() []registry.SessionRuntime { return nil },
-			ListTunnels:         func() []registry.TunnelRuntime { return nil },
-			TunnelSnapshot:      func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
-			BuildConfigSnapshot: func() map[string]any { return map[string]any{} },
+			ListRoutes:           func() []pb.Route { return nil },
+			ListLogicalServices:  func() []pb.LogicalService { return nil },
+			ListServiceInstances: func() []pb.ServiceInstance { return nil },
+			ListSessions:         func() []registry.SessionRuntime { return nil },
+			ListTunnels:          func() []registry.TunnelRuntime { return nil },
+			TunnelSnapshot:       func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
+			BuildConfigSnapshot:  func() map[string]any { return map[string]any{} },
 		},
 		BearerTokens: []BearerToken{
 			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
@@ -50,9 +51,12 @@ func TestViewerTokenCanReadOverview(testingObject *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
-			Now:          func() time.Time { return now },
-			ListRoutes:   func() []pb.Route { return []pb.Route{{RouteID: "route-1"}} },
-			ListServices: func() []pb.Service { return []pb.Service{{ServiceID: "svc-1", ConnectorID: "conn-1"}} },
+			Now:                 func() time.Time { return now },
+			ListRoutes:          func() []pb.Route { return []pb.Route{{RouteID: "route-1"}} },
+			ListLogicalServices: func() []pb.LogicalService { return []pb.LogicalService{{LogicalServiceID: "ls-1"}} },
+			ListServiceInstances: func() []pb.ServiceInstance {
+				return []pb.ServiceInstance{{InstanceID: "inst-1", ConnectorID: "conn-1"}}
+			},
 			ListSessions: func() []registry.SessionRuntime {
 				return []registry.SessionRuntime{{SessionID: "sess-1", ConnectorID: "conn-1", State: registry.SessionActive}}
 			},
@@ -107,11 +111,12 @@ func TestLogsSearchRequiresTimeWindow(testingObject *testing.T) {
 
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
-			ListRoutes:     func() []pb.Route { return nil },
-			ListServices:   func() []pb.Service { return nil },
-			ListSessions:   func() []registry.SessionRuntime { return nil },
-			ListTunnels:    func() []registry.TunnelRuntime { return nil },
-			TunnelSnapshot: func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
+			ListRoutes:           func() []pb.Route { return nil },
+			ListLogicalServices:  func() []pb.LogicalService { return nil },
+			ListServiceInstances: func() []pb.ServiceInstance { return nil },
+			ListSessions:         func() []registry.SessionRuntime { return nil },
+			ListTunnels:          func() []registry.TunnelRuntime { return nil },
+			TunnelSnapshot:       func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
 		},
 		BearerTokens: []BearerToken{
 			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
@@ -292,18 +297,27 @@ func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
 	server, err := NewServer(ServerOptions{
 		Dependencies: Dependencies{
 			Now: func() time.Time { return now },
-			ListServices: func() []pb.Service {
-				return []pb.Service{
+			ListLogicalServices: func() []pb.LogicalService {
+				return []pb.LogicalService{
 					{
-						ServiceID:    "svc-order",
-						ServiceKey:   "dev/demo/order-service",
-						Namespace:    "dev",
-						Environment:  "demo",
-						ConnectorID:  "agent-a",
-						ServiceName:  "order-service",
-						ServiceType:  "https",
-						Status:       pb.ServiceStatusActive,
-						HealthStatus: pb.HealthStatusHealthy,
+						LogicalServiceID:     "ls-order",
+						ServiceName:          "order-service",
+						Scope:                pb.Scope{Namespace: "dev", Environment: "demo"},
+						Status:               pb.ServiceStatusActive,
+						ActiveInstanceCount:  1,
+						HealthyInstanceCount: 1,
+					},
+				}
+			},
+			ListServiceInstances: func() []pb.ServiceInstance {
+				return []pb.ServiceInstance{
+					{
+						InstanceID:       "inst-order",
+						LogicalServiceID: "ls-order",
+						ConnectorID:      "agent-a",
+						SessionID:        "session-a",
+						InstanceStatus:   pb.ServiceStatusActive,
+						HealthStatus:     pb.HealthStatusHealthy,
 						Endpoints: []pb.ServiceEndpoint{
 							{
 								EndpointID: "ep-order-1",
@@ -361,7 +375,7 @@ func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
 	if item["connector_id"] != "agent-a" || item["session_id"] != "session-a" {
 		testingObject.Fatalf("unexpected connector/session mapping: %+v", item)
 	}
-	if item["route_target"] != "connector_service.service_key=dev/demo/order-service" {
+	if item["route_target"] != "connector_service.selector={serviceName:order-service,scope:dev/demo}" {
 		testingObject.Fatalf("unexpected route_target: %+v", item["route_target"])
 	}
 	if item["sni_name"] != "order.demo.example.com" {
@@ -380,16 +394,17 @@ func TestTrafficOwnershipLookupByTrafficID(testingObject *testing.T) {
 					return TrafficOwnershipRecord{}, false
 				}
 				return TrafficOwnershipRecord{
-					TrafficID:         "traffic-ownership-1",
-					RouteID:           "route-1",
-					TargetKind:        "connector_service",
-					IngressMode:       "l7_shared",
-					ServiceID:         "svc-1",
-					ServiceKey:        "dev/demo/order-service",
-					ServiceInstanceID: "svcinst:svc-1|connector-1|session-1",
-					ConnectorID:       "connector-1",
-					SessionID:         "session-1",
-					UpdatedAtMS:       1700000000000,
+					TrafficID:        "traffic-ownership-1",
+					RouteID:          "route-1",
+					TargetKind:       "connector_service",
+					IngressMode:      "l7_shared",
+					LogicalServiceID: "svc-1",
+					ServiceName:      "order-service",
+					Scope:            pb.Scope{Namespace: "dev", Environment: "demo"},
+					InstanceID:       "svcinst:svc-1|connector-1|session-1",
+					ConnectorID:      "connector-1",
+					SessionID:        "session-1",
+					UpdatedAtMS:      1700000000000,
 				}, true
 			},
 		},
@@ -418,11 +433,18 @@ func TestTrafficOwnershipLookupByTrafficID(testingObject *testing.T) {
 	if !ok {
 		testingObject.Fatalf("ownership payload missing: %+v", payload)
 	}
-	if ownership["service_id"] != "svc-1" {
-		testingObject.Fatalf("unexpected service_id: %+v", ownership["service_id"])
+	if ownership["logical_service_id"] != "svc-1" {
+		testingObject.Fatalf("unexpected logical_service_id: %+v", ownership["logical_service_id"])
 	}
-	if ownership["service_instance_id"] != "svcinst:svc-1|connector-1|session-1" {
-		testingObject.Fatalf("unexpected service_instance_id: %+v", ownership["service_instance_id"])
+	if ownership["instance_id"] != "svcinst:svc-1|connector-1|session-1" {
+		testingObject.Fatalf("unexpected instance_id: %+v", ownership["instance_id"])
+	}
+	scope, ok := ownership["scope"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("unexpected ownership scope: %+v", ownership["scope"])
+	}
+	if scope["namespace"] != "dev" || scope["environment"] != "demo" {
+		testingObject.Fatalf("unexpected ownership scope payload: %+v", scope)
 	}
 }
 

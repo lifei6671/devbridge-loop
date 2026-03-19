@@ -306,8 +306,8 @@ func TestRunTrafficAcceptorWorkerConsumesOpenAndClosesTunnel(testingObject *test
 	}
 	testTunnel.EnqueueReadPayload(pb.StreamPayload{
 		OpenReq: &pb.TrafficOpen{
-			TrafficID: "traffic-1",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-1",
+			LogicalServiceID: "ls-1",
 		},
 	})
 
@@ -339,10 +339,12 @@ func TestRuntimeHintEndpointSelectorFallsBackToServiceCatalog(testingObject *tes
 
 	catalog := service.NewCatalog()
 	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
-		ServiceID:   "svc-1",
-		ServiceKey:  "dev/demo/jelly",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "ls-1",
+		InstanceID:       "inst-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "jelly",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
@@ -356,7 +358,7 @@ func TestRuntimeHintEndpointSelectorFallsBackToServiceCatalog(testingObject *tes
 	})
 	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
 
-	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/jelly", map[string]string{})
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "ls-1", map[string]string{})
 	if err != nil {
 		testingObject.Fatalf("select endpoint from catalog failed: %v", err)
 	}
@@ -628,10 +630,12 @@ func TestRuntimeHintEndpointSelectorPrefersHintOverCatalog(testingObject *testin
 
 	catalog := service.NewCatalog()
 	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
-		ServiceID:   "svc-1",
-		ServiceKey:  "dev/demo/jelly",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "ls-1",
+		InstanceID:       "inst-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "jelly",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
@@ -645,7 +649,7 @@ func TestRuntimeHintEndpointSelectorPrefersHintOverCatalog(testingObject *testin
 	})
 	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
 
-	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/jelly", map[string]string{
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "ls-1", map[string]string{
 		trafficOpenHintEndpointIDKey:   "ep-hint",
 		trafficOpenHintEndpointAddrKey: "127.0.0.1:9090",
 	})
@@ -666,10 +670,12 @@ func TestRuntimeHintEndpointSelectorReturnsHTTPSMetadata(testingObject *testing.
 
 	catalog := service.NewCatalog()
 	catalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
-		ServiceID:   "svc-https-1",
-		ServiceKey:  "dev/demo/deepin-service",
-		Namespace:   "dev",
-		Environment: "demo",
+		LogicalServiceID: "ls-https-1",
+		InstanceID:       "inst-https-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceName: "deepin-service",
 		ServiceType: "https",
 		Endpoints: []pb.ServiceEndpoint{
@@ -684,7 +690,7 @@ func TestRuntimeHintEndpointSelectorReturnsHTTPSMetadata(testingObject *testing.
 	})
 	selector := &runtimeHintEndpointSelector{serviceCatalog: catalog}
 
-	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "dev/demo/deepin-service", map[string]string{})
+	selectedEndpoint, err := selector.SelectEndpoint(context.Background(), "ls-https-1", map[string]string{})
 	if err != nil {
 		testingObject.Fatalf("select https endpoint from catalog failed: %v", err)
 	}
@@ -771,10 +777,11 @@ func TestTunnelAssociationLifecycle(testingObject *testing.T) {
 	}
 	firstUpdatedAt := time.Unix(1700002000, 0).UTC()
 	runtime.upsertTunnelAssociation(tunnelAssociation{
-		TunnelID:  "tunnel-1",
-		TrafficID: "traffic-1",
-		ServiceID: "svc-1",
-		UpdatedAt: firstUpdatedAt,
+		TunnelID:         "tunnel-1",
+		TrafficID:        "traffic-1",
+		LogicalServiceID: "ls-1",
+		InstanceID:       "inst-1",
+		UpdatedAt:        firstUpdatedAt,
 	})
 	// 第二次只补充地址与延迟，原有 traffic/service 信息应保留。
 	runtime.upsertTunnelAssociation(tunnelAssociation{
@@ -789,7 +796,7 @@ func TestTunnelAssociationLifecycle(testingObject *testing.T) {
 	if !exists {
 		testingObject.Fatalf("expected tunnel association exists")
 	}
-	if association.TrafficID != "traffic-1" || association.ServiceID != "svc-1" {
+	if association.TrafficID != "traffic-1" || association.LogicalServiceID != "ls-1" || association.InstanceID != "inst-1" {
 		testingObject.Fatalf("unexpected association identity: %+v", association)
 	}
 	if association.LocalAddr != "127.0.0.1:18080" {

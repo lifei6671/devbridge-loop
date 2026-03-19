@@ -16,12 +16,14 @@ type directProxyTestDiscoveryProvider struct {
 	endpoints []ExternalEndpoint
 	err       error
 	calls     int
+	requests  []DiscoveryRequest
 }
 
-func (provider *directProxyTestDiscoveryProvider) Discover(_ context.Context, _ DiscoveryRequest) ([]ExternalEndpoint, error) {
+func (provider *directProxyTestDiscoveryProvider) Discover(_ context.Context, request DiscoveryRequest) ([]ExternalEndpoint, error) {
 	provider.mutex.Lock()
 	defer provider.mutex.Unlock()
 	provider.calls++
+	provider.requests = append(provider.requests, request)
 	return cloneEndpoints(provider.endpoints), provider.err
 }
 
@@ -35,6 +37,14 @@ func (provider *directProxyTestDiscoveryProvider) Calls() int {
 	provider.mutex.Lock()
 	defer provider.mutex.Unlock()
 	return provider.calls
+}
+
+func (provider *directProxyTestDiscoveryProvider) Requests() []DiscoveryRequest {
+	provider.mutex.Lock()
+	defer provider.mutex.Unlock()
+	copied := make([]DiscoveryRequest, 0, len(provider.requests))
+	copied = append(copied, provider.requests...)
+	return copied
 }
 
 type directProxyTestConnection struct {
@@ -172,6 +182,10 @@ func TestExecutorExecuteExternalPath(testingObject *testing.T) {
 			Environment: "alice",
 			ServiceName: "pay",
 		},
+		RequestScope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 	})
 	if err != nil {
 		testingObject.Fatalf("execute external path failed: %v", err)
@@ -245,6 +259,10 @@ func TestExecutorExecuteCacheHit(testingObject *testing.T) {
 			Environment: "alice",
 			ServiceName: "pay",
 		},
+		RequestScope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 	}
 	if _, err := executor.Execute(context.Background(), request); err != nil {
 		testingObject.Fatalf("first execute failed: %v", err)
@@ -259,6 +277,62 @@ func TestExecutorExecuteCacheHit(testingObject *testing.T) {
 	}
 	if discoveryProvider.Calls() != 1 {
 		testingObject.Fatalf("expected discovery still called once, got=%d", discoveryProvider.Calls())
+	}
+}
+
+// TestExecutorExecuteUsesRequestScopeForDiscovery 验证外部发现查询使用 request_scope，而不是 target 自带 scope。
+func TestExecutorExecuteUsesRequestScopeForDiscovery(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	discoveryProvider := &directProxyTestDiscoveryProvider{
+		endpoints: []ExternalEndpoint{
+			{EndpointID: "ep-1", Address: "10.0.0.10:443"},
+		},
+	}
+	discoveryAdapter, err := NewDiscoveryAdapter(DiscoveryAdapterOptions{
+		Provider: discoveryProvider,
+	})
+	if err != nil {
+		testingObject.Fatalf("new discovery adapter failed: %v", err)
+	}
+	dialer, err := NewDialer(DialerOptions{
+		Upstream: &directProxyTestDialer{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new dialer failed: %v", err)
+	}
+	executor, err := NewExecutor(ExecutorOptions{
+		Discovery: discoveryAdapter,
+		Cache:     NewEndpointCache(EndpointCacheOptions{}),
+		Dialer:    dialer,
+		Relay:     &directProxyTestRelay{},
+	})
+	if err != nil {
+		testingObject.Fatalf("new direct executor failed: %v", err)
+	}
+
+	_, err = executor.Execute(context.Background(), ExecuteRequest{
+		TrafficID: "traffic-scope",
+		Target: pb.ExternalServiceTarget{
+			Provider:    "k8s",
+			Namespace:   "route-ns",
+			Environment: "route-env",
+			ServiceName: "pay",
+		},
+		RequestScope: pb.Scope{
+			Namespace:   "request-ns",
+			Environment: "request-env",
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("execute external path failed: %v", err)
+	}
+	requests := discoveryProvider.Requests()
+	if len(requests) != 1 {
+		testingObject.Fatalf("unexpected discovery request count: %d", len(requests))
+	}
+	if requests[0].Namespace != "request-ns" || requests[0].Environment != "request-env" {
+		testingObject.Fatalf("unexpected request scope passed to discovery: %+v", requests[0])
 	}
 }
 

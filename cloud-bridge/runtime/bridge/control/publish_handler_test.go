@@ -1,11 +1,6 @@
 package control
 
 import (
-	"bytes"
-	"encoding/json"
-	"log/slog"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +9,18 @@ import (
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
+
+type publishHandlerTestHostDeriver struct {
+	host string
+	err  error
+}
+
+func (deriver publishHandlerTestHostDeriver) Derive(_ string, _ pb.Scope) (string, error) {
+	if deriver.err != nil {
+		return "", deriver.err
+	}
+	return deriver.host, nil
+}
 
 // TestPublishHandlerHandlePublish 验证发布处理器的幂等与版本比较行为。
 func TestPublishHandlerHandlePublish(t *testing.T) {
@@ -29,14 +36,18 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-1"
+		},
 	})
 
 	message := pb.PublishService{
-		ServiceID:   "svc-1",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
+		InstanceID:  "inst-1",
 		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
@@ -61,7 +72,6 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 				SessionEpoch:    3,
 				EventID:         "evt-1",
 				ResourceVersion: 1,
-				ResourceID:      "svc-1",
 			},
 			expectAccepted:     true,
 			expectCurrentVer:   1,
@@ -77,7 +87,6 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 				SessionEpoch:    3,
 				EventID:         "evt-2",
 				ResourceVersion: 2,
-				ResourceID:      "svc-1",
 			},
 			expectAccepted:     true,
 			expectCurrentVer:   2,
@@ -93,7 +102,6 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 				SessionEpoch:    3,
 				EventID:         "evt-3",
 				ResourceVersion: 1,
-				ResourceID:      "svc-1",
 			},
 			expectAccepted:     false,
 			expectErrorCode:    ltfperrors.CodeVersionRollback,
@@ -110,7 +118,6 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 				SessionEpoch:    3,
 				EventID:         "evt-2",
 				ResourceVersion: 3,
-				ResourceID:      "svc-1",
 			},
 			expectAccepted:     true,
 			expectCurrentVer:   2,
@@ -126,10 +133,9 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 				SessionEpoch:    2,
 				EventID:         "evt-4",
 				ResourceVersion: 3,
-				ResourceID:      "svc-1",
 			},
 			expectAccepted:     false,
-			expectErrorCode:    ltfperrors.CodeStaleEpochEvent,
+			expectErrorCode:    ltfperrors.CodeStaleSessionEpoch,
 			expectCurrentVer:   2,
 			expectRegistrySize: 1,
 		},
@@ -154,17 +160,130 @@ func TestPublishHandlerHandlePublish(t *testing.T) {
 		})
 	}
 
-	serviceSnapshot, exists := handler.serviceRegistry.GetByServiceID("svc-1")
+	instanceSnapshot, exists := handler.serviceRegistry.GetInstanceByID("inst-1")
 	if !exists {
-		t.Fatalf("expected service snapshot exists after publish flow")
+		t.Fatalf("expected instance snapshot exists after publish flow")
 	}
-	if serviceSnapshot.ConnectorID != "connector-1" {
-		t.Fatalf("unexpected connector_id: got=%s want=connector-1", serviceSnapshot.ConnectorID)
+	if instanceSnapshot.Instance.ConnectorID != "connector-1" {
+		t.Fatalf("unexpected connector_id: got=%s want=connector-1", instanceSnapshot.Instance.ConnectorID)
+	}
+	if instanceSnapshot.Instance.LogicalServiceID != "ls-1" {
+		t.Fatalf("unexpected logical_service_id: got=%s want=ls-1", instanceSnapshot.Instance.LogicalServiceID)
 	}
 }
 
-// TestPublishHandlerRejectStaleInstancePublishAfterFullSync
-// 验证 full-sync 后会话维度资源键也会回填版本，防止旧版本实例事件绕过回滚保护。
+// TestPublishHandlerDerivesExposureHostAndPersistsPayload 验证空 exposure.host 会被派生并写入实例快照。
+func TestPublishHandlerDerivesExposureHostAndPersistsPayload(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-derive",
+		ConnectorID: "connector-derive",
+		Epoch:       3,
+		State:       registry.SessionActive,
+	})
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+		HostDeriver: publishHandlerTestHostDeriver{
+			host: "orders.alice.dev.example.com",
+		},
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-derive"
+		},
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-derive",
+		SessionEpoch:    3,
+		EventID:         "evt-derive",
+		ResourceVersion: 1,
+	}, pb.PublishService{
+		InstanceID:  "inst-derive",
+		ServiceName: "orders",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+		Exposure: pb.ServiceExposure{
+			IngressMode: pb.IngressModeL7Shared,
+			PathPrefix:  "/api",
+		},
+		DiscoveryPolicy: pb.DiscoveryPolicy{
+			Enabled:   true,
+			Providers: []string{"nacos"},
+		},
+	})
+	if !ack.Accepted {
+		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
+	}
+
+	instanceSnapshot, exists := handler.serviceRegistry.GetInstanceByID("inst-derive")
+	if !exists {
+		t.Fatalf("expected derived instance snapshot exists")
+	}
+	if instanceSnapshot.Instance.Exposure.Host != "orders.alice.dev.example.com" {
+		t.Fatalf("unexpected derived exposure host: %s", instanceSnapshot.Instance.Exposure.Host)
+	}
+	if len(instanceSnapshot.Instance.Endpoints) != 1 || instanceSnapshot.Instance.Endpoints[0].Port != 18080 {
+		t.Fatalf("unexpected endpoints persisted: %+v", instanceSnapshot.Instance.Endpoints)
+	}
+	if !instanceSnapshot.Instance.DiscoveryPolicy.Enabled {
+		t.Fatalf("expected discovery policy persisted")
+	}
+}
+
+// TestPublishHandlerRejectLegacyPayloadFields 验证旧字段一律拒绝。
+func TestPublishHandlerRejectLegacyPayloadFields(t *testing.T) {
+	t.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
+		SessionID:   "session-legacy",
+		ConnectorID: "connector-legacy",
+		Epoch:       3,
+		State:       registry.SessionActive,
+	})
+	handler := NewPublishHandler(PublishHandlerOptions{
+		SessionRegistry: sessionRegistry,
+	})
+
+	ack := handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-legacy",
+		SessionEpoch:    3,
+		EventID:         "evt-legacy",
+		ResourceVersion: 1,
+		Payload:         []byte(`{"serviceKey":"legacy/order-service"}`),
+	}, pb.PublishService{
+		InstanceID:  "inst-legacy",
+		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
+	if ack.Accepted {
+		t.Fatalf("expected legacy payload rejected")
+	}
+	if ack.ErrorCode != ltfperrors.CodeUnsupportedLegacyProtocol {
+		t.Fatalf("unexpected error code: got=%s want=%s", ack.ErrorCode, ltfperrors.CodeUnsupportedLegacyProtocol)
+	}
+}
+
+// TestPublishHandlerRejectStaleInstancePublishAfterFullSync 验证 full-sync 回填版本后旧实例事件不能绕过回滚保护。
 func TestPublishHandlerRejectStaleInstancePublishAfterFullSync(t *testing.T) {
 	t.Parallel()
 
@@ -181,14 +300,28 @@ func TestPublishHandlerRejectStaleInstancePublishAfterFullSync(t *testing.T) {
 	})
 	handler.ReconcileFromFullSync(pb.FullSyncSnapshot{
 		Completed: true,
-		Services: []pb.Service{
+		LogicalServices: []pb.LogicalService{
 			{
-				ServiceID:       "svc-fs",
-				ServiceKey:      "order-service/http",
-				ConnectorID:     "connector-fs",
+				LogicalServiceID: "ls-fs",
+				ServiceName:      "order-service",
+				Scope: pb.Scope{
+					Namespace:   "dev",
+					Environment: "alice",
+				},
 				Status:          pb.ServiceStatusActive,
-				HealthStatus:    pb.HealthStatusHealthy,
 				ResourceVersion: 10,
+			},
+		},
+		ServiceInstances: []pb.ServiceInstance{
+			{
+				InstanceID:       "inst-fs",
+				LogicalServiceID: "ls-fs",
+				ConnectorID:      "connector-fs",
+				SessionID:        "session-fs",
+				SessionEpoch:     5,
+				InstanceStatus:   pb.ServiceStatusActive,
+				HealthStatus:     pb.HealthStatusHealthy,
+				ResourceVersion:  10,
 			},
 		},
 	})
@@ -203,11 +336,12 @@ func TestPublishHandlerRejectStaleInstancePublishAfterFullSync(t *testing.T) {
 		EventID:         "evt-stale-after-full-sync",
 		ResourceVersion: 5,
 	}, pb.PublishService{
-		ServiceID:   "svc-fs",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
+		InstanceID:  "inst-fs",
 		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
@@ -222,7 +356,7 @@ func TestPublishHandlerRejectStaleInstancePublishAfterFullSync(t *testing.T) {
 	if ack.CurrentResourceVersion != 10 {
 		t.Fatalf("unexpected current resource version: got=%d want=10", ack.CurrentResourceVersion)
 	}
-	if currentVersion := handler.serviceRegistry.CurrentVersion("svc-fs", "order-service/http"); currentVersion != 10 {
+	if currentVersion := handler.serviceRegistry.CurrentVersion("ls-fs", "inst-fs"); currentVersion != 10 {
 		t.Fatalf("unexpected registry current version after stale publish: got=%d want=10", currentVersion)
 	}
 }
@@ -241,20 +375,10 @@ func TestPublishHandlerHandleUnpublish(t *testing.T) {
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	})
-	publishMessage := pb.PublishService{
-		ServiceID:   "svc-1",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-1"
 		},
-	}
-
-	// 先发布服务，构造可下线的前置状态。
+	})
 	publishAck := handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
@@ -263,16 +387,22 @@ func TestPublishHandlerHandleUnpublish(t *testing.T) {
 		SessionEpoch:    3,
 		EventID:         "evt-1",
 		ResourceVersion: 1,
-		ResourceID:      "svc-1",
-	}, publishMessage)
+	}, pb.PublishService{
+		InstanceID:  "inst-1",
+		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	})
 	if !publishAck.Accepted {
 		t.Fatalf("publish should be accepted, got error=%s", publishAck.ErrorCode)
 	}
 
-	unpublishMessage := pb.UnpublishService{
-		ServiceID:  "svc-1",
-		ServiceKey: "order-service/http",
-	}
 	unpublishAck := handler.HandleUnpublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
@@ -281,16 +411,25 @@ func TestPublishHandlerHandleUnpublish(t *testing.T) {
 		SessionEpoch:    3,
 		EventID:         "evt-2",
 		ResourceVersion: 2,
-		ResourceID:      "svc-1",
-	}, unpublishMessage)
+	}, pb.UnpublishService{
+		InstanceID:       "inst-1",
+		LogicalServiceID: "ls-1",
+	})
 	if !unpublishAck.Accepted {
 		t.Fatalf("unpublish should be accepted, got error=%s", unpublishAck.ErrorCode)
 	}
-	if services := handler.serviceRegistry.List(); len(services) != 0 {
-		t.Fatalf("service should be removed, got=%d", len(services))
+	if instances := handler.serviceRegistry.ListInstancesByLogicalServiceID("ls-1"); len(instances) != 0 {
+		t.Fatalf("instance should be removed, got=%d", len(instances))
 	}
 
-	// 重放同一事件应走 duplicate 幂等分支，且保持无副作用。
+	logicalService, exists := handler.serviceRegistry.GetLogicalServiceByID("ls-1")
+	if !exists {
+		t.Fatalf("logical service should still exist after last instance removed")
+	}
+	if logicalService.Status != pb.ServiceStatusInactive {
+		t.Fatalf("expected logical service becomes inactive, got=%s", logicalService.Status)
+	}
+
 	dupAck := handler.HandleUnpublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
@@ -299,8 +438,10 @@ func TestPublishHandlerHandleUnpublish(t *testing.T) {
 		SessionEpoch:    3,
 		EventID:         "evt-2",
 		ResourceVersion: 999,
-		ResourceID:      "svc-1",
-	}, unpublishMessage)
+	}, pb.UnpublishService{
+		InstanceID:       "inst-1",
+		LogicalServiceID: "ls-1",
+	})
 	if !dupAck.Accepted {
 		t.Fatalf("duplicate unpublish should be accepted")
 	}
@@ -331,13 +472,13 @@ func TestPublishHandlerRejectMutationWhenSessionNotActive(t *testing.T) {
 		SessionEpoch:    3,
 		EventID:         "evt-draining",
 		ResourceVersion: 1,
-		ResourceID:      "svc-draining",
 	}, pb.PublishService{
-		ServiceID:   "svc-draining",
-		ServiceKey:  "draining-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
+		InstanceID:  "inst-draining",
 		ServiceName: "draining-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
@@ -351,129 +492,8 @@ func TestPublishHandlerRejectMutationWhenSessionNotActive(t *testing.T) {
 	}
 }
 
-// TestPublishHandlerBackfillsCanonicalServiceKey 验证 service_key 为空时会按 <service_name>/<protocol> 自动补全。
-func TestPublishHandlerBackfillsCanonicalServiceKey(t *testing.T) {
-	t.Parallel()
-
-	sessionRegistry := registry.NewSessionRegistry()
-	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-		SessionID:   "session-canonical",
-		ConnectorID: "connector-canonical",
-		Epoch:       7,
-		State:       registry.SessionActive,
-	})
-	handler := NewPublishHandler(PublishHandlerOptions{
-		SessionRegistry: sessionRegistry,
-		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	})
-	ack := handler.HandlePublish(pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-canonical",
-		SessionEpoch:    7,
-		EventID:         "evt-canonical-1",
-		ResourceVersion: 1,
-		ResourceID:      "service:canonical",
-	}, pb.PublishService{
-		ServiceID:   "",
-		ServiceKey:  "",
-		Namespace:   "dev",
-		Environment: "alice",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: " HTTP ", Host: "127.0.0.1", Port: 18080},
-		},
-	})
-	if !ack.Accepted {
-		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
-	}
-	if ack.ServiceKey != "order-service/http" {
-		t.Fatalf("unexpected canonical service key: got=%s want=%s", ack.ServiceKey, "order-service/http")
-	}
-	if ack.ServiceID == "" {
-		t.Fatalf("expected generated service id not empty")
-	}
-	serviceSnapshot, exists := handler.serviceRegistry.GetByServiceKey("order-service/http")
-	if !exists {
-		t.Fatalf("expected service snapshot exists by canonical key")
-	}
-	if serviceSnapshot.ServiceID != ack.ServiceID {
-		t.Fatalf("unexpected service id mapping: got=%s want=%s", serviceSnapshot.ServiceID, ack.ServiceID)
-	}
-	if len(serviceSnapshot.Endpoints) != 1 || serviceSnapshot.Endpoints[0].Protocol != "http" {
-		t.Fatalf("expected endpoint protocol normalized to lower-case, got=%+v", serviceSnapshot.Endpoints)
-	}
-}
-
-// TestPublishHandlerReusesServiceIDByServiceKey 验证 service_id 为空时会复用同 key 既有 service_id。
-func TestPublishHandlerReusesServiceIDByServiceKey(t *testing.T) {
-	t.Parallel()
-
-	sessionRegistry := registry.NewSessionRegistry()
-	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-		SessionID:   "session-reuse",
-		ConnectorID: "connector-reuse",
-		Epoch:       9,
-		State:       registry.SessionActive,
-	})
-	handler := NewPublishHandler(PublishHandlerOptions{
-		SessionRegistry: sessionRegistry,
-		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	})
-	baseEnvelope := pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-reuse",
-		SessionEpoch:    9,
-		EventID:         "evt-reuse-1",
-		ResourceVersion: 1,
-		ResourceID:      "service:reuse",
-	}
-	firstAck := handler.HandlePublish(baseEnvelope, pb.PublishService{
-		ServiceID:   "",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
-		},
-	})
-	if !firstAck.Accepted {
-		t.Fatalf("expected first publish accepted, got error=%s", firstAck.ErrorCode)
-	}
-	if firstAck.ServiceID == "" {
-		t.Fatalf("expected first generated service id not empty")
-	}
-
-	secondEnvelope := baseEnvelope
-	secondEnvelope.EventID = "evt-reuse-2"
-	secondEnvelope.ResourceVersion = 2
-	secondAck := handler.HandlePublish(secondEnvelope, pb.PublishService{
-		ServiceID:   "",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 18081},
-		},
-	})
-	if !secondAck.Accepted {
-		t.Fatalf("expected second publish accepted, got error=%s", secondAck.ErrorCode)
-	}
-	if secondAck.ServiceID != firstAck.ServiceID {
-		t.Fatalf("expected service id reused by key: first=%s second=%s", firstAck.ServiceID, secondAck.ServiceID)
-	}
-}
-
-// TestPublishHandlerAllowsConcurrentPublishBySameServiceKey 验证同 key 多 connector 发布会归并到同一服务池并保留实例。
-func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
+// TestPublishHandlerGroupsInstancesByLogicalService 验证同 scope/serviceName 的多实例会归并到同一 logical service。
+func TestPublishHandlerGroupsInstancesByLogicalService(t *testing.T) {
 	t.Parallel()
 
 	sessionRegistry := registry.NewSessionRegistry()
@@ -492,6 +512,9 @@ func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-shared"
+		},
 	})
 	firstAck := handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
@@ -503,11 +526,12 @@ func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
 		EventID:         "evt-multi-a-1",
 		ResourceVersion: 1,
 	}, pb.PublishService{
-		ServiceID:   "",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
+		InstanceID:  "inst-a",
 		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
@@ -516,6 +540,7 @@ func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
 	if !firstAck.Accepted {
 		t.Fatalf("expected first publish accepted, got error=%s", firstAck.ErrorCode)
 	}
+
 	secondAck := handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
@@ -526,11 +551,12 @@ func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
 		EventID:         "evt-multi-b-1",
 		ResourceVersion: 1,
 	}, pb.PublishService{
-		ServiceID:   "",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
+		InstanceID:  "inst-b",
 		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 19090},
@@ -539,20 +565,19 @@ func TestPublishHandlerAllowsConcurrentPublishBySameServiceKey(t *testing.T) {
 	if !secondAck.Accepted {
 		t.Fatalf("expected second publish accepted, got error=%s", secondAck.ErrorCode)
 	}
-	if secondAck.ServiceID != firstAck.ServiceID {
-		t.Fatalf("expected pooled service_id reused: first=%s second=%s", firstAck.ServiceID, secondAck.ServiceID)
+	if secondAck.LogicalServiceID != firstAck.LogicalServiceID {
+		t.Fatalf("expected pooled logical_service_id reused: first=%s second=%s", firstAck.LogicalServiceID, secondAck.LogicalServiceID)
 	}
-	// 池级接口仍返回一条逻辑服务，避免破坏旧调用路径。
 	if services := handler.serviceRegistry.List(); len(services) != 1 {
-		t.Fatalf("unexpected service pool size: got=%d want=1", len(services))
+		t.Fatalf("unexpected logical service size: got=%d want=1", len(services))
 	}
-	instances := handler.serviceRegistry.ListInstancesByServiceKey("order-service/http")
+	instances := handler.serviceRegistry.ListInstancesByLogicalServiceID("ls-shared")
 	if len(instances) != 2 {
 		t.Fatalf("unexpected service instance count: got=%d want=2", len(instances))
 	}
 }
 
-// TestPublishHandlerUnpublishRemovesOnlyMatchedInstance 验证按 connector/session 下线时仅删除目标实例。
+// TestPublishHandlerUnpublishRemovesOnlyMatchedInstance 验证按实例下线时仅删除目标实例。
 func TestPublishHandlerUnpublishRemovesOnlyMatchedInstance(t *testing.T) {
 	t.Parallel()
 
@@ -572,6 +597,9 @@ func TestPublishHandlerUnpublishRemovesOnlyMatchedInstance(t *testing.T) {
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-pay"
+		},
 	})
 	handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
@@ -583,10 +611,12 @@ func TestPublishHandlerUnpublishRemovesOnlyMatchedInstance(t *testing.T) {
 		EventID:         "evt-unpub-a-pub",
 		ResourceVersion: 1,
 	}, pb.PublishService{
-		ServiceKey:  "pay-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
+		InstanceID:  "inst-pay-a",
 		ServiceName: "pay-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 28080},
@@ -602,10 +632,12 @@ func TestPublishHandlerUnpublishRemovesOnlyMatchedInstance(t *testing.T) {
 		EventID:         "evt-unpub-b-pub",
 		ResourceVersion: 1,
 	}, pb.PublishService{
-		ServiceKey:  "pay-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
+		InstanceID:  "inst-pay-b",
 		ServiceName: "pay-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 29090},
@@ -622,414 +654,165 @@ func TestPublishHandlerUnpublishRemovesOnlyMatchedInstance(t *testing.T) {
 		EventID:         "evt-unpub-a-1",
 		ResourceVersion: 2,
 	}, pb.UnpublishService{
-		ServiceKey: "pay-service/http",
+		InstanceID:       "inst-pay-a",
+		LogicalServiceID: "ls-pay",
 	})
 	if !unpublishAck.Accepted {
 		t.Fatalf("expected unpublish accepted, got error=%s", unpublishAck.ErrorCode)
 	}
-	if instances := handler.serviceRegistry.ListInstancesByServiceKey("pay-service/http"); len(instances) != 1 {
+	if instances := handler.serviceRegistry.ListInstancesByLogicalServiceID("ls-pay"); len(instances) != 1 {
 		t.Fatalf("unexpected remaining instance count: got=%d want=1", len(instances))
 	}
 	if services := handler.serviceRegistry.List(); len(services) != 1 {
-		t.Fatalf("expected pooled service still exists, got=%d", len(services))
+		t.Fatalf("expected pooled logical service still exists, got=%d", len(services))
 	}
 }
 
-// TestPublishHandlerConcurrentPublishRepublishAndRecoverByServiceKey
-// 验证同 key 多 connector 并发发布、重复 republish、实例摘除与恢复的闭环行为。
-func TestPublishHandlerConcurrentPublishRepublishAndRecoverByServiceKey(t *testing.T) {
+// TestPublishHandlerRejectsCrossConnectorUnpublishByInstanceID 验证 instance_id 下线会严格校验 connector 归属。
+func TestPublishHandlerRejectsCrossConnectorUnpublishByInstanceID(t *testing.T) {
 	t.Parallel()
 
 	sessionRegistry := registry.NewSessionRegistry()
 	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-		SessionID:   "session-1",
-		ConnectorID: "connector-1",
-		Epoch:       31,
+		SessionID:   "session-a",
+		ConnectorID: "connector-a",
+		Epoch:       21,
 		State:       registry.SessionActive,
 	})
 	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-		SessionID:   "session-2",
-		ConnectorID: "connector-2",
-		Epoch:       32,
+		SessionID:   "session-b",
+		ConnectorID: "connector-b",
+		Epoch:       22,
 		State:       registry.SessionActive,
 	})
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
-		Now:             func() time.Time { return time.Unix(1700001000, 0).UTC() },
-	})
-
-	// 两个 connector 在同一服务 key 下并发发布，模拟控制面同时接收多实例上报。
-	startSignal := make(chan struct{})
-	type publishResult struct {
-		ack pb.PublishServiceAck
-	}
-	results := make(chan publishResult, 2)
-	var waitGroup sync.WaitGroup
-	publish := func(sessionID string, sessionEpoch uint64, connectorID string, eventID string, port uint32) {
-		defer waitGroup.Done()
-		<-startSignal
-		results <- publishResult{
-			ack: handler.HandlePublish(pb.ControlEnvelope{
-				VersionMajor:    2,
-				VersionMinor:    1,
-				MessageType:     pb.ControlMessagePublishService,
-				SessionID:       sessionID,
-				SessionEpoch:    sessionEpoch,
-				ConnectorID:     connectorID,
-				EventID:         eventID,
-				ResourceVersion: 1,
-			}, pb.PublishService{
-				ServiceID:   "svc-regression",
-				ServiceKey:  "inventory-service/http",
-				Namespace:   "dev",
-				Environment: "demo",
-				ServiceName: "inventory-service",
-				ServiceType: "http",
-				Endpoints: []pb.ServiceEndpoint{
-					{Protocol: "http", Host: "127.0.0.1", Port: port},
-				},
-			}),
-		}
-	}
-	waitGroup.Add(2)
-	go publish("session-1", 31, "connector-1", "evt-concurrent-1", 30080)
-	go publish("session-2", 32, "connector-2", "evt-concurrent-2", 30090)
-	close(startSignal)
-	waitGroup.Wait()
-	close(results)
-	for result := range results {
-		if !result.ack.Accepted {
-			t.Fatalf("expected concurrent publish accepted, got error=%s", result.ack.ErrorCode)
-		}
-		if result.ack.ServiceID != "svc-regression" {
-			t.Fatalf("unexpected pooled service_id: got=%s want=svc-regression", result.ack.ServiceID)
-		}
-	}
-	if instances := handler.serviceRegistry.ListInstancesByServiceID("svc-regression"); len(instances) != 2 {
-		t.Fatalf("unexpected instance count after concurrent publish: got=%d want=2", len(instances))
-	}
-
-	// 同一 connector 连续 republish 只应覆盖该实例，不应新增实例条目。
-	republishAckVersion2 := handler.HandlePublish(pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-1",
-		SessionEpoch:    31,
-		ConnectorID:     "connector-1",
-		EventID:         "evt-republish-connector-1-v2",
-		ResourceVersion: 2,
-	}, pb.PublishService{
-		ServiceID:   "svc-regression",
-		ServiceKey:  "inventory-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "inventory-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 30180},
+		Now:             func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-pay"
 		},
 	})
-	if !republishAckVersion2.Accepted {
-		t.Fatalf("expected republish version2 accepted, got error=%s", republishAckVersion2.ErrorCode)
-	}
-	republishAckVersion3 := handler.HandlePublish(pb.ControlEnvelope{
+	handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
 		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-1",
-		SessionEpoch:    31,
-		ConnectorID:     "connector-1",
-		EventID:         "evt-republish-connector-1-v3",
-		ResourceVersion: 3,
-	}, pb.PublishService{
-		ServiceID:   "svc-regression",
-		ServiceKey:  "inventory-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "inventory-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 30280},
-		},
-	})
-	if !republishAckVersion3.Accepted {
-		t.Fatalf("expected republish version3 accepted, got error=%s", republishAckVersion3.ErrorCode)
-	}
-	instancesAfterRepublish := handler.serviceRegistry.ListInstancesByServiceID("svc-regression")
-	if len(instancesAfterRepublish) != 2 {
-		t.Fatalf("republish should not create new instances: got=%d want=2", len(instancesAfterRepublish))
-	}
-	foundSessionOne := false
-	for _, instance := range instancesAfterRepublish {
-		if instance.SessionID != "session-1" {
-			continue
-		}
-		foundSessionOne = true
-		if len(instance.Service.Endpoints) != 1 || instance.Service.Endpoints[0].Port != 30280 {
-			t.Fatalf("expected republish endpoint applied to session-1 instance, got=%+v", instance.Service.Endpoints)
-		}
-	}
-	if !foundSessionOne {
-		t.Fatalf("expected session-1 instance exists after republish")
-	}
-
-	// 摘除 connector-2 实例后应只剩 1 条实例。
-	unpublishAck := handler.HandleUnpublish(pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessageUnpublishService,
-		SessionID:       "session-2",
-		SessionEpoch:    32,
-		ConnectorID:     "connector-2",
-		EventID:         "evt-remove-connector-2",
-		ResourceVersion: 2,
-	}, pb.UnpublishService{
-		ServiceID:  "svc-regression",
-		ServiceKey: "inventory-service/http",
-	})
-	if !unpublishAck.Accepted {
-		t.Fatalf("expected unpublish accepted, got error=%s", unpublishAck.ErrorCode)
-	}
-	if instances := handler.serviceRegistry.ListInstancesByServiceID("svc-regression"); len(instances) != 1 {
-		t.Fatalf("unexpected instance count after remove: got=%d want=1", len(instances))
-	}
-
-	// connector-2 恢复 republish 后实例池应回到 2 条，完成摘除/恢复闭环。
-	recoveryAck := handler.HandlePublish(pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-2",
-		SessionEpoch:    32,
-		ConnectorID:     "connector-2",
-		EventID:         "evt-recover-connector-2",
-		ResourceVersion: 3,
-	}, pb.PublishService{
-		ServiceID:   "svc-regression",
-		ServiceKey:  "inventory-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "inventory-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 30390},
-		},
-	})
-	if !recoveryAck.Accepted {
-		t.Fatalf("expected recovery publish accepted, got error=%s", recoveryAck.ErrorCode)
-	}
-	if instances := handler.serviceRegistry.ListInstancesByServiceID("svc-regression"); len(instances) != 2 {
-		t.Fatalf("unexpected instance count after recovery: got=%d want=2", len(instances))
-	}
-}
-
-// TestPublishHandlerServiceIdentityConsistencyAcrossAckAuditRuntime
-// 验证 service_id/service_key/service_instance_id 在 ACK、audit、runtime 三处保持一致。
-func TestPublishHandlerServiceIdentityConsistencyAcrossAckAuditRuntime(t *testing.T) {
-	sessionRegistry := registry.NewSessionRegistry()
-	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
-		SessionID:   "session-consistency",
-		ConnectorID: "connector-consistency",
-		Epoch:       41,
-		State:       registry.SessionActive,
-	})
-	handler := NewPublishHandler(PublishHandlerOptions{
-		SessionRegistry: sessionRegistry,
-		Now:             func() time.Time { return time.Unix(1700002000, 0).UTC() },
-	})
-
-	// 捕获审计日志并在测试结束后恢复默认 logger，避免影响其他用例。
-	var logBuffer bytes.Buffer
-	originalLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuffer, &slog.HandlerOptions{})))
-	defer slog.SetDefault(originalLogger)
-
-	publishAck := handler.HandlePublish(pb.ControlEnvelope{
-		VersionMajor:    2,
-		VersionMinor:    1,
-		MessageType:     pb.ControlMessagePublishService,
-		SessionID:       "session-consistency",
-		SessionEpoch:    41,
-		ConnectorID:     "connector-consistency",
-		EventID:         "evt-consistency-publish",
+		SessionID:       "session-a",
+		SessionEpoch:    21,
+		ConnectorID:     "connector-a",
+		EventID:         "evt-unpub-a-pub",
 		ResourceVersion: 1,
-		ResourceID:      "svc-consistency",
 	}, pb.PublishService{
-		ServiceID:   "svc-consistency",
-		ServiceKey:  "consistency-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "consistency-service",
+		InstanceID:  "inst-pay-a",
+		ServiceName: "pay-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 31080},
+			{Protocol: "http", Host: "127.0.0.1", Port: 28080},
 		},
 	})
-	if !publishAck.Accepted {
-		t.Fatalf("expected publish accepted, got error=%s", publishAck.ErrorCode)
-	}
-	if publishAck.ServiceID == "" || publishAck.ServiceKey == "" {
-		t.Fatalf("expected ack service identity not empty, ack=%+v", publishAck)
-	}
-	instances := handler.serviceRegistry.ListInstancesByServiceID(publishAck.ServiceID)
-	if len(instances) != 1 {
-		t.Fatalf("unexpected runtime instance count: got=%d want=1", len(instances))
-	}
-	runtimeInstanceID := strings.TrimSpace(instances[0].ServiceInstanceID)
-	if runtimeInstanceID == "" {
-		t.Fatalf("expected runtime service_instance_id not empty")
-	}
-	publishAuditEntry := decodeLastServiceResourceAuditEntry(t, logBuffer.Bytes(), "publish", "session-consistency")
-	if gotServiceID, _ := publishAuditEntry["service_id"].(string); gotServiceID != publishAck.ServiceID {
-		t.Fatalf("unexpected publish audit service_id: got=%v want=%s", publishAuditEntry["service_id"], publishAck.ServiceID)
-	}
-	if gotServiceKey, _ := publishAuditEntry["service_key"].(string); gotServiceKey != publishAck.ServiceKey {
-		t.Fatalf("unexpected publish audit service_key: got=%v want=%s", publishAuditEntry["service_key"], publishAck.ServiceKey)
-	}
-	if gotInstanceID, _ := publishAuditEntry["service_instance_id"].(string); gotInstanceID != runtimeInstanceID {
-		t.Fatalf("unexpected publish audit service_instance_id: got=%v want=%s", publishAuditEntry["service_instance_id"], runtimeInstanceID)
-	}
+	handler.HandlePublish(pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       "session-b",
+		SessionEpoch:    22,
+		ConnectorID:     "connector-b",
+		EventID:         "evt-unpub-b-pub",
+		ResourceVersion: 1,
+	}, pb.PublishService{
+		InstanceID:  "inst-pay-b",
+		ServiceName: "pay-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		ServiceType: "http",
+		Endpoints: []pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 29090},
+		},
+	})
 
 	unpublishAck := handler.HandleUnpublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
 		MessageType:     pb.ControlMessageUnpublishService,
-		SessionID:       "session-consistency",
-		SessionEpoch:    41,
-		ConnectorID:     "connector-consistency",
-		EventID:         "evt-consistency-unpublish",
+		SessionID:       "session-a",
+		SessionEpoch:    21,
+		ConnectorID:     "connector-a",
+		EventID:         "evt-unpub-cross-1",
 		ResourceVersion: 2,
-		ResourceID:      "svc-consistency",
 	}, pb.UnpublishService{
-		ServiceID:  publishAck.ServiceID,
-		ServiceKey: publishAck.ServiceKey,
+		InstanceID:       "inst-pay-b",
+		LogicalServiceID: "ls-pay",
 	})
-	if !unpublishAck.Accepted {
-		t.Fatalf("expected unpublish accepted, got error=%s", unpublishAck.ErrorCode)
+	if unpublishAck.Accepted {
+		t.Fatalf("expected cross-connector unpublish rejected")
 	}
-	if unpublishAck.ServiceID != publishAck.ServiceID || unpublishAck.ServiceKey != publishAck.ServiceKey {
-		t.Fatalf(
-			"unexpected unpublish ack identity: got service_id=%s service_key=%s want service_id=%s service_key=%s",
-			unpublishAck.ServiceID,
-			unpublishAck.ServiceKey,
-			publishAck.ServiceID,
-			publishAck.ServiceKey,
-		)
+	if unpublishAck.ErrorCode != ltfperrors.CodeInstanceOwnershipMismatch {
+		t.Fatalf("unexpected error code: got=%s want=%s", unpublishAck.ErrorCode, ltfperrors.CodeInstanceOwnershipMismatch)
 	}
-	unpublishAuditEntry := decodeLastServiceResourceAuditEntry(t, logBuffer.Bytes(), "unpublish", "session-consistency")
-	if gotServiceID, _ := unpublishAuditEntry["service_id"].(string); gotServiceID != publishAck.ServiceID {
-		t.Fatalf("unexpected unpublish audit service_id: got=%v want=%s", unpublishAuditEntry["service_id"], publishAck.ServiceID)
-	}
-	if gotServiceKey, _ := unpublishAuditEntry["service_key"].(string); gotServiceKey != publishAck.ServiceKey {
-		t.Fatalf("unexpected unpublish audit service_key: got=%v want=%s", unpublishAuditEntry["service_key"], publishAck.ServiceKey)
-	}
-	if gotInstanceID, _ := unpublishAuditEntry["service_instance_id"].(string); gotInstanceID != runtimeInstanceID {
-		t.Fatalf("unexpected unpublish audit service_instance_id: got=%v want=%s", unpublishAuditEntry["service_instance_id"], runtimeInstanceID)
-	}
-
-	// runtime 视图应与 unpublish ACK 对齐，删除目标实例后不再保留服务池。
-	if remaining := handler.serviceRegistry.ListInstancesByServiceID(publishAck.ServiceID); len(remaining) != 0 {
-		t.Fatalf("expected runtime instances removed after unpublish, got=%d", len(remaining))
+	if instances := handler.serviceRegistry.ListInstancesByLogicalServiceID("ls-pay"); len(instances) != 2 {
+		t.Fatalf("unexpected instance count after rejected cross unpublish: got=%d want=2", len(instances))
 	}
 }
 
-// TestPublishHandlerRecordsServicePublishMetrics 验证发布路径会记录服务池/实例维度发布指标。
-func TestPublishHandlerRecordsServicePublishMetrics(t *testing.T) {
+// TestPublishHandlerRecordsMetrics 验证发布会刷新服务池/实例计数指标。
+func TestPublishHandlerRecordsMetrics(t *testing.T) {
 	t.Parallel()
 
 	sessionRegistry := registry.NewSessionRegistry()
 	sessionRegistry.Upsert(time.Now().UTC(), registry.SessionRuntime{
 		SessionID:   "session-metric",
 		ConnectorID: "connector-metric",
-		Epoch:       7,
+		Epoch:       4,
 		State:       registry.SessionActive,
 	})
 	metrics := obs.NewMetrics()
 	handler := NewPublishHandler(PublishHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		Metrics:         metrics,
-		Now:             func() time.Time { return time.Unix(1700003000, 0).UTC() },
+		ServiceIDGenerator: func(_ time.Time, _ string) string {
+			return "ls-metric"
+		},
 	})
 
-	publishAck := handler.HandlePublish(pb.ControlEnvelope{
+	ack := handler.HandlePublish(pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
 		MessageType:     pb.ControlMessagePublishService,
 		SessionID:       "session-metric",
-		SessionEpoch:    7,
+		SessionEpoch:    4,
 		ConnectorID:     "connector-metric",
-		EventID:         "evt-metric-publish",
+		EventID:         "evt-metric",
 		ResourceVersion: 1,
-		ResourceID:      "svc-metric",
 	}, pb.PublishService{
-		ServiceID:   "svc-metric",
-		ServiceKey:  "metric-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
+		InstanceID:  "inst-metric",
 		ServiceName: "metric-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
-			{Protocol: "http", Host: "127.0.0.1", Port: 32080},
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
 		},
 	})
-	if !publishAck.Accepted {
-		t.Fatalf("expected publish accepted, got error=%s", publishAck.ErrorCode)
+	if !ack.Accepted {
+		t.Fatalf("expected publish accepted, got error=%s", ack.ErrorCode)
 	}
-	instances := handler.serviceRegistry.ListInstancesByServiceID("svc-metric")
-	if len(instances) != 1 {
-		t.Fatalf("unexpected instance count: got=%d want=1", len(instances))
+	if metrics.BridgeServicePublishTotal("ls-metric") != 1 {
+		t.Fatalf("unexpected service publish total: got=%d want=1", metrics.BridgeServicePublishTotal("ls-metric"))
 	}
-	serviceInstanceID := strings.TrimSpace(instances[0].ServiceInstanceID)
-	if serviceInstanceID == "" {
-		t.Fatalf("expected service_instance_id not empty")
-	}
-	if metrics.BridgeServicePublishTotal("svc-metric") != 1 {
-		t.Fatalf("unexpected service publish total: got=%d want=1", metrics.BridgeServicePublishTotal("svc-metric"))
-	}
-	if metrics.BridgeServiceInstancePublishTotal("svc-metric", serviceInstanceID) != 1 {
+	if metrics.BridgeServiceInstancePublishTotal("ls-metric", "inst-metric") != 1 {
 		t.Fatalf(
 			"unexpected service instance publish total: got=%d want=1",
-			metrics.BridgeServiceInstancePublishTotal("svc-metric", serviceInstanceID),
+			metrics.BridgeServiceInstancePublishTotal("ls-metric", "inst-metric"),
 		)
 	}
-}
-
-// decodeLastServiceResourceAuditEntry 从日志缓冲中提取指定 action/session 的最新 service 资源审计记录。
-func decodeLastServiceResourceAuditEntry(
-	testingObject *testing.T,
-	rawLogs []byte,
-	action string,
-	sessionID string,
-) map[string]any {
-	testingObject.Helper()
-
-	normalizedAction := strings.TrimSpace(action)
-	normalizedSessionID := strings.TrimSpace(sessionID)
-	lines := bytes.Split(bytes.TrimSpace(rawLogs), []byte{'\n'})
-	for index := len(lines) - 1; index >= 0; index-- {
-		line := bytes.TrimSpace(lines[index])
-		if len(line) == 0 {
-			continue
-		}
-		var entry map[string]any
-		if err := json.Unmarshal(line, &entry); err != nil {
-			testingObject.Fatalf("unmarshal service audit log entry failed: %v", err)
-		}
-		message, _ := entry["msg"].(string)
-		logAction, _ := entry["action"].(string)
-		logSessionID, _ := entry["session_id"].(string)
-		if message == "service resource audit" &&
-			logAction == normalizedAction &&
-			logSessionID == normalizedSessionID {
-			return entry
-		}
+	if metrics.BridgeServiceAvailableInstanceTotal("ls-metric") != 0 {
+		t.Fatalf("newly published unknown-health instance should not be routable")
 	}
-	testingObject.Fatalf(
-		"expected service resource audit log entry for action=%s session_id=%s, got=%s",
-		normalizedAction,
-		normalizedSessionID,
-		string(rawLogs),
-	)
-	return nil
 }

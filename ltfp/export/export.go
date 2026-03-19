@@ -14,7 +14,7 @@ import (
 type EligibilityInput struct {
 	Connector           pb.Connector
 	Session             pb.Session
-	Service             pb.Service
+	ServiceInstance     pb.ServiceInstance
 	HasReachableIngress bool
 }
 
@@ -37,9 +37,9 @@ type ReconcilePlan struct {
 	Delete []pb.DiscoveryProjection
 }
 
-// CheckEligibility 校验 service 是否满足 export 准入条件。
+// CheckEligibility 校验 service instance 是否满足 export 准入条件。
 func CheckEligibility(input EligibilityInput) error {
-	service := input.Service
+	instance := input.ServiceInstance
 	connector := input.Connector
 	session := input.Session
 	if isOfflineStatus(connector.Status) {
@@ -48,19 +48,19 @@ func CheckEligibility(input EligibilityInput) error {
 	if strings.TrimSpace(session.SessionID) == "" || session.State != pb.SessionStateActive {
 		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "active session is required")
 	}
-	if strings.TrimSpace(session.ConnectorID) != strings.TrimSpace(service.ConnectorID) {
-		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "session connector does not match service connector")
+	if strings.TrimSpace(session.ConnectorID) != strings.TrimSpace(instance.ConnectorID) {
+		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "session connector does not match service instance connector")
 	}
-	if service.Status != pb.ServiceStatusActive {
-		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "service is not active")
+	if instance.InstanceStatus != pb.ServiceStatusActive {
+		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "service instance is not active")
 	}
-	if service.HealthStatus != pb.HealthStatusHealthy {
-		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "service is not healthy")
+	if instance.HealthStatus != pb.HealthStatusHealthy {
+		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "service instance is not healthy")
 	}
-	if !service.DiscoveryPolicy.Enabled {
+	if !instance.DiscoveryPolicy.Enabled {
 		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "discovery_policy.enabled must be true")
 	}
-	if !service.Exposure.AllowExport {
+	if !instance.Exposure.AllowExport {
 		return ltfperrors.New(ltfperrors.CodeExportNotEligible, "exposure.allow_export must be true")
 	}
 	if !input.HasReachableIngress {
@@ -70,17 +70,16 @@ func CheckEligibility(input EligibilityInput) error {
 }
 
 // BuildEndpoint 基于 ingress mode 生成 export endpoint。
-func BuildEndpoint(service pb.Service, options EndpointBuildOptions) (EndpointBuildResult, error) {
-	switch service.Exposure.IngressMode {
+func BuildEndpoint(instance pb.ServiceInstance, options EndpointBuildOptions) (EndpointBuildResult, error) {
+	switch instance.Exposure.IngressMode {
 	case pb.IngressModeL7Shared:
-		// l7_shared 导出共享域名和端口。
-		host := strings.TrimSpace(service.Exposure.Host)
+		host := strings.TrimSpace(instance.Exposure.Host)
 		if host == "" {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "exposure.host is required for l7_shared")
 		}
-		port := resolvePort(service.Exposure.ListenPort, options.SharedPort)
+		port := resolvePort(instance.Exposure.ListenPort, options.SharedPort)
 		address := fmt.Sprintf("%s:%d", host, port)
-		if matchesUpstreamEndpoint(address, service.Endpoints) {
+		if matchesUpstreamEndpoint(address, instance.Endpoints) {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeExportNotEligible, "l7 export address must not equal upstream endpoint")
 		}
 		return EndpointBuildResult{
@@ -90,18 +89,17 @@ func BuildEndpoint(service pb.Service, options EndpointBuildOptions) (EndpointBu
 			},
 		}, nil
 	case pb.IngressModeTLSSNIShared:
-		// tls_sni_shared 导出 server reachable address，并附带 sni metadata。
 		gatewayHost := strings.TrimSpace(options.GatewayHost)
 		if gatewayHost == "" {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "gatewayHost is required for tls_sni_shared")
 		}
-		port := resolvePort(service.Exposure.ListenPort, options.SharedPort)
-		sni := strings.TrimSpace(service.Exposure.SNIName)
+		port := resolvePort(instance.Exposure.ListenPort, options.SharedPort)
+		sni := strings.TrimSpace(instance.Exposure.SNIName)
 		if sni == "" {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "exposure.sniName is required for tls_sni_shared")
 		}
 		address := fmt.Sprintf("%s:%d", gatewayHost, port)
-		if matchesUpstreamEndpoint(address, service.Endpoints) {
+		if matchesUpstreamEndpoint(address, instance.Endpoints) {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeExportNotEligible, "tls_sni export address must not equal upstream endpoint")
 		}
 		return EndpointBuildResult{
@@ -112,16 +110,15 @@ func BuildEndpoint(service pb.Service, options EndpointBuildOptions) (EndpointBu
 			},
 		}, nil
 	case pb.IngressModeL4DedicatedPort:
-		// l4_dedicated_port 导出 gateway_host:dedicated_port。
 		gatewayHost := strings.TrimSpace(options.GatewayHost)
 		if gatewayHost == "" {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "gatewayHost is required for l4_dedicated_port")
 		}
-		if service.Exposure.ListenPort == 0 {
+		if instance.Exposure.ListenPort == 0 {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "exposure.listenPort is required for l4_dedicated_port")
 		}
-		address := fmt.Sprintf("%s:%d", gatewayHost, service.Exposure.ListenPort)
-		if matchesUpstreamEndpoint(address, service.Endpoints) {
+		address := fmt.Sprintf("%s:%d", gatewayHost, instance.Exposure.ListenPort)
+		if matchesUpstreamEndpoint(address, instance.Endpoints) {
 			return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeExportNotEligible, "l4 export address must not equal upstream endpoint")
 		}
 		return EndpointBuildResult{
@@ -131,33 +128,33 @@ func BuildEndpoint(service pb.Service, options EndpointBuildOptions) (EndpointBu
 			},
 		}, nil
 	default:
-		return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("unsupported ingress mode: %s", service.Exposure.IngressMode))
+		return EndpointBuildResult{}, ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("unsupported ingress mode: %s", instance.Exposure.IngressMode))
 	}
 }
 
-// BuildDesiredProjections 基于 service 配置生成期望投影列表。
-func BuildDesiredProjections(service pb.Service, endpoint EndpointBuildResult) []pb.DiscoveryProjection {
-	providers := slices.Clone(service.DiscoveryPolicy.Providers)
+// BuildDesiredProjections 基于 service instance 配置生成期望投影列表。
+func BuildDesiredProjections(instance pb.ServiceInstance, endpoint EndpointBuildResult) []pb.DiscoveryProjection {
+	providers := slices.Clone(instance.DiscoveryPolicy.Providers)
 	slices.Sort(providers)
 
 	projections := make([]pb.DiscoveryProjection, 0, len(providers))
 	for _, provider := range providers {
 		normalizedProvider := strings.TrimSpace(provider)
 		if normalizedProvider == "" {
-			// provider 为空时直接忽略，避免生成脏 projection。
 			continue
 		}
 		projections = append(projections, pb.DiscoveryProjection{
-			ProjectionID: projectionID(service.ServiceID, normalizedProvider, service.Namespace, service.Environment),
-			ServiceID:    service.ServiceID,
-			Provider:     normalizedProvider,
-			Namespace:    service.DiscoveryPolicy.Namespace,
-			Environment:  service.Environment,
-			ExportedAddr: endpoint.Address,
-			Status:       "ACTIVE",
+			ProjectionID:     projectionID(instance.LogicalServiceID, instance.InstanceID, normalizedProvider, instance.DiscoveryPolicy.Namespace),
+			LogicalServiceID: instance.LogicalServiceID,
+			InstanceID:       instance.InstanceID,
+			Provider:         normalizedProvider,
+			Namespace:        instance.DiscoveryPolicy.Namespace,
+			Environment:      instance.Metadata["scope.environment"],
+			ExportedAddr:     endpoint.Address,
+			Status:           "ACTIVE",
 			Metadata: mergeMetadata(
-				service.DiscoveryPolicy.Metadata,
-				service.DiscoveryPolicy.Tags,
+				instance.DiscoveryPolicy.Metadata,
+				instance.DiscoveryPolicy.Tags,
 				endpoint.Metadata,
 			),
 		})
@@ -184,18 +181,15 @@ func BuildReconcilePlan(current []pb.DiscoveryProjection, desired []pb.Discovery
 	for projectionID, desiredProjection := range desiredMap {
 		currentProjection, exists := currentMap[projectionID]
 		if !exists {
-			// 当前不存在的 projection 需要创建。
 			plan.Create = append(plan.Create, desiredProjection)
 			continue
 		}
 		if !reflect.DeepEqual(currentProjection, desiredProjection) {
-			// 字段有差异时放入更新列表。
 			plan.Update = append(plan.Update, desiredProjection)
 		}
 	}
 	for projectionID, currentProjection := range currentMap {
 		if _, exists := desiredMap[projectionID]; !exists {
-			// 期望中不存在的 projection 需要删除。
 			plan.Delete = append(plan.Delete, currentProjection)
 		}
 	}
@@ -236,12 +230,12 @@ func matchesUpstreamEndpoint(address string, endpoints []pb.ServiceEndpoint) boo
 }
 
 // projectionID 构造 projection 稳定主键。
-func projectionID(serviceID string, provider string, namespace string, environment string) string {
+func projectionID(logicalServiceID string, instanceID string, provider string, namespace string) string {
 	return strings.Join([]string{
-		strings.TrimSpace(serviceID),
+		strings.TrimSpace(logicalServiceID),
+		strings.TrimSpace(instanceID),
 		strings.TrimSpace(provider),
 		strings.TrimSpace(namespace),
-		strings.TrimSpace(environment),
 	}, "|")
 }
 
@@ -250,7 +244,6 @@ func mergeMetadata(maps ...map[string]string) map[string]string {
 	result := make(map[string]string)
 	for _, source := range maps {
 		for key, value := range source {
-			// key 为空时跳过，避免污染导出结果。
 			if strings.TrimSpace(key) == "" {
 				continue
 			}

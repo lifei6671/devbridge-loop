@@ -97,10 +97,8 @@ type runtimeSessionSnapshot struct {
 }
 
 type runtimeServiceAddInput struct {
-	ServiceID              string
-	ServiceKey             string
-	Namespace              string
-	Environment            string
+	InstanceID             string
+	Scope                  pb.Scope
 	ServiceName            string
 	Protocol               string
 	Host                   string
@@ -112,8 +110,8 @@ type runtimeServiceAddInput struct {
 }
 
 type runtimeServiceDeleteInput struct {
-	ServiceID  string
-	ServiceKey string
+	LogicalServiceID string
+	InstanceID       string
 }
 
 // bridgeTunnelOpener 实现数据面 tunnel 建连，按配置选择底层 binding。
@@ -1254,7 +1252,7 @@ func (r *Runtime) handleControlErrorEnvelope(envelope pb.ControlEnvelope) error 
 	return nil
 }
 
-// handlePublishServiceAckEnvelope 消费 PublishServiceAck，并回写 catalog 的稳定 service_id。
+// handlePublishServiceAckEnvelope 消费 PublishServiceAck，并回写 catalog 的稳定服务身份。
 func (r *Runtime) handlePublishServiceAckEnvelope(envelope pb.ControlEnvelope) error {
 	if r == nil || r.serviceCatalog == nil {
 		return nil
@@ -1267,15 +1265,19 @@ func (r *Runtime) handlePublishServiceAckEnvelope(envelope pb.ControlEnvelope) e
 		return fmt.Errorf("unmarshal publish service ack payload failed: %w", err)
 	}
 	if !publishAck.Accepted {
-		// 发布被拒绝时保留本地配置，不做 service_id 回写。
+		// 发布被拒绝时保留本地配置，不做身份回写。
 		return nil
 	}
-	serviceID := strings.TrimSpace(publishAck.ServiceID)
-	serviceKey := strings.TrimSpace(publishAck.ServiceKey)
-	if serviceID == "" || serviceKey == "" {
+	if strings.TrimSpace(publishAck.LogicalServiceID) == "" {
 		return nil
 	}
-	r.serviceCatalog.SetServiceIDByKey(time.Now().UTC(), serviceKey, serviceID)
+	r.serviceCatalog.ApplyPublishIdentity(
+		time.Now().UTC(),
+		publishAck.ServiceName,
+		publishAck.Scope,
+		publishAck.LogicalServiceID,
+		publishAck.InstanceID,
+	)
 	return nil
 }
 
@@ -1413,9 +1415,9 @@ func (r *Runtime) publishCatalogServices(ctx context.Context) error {
 	}
 	for _, record := range records {
 		publishPayload := adapter.ToPublishService(record.Registration)
-		resourceID := strings.TrimSpace(publishPayload.ServiceID)
+		resourceID := strings.TrimSpace(publishPayload.InstanceID)
 		if resourceID == "" {
-			resourceID = strings.TrimSpace(publishPayload.ServiceKey)
+			resourceID = buildRuntimeScopeServiceNameKey(publishPayload.ServiceName, publishPayload.Scope)
 		}
 		envelope, err := r.controlPublisher.Publish(
 			ctx,
@@ -1513,9 +1515,9 @@ func (r *Runtime) publishServiceHealthReport(ctx context.Context, localService a
 		return nil
 	}
 	healthReport := r.healthReporter.BuildServiceReport(ctx, localService)
-	resourceID := strings.TrimSpace(healthReport.ServiceID)
+	resourceID := strings.TrimSpace(healthReport.InstanceID)
 	if resourceID == "" {
-		resourceID = strings.TrimSpace(healthReport.ServiceKey)
+		resourceID = strings.TrimSpace(healthReport.LogicalServiceID)
 	}
 	envelope, err := r.controlPublisher.Publish(
 		ctx,
@@ -1533,8 +1535,8 @@ func (r *Runtime) publishServiceHealthReport(ctx context.Context, localService a
 	// 上报成功后回写本地健康快照，供 UI 与诊断直接读取。
 	r.serviceCatalog.UpdateHealth(
 		time.Now().UTC(),
-		healthReport.ServiceID,
-		healthReport.ServiceKey,
+		healthReport.LogicalServiceID,
+		healthReport.InstanceID,
 		healthReport.ServiceHealthStatus,
 		healthReport.EndpointStatuses,
 	)
@@ -2306,17 +2308,10 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	if input.Port == 0 {
 		return nil, errors.New("port must be greater than 0")
 	}
-	normalizedNamespace := strings.TrimSpace(input.Namespace)
-	normalizedEnvironment := strings.TrimSpace(input.Environment)
+	normalizedNamespace := strings.TrimSpace(input.Scope.Namespace)
+	normalizedEnvironment := strings.TrimSpace(input.Scope.Environment)
 	if normalizedNamespace == "" && normalizedEnvironment == "" && normalizedSNIName == "" {
-		return nil, errors.New("namespace、environment、sni_name 至少填写一个")
-	}
-	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
-	if normalizedServiceKey == "" {
-		normalizedServiceKey = adapter.BuildServiceKey(
-			normalizedServiceName,
-			normalizedProtocol,
-		)
+		return nil, errors.New("scope.namespace、scope.environment、sni_name 至少填写一个")
 	}
 	healthCheckConfig, err := normalizeServiceHealthCheckConfig(
 		normalizedProtocol,
@@ -2329,10 +2324,12 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	}
 
 	record := r.serviceCatalog.Upsert(time.Now().UTC(), adapter.LocalRegistration{
-		ServiceID:   strings.TrimSpace(input.ServiceID),
-		ServiceKey:  normalizedServiceKey,
-		Namespace:   normalizedNamespace,
-		Environment: normalizedEnvironment,
+		LogicalServiceID: "",
+		InstanceID:       strings.TrimSpace(input.InstanceID),
+		Scope: pb.Scope{
+			Namespace:   normalizedNamespace,
+			Environment: normalizedEnvironment,
+		},
 		ServiceName: normalizedServiceName,
 		ServiceType: normalizedProtocol,
 		HealthCheck: healthCheckConfig,
@@ -2346,7 +2343,7 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 			},
 		},
 	})
-	if strings.TrimSpace(record.Registration.ServiceID) == "" {
+	if strings.TrimSpace(record.Registration.InstanceID) == "" {
 		return nil, errors.New("add service failed: empty service identity")
 	}
 	if _, _, active := r.bridgeSessionConnectedMeta(); active {
@@ -2367,11 +2364,10 @@ func (r *Runtime) addOrUpdateService(input runtimeServiceAddInput) (map[string]a
 	}
 	return map[string]any{
 		"accepted":                  true,
-		"service_id":                record.Registration.ServiceID,
+		"logical_service_id":        record.Registration.LogicalServiceID,
+		"instance_id":               record.Registration.InstanceID,
+		"scope":                     record.Registration.Scope,
 		"service_name":              record.Registration.ServiceName,
-		"service_key":               record.Registration.ServiceKey,
-		"namespace":                 record.Registration.Namespace,
-		"environment":               record.Registration.Environment,
 		"protocol":                  normalizedProtocol,
 		"host":                      normalizedHost,
 		"port":                      input.Port,
@@ -2390,57 +2386,47 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 	if r == nil || r.serviceCatalog == nil {
 		return nil, errors.New("service catalog is not initialized")
 	}
-	normalizedServiceID := strings.TrimSpace(input.ServiceID)
-	normalizedServiceKey := strings.TrimSpace(input.ServiceKey)
-	if normalizedServiceID == "" && normalizedServiceKey == "" {
-		return nil, errors.New("service_id or service_key is required")
+	normalizedLogicalServiceID := strings.TrimSpace(input.LogicalServiceID)
+	normalizedInstanceID := strings.TrimSpace(input.InstanceID)
+	if normalizedLogicalServiceID == "" && normalizedInstanceID == "" {
+		return nil, errors.New("logical_service_id or instance_id is required")
 	}
 
 	var targetRegistration adapter.LocalRegistration
 	for _, record := range r.serviceCatalog.List() {
-		recordServiceID := strings.TrimSpace(record.Registration.ServiceID)
-		recordServiceKey := strings.TrimSpace(record.Registration.ServiceKey)
-		if normalizedServiceID != "" {
-			if recordServiceID != normalizedServiceID {
+		recordLogicalServiceID := strings.TrimSpace(record.Registration.LogicalServiceID)
+		recordInstanceID := strings.TrimSpace(record.Registration.InstanceID)
+		if normalizedInstanceID != "" {
+			if recordInstanceID != normalizedInstanceID {
 				continue
 			}
-		} else if recordServiceKey != normalizedServiceKey {
+		} else if recordLogicalServiceID != normalizedLogicalServiceID {
 			continue
 		}
-		normalizedServiceID = recordServiceID
+		normalizedLogicalServiceID = recordLogicalServiceID
+		normalizedInstanceID = recordInstanceID
 		targetRegistration = record.Registration
 		break
 	}
-	if normalizedServiceID == "" {
+	if normalizedLogicalServiceID == "" && normalizedInstanceID == "" {
 		return map[string]any{
-			"accepted":      true,
-			"deleted":       false,
-			"service_id":    strings.TrimSpace(input.ServiceID),
-			"service_key":   normalizedServiceKey,
-			"updated_at_ms": runtimeNowMillis(),
-			"source":        "agent.runtime",
+			"accepted":           true,
+			"deleted":            false,
+			"logical_service_id": strings.TrimSpace(input.LogicalServiceID),
+			"instance_id":        strings.TrimSpace(input.InstanceID),
+			"updated_at_ms":      runtimeNowMillis(),
+			"source":             "agent.runtime",
 		}, nil
 	}
 
-	deleted := r.serviceCatalog.RemoveByServiceID(normalizedServiceID)
-	if deleted {
-		normalizedServiceKey = strings.TrimSpace(targetRegistration.ServiceKey)
-		if normalizedServiceKey == "" {
-			normalizedServiceKey = adapter.BuildServiceKey(
-				targetRegistration.ServiceName,
-				adapter.ResolveServiceProtocol(targetRegistration.ServiceType, targetRegistration.Endpoints),
-			)
-		}
-	}
-
+	deleted := r.serviceCatalog.RemoveByInstanceID(normalizedInstanceID)
 	if deleted {
 		if _, _, active := r.bridgeSessionConnectedMeta(); active && r.controlPublisher != nil {
 			if routeID := buildAutoRouteID(targetRegistration); routeID != "" {
 				routeRevokePayload := pb.RouteRevoke{
-					RouteID:     routeID,
-					Namespace:   strings.TrimSpace(targetRegistration.Namespace),
-					Environment: strings.TrimSpace(targetRegistration.Environment),
-					Reason:      "service_removed",
+					RouteID: routeID,
+					Scope:   targetRegistration.Scope,
+					Reason:  "service_removed",
 				}
 				envelope, err := r.controlPublisher.Publish(
 					context.Background(),
@@ -2470,9 +2456,9 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 				targetRegistration,
 				"service removed by agent localrpc",
 			)
-			resourceID := strings.TrimSpace(unpublishPayload.ServiceID)
+			resourceID := strings.TrimSpace(unpublishPayload.InstanceID)
 			if resourceID == "" {
-				resourceID = strings.TrimSpace(unpublishPayload.ServiceKey)
+				resourceID = strings.TrimSpace(unpublishPayload.LogicalServiceID)
 			}
 			envelope, err := r.controlPublisher.Publish(
 				context.Background(),
@@ -2500,26 +2486,16 @@ func (r *Runtime) removeService(input runtimeServiceDeleteInput) (map[string]any
 	}
 
 	return map[string]any{
-		"accepted":      true,
-		"deleted":       deleted,
-		"service_id":    normalizedServiceID,
-		"service_key":   normalizedServiceKey,
-		"updated_at_ms": runtimeNowMillis(),
-		"source":        "agent.runtime",
+		"accepted":           true,
+		"deleted":            deleted,
+		"logical_service_id": normalizedLogicalServiceID,
+		"instance_id":        normalizedInstanceID,
+		"updated_at_ms":      runtimeNowMillis(),
+		"source":             "agent.runtime",
 	}, nil
 }
 
 func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.RouteAssign, bool) {
-	serviceKey := strings.TrimSpace(registration.ServiceKey)
-	if serviceKey == "" {
-		serviceKey = adapter.BuildServiceKey(
-			registration.ServiceName,
-			adapter.ResolveServiceProtocol(registration.ServiceType, registration.Endpoints),
-		)
-	}
-	if strings.TrimSpace(serviceKey) == "" {
-		return pb.RouteAssign{}, false
-	}
 	normalizedProtocol := normalizeAutoRouteProtocol(registration.ServiceType)
 	if normalizedProtocol == "" {
 		return pb.RouteAssign{}, false
@@ -2528,16 +2504,13 @@ func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.Rou
 	if routeID == "" {
 		return pb.RouteAssign{}, false
 	}
-	namespace := strings.TrimSpace(registration.Namespace)
-	environment := strings.TrimSpace(registration.Environment)
 	pathPrefix := strings.TrimSpace(registration.Exposure.PathPrefix)
 	if pathPrefix == "" {
 		pathPrefix = "/"
 	}
 	return pb.RouteAssign{
-		RouteID:     routeID,
-		Namespace:   namespace,
-		Environment: environment,
+		RouteID: routeID,
+		Scope:   registration.Scope,
 		Match: pb.RouteMatch{
 			Protocol:   normalizedProtocol,
 			Host:       resolveAutoRouteHost(registration),
@@ -2546,14 +2519,19 @@ func buildAutoRouteAssignPayload(registration adapter.LocalRegistration) (pb.Rou
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: serviceKey,
+				Selector: pb.ServiceSelector{
+					LogicalServiceID: strings.TrimSpace(registration.LogicalServiceID),
+					ServiceName:      strings.TrimSpace(registration.ServiceName),
+					Scope:            registration.Scope,
+				},
 			},
 		},
 		Priority: 100,
 		Metadata: map[string]string{
-			"source":       "agent.auto_route",
-			"service_key":  serviceKey,
-			"ingress_mode": string(pb.IngressModeL7Shared),
+			"source":             "agent.auto_route",
+			"logical_service_id": strings.TrimSpace(registration.LogicalServiceID),
+			"service_name":       strings.TrimSpace(registration.ServiceName),
+			"ingress_mode":       string(pb.IngressModeL7Shared),
 		},
 	}, true
 }
@@ -2586,15 +2564,12 @@ func resolveAutoRouteHost(registration adapter.LocalRegistration) string {
 }
 
 func buildAutoRouteID(registration adapter.LocalRegistration) string {
-	resourceID := strings.TrimSpace(registration.ServiceID)
+	resourceID := strings.TrimSpace(registration.LogicalServiceID)
 	if resourceID == "" {
-		resourceID = strings.TrimSpace(registration.ServiceKey)
+		resourceID = strings.TrimSpace(registration.InstanceID)
 	}
 	if resourceID == "" {
-		resourceID = adapter.BuildServiceKey(
-			registration.ServiceName,
-			adapter.ResolveServiceProtocol(registration.ServiceType, registration.Endpoints),
-		)
+		resourceID = buildRuntimeScopeServiceNameKey(registration.ServiceName, registration.Scope)
 	}
 	normalizedResourceID := strings.TrimSpace(resourceID)
 	if normalizedResourceID == "" {
@@ -2608,6 +2583,16 @@ func buildAutoRouteID(registration adapter.LocalRegistration) string {
 		" ", "-",
 	).Replace(normalizedResourceID)
 	return fmt.Sprintf("%s-%s", bridgeAutoRouteIDPrefix, sanitizedResourceID)
+}
+
+func buildRuntimeScopeServiceNameKey(serviceName string, scope pb.Scope) string {
+	normalizedServiceName := strings.TrimSpace(serviceName)
+	normalizedNamespace := strings.TrimSpace(scope.Namespace)
+	normalizedEnvironment := strings.TrimSpace(scope.Environment)
+	if normalizedServiceName == "" || normalizedNamespace == "" || normalizedEnvironment == "" {
+		return ""
+	}
+	return normalizedNamespace + "|" + normalizedEnvironment + "|" + normalizedServiceName
 }
 
 // 组装 service.list 返回体。
@@ -2643,10 +2628,9 @@ func (r *Runtime) serviceListPayload() map[string]any {
 			})
 		}
 		items = append(items, map[string]any{
-			"service_id":                record.Registration.ServiceID,
-			"service_key":               record.Registration.ServiceKey,
-			"namespace":                 record.Registration.Namespace,
-			"environment":               record.Registration.Environment,
+			"logical_service_id":        record.Registration.LogicalServiceID,
+			"instance_id":               record.Registration.InstanceID,
+			"scope":                     record.Registration.Scope,
 			"service_name":              record.Registration.ServiceName,
 			"service_type":              record.Registration.ServiceType,
 			"protocol":                  record.Registration.ServiceType,
@@ -2698,7 +2682,8 @@ func (r *Runtime) tunnelListPayload() map[string]any {
 		items = append(items, map[string]any{
 			"tunnel_id":                 record.TunnelID,
 			"traffic_id":                association.TrafficID,
-			"service_id":                association.ServiceID,
+			"logical_service_id":        association.LogicalServiceID,
+			"instance_id":               association.InstanceID,
 			"state":                     string(record.State),
 			"protocol":                  connectionProtocol,
 			"local_addr":                association.LocalAddr,

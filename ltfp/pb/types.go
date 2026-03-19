@@ -2,6 +2,12 @@ package pb
 
 import "encoding/json"
 
+// Scope 描述服务或路由所属的独立作用域。
+type Scope struct {
+	Namespace   string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	Environment string `json:"environment,omitempty" yaml:"environment,omitempty"`
+}
+
 // ControlEnvelope 描述控制通道上的统一消息封装。
 type ControlEnvelope struct {
 	VersionMajor    uint32             `json:"versionMajor"`
@@ -21,8 +27,8 @@ type ControlEnvelope struct {
 // ConnectorHello 描述连接器发起握手时上报的信息。
 type ConnectorHello struct {
 	ConnectorID       string            `json:"connectorId"`
-	Namespace         string            `json:"namespace"`
-	Environment       string            `json:"environment"`
+	Namespace         string            `json:"namespace,omitempty"`
+	Environment       string            `json:"environment,omitempty"`
 	NodeName          string            `json:"nodeName"`
 	Version           string            `json:"version"`
 	SupportedBindings []string          `json:"supportedBindings,omitempty"`
@@ -48,14 +54,10 @@ type ConnectorWelcome struct {
 
 // ConnectorAuth 描述连接器认证请求。
 type ConnectorAuth struct {
-	// AuthMethod 固定为 token，表示采用 Bearer Token 认证。
-	AuthMethod string `json:"authMethod"`
-	// Token 承载认证凭证明文，由 Agent 在握手阶段发送。
-	Token string `json:"token,omitempty"`
-	// ClientCapVersion 表示客户端能力版本，用于服务端做能力分支判断。
-	ClientCapVersion string `json:"clientCapVersion,omitempty"`
-	// Metadata 仅承载非核心扩展字段，不参与认证主判断。
-	Metadata map[string]string `json:"metadata,omitempty"`
+	AuthMethod       string            `json:"authMethod"`
+	Token            string            `json:"token,omitempty"`
+	ClientCapVersion string            `json:"clientCapVersion,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
 // ConnectorAuthAck 描述认证结果。
@@ -122,54 +124,97 @@ type DiscoveryPolicy struct {
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
+// ServiceSelector 描述 Route 引用逻辑服务的方式。
+type ServiceSelector struct {
+	LogicalServiceID string            `json:"logicalServiceId,omitempty"`
+	ServiceName      string            `json:"serviceName,omitempty"`
+	Scope            Scope             `json:"scope,omitempty"`
+	MatchLabels      map[string]string `json:"matchLabels,omitempty"`
+	InstanceLabels   map[string]string `json:"instanceLabels,omitempty"`
+}
+
+// HeaderMatcher 描述 Header 级匹配条件。
+type HeaderMatcher struct {
+	Name    string `json:"name"`
+	Exact   string `json:"exact,omitempty"`
+	Prefix  string `json:"prefix,omitempty"`
+	Regex   string `json:"regex,omitempty"`
+	Present *bool  `json:"present,omitempty"`
+}
+
+// QueryMatcher 描述 Query 参数级匹配条件。
+type QueryMatcher struct {
+	Name    string `json:"name"`
+	Exact   string `json:"exact,omitempty"`
+	Prefix  string `json:"prefix,omitempty"`
+	Regex   string `json:"regex,omitempty"`
+	Present *bool  `json:"present,omitempty"`
+}
+
+// ScopeFallbackPolicy 描述按 namespace 生效的作用域降级策略。
+type ScopeFallbackPolicy struct {
+	PolicyID  string                 `json:"policyId" yaml:"policy_id"`
+	Namespace string                 `json:"namespace" yaml:"namespace"`
+	Enabled   bool                   `json:"enabled" yaml:"enabled"`
+	Chain     []FallbackStep         `json:"chain,omitempty" yaml:"chain,omitempty"`
+	External  ExternalFallbackConfig `json:"external,omitempty" yaml:"external,omitempty"`
+}
+
+// FallbackStep 描述单个降级目标 scope。
+type FallbackStep struct {
+	TargetScope Scope `json:"targetScope" yaml:"target_scope"`
+}
+
+// ExternalFallbackConfig 描述是否允许本地降级链 miss 后查询外部发现系统。
+type ExternalFallbackConfig struct {
+	Enabled bool `json:"enabled" yaml:"enabled"`
+}
+
 // PublishService 描述服务发布请求。
 type PublishService struct {
-	// serviceId 在首次发布时允许为空；若 service_key 已存在，服务端必须复用既有 service_id。
-	ServiceID       string            `json:"serviceId,omitempty"`
-	ServiceKey      string            `json:"serviceKey"`
-	Namespace       string            `json:"namespace"`
-	Environment     string            `json:"environment"`
+	InstanceID      string            `json:"instanceId,omitempty"`
 	ServiceName     string            `json:"serviceName"`
+	Scope           Scope             `json:"scope"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 	ServiceType     string            `json:"serviceType,omitempty"`
 	Endpoints       []ServiceEndpoint `json:"endpoints"`
 	Exposure        ServiceExposure   `json:"exposure"`
 	HealthCheck     HealthCheckConfig `json:"healthCheck,omitempty"`
 	DiscoveryPolicy DiscoveryPolicy   `json:"discoveryPolicy,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
 // PublishServiceAck 描述发布服务响应。
 type PublishServiceAck struct {
-	Accepted                bool              `json:"accepted"`
-	ServiceID               string            `json:"serviceId,omitempty"`
-	ServiceKey              string            `json:"serviceKey,omitempty"`
-	AcceptedResourceVersion uint64            `json:"acceptedResourceVersion,omitempty"`
-	CurrentResourceVersion  uint64            `json:"currentResourceVersion,omitempty"`
-	ErrorCode               string            `json:"errorCode,omitempty"`
-	ErrorMessage            string            `json:"errorMessage,omitempty"`
-	Metadata                map[string]string `json:"metadata,omitempty"`
+	Accepted                bool   `json:"accepted"`
+	LogicalServiceID        string `json:"logicalServiceId,omitempty"`
+	InstanceID              string `json:"instanceId,omitempty"`
+	ServiceName             string `json:"serviceName,omitempty"`
+	Scope                   Scope  `json:"scope,omitempty"`
+	AcceptedResourceVersion uint64 `json:"acceptedResourceVersion,omitempty"`
+	CurrentResourceVersion  uint64 `json:"currentResourceVersion,omitempty"`
+	ErrorCode               string `json:"errorCode,omitempty"`
+	ErrorMessage            string `json:"errorMessage,omitempty"`
 }
 
 // UnpublishService 描述服务下线请求。
 type UnpublishService struct {
-	ServiceID   string `json:"serviceId,omitempty"`
-	ServiceKey  string `json:"serviceKey,omitempty"`
-	Namespace   string `json:"namespace,omitempty"`
-	Environment string `json:"environment,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	InstanceID       string `json:"instanceId,omitempty"`
+	LogicalServiceID string `json:"logicalServiceId,omitempty"`
+	ServiceName      string `json:"serviceName,omitempty"`
+	Scope            Scope  `json:"scope,omitempty"`
+	Reason           string `json:"reason,omitempty"`
 }
 
 // UnpublishServiceAck 描述服务下线响应。
 type UnpublishServiceAck struct {
-	Accepted                bool              `json:"accepted"`
-	ServiceID               string            `json:"serviceId,omitempty"`
-	ServiceKey              string            `json:"serviceKey,omitempty"`
-	AcceptedResourceVersion uint64            `json:"acceptedResourceVersion,omitempty"`
-	CurrentResourceVersion  uint64            `json:"currentResourceVersion,omitempty"`
-	ErrorCode               string            `json:"errorCode,omitempty"`
-	ErrorMessage            string            `json:"errorMessage,omitempty"`
-	Metadata                map[string]string `json:"metadata,omitempty"`
+	Accepted                bool   `json:"accepted"`
+	LogicalServiceID        string `json:"logicalServiceId,omitempty"`
+	InstanceID              string `json:"instanceId,omitempty"`
+	AcceptedResourceVersion uint64 `json:"acceptedResourceVersion,omitempty"`
+	CurrentResourceVersion  uint64 `json:"currentResourceVersion,omitempty"`
+	ErrorCode               string `json:"errorCode,omitempty"`
+	ErrorMessage            string `json:"errorMessage,omitempty"`
 }
 
 // EndpointHealthStatus 描述 endpoint 级健康状态。
@@ -181,8 +226,8 @@ type EndpointHealthStatus struct {
 
 // ServiceHealthReport 描述服务健康上报。
 type ServiceHealthReport struct {
-	ServiceID           string                 `json:"serviceId,omitempty"`
-	ServiceKey          string                 `json:"serviceKey,omitempty"`
+	InstanceID          string                 `json:"instanceId"`
+	LogicalServiceID    string                 `json:"logicalServiceId,omitempty"`
 	ServiceHealthStatus HealthStatus           `json:"serviceHealthStatus"`
 	EndpointStatuses    []EndpointHealthStatus `json:"endpointStatuses,omitempty"`
 	CheckTimeUnix       int64                  `json:"checkTimeUnix"`
@@ -192,60 +237,41 @@ type ServiceHealthReport struct {
 
 // TunnelPoolReport 描述 Agent 向 Bridge 上报 tunnel 池状态的控制面消息。
 type TunnelPoolReport struct {
-	// SessionID 标识当前池状态归属的会话。
-	SessionID string `json:"sessionId,omitempty"`
-	// SessionEpoch 用于防止旧会话状态覆盖新会话。
-	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
-	// IdleCount 表示当前 idle tunnel 数量。
-	IdleCount int `json:"idleCount"`
-	// InUseCount 表示当前已被消费中的 tunnel 数量。
-	InUseCount int `json:"inUseCount"`
-	// TargetIdleCount 表示 Agent 期望维持的 idle 目标值。
-	TargetIdleCount int `json:"targetIdleCount"`
-	// Trigger 标识本次上报触发来源（事件或周期纠偏）。
-	Trigger string `json:"trigger,omitempty"`
-	// TimestampUnix 为上报发生时刻（Unix 秒）。
-	TimestampUnix int64 `json:"timestampUnix"`
-	// Metadata 承载扩展诊断字段。
-	Metadata map[string]string `json:"metadata,omitempty"`
+	SessionID       string            `json:"sessionId,omitempty"`
+	SessionEpoch    uint64            `json:"sessionEpoch,omitempty"`
+	IdleCount       int               `json:"idleCount"`
+	InUseCount      int               `json:"inUseCount"`
+	TargetIdleCount int               `json:"targetIdleCount"`
+	Trigger         string            `json:"trigger,omitempty"`
+	TimestampUnix   int64             `json:"timestampUnix"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
 // TunnelDialAnnounce 描述 Agent 成功建立 tunnel 后向 Bridge 宣告 tunnel_id 的控制面消息。
 type TunnelDialAnnounce struct {
-	// SessionID 标识宣告归属的会话。
-	SessionID string `json:"sessionId,omitempty"`
-	// SessionEpoch 用于和 Bridge 当前会话代际做匹配。
-	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
-	// TunnelID 为 Agent 侧 tunnel 唯一标识。
-	TunnelID string `json:"tunnelId,omitempty"`
-	// DialLocalAddr 为 Agent 侧该 tunnel TCP 连接本地地址（ip:port），用于 Bridge 入站精准匹配。
+	SessionID     string `json:"sessionId,omitempty"`
+	SessionEpoch  uint64 `json:"sessionEpoch,omitempty"`
+	TunnelID      string `json:"tunnelId,omitempty"`
 	DialLocalAddr string `json:"dialLocalAddr,omitempty"`
-	// TimestampUnix 为宣告发送时刻（Unix 秒）。
-	TimestampUnix int64 `json:"timestampUnix"`
+	TimestampUnix int64  `json:"timestampUnix"`
 }
 
 // TunnelRefillRequest 描述 Bridge 请求 Agent 扩容 tunnel 池的控制面消息。
 type TunnelRefillRequest struct {
-	// SessionID 标识补池请求归属的会话。
-	SessionID string `json:"sessionId,omitempty"`
-	// SessionEpoch 用于和 Agent 当前会话做代际匹配。
-	SessionEpoch uint64 `json:"sessionEpoch,omitempty"`
-	// RequestID 是补池请求幂等键。
-	RequestID string `json:"requestId"`
-	// RequestedIdleDelta 表示希望补齐的 idle 增量。
-	RequestedIdleDelta int `json:"requestedIdleDelta"`
-	// Reason 标识触发补池的原因。
-	Reason string `json:"reason,omitempty"`
-	// TimestampUnix 为请求创建时刻（Unix 秒）。
-	TimestampUnix int64 `json:"timestampUnix"`
-	// Metadata 承载扩展诊断字段。
-	Metadata map[string]string `json:"metadata,omitempty"`
+	SessionID          string            `json:"sessionId,omitempty"`
+	SessionEpoch       uint64            `json:"sessionEpoch,omitempty"`
+	RequestID          string            `json:"requestId"`
+	RequestedIdleDelta int               `json:"requestedIdleDelta"`
+	Reason             string            `json:"reason,omitempty"`
+	TimestampUnix      int64             `json:"timestampUnix"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
 }
 
 // ConnectorServiceTarget 描述 connector service 目标。
 type ConnectorServiceTarget struct {
-	ServiceKey string            `json:"serviceKey"`
-	Selector   map[string]string `json:"selector,omitempty"`
+	Selector          ServiceSelector   `json:"selector"`
+	InstanceSelector  map[string]string `json:"instanceSelector,omitempty"`
+	LoadBalancePolicy string            `json:"loadBalancePolicy,omitempty"`
 }
 
 // ExternalServiceTarget 描述 external service 目标。
@@ -260,42 +286,34 @@ type ExternalServiceTarget struct {
 	StaleIfErrorSec uint32            `json:"staleIfErrorSec,omitempty"`
 }
 
-// HybridGroupTarget 描述 hybrid 目标。
-type HybridGroupTarget struct {
-	PrimaryConnectorService ConnectorServiceTarget `json:"primaryConnectorService"`
-	FallbackExternalService ExternalServiceTarget  `json:"fallbackExternalService"`
-	FallbackPolicy          FallbackPolicy         `json:"fallbackPolicy"`
-}
-
 // RouteTarget 描述 route 指向的目标。
 type RouteTarget struct {
 	Type             RouteTargetType         `json:"type"`
 	ConnectorService *ConnectorServiceTarget `json:"connectorService,omitempty"`
 	ExternalService  *ExternalServiceTarget  `json:"externalService,omitempty"`
-	HybridGroup      *HybridGroupTarget      `json:"hybridGroup,omitempty"`
 }
 
 // RouteMatch 描述路由匹配条件。
 type RouteMatch struct {
-	Protocol      string            `json:"protocol,omitempty"`
-	Host          string            `json:"host,omitempty"`
-	Authority     string            `json:"authority,omitempty"`
-	ListenPort    uint32            `json:"listenPort,omitempty"`
-	PathPrefix    string            `json:"pathPrefix,omitempty"`
-	SNI           string            `json:"sni,omitempty"`
-	HeaderMatches map[string]string `json:"headerMatches,omitempty"`
+	Protocol   string          `json:"protocol,omitempty"`
+	Host       string          `json:"host,omitempty"`
+	Authority  string          `json:"authority,omitempty"`
+	ListenPort uint32          `json:"listenPort,omitempty"`
+	PathPrefix string          `json:"pathPrefix,omitempty"`
+	SNI        string          `json:"sni,omitempty"`
+	Headers    []HeaderMatcher `json:"headers,omitempty"`
+	Queries    []QueryMatcher  `json:"queries,omitempty"`
 }
 
 // RouteAssign 描述可选扩展 route 下发消息。
 type RouteAssign struct {
-	RouteID     string            `json:"routeId"`
-	Namespace   string            `json:"namespace"`
-	Environment string            `json:"environment"`
-	Match       RouteMatch        `json:"match"`
-	Target      RouteTarget       `json:"target"`
-	Priority    uint32            `json:"priority,omitempty"`
-	PolicyJSON  string            `json:"policyJson,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	RouteID    string            `json:"routeId"`
+	Scope      Scope             `json:"scope,omitempty"`
+	Match      RouteMatch        `json:"match"`
+	Target     RouteTarget       `json:"target"`
+	Priority   uint32            `json:"priority,omitempty"`
+	PolicyJSON string            `json:"policyJson,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 // RouteAssignAck 描述 route 下发 ACK。
@@ -306,15 +324,15 @@ type RouteAssignAck struct {
 	CurrentResourceVersion  uint64            `json:"currentResourceVersion,omitempty"`
 	ErrorCode               string            `json:"errorCode,omitempty"`
 	ErrorMessage            string            `json:"errorMessage,omitempty"`
+	Warnings                []string          `json:"warnings,omitempty"`
 	Metadata                map[string]string `json:"metadata,omitempty"`
 }
 
 // RouteRevoke 描述 route 撤销消息。
 type RouteRevoke struct {
-	RouteID     string `json:"routeId"`
-	Namespace   string `json:"namespace"`
-	Environment string `json:"environment"`
-	Reason      string `json:"reason,omitempty"`
+	RouteID string `json:"routeId"`
+	Scope   Scope  `json:"scope,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // RouteRevokeAck 描述 route 撤销 ACK。
@@ -348,7 +366,8 @@ type ControlError struct {
 type TrafficOpen struct {
 	TrafficID             string            `json:"trafficId"`
 	RouteID               string            `json:"routeId,omitempty"`
-	ServiceID             string            `json:"serviceId"`
+	LogicalServiceID      string            `json:"logicalServiceId"`
+	InstanceID            string            `json:"instanceId"`
 	SourceAddr            string            `json:"sourceAddr,omitempty"`
 	ProtocolHint          string            `json:"protocolHint,omitempty"`
 	TraceID               string            `json:"traceId,omitempty"`
@@ -421,35 +440,27 @@ type StreamPayload struct {
 // ActivePayloadCount 统计数据面 oneof 实际被设置的字段数量。
 func (payload StreamPayload) ActivePayloadCount() int {
 	count := 0
-	// oneof 语义要求只有一个字段生效，这里用于校验前快速计数。
 	if payload.OpenReq != nil {
 		count++
 	}
-	// OpenAck 表示 pre-open 结果。
 	if payload.OpenAck != nil {
 		count++
 	}
-	// Data 字段允许二进制内容，因此以长度判断是否存在。
 	if len(payload.Data) > 0 {
 		count++
 	}
-	// Close 字段表示正常结束。
 	if payload.Close != nil {
 		count++
 	}
-	// CloseAck 字段表示对 close 的确认。
 	if payload.CloseAck != nil {
 		count++
 	}
-	// Reset 字段表示异常结束。
 	if payload.Reset != nil {
 		count++
 	}
-	// Recycle 字段表示服务端请求回收 tunnel。
 	if payload.Recycle != nil {
 		count++
 	}
-	// RecycleAck 字段表示 Agent 回收确认。
 	if payload.RecycleAck != nil {
 		count++
 	}

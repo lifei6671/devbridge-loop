@@ -272,8 +272,8 @@ func runParityClientScenario(
 	}
 	protocol := runtime.NewLengthPrefixedTrafficProtocol()
 	trafficMeta := runtime.TrafficMeta{
-		TrafficID: "parity-traffic-id",
-		ServiceID: "svc-parity",
+		TrafficID:        "parity-traffic-id",
+		LogicalServiceID: "ls-parity",
 	}
 	if err := protocol.WriteFrame(tunnel, runtime.TrafficFrame{
 		Type: runtime.TrafficFrameOpen,

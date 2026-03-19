@@ -1,6 +1,6 @@
 # DevBridge 多 Agent 服务模型重构任务清单
 
-**文档状态**：Draft for Execution  
+**文档状态**：Completed  
 **基线文档**：`docs/DevBridge-MultiAgent-ServiceModel-TechDesign.md`（v1.5）  
 **编制日期**：2026-03-19
 
@@ -11,6 +11,7 @@
 - 以 `DevBridge-MultiAgent-ServiceModel-TechDesign.md` 为唯一协议与实现基线。
 - 本次是**彻底重构**，不做 `service_key` 兼容路径，不做双栈。
 - Bridge 与 Agent 控制面、路由层、数据面、观测面一次性收敛到新语义。
+- 代码必须符合Golang官方代码规范，必须增加函数级别和行内级别中文注释。
 
 ### 1.1 开工冻结决策（与 TechDesign 第12章一致）
 
@@ -22,26 +23,30 @@
 - ScopeFallbackPolicy：本版为“本级 miss 即降级”，不引入条件触发器。
 - 范围边界：`match_labels`、高级 `sticky_by`、host 模板扩展均在 P2，不阻塞 P0/P1 开工。
 
-## 2. 当前代码现状（项目实际情况）
+## 2. 当前交付状态（2026-03-19）
 
-当前实现仍以旧模型为主，关键差距如下：
+当前清单对应改造已完成，交付状态如下：
 
-- 协议与类型：`ltfp/proto/devbridge/loop/v2/ltfp.proto`、`ltfp/pb/types.go` 仍是 `service_id/service_key/hybrid_group` 语义。
-- 校验与适配：`ltfp/validate/validator.go`、`ltfp/adapter/local_service_adapter.go` 仍强绑定 `service_key`。
-- Bridge 服务注册：`cloud-bridge/runtime/bridge/registry/service_registry.go` 仍以 `byServiceID + byServiceKey` 为中心，未落地 `LogicalService + ServiceInstance(instance_id)`。
-- Bridge 发布与路由：
-  - `cloud-bridge/runtime/bridge/control/publish_handler.go` 仍按 `service_key -> service_id` 复用。
-  - `cloud-bridge/runtime/bridge/routing/resolver.go` 仍按 `connector_service.service_key` 解析，并保留 `hybrid_group`。
-  - `cloud-bridge/runtime/bridge/routing/matcher.go` 仅支持 `header_matches(map[string]string)` 精确匹配，不支持 `queries`、`prefix/regex/present`。
-- 数据面：`TrafficOpen` 仍以 `service_id` 为主，`instance_id` 未进入权威字段。
-- Agent：`agent-core/runtime/agent/app/runtime_bridge.go`、`agent-core/runtime/agent/control/health_reporter.go` 仍围绕 `service_id/service_key`。
-- 管理面与观测：`adminview/snapshot.go`、`web/src/App.tsx` 仍展示 `service_key` 与 `hybrid_fallback_total`。
+- 协议与类型：`ltfp` 已切换到 `logical_service_id`、`instance_id`、`Scope`、`ServiceSelector`、`RouteMatch.headers/queries` 新模型。
+- 校验与错误码：旧 `service_key/service_id/namespace/environment` 主路径请求会被显式拒绝，新增实例归属与 session_epoch 相关错误码已接通。
+- Bridge 控制面与注册表：已完成 `LogicalService + ServiceInstance` 两层注册表、Publish/Unpublish/Health 新语义切换。
+- 路由与数据面：已完成 scope 降级链、external fallback gating、Header/Query matcher、regex cache、Admission 冲突检测、shadow warning、`TrafficOpen(logical_service_id + instance_id)` 全链路切换。
+- Agent：已完成 `instance_id` 持久化复用、TrafficOpen 实例归属校验、自动路由切换到 `ServiceSelector`。
+- 管理面与观测：已完成 `logical_service_id/instance_id/scope` 展示、`scope_fallback_total`/`bridge_host_derive_total`/`bridge_instance_selector_pick_total`/`bridge_route_conflict_rejection_total` 指标接通。
+- 运行验证：`cloud-bridge`、`agent-core`、`ltfp` 已完成 `go test ./... -timeout 60s`，`cloud-bridge/web` 已完成 `npm run build`。
 
 ## 3. 优先级定义
 
 - `P0`：阻塞新协议上线的核心路径，必须先完成。
 - `P1`：保证可运维、可观测、可配置的关键配套。
 - `P2`：增强项，非首批上线阻塞。
+
+### 3.1 2026-03-19 修复补丁（控制面与入口严格化）
+
+- 控制面实例归属：`UnpublishService(instance_id)` 仅允许删除当前 `connector/session` 归属实例；跨 connector/session 请求返回 `INSTANCE_OWNERSHIP_MISMATCH`。
+- 入口 scope header：不再接受历史 header（`X-DevBridge-*`/`X-Namespace`/`X-Env`），检测到即返回 `UNSUPPORTED_LEGACY_PROTOCOL`，仅允许 `X-Bridge-Namespace` 与 `X-Bridge-Environment`。
+- RouteAssign 目标类型：`route.target.type` 改为强约束，必须显式为 `connector_service` 或 `external_service`，缺失或非法值直接拒绝（`UNSUPPORTED_VALUE`）。
+- 验证记录：`cloud-bridge/runtime/bridge/...` 已完成 `go test -timeout 120s ./runtime/bridge/...` 全绿。
 
 ---
 
@@ -89,6 +94,8 @@
 - 可观测门槛：新指标与新日志字段齐全，可定位 `logical_service_id + instance_id + scope`。
 - 稳定性门槛：`go test ./...` 在 `cloud-bridge`、`agent-core`、`ltfp` 全绿。
 
+**当前验收结论**：以上 Release Gate 已全部满足，本清单对应重构任务完成。
+
 ---
 
 ## 7. 执行任务清单（开发按单推进）
@@ -110,12 +117,12 @@
 
 ### 7.1 每阶段执行 Checklist（可直接勾选）
 
-- [ ] C01 已确认本次为彻底重构，不引入任何 `service_key` 兼容逻辑。
-- [ ] C02 当前阶段代码改动仅覆盖本阶段任务，不混入下一阶段能力。
-- [ ] C03 当前阶段单测已补齐并通过（至少覆盖新增规则与拒绝路径）。
-- [ ] C04 当前阶段关键日志与指标字段已同步更新。
-- [ ] C05 当前阶段文档（字段、流程图、错误码）已同步。
-- [ ] C06 阶段出口验收完成并记录结果后，再进入下一阶段。
+- [x] C01 已确认本次为彻底重构，不引入任何 `service_key` 兼容逻辑。
+- [x] C02 当前阶段代码改动仅覆盖本阶段任务，不混入下一阶段能力。
+- [x] C03 当前阶段单测已补齐并通过（至少覆盖新增规则与拒绝路径）。
+- [x] C04 当前阶段关键日志与指标字段已同步更新。
+- [x] C05 当前阶段文档（字段、流程图、错误码）已同步。
+- [x] C06 阶段出口验收完成并记录结果后，再进入下一阶段。
 
 ### 7.2 每日推进要求（执行纪律）
 
@@ -127,7 +134,11 @@
 
 | 日期 | 执行阶段 | 状态（NotStarted/InProgress/Done/Blocked） | 完成项 | 阻塞项 | 下一步 |
 |---|---|---|---|---|---|
-| YYYY-MM-DD | EXX | InProgress | - | - | - |
+| 2026-03-19 | E04 | Done | 已补齐 `RouteMatch.queries`、regex cache、Admission 冲突检测与 shadow warning；`bridge_route_conflict_rejection_total` 指标已接通；路由冲突可返回 `conflict_route_id` | 无 | 继续完成剩余阶段并收口 Release Gate |
+| 2026-03-19 | E07 | Done | 已移除 `hybrid_group/pre_open_only` 主路径；已删除 `ltfp/fallback/*` 与 Bridge hybrid resolver/executor 路径；旧路径测试已替换，`ltfp/cloud-bridge/agent-core` 均已完成 `go test ./... -timeout 60s` | 无 | 进入 E08，推进 `default_scope/fallback_policies`、scope header 标准化、external discovery scope 化 |
+| 2026-03-19 | E08 | Done | 已完成 E01-E07；已完成 `default_scope/fallback_policies` 配置模型、合法性校验与 YAML/管理面快照回写；HTTP/gRPC ingress 已统一收敛到 `X-Bridge-Namespace/X-Bridge-Environment` 并在缺失时使用 `default_scope`；resolver 已改为“本地 connector 优先、local miss 后再落 external”，并新增按 namespace policy 的 `external.enabled` 显式 gating；`request_scope/matched_scope/is_external_fallback` 已进入 direct path 日志字段、traffic ownership/admin API 与 Web UI 查询面板；Ops UI 已支持 `default_scope.namespace/default_scope.environment` 配置补丁 | 无 | 进入 E09，开始推进 Host 自动派生与 selector 增强能力 |
+| 2026-03-19 | E09 | Done | 已完成 T19-T20：新增 `ingress.base_domain` 配置与 `hostderiver` 模块；`PublishService` 与 `RouteAssign` 在空 host 时可按 `service_name + scope + base_domain` 自动派生；resolver 已支持 label-only `ServiceSelector.match_labels` 解析、`instance_labels` 实例过滤、`load_balance_policy=sticky/weighted`；`sticky_by` 已支持 `client_ip/header:/cookie:`；`bridge_host_derive_total` 与 `bridge_instance_selector_pick_total` 指标已接通；`cloud-bridge` 已完成 `go test ./... -timeout 60s` 与 `cloud-bridge/web` `npm run build` | 无 | 进入后续收尾/发布闸门或继续补全跨模块专项回归 |
+| 2026-03-19 | Release Gate | Done | 已完成 `cloud-bridge`、`agent-core`、`ltfp` 全量 `go test ./... -timeout 60s`；`cloud-bridge/web` `npm run build` 通过；协议、功能、正确性、可观测、稳定性门槛全部达成 | 无 | 本任务清单关闭 |
 
 ---
 

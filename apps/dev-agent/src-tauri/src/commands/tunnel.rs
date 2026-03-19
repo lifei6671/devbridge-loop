@@ -11,7 +11,8 @@ use crate::state::app_state::{now_ms, push_host_log, with_rpc_metrics, AppRuntim
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelListItem {
     pub tunnel_id: String,
-    pub service_id: String,
+    pub logical_service_id: String,
+    pub instance_id: String,
     pub state: String,
     pub protocol: String,
     pub local_addr: String,
@@ -83,7 +84,8 @@ fn parse_tunnel_list(payload: &Value) -> Vec<TunnelListItem> {
         };
         let candidate = TunnelListItem {
             tunnel_id: normalized_tunnel_id.clone(),
-            service_id: value_str_or(item, &["service_id", "service"], "--"),
+            logical_service_id: value_str_or(item, &["logical_service_id", "service"], "--"),
+            instance_id: value_str_or(item, &["instance_id"], "--"),
             state: value_str_or(item, &["state", "status"], "unknown"),
             protocol: value_str_or(item, &["protocol", "transport"], "unknown"),
             local_addr: value_str_or(item, &["local_addr", "local_target"], "--"),

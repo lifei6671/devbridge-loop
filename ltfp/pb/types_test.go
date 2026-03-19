@@ -8,8 +8,9 @@ func TestActivePayloadCount(t *testing.T) {
 
 	payload := StreamPayload{
 		OpenReq: &TrafficOpen{
-			TrafficID: "traffic-001",
-			ServiceID: "svc-001",
+			TrafficID:        "traffic-001",
+			LogicalServiceID: "ls-001",
+			InstanceID:       "si-001",
 		},
 	}
 	// 仅设置 OpenReq 时应返回 1。

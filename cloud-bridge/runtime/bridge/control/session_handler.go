@@ -105,17 +105,25 @@ func (handler *SessionHandler) ApplyFullSyncSnapshot(snapshot pb.FullSyncSnapsho
 	}
 	now := handler.now()
 	// 先覆盖服务与路由视图，确保运行态与快照一致。
-	handler.serviceRegistry.ReplaceAll(now, snapshot.Services)
+	handler.serviceRegistry.ReplaceAll(now, snapshot.LogicalServices, snapshot.ServiceInstances)
 	handler.routeRegistry.ReplaceAll(now, snapshot.Routes)
 
-	versionSnapshot := make(map[string]uint64, len(snapshot.Services)+len(snapshot.Routes))
-	for _, service := range snapshot.Services {
-		resourceID := resolveServiceResourceID("", service.ServiceID, service.ServiceKey)
-		if resourceID == "" {
-			// 服务索引键不合法时跳过。
+	versionSnapshot := make(map[string]uint64, len(snapshot.LogicalServices)+len(snapshot.ServiceInstances)+len(snapshot.Routes))
+	for _, logicalService := range snapshot.LogicalServices {
+		logicalServiceID := logicalService.LogicalServiceID
+		if logicalServiceID == "" {
+			// logical_service_id 不合法时跳过。
 			continue
 		}
-		versionSnapshot["service:"+resourceID] = service.ResourceVersion
+		versionSnapshot["logical_service:"+logicalServiceID] = logicalService.ResourceVersion
+	}
+	for _, instance := range snapshot.ServiceInstances {
+		instanceID := instance.InstanceID
+		if instanceID == "" {
+			// instance_id 不合法时跳过。
+			continue
+		}
+		versionSnapshot["service_instance:"+instanceID] = instance.ResourceVersion
 	}
 	for _, route := range snapshot.Routes {
 		if route.RouteID == "" {

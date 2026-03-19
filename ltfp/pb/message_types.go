@@ -108,8 +108,6 @@ const (
 	RouteTargetTypeConnectorService RouteTargetType = "connector_service"
 	// RouteTargetTypeExternalService 表示目标为外部发现服务。
 	RouteTargetTypeExternalService RouteTargetType = "external_service"
-	// RouteTargetTypeHybridGroup 表示目标为混合组。
-	RouteTargetTypeHybridGroup RouteTargetType = "hybrid_group"
 )
 
 // IngressMode 定义入口暴露模式。
@@ -122,14 +120,6 @@ const (
 	IngressModeTLSSNIShared IngressMode = "tls_sni_shared"
 	// IngressModeL4DedicatedPort 表示 L4 专属端口入口。
 	IngressModeL4DedicatedPort IngressMode = "l4_dedicated_port"
-)
-
-// FallbackPolicy 定义 hybrid fallback 策略。
-type FallbackPolicy string
-
-const (
-	// FallbackPolicyPreOpenOnly 表示只允许 pre-open 阶段 fallback。
-	FallbackPolicyPreOpenOnly FallbackPolicy = "pre_open_only"
 )
 
 // IsKnownControlMessageType 判断控制面消息类型是否在协议定义内。

@@ -38,7 +38,6 @@ func NewHealthHandler(options HealthHandlerOptions) *HealthHandler {
 	}
 	metrics := options.Metrics
 	if metrics == nil {
-		// 未显式注入指标容器时回落默认容器，保证健康维度指标连续。
 		metrics = obs.DefaultMetrics
 	}
 	return &HealthHandler{
@@ -54,126 +53,77 @@ func (handler *HealthHandler) HandleReport(envelope pb.ControlEnvelope, report p
 	if handler == nil || handler.serviceRegistry == nil {
 		return
 	}
-	normalizedServiceID := strings.TrimSpace(report.ServiceID)
-	normalizedServiceKey := strings.TrimSpace(report.ServiceKey)
+	normalizedInstanceID := strings.TrimSpace(report.InstanceID)
+	normalizedLogicalServiceID := strings.TrimSpace(report.LogicalServiceID)
 	normalizedConnectorID := strings.TrimSpace(envelope.ConnectorID)
 	normalizedSessionID := strings.TrimSpace(envelope.SessionID)
 	if !handler.validateSessionEpoch(envelope) {
-		// 非 ACTIVE 会话或旧代际上报直接丢弃，避免覆盖新 session 真相源。
 		slog.Info(
 			"bridge ignore service health report: invalid session runtime",
-			"connector_id", strings.TrimSpace(envelope.ConnectorID),
-			"session_id", strings.TrimSpace(envelope.SessionID),
-			"session_epoch", envelope.SessionEpoch,
-			"service_id", normalizedServiceID,
-			"service_key", normalizedServiceKey,
-			"reported_health_status", report.ServiceHealthStatus,
-		)
-		return
-	}
-	serviceInstances := handler.lookupServiceInstances(normalizedServiceID, normalizedServiceKey)
-	if len(serviceInstances) == 0 {
-		// 健康上报先于发布到达时保持无副作用，等待 publish 建立主记录。
-		slog.Info(
-			"bridge ignore service health report: service not found",
-			"connector_id", strings.TrimSpace(envelope.ConnectorID),
-			"session_id", strings.TrimSpace(envelope.SessionID),
-			"session_epoch", envelope.SessionEpoch,
-			"service_id", normalizedServiceID,
-			"service_key", normalizedServiceKey,
-			"reported_health_status", report.ServiceHealthStatus,
-		)
-		return
-	}
-	updatedCount := 0
-	updatedServiceIDs := make(map[string]struct{}, len(serviceInstances))
-	for _, serviceInstance := range serviceInstances {
-		instanceConnectorID := strings.TrimSpace(serviceInstance.Service.ConnectorID)
-		instanceSessionID := strings.TrimSpace(serviceInstance.SessionID)
-		if normalizedConnectorID != "" && instanceConnectorID != normalizedConnectorID {
-			// connector 不匹配的实例不接受本次健康更新。
-			continue
-		}
-		if normalizedSessionID != "" && instanceSessionID != "" && instanceSessionID != normalizedSessionID {
-			// 已记录 session_id 且与上报不一致时，避免跨会话污染实例健康状态。
-			continue
-		}
-		previousHealthStatus := serviceInstance.Service.HealthStatus
-		serviceSnapshot := serviceInstance.Service
-		serviceSnapshot.HealthStatus = normalizeHealthStatus(report.ServiceHealthStatus)
-		handler.serviceRegistry.UpsertWithRuntime(
-			handler.now(),
-			serviceSnapshot,
-			instanceSessionID,
-		)
-		slog.Info(
-			"bridge apply service health report",
-			"connector_id", instanceConnectorID,
-			"session_id", firstNonEmpty(instanceSessionID, normalizedSessionID),
-			"session_epoch", envelope.SessionEpoch,
-			"service_id", strings.TrimSpace(serviceSnapshot.ServiceID),
-			"service_key", strings.TrimSpace(serviceSnapshot.ServiceKey),
-			"service_instance_id", strings.TrimSpace(serviceInstance.ServiceInstanceID),
-			"service_status", serviceSnapshot.Status,
-			"health_status_before", previousHealthStatus,
-			"health_status_after", serviceSnapshot.HealthStatus,
-			"resource_version", serviceSnapshot.ResourceVersion,
-		)
-		updatedServiceIDs[strings.TrimSpace(serviceSnapshot.ServiceID)] = struct{}{}
-		updatedCount++
-	}
-	if updatedCount == 0 {
-		// 所有实例都因 connector/session 过滤未命中时，不执行写入。
-		slog.Info(
-			"bridge ignore service health report: no matching service instance",
 			"connector_id", normalizedConnectorID,
 			"session_id", normalizedSessionID,
 			"session_epoch", envelope.SessionEpoch,
-			"service_id", normalizedServiceID,
-			"service_key", normalizedServiceKey,
+			"logical_service_id", normalizedLogicalServiceID,
+			"instance_id", normalizedInstanceID,
 			"reported_health_status", report.ServiceHealthStatus,
 		)
 		return
 	}
-	slog.Info(
-		"bridge apply service health report summary",
-		"connector_id", normalizedConnectorID,
-		"session_id", normalizedSessionID,
-		"session_epoch", envelope.SessionEpoch,
-		"service_id", normalizedServiceID,
-		"service_key", normalizedServiceKey,
-		"updated_instances", updatedCount,
-	)
-	// 健康更新完成后，按受影响 service_id 批量刷新可用实例指标快照。
-	affectedServiceIDs := make([]string, 0, len(updatedServiceIDs))
-	for serviceID := range updatedServiceIDs {
-		if strings.TrimSpace(serviceID) == "" {
-			continue
-		}
-		affectedServiceIDs = append(affectedServiceIDs, serviceID)
+	instanceSnapshot, exists := handler.serviceRegistry.GetInstanceByID(normalizedInstanceID)
+	if !exists {
+		slog.Info(
+			"bridge ignore service health report: instance not found",
+			"connector_id", normalizedConnectorID,
+			"session_id", normalizedSessionID,
+			"session_epoch", envelope.SessionEpoch,
+			"logical_service_id", normalizedLogicalServiceID,
+			"instance_id", normalizedInstanceID,
+			"reported_health_status", report.ServiceHealthStatus,
+		)
+		return
 	}
-	RefreshServiceAvailabilityMetricsByServiceIDs(handler.metrics, handler.serviceRegistry, affectedServiceIDs)
-}
+	if normalizedConnectorID != "" && strings.TrimSpace(instanceSnapshot.Instance.ConnectorID) != normalizedConnectorID {
+		slog.Info(
+			"bridge ignore service health report: connector mismatch",
+			"connector_id", normalizedConnectorID,
+			"instance_connector_id", strings.TrimSpace(instanceSnapshot.Instance.ConnectorID),
+			"instance_id", normalizedInstanceID,
+		)
+		return
+	}
+	if normalizedSessionID != "" && strings.TrimSpace(instanceSnapshot.Instance.SessionID) != "" &&
+		strings.TrimSpace(instanceSnapshot.Instance.SessionID) != normalizedSessionID {
+		slog.Info(
+			"bridge ignore service health report: session mismatch",
+			"session_id", normalizedSessionID,
+			"instance_session_id", strings.TrimSpace(instanceSnapshot.Instance.SessionID),
+			"instance_id", normalizedInstanceID,
+		)
+		return
+	}
 
-// lookupServiceInstances 按 service_id/service_key 查找服务池内实例快照。
-func (handler *HealthHandler) lookupServiceInstances(serviceID string, serviceKey string) []registry.ServiceInstanceSnapshot {
-	if strings.TrimSpace(serviceID) != "" {
-		if serviceSnapshots := handler.serviceRegistry.ListInstancesByServiceID(serviceID); len(serviceSnapshots) > 0 {
-			return serviceSnapshots
-		}
-	}
-	if strings.TrimSpace(serviceKey) != "" {
-		if serviceSnapshots := handler.serviceRegistry.ListInstancesByServiceKey(serviceKey); len(serviceSnapshots) > 0 {
-			return serviceSnapshots
-		}
-	}
-	return nil
+	previousHealthStatus := instanceSnapshot.Instance.HealthStatus
+	instanceSnapshot.Instance.HealthStatus = normalizeHealthStatus(report.ServiceHealthStatus)
+	instanceSnapshot.UpdatedAt = handler.now()
+	handler.serviceRegistry.Upsert(instanceSnapshot.UpdatedAt, instanceSnapshot.LogicalService, instanceSnapshot.Instance)
+	slog.Info(
+		"bridge apply service health report",
+		"connector_id", strings.TrimSpace(instanceSnapshot.Instance.ConnectorID),
+		"session_id", firstNonEmpty(instanceSnapshot.Instance.SessionID, normalizedSessionID),
+		"session_epoch", envelope.SessionEpoch,
+		"logical_service_id", strings.TrimSpace(instanceSnapshot.Instance.LogicalServiceID),
+		"instance_id", strings.TrimSpace(instanceSnapshot.Instance.InstanceID),
+		"instance_status", instanceSnapshot.Instance.InstanceStatus,
+		"health_status_before", previousHealthStatus,
+		"health_status_after", instanceSnapshot.Instance.HealthStatus,
+		"resource_version", instanceSnapshot.Instance.ResourceVersion,
+	)
+	RefreshServiceAvailabilityMetrics(handler.metrics, handler.serviceRegistry, instanceSnapshot.Instance.LogicalServiceID)
 }
 
 // validateSessionEpoch 校验上报是否来自当前有效会话代际。
 func (handler *HealthHandler) validateSessionEpoch(envelope pb.ControlEnvelope) bool {
 	if handler.sessionRegistry == nil {
-		// 未注入 session 视图时保持向后兼容。
 		return true
 	}
 	sessionID := strings.TrimSpace(envelope.SessionID)
@@ -184,7 +134,6 @@ func (handler *HealthHandler) validateSessionEpoch(envelope pb.ControlEnvelope) 
 	if !exists {
 		return false
 	}
-	// 仅 ACTIVE 会话允许写入健康状态，防止旧会话在 draining/stale/failed 阶段继续污染状态。
 	return sessionRuntime.Epoch == envelope.SessionEpoch && sessionRuntime.State == registry.SessionActive
 }
 

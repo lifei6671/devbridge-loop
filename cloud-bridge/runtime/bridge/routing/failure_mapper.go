@@ -59,8 +59,7 @@ func (mapper *FailureMapper) Map(err error, result PathExecuteResult) MappedFail
 		mapped.Code = code
 		return mapped
 	case ltfperrors.CodeResolveServiceUnavailable, ltfperrors.CodeResolveSessionNotActive,
-		ltfperrors.CodeDiscoveryNoEndpoint, ltfperrors.CodeDiscoveryProviderUnavailable, ltfperrors.CodeDiscoveryRefreshFailed,
-		ltfperrors.CodeHybridFallbackForbidden:
+		ltfperrors.CodeDiscoveryNoEndpoint, ltfperrors.CodeDiscoveryProviderUnavailable, ltfperrors.CodeDiscoveryRefreshFailed:
 		mapped.HTTPStatus = 503
 		mapped.Code = code
 		return mapped

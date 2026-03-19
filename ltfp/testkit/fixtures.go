@@ -9,8 +9,6 @@ import (
 
 // GoldenConnectorHello 返回可复用的握手测试样例。
 func GoldenConnectorHello() pb.ConnectorHello {
-	// 固定样例值，保证不同模块测试输入一致。
-	// namespace/environment 在协议中已是可选字段，此处仍保留默认值用于覆盖常规场景。
 	return pb.ConnectorHello{
 		ConnectorID:       "connector-dev-01",
 		Namespace:         "dev",
@@ -24,14 +22,13 @@ func GoldenConnectorHello() pb.ConnectorHello {
 
 // GoldenPublishService 返回可复用的服务发布测试样例。
 func GoldenPublishService() pb.PublishService {
-	// 使用单 endpoint 样例覆盖首批最小闭环场景。
 	return pb.PublishService{
-		ServiceID: "svc_01J8Z6C4X9K7M2P4",
-		// service_key 使用 canonical 口径：<service_name>/<protocol>。
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "alice",
+		InstanceID:  "si_01J8Z6C4X9K7M2P4",
 		ServiceName: "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "alice",
+		},
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
 			{
@@ -52,14 +49,14 @@ func GoldenPublishService() pb.PublishService {
 
 // GoldenTrafficOpen 返回可复用的 TrafficOpen 测试样例。
 func GoldenTrafficOpen() pb.TrafficOpen {
-	// endpointSelectionHint 仅作提示，不携带权威 target 地址。
 	return pb.TrafficOpen{
-		TrafficID:    "traffic-001",
-		RouteID:      "route-001",
-		ServiceID:    "svc_01J8Z6C4X9K7M2P4",
-		SourceAddr:   "10.0.0.1:54000",
-		ProtocolHint: "http",
-		TraceID:      "trace-001",
+		TrafficID:        "traffic-001",
+		RouteID:          "route-001",
+		LogicalServiceID: "ls_01J8Z6C4X9K7M2P4",
+		InstanceID:       "si_01J8Z6C4X9K7M2P4",
+		SourceAddr:       "10.0.0.1:54000",
+		ProtocolHint:     "http",
+		TraceID:          "trace-001",
 		EndpointSelectionHint: map[string]string{
 			"zone": "az-a",
 		},
@@ -68,7 +65,6 @@ func GoldenTrafficOpen() pb.TrafficOpen {
 
 // GoldenTrafficOpenAckSuccess 返回可复用的成功 ACK 样例。
 func GoldenTrafficOpenAckSuccess() pb.TrafficOpenAck {
-	// success=true 表示 pre-open 阶段已经通过。
 	return pb.TrafficOpenAck{
 		TrafficID: "traffic-001",
 		Success:   true,
@@ -79,11 +75,9 @@ func GoldenTrafficOpenAckSuccess() pb.TrafficOpenAck {
 func GoldenControlEnvelope(messageType pb.ControlMessageType, payload any) (pb.ControlEnvelope, error) {
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
-		// 测试夹具在编码失败时直接返回错误给测试调用方。
 		return pb.ControlEnvelope{}, err
 	}
 
-	// 固定元信息，便于跨模块复用同一组断言。
 	return pb.ControlEnvelope{
 		VersionMajor:    2,
 		VersionMinor:    1,
@@ -100,7 +94,6 @@ func GoldenControlEnvelope(messageType pb.ControlMessageType, payload any) (pb.C
 
 // GoldenHeartbeat 返回可复用的心跳样例。
 func GoldenHeartbeat() pb.Heartbeat {
-	// 使用当前时间戳模拟真实心跳上报场景。
 	return pb.Heartbeat{
 		TimestampUnix: time.Now().Unix(),
 		SessionState:  pb.SessionStateActive,

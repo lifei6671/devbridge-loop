@@ -160,20 +160,20 @@ func TestTrafficMetaValidate(testingObject *testing.T) {
 		{
 			name: "valid meta",
 			meta: TrafficMeta{
-				TrafficID: "traffic-1",
-				ServiceID: "svc-1",
+				TrafficID:        "traffic-1",
+				LogicalServiceID: "ls-1",
 			},
 		},
 		{
 			name: "empty traffic id",
 			meta: TrafficMeta{
-				ServiceID: "svc-1",
+				LogicalServiceID: "ls-1",
 			},
 			expectErr:  true,
 			errMatcher: transport.ErrInvalidArgument,
 		},
 		{
-			name: "empty service id",
+			name: "empty logical service id",
 			meta: TrafficMeta{
 				TrafficID: "traffic-1",
 			},
@@ -213,7 +213,7 @@ func TestTrafficFrameValidate(testingObject *testing.T) {
 			name: "valid open",
 			frame: TrafficFrame{
 				Type: TrafficFrameOpen,
-				Open: &TrafficMeta{TrafficID: "traffic-1", ServiceID: "svc-1"},
+				Open: &TrafficMeta{TrafficID: "traffic-1", LogicalServiceID: "ls-1"},
 			},
 		},
 		{
@@ -234,7 +234,7 @@ func TestTrafficFrameValidate(testingObject *testing.T) {
 			name: "open carries data",
 			frame: TrafficFrame{
 				Type: TrafficFrameOpen,
-				Open: &TrafficMeta{TrafficID: "traffic-1", ServiceID: "svc-1"},
+				Open: &TrafficMeta{TrafficID: "traffic-1", LogicalServiceID: "ls-1"},
 				Data: []byte("unexpected"),
 			},
 			expectErr: true,
@@ -273,10 +273,10 @@ func TestLengthPrefixedTrafficProtocolRoundTrip(testingObject *testing.T) {
 			frame: TrafficFrame{
 				Type: TrafficFrameOpen,
 				Open: &TrafficMeta{
-					TrafficID:    "traffic-open",
-					SessionID:    "session-1",
-					SessionEpoch: 9,
-					ServiceID:    "svc-open",
+					TrafficID:        "traffic-open",
+					SessionID:        "session-1",
+					SessionEpoch:     9,
+					LogicalServiceID: "ls-open",
 					Labels: map[string]string{
 						"trace": "trace-open",
 					},

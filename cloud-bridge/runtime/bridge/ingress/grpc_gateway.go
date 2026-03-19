@@ -8,6 +8,7 @@ type GRPCGatewayRequest struct {
 	Environment string
 	Metadata    map[string]string
 	Headers     map[string][]string
+	Queries     map[string][]string
 }
 
 // GRPCGateway 负责把 gRPC 请求转换为统一路由请求。
@@ -30,5 +31,6 @@ func (gateway *GRPCGateway) BuildRouteLookupRequest(request GRPCGatewayRequest) 
 		Environment: request.Environment,
 		Metadata:    request.Metadata,
 		Headers:     request.Headers,
+		Queries:     request.Queries,
 	})
 }

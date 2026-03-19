@@ -19,7 +19,7 @@ type trafficAffinityEntry struct {
 	expiresAt         time.Time
 }
 
-// trafficAffinityStore 维护 traffic_id 到 service_instance_id 的短期粘性映射。
+// trafficAffinityStore 维护 traffic_id 到 instance_id 的短期粘性映射。
 type trafficAffinityStore struct {
 	mu       sync.Mutex
 	ttl      time.Duration

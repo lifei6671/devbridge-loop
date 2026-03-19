@@ -75,27 +75,29 @@ type SessionItem struct {
 
 // ServiceItem 定义管理后台 services 列表项。
 type ServiceItem struct {
-	ServiceID       string `json:"service_id"`
-	ServiceKey      string `json:"service_key"`
-	Namespace       string `json:"namespace"`
-	Environment     string `json:"environment"`
-	ConnectorID     string `json:"connector_id"`
-	SessionID       string `json:"session_id"`
-	SessionState    string `json:"session_state"`
-	ServiceName     string `json:"service_name"`
-	ServiceType     string `json:"service_type"`
-	EndpointCount   int    `json:"endpoint_count"`
-	EndpointProto   string `json:"endpoint_protocol"`
-	EndpointHost    string `json:"endpoint_host"`
-	EndpointPort    uint32 `json:"endpoint_port"`
-	EndpointAddress string `json:"endpoint_address"`
-	IngressMode     string `json:"ingress_mode"`
-	SNIName         string `json:"sni_name"`
-	RouteTarget     string `json:"route_target"`
-	AccessHint      string `json:"access_hint"`
-	Status          string `json:"status"`
-	HealthStatus    string `json:"health_status"`
-	UpdatedAtMS     uint64 `json:"updated_at_ms"`
+	LogicalServiceID string   `json:"logical_service_id"`
+	InstanceID       string   `json:"instance_id"`
+	Scope            pb.Scope `json:"scope"`
+	ConnectorID      string   `json:"connector_id"`
+	SessionID        string   `json:"session_id"`
+	SessionState     string   `json:"session_state"`
+	ServiceName      string   `json:"service_name"`
+	ServiceType      string   `json:"service_type"`
+	EndpointCount    int      `json:"endpoint_count"`
+	EndpointProto    string   `json:"endpoint_protocol"`
+	EndpointHost     string   `json:"endpoint_host"`
+	EndpointPort     uint32   `json:"endpoint_port"`
+	EndpointAddress  string   `json:"endpoint_address"`
+	IngressMode      string   `json:"ingress_mode"`
+	SNIName          string   `json:"sni_name"`
+	RouteTarget      string   `json:"route_target"`
+	AccessHint       string   `json:"access_hint"`
+	Status           string   `json:"status"`
+	InstanceStatus   string   `json:"instance_status"`
+	HealthStatus     string   `json:"health_status"`
+	ActiveInstances  int32    `json:"active_instance_count"`
+	HealthyInstances int32    `json:"healthy_instance_count"`
+	UpdatedAtMS      uint64   `json:"updated_at_ms"`
 }
 
 // TunnelItem 定义管理后台 tunnels 列表项。
@@ -128,7 +130,10 @@ type TrafficSummarySnapshot struct {
 	OpenTimeoutTotal                  uint64            `json:"open_timeout_total"`
 	OpenRejectTotal                   uint64            `json:"open_reject_total"`
 	OpenAckLateTotal                  uint64            `json:"open_ack_late_total"`
-	HybridFallbackTotal               uint64            `json:"hybrid_fallback_total"`
+	ScopeFallbackTotal                uint64            `json:"scope_fallback_total"`
+	RouteConflictRejectionTotal       uint64            `json:"route_conflict_rejection_total"`
+	HostDeriveSuccessTotal            uint64            `json:"host_derive_success_total"`
+	HostDeriveFailureTotal            uint64            `json:"host_derive_failure_total"`
 	EndpointOverrideTotal             uint64            `json:"endpoint_override_total"`
 	AuthSuccessTotal                  uint64            `json:"auth_success_total"`
 	AuthFailureTotal                  uint64            `json:"auth_failure_total"`
@@ -153,7 +158,7 @@ type DiagnoseSummarySnapshot struct {
 func BuildBridgeOverview(
 	now time.Time,
 	sessions []registry.SessionRuntime,
-	services []pb.Service,
+	logicalServices []pb.LogicalService,
 	routes []pb.Route,
 	tunnelSnapshot registry.TunnelSnapshot,
 	configSnapshot map[string]any,
@@ -182,7 +187,7 @@ func BuildBridgeOverview(
 		SessionTotal:   len(sessions),
 		SessionActive:  activeSessions,
 		SessionStale:   staleSessions,
-		ServiceTotal:   len(services),
+		ServiceTotal:   len(logicalServices),
 		RouteTotal:     len(routes),
 		TunnelIdle:     tunnelSnapshot.IdleCount,
 		TunnelReserved: tunnelSnapshot.ReservedCount,
@@ -314,8 +319,8 @@ func BuildRouteItems(routes []pb.Route) []RouteItem {
 	for _, route := range routes {
 		items = append(items, RouteItem{
 			RouteID:         strings.TrimSpace(route.RouteID),
-			Namespace:       strings.TrimSpace(route.Namespace),
-			Environment:     strings.TrimSpace(route.Environment),
+			Namespace:       strings.TrimSpace(route.Scope.Namespace),
+			Environment:     strings.TrimSpace(route.Scope.Environment),
 			TargetType:      strings.TrimSpace(string(route.Target.Type)),
 			Protocol:        strings.TrimSpace(route.Match.Protocol),
 			Host:            strings.TrimSpace(route.Match.Host),
@@ -331,16 +336,16 @@ func BuildRouteItems(routes []pb.Route) []RouteItem {
 }
 
 // BuildConnectorItems 构建 connectors 只读列表项。
-func BuildConnectorItems(sessions []registry.SessionRuntime, services []pb.Service) []ConnectorItem {
+func BuildConnectorItems(sessions []registry.SessionRuntime, serviceInstances []pb.ServiceInstance) []ConnectorItem {
 	serviceCountByConnector := make(map[string]int)
 	activeServiceCountByConnector := make(map[string]int)
-	for _, service := range services {
-		connectorID := strings.TrimSpace(service.ConnectorID)
+	for _, serviceInstance := range serviceInstances {
+		connectorID := strings.TrimSpace(serviceInstance.ConnectorID)
 		if connectorID == "" {
 			continue
 		}
 		serviceCountByConnector[connectorID]++
-		if service.Status == pb.ServiceStatusActive {
+		if serviceInstance.InstanceStatus == pb.ServiceStatusActive {
 			activeServiceCountByConnector[connectorID]++
 		}
 	}
@@ -439,7 +444,8 @@ func BuildSessionItems(sessions []registry.SessionRuntime) []SessionItem {
 // BuildServiceItems 构建 services 只读列表项，包含与 session 的关联信息和访问提示。
 func BuildServiceItems(
 	now time.Time,
-	services []pb.Service,
+	logicalServices []pb.LogicalService,
+	serviceInstances []pb.ServiceInstance,
 	sessions []registry.SessionRuntime,
 ) []ServiceItem {
 	normalizedNow := now
@@ -447,6 +453,10 @@ func BuildServiceItems(
 		normalizedNow = time.Now().UTC()
 	}
 	nowMS := uint64(normalizedNow.UnixMilli())
+	logicalServicesByID := make(map[string]pb.LogicalService, len(logicalServices))
+	for _, logicalService := range logicalServices {
+		logicalServicesByID[strings.TrimSpace(logicalService.LogicalServiceID)] = logicalService
+	}
 
 	latestSessionByConnector := make(map[string]registry.SessionRuntime)
 	for _, session := range sessions {
@@ -468,9 +478,10 @@ func BuildServiceItems(
 		}
 	}
 
-	items := make([]ServiceItem, 0, len(services))
-	for _, service := range services {
-		connectorID := strings.TrimSpace(service.ConnectorID)
+	items := make([]ServiceItem, 0, len(serviceInstances))
+	for _, serviceInstance := range serviceInstances {
+		connectorID := strings.TrimSpace(serviceInstance.ConnectorID)
+		logicalService := logicalServicesByID[strings.TrimSpace(serviceInstance.LogicalServiceID)]
 		sessionItem, hasSession := latestSessionByConnector[connectorID]
 		sessionID := ""
 		sessionState := "UNAVAILABLE"
@@ -493,9 +504,9 @@ func BuildServiceItems(
 		endpointHost := ""
 		var endpointPort uint32
 		endpointAddress := "--"
-		sniName := strings.TrimSpace(service.Exposure.SNIName)
-		if len(service.Endpoints) > 0 {
-			firstEndpoint := service.Endpoints[0]
+		sniName := strings.TrimSpace(serviceInstance.Exposure.SNIName)
+		if len(serviceInstance.Endpoints) > 0 {
+			firstEndpoint := serviceInstance.Endpoints[0]
 			endpointProto = strings.TrimSpace(firstEndpoint.Protocol)
 			endpointHost = strings.TrimSpace(firstEndpoint.Host)
 			endpointPort = firstEndpoint.Port
@@ -510,56 +521,56 @@ func BuildServiceItems(
 				sniName = strings.TrimSpace(firstEndpoint.ServerName)
 			}
 		}
-		serviceType := strings.TrimSpace(service.ServiceType)
-		if serviceType == "" {
-			serviceType = endpointProto
-		}
-		ingressMode := strings.TrimSpace(string(service.Exposure.IngressMode))
+		serviceType := endpointProto
+		ingressMode := strings.TrimSpace(string(serviceInstance.Exposure.IngressMode))
 		if ingressMode == "" {
 			ingressMode = "direct"
 		}
-		routeTarget := ""
-		serviceKey := strings.TrimSpace(service.ServiceKey)
-		if serviceKey != "" {
-			routeTarget = fmt.Sprintf("connector_service.service_key=%s", serviceKey)
-		}
+		routeTarget := fmt.Sprintf(
+			"connector_service.selector={serviceName:%s,scope:%s/%s}",
+			strings.TrimSpace(logicalService.ServiceName),
+			strings.TrimSpace(logicalService.Scope.Namespace),
+			strings.TrimSpace(logicalService.Scope.Environment),
+		)
 		accessHint := routeTarget
-		if strings.TrimSpace(accessHint) == "" {
-			accessHint = "请先配置 service_key 后再通过 route 指向该服务"
-		}
 		if sniName != "" {
 			accessHint = fmt.Sprintf("%s; route.match.sni=%s", accessHint, sniName)
 		}
 
 		items = append(items, ServiceItem{
-			ServiceID:       strings.TrimSpace(service.ServiceID),
-			ServiceKey:      serviceKey,
-			Namespace:       strings.TrimSpace(service.Namespace),
-			Environment:     strings.TrimSpace(service.Environment),
-			ConnectorID:     connectorID,
-			SessionID:       sessionID,
-			SessionState:    sessionState,
-			ServiceName:     strings.TrimSpace(service.ServiceName),
-			ServiceType:     serviceType,
-			EndpointCount:   len(service.Endpoints),
-			EndpointProto:   endpointProto,
-			EndpointHost:    endpointHost,
-			EndpointPort:    endpointPort,
-			EndpointAddress: endpointAddress,
-			IngressMode:     ingressMode,
-			SNIName:         sniName,
-			RouteTarget:     routeTarget,
-			AccessHint:      accessHint,
-			Status:          strings.TrimSpace(string(service.Status)),
-			HealthStatus:    strings.TrimSpace(string(service.HealthStatus)),
-			UpdatedAtMS:     updatedAtMS,
+			LogicalServiceID: strings.TrimSpace(logicalService.LogicalServiceID),
+			InstanceID:       strings.TrimSpace(serviceInstance.InstanceID),
+			Scope: pb.Scope{
+				Namespace:   strings.TrimSpace(logicalService.Scope.Namespace),
+				Environment: strings.TrimSpace(logicalService.Scope.Environment),
+			},
+			ConnectorID:      connectorID,
+			SessionID:        sessionID,
+			SessionState:     sessionState,
+			ServiceName:      strings.TrimSpace(logicalService.ServiceName),
+			ServiceType:      serviceType,
+			EndpointCount:    len(serviceInstance.Endpoints),
+			EndpointProto:    endpointProto,
+			EndpointHost:     endpointHost,
+			EndpointPort:     endpointPort,
+			EndpointAddress:  endpointAddress,
+			IngressMode:      ingressMode,
+			SNIName:          sniName,
+			RouteTarget:      routeTarget,
+			AccessHint:       accessHint,
+			Status:           strings.TrimSpace(string(logicalService.Status)),
+			InstanceStatus:   strings.TrimSpace(string(serviceInstance.InstanceStatus)),
+			HealthStatus:     strings.TrimSpace(string(serviceInstance.HealthStatus)),
+			ActiveInstances:  logicalService.ActiveInstanceCount,
+			HealthyInstances: logicalService.HealthyInstanceCount,
+			UpdatedAtMS:      updatedAtMS,
 		})
 	}
 
 	sort.Slice(items, func(left, right int) bool {
 		if items[left].UpdatedAtMS == items[right].UpdatedAtMS {
 			if items[left].ConnectorID == items[right].ConnectorID {
-				return items[left].ServiceKey < items[right].ServiceKey
+				return items[left].InstanceID < items[right].InstanceID
 			}
 			return items[left].ConnectorID < items[right].ConnectorID
 		}
@@ -674,7 +685,10 @@ func BuildTrafficSummary(now time.Time, metrics *obs.Metrics) TrafficSummarySnap
 		OpenTimeoutTotal:                  metrics.BridgeTrafficOpenTimeoutTotal(),
 		OpenRejectTotal:                   metrics.BridgeTrafficOpenRejectTotal(),
 		OpenAckLateTotal:                  metrics.BridgeTrafficOpenAckLateTotal(),
-		HybridFallbackTotal:               metrics.BridgeHybridFallbackTotal(),
+		ScopeFallbackTotal:                metrics.BridgeScopeFallbackTotal(),
+		RouteConflictRejectionTotal:       metrics.BridgeRouteConflictRejectionTotal(),
+		HostDeriveSuccessTotal:            metrics.BridgeHostDeriveTotal(true),
+		HostDeriveFailureTotal:            metrics.BridgeHostDeriveTotal(false),
 		EndpointOverrideTotal:             metrics.BridgeActualEndpointOverrideTotal(),
 		AuthSuccessTotal:                  metrics.BridgeAuthSuccessTotal(),
 		AuthFailureTotal:                  metrics.BridgeAuthFailureTotal(),

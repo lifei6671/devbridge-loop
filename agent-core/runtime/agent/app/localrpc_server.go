@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 type codedError struct {
@@ -87,10 +89,8 @@ type localRPCAuthCompletePayload struct {
 }
 
 type localRPCServiceAddPayload struct {
-	ServiceID              string `json:"service_id"`
-	ServiceKey             string `json:"service_key"`
-	Namespace              string `json:"namespace"`
-	Environment            string `json:"environment"`
+	InstanceID             string   `json:"instance_id"`
+	Scope                  pb.Scope `json:"scope"`
 	ServiceName            string `json:"service_name"`
 	Protocol               string `json:"protocol"`
 	Host                   string `json:"host"`
@@ -102,8 +102,8 @@ type localRPCServiceAddPayload struct {
 }
 
 type localRPCServiceDeletePayload struct {
-	ServiceID  string `json:"service_id"`
-	ServiceKey string `json:"service_key"`
+	LogicalServiceID string `json:"logical_service_id"`
+	InstanceID       string `json:"instance_id"`
 }
 
 type localRPCAuthPending struct {
@@ -435,10 +435,8 @@ func (server *localRPCServer) dispatchRequest(
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.add payload"}
 		}
 		addedPayload, addErr := server.runtime.addOrUpdateService(runtimeServiceAddInput{
-			ServiceID:              servicePayload.ServiceID,
-			ServiceKey:             servicePayload.ServiceKey,
-			Namespace:              servicePayload.Namespace,
-			Environment:            servicePayload.Environment,
+			InstanceID:             servicePayload.InstanceID,
+			Scope:                  servicePayload.Scope,
 			ServiceName:            servicePayload.ServiceName,
 			Protocol:               servicePayload.Protocol,
 			Host:                   servicePayload.Host,
@@ -460,8 +458,8 @@ func (server *localRPCServer) dispatchRequest(
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.delete payload"}
 		}
 		deletedPayload, deleteErr := server.runtime.removeService(runtimeServiceDeleteInput{
-			ServiceID:  servicePayload.ServiceID,
-			ServiceKey: servicePayload.ServiceKey,
+			LogicalServiceID: servicePayload.LogicalServiceID,
+			InstanceID:       servicePayload.InstanceID,
 		})
 		if deleteErr != nil {
 			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: deleteErr.Error()}

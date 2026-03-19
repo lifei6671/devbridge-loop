@@ -61,11 +61,22 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 					}
 					return dataPlane.routeRegistry.List()
 				},
-				ListServices: func() []pb.Service {
+				ListLogicalServices: func() []pb.LogicalService {
 					if dataPlane == nil || dataPlane.serviceRegistry == nil {
-						return []pb.Service{}
+						return []pb.LogicalService{}
 					}
 					return dataPlane.serviceRegistry.List()
+				},
+				ListServiceInstances: func() []pb.ServiceInstance {
+					if dataPlane == nil || dataPlane.serviceRegistry == nil {
+						return []pb.ServiceInstance{}
+					}
+					serviceInstances := dataPlane.serviceRegistry.ListInstances()
+					result := make([]pb.ServiceInstance, 0, len(serviceInstances))
+					for _, serviceInstance := range serviceInstances {
+						result = append(result, serviceInstance.Instance)
+					}
+					return result
 				},
 				ListSessions: func() []registry.SessionRuntime {
 					if dataPlane == nil || dataPlane.sessionRegistry == nil {
@@ -128,16 +139,20 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 						updatedAtMS = uint64(ownership.UpdatedAt.UTC().UnixMilli())
 					}
 					return adminapi.TrafficOwnershipRecord{
-						TrafficID:         strings.TrimSpace(ownership.TrafficID),
-						RouteID:           strings.TrimSpace(ownership.RouteID),
-						TargetKind:        strings.TrimSpace(ownership.TargetKind),
-						IngressMode:       strings.TrimSpace(ownership.IngressMode),
-						ServiceID:         strings.TrimSpace(ownership.ServiceID),
-						ServiceKey:        strings.TrimSpace(ownership.ServiceKey),
-						ServiceInstanceID: strings.TrimSpace(ownership.ServiceInstanceID),
-						ConnectorID:       strings.TrimSpace(ownership.ConnectorID),
-						SessionID:         strings.TrimSpace(ownership.SessionID),
-						UpdatedAtMS:       updatedAtMS,
+						TrafficID:          strings.TrimSpace(ownership.TrafficID),
+						RouteID:            strings.TrimSpace(ownership.RouteID),
+						TargetKind:         strings.TrimSpace(ownership.TargetKind),
+						IngressMode:        strings.TrimSpace(ownership.IngressMode),
+						LogicalServiceID:   strings.TrimSpace(ownership.LogicalServiceID),
+						ServiceName:        strings.TrimSpace(ownership.ServiceName),
+						Scope:              ownership.Scope,
+						RequestScope:       ownership.RequestScope,
+						MatchedScope:       ownership.MatchedScope,
+						IsExternalFallback: ownership.IsExternalFallback,
+						InstanceID:         strings.TrimSpace(ownership.InstanceID),
+						ConnectorID:        strings.TrimSpace(ownership.ConnectorID),
+						SessionID:          strings.TrimSpace(ownership.SessionID),
+						UpdatedAtMS:        updatedAtMS,
 					}, true
 				},
 				ReloadConfig: func(now time.Time, actor string) (adminapi.ReloadConfigResult, error) {
@@ -193,6 +208,7 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 		tunnelRegistry:        dataPlane.tunnelRegistry,
 		tunnelPoolReportStore: tunnelPoolReportStore,
 		metrics:               sharedMetrics,
+		hostDerivationDomain:  cfg.Ingress.BaseDomain,
 	})
 	if err != nil {
 		return nil, err

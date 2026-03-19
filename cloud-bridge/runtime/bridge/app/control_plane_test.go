@@ -182,6 +182,58 @@ func decodeConnectorAuthAckFromEnvelope(testingObject *testing.T, envelope *pb.C
 	return authAckPayload
 }
 
+func buildPublishServiceForTest(
+	instanceID string,
+	serviceName string,
+	serviceType string,
+	endpoints []pb.ServiceEndpoint,
+) pb.PublishService {
+	return pb.PublishService{
+		InstanceID:  instanceID,
+		ServiceName: serviceName,
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		ServiceType: serviceType,
+		Endpoints:   endpoints,
+	}
+}
+
+func upsertControlPlaneServiceInstanceForTest(
+	serviceRegistry *registry.ServiceRegistry,
+	now time.Time,
+	logicalServiceID string,
+	instanceID string,
+	serviceName string,
+	connectorID string,
+	sessionID string,
+	sessionEpoch uint64,
+	resourceVersion uint64,
+	instanceStatus pb.ServiceStatus,
+	healthStatus pb.HealthStatus,
+) {
+	serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: logicalServiceID,
+		ServiceName:      serviceName,
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Status:          instanceStatus,
+		ResourceVersion: resourceVersion,
+	}, pb.ServiceInstance{
+		InstanceID:       instanceID,
+		LogicalServiceID: logicalServiceID,
+		ConnectorID:      connectorID,
+		SessionID:        sessionID,
+		SessionEpoch:     sessionEpoch,
+		InstanceStatus:   instanceStatus,
+		HealthStatus:     healthStatus,
+		ResourceVersion:  resourceVersion,
+	})
+}
+
 // TestServeControlChannelReplyHeartbeatPong 验证 Bridge 在收到 ping 后立即回 pong。
 func TestServeControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -299,17 +351,14 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 		testingObject.Fatalf("expected auth success before publish, got=%s", authAckPayload.ErrorCode)
 	}
 
-	publishPayload := pb.PublishService{
-		ServiceID:   "svc-001",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
+	publishPayload := buildPublishServiceForTest(
+		"inst-001",
+		"order-service",
+		"http",
+		[]pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
 		},
-	}
+	)
 	encodedPublishPayload, err := json.Marshal(publishPayload)
 	if err != nil {
 		testingObject.Fatalf("marshal publish payload failed: %v", err)
@@ -324,7 +373,7 @@ func TestServeControlChannelHandlePublishService(testingObject *testing.T) {
 		RequestID:       "req-001",
 		EventID:         "evt-001",
 		ResourceType:    "service",
-		ResourceID:      "svc-001",
+		ResourceID:      "inst-001",
 		ResourceVersion: 1,
 		Payload:         encodedPublishPayload,
 	})
@@ -411,14 +460,7 @@ func TestServeControlChannelRejectPublishServiceBeforeAuth(testingObject *testin
 		)
 	}()
 
-	publishPayload := pb.PublishService{
-		ServiceID:   "svc-unauth",
-		ServiceKey:  "unauth-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "unauth-service",
-		ServiceType: "http",
-	}
+	publishPayload := buildPublishServiceForTest("inst-unauth", "unauth-service", "http", nil)
 	encodedPublishPayload, err := json.Marshal(publishPayload)
 	if err != nil {
 		testingObject.Fatalf("marshal publish payload failed: %v", err)
@@ -432,7 +474,7 @@ func TestServeControlChannelRejectPublishServiceBeforeAuth(testingObject *testin
 		RequestID:       "req-unauth",
 		EventID:         "evt-unauth",
 		ResourceType:    "service",
-		ResourceID:      "svc-unauth",
+		ResourceID:      "inst-unauth",
 		ResourceVersion: 1,
 		Payload:         encodedPublishPayload,
 	})
@@ -1066,17 +1108,14 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 		testingObject.Fatalf("expected auth success before grpc publish, got=%s", authAckPayload.ErrorCode)
 	}
 
-	publishPayload := pb.PublishService{
-		ServiceID:   "svc-002",
-		ServiceKey:  "pay-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "pay-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
+	publishPayload := buildPublishServiceForTest(
+		"inst-002",
+		"pay-service",
+		"http",
+		[]pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18081},
 		},
-	}
+	)
 	encodedPublishPayload, err := json.Marshal(publishPayload)
 	if err != nil {
 		testingObject.Fatalf("marshal grpc publish payload failed: %v", err)
@@ -1091,7 +1130,7 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 		RequestID:       "req-002",
 		EventID:         "evt-002",
 		ResourceType:    "service",
-		ResourceID:      "svc-002",
+		ResourceID:      "inst-002",
 		ResourceVersion: 1,
 		Payload:         encodedPublishPayload,
 	})
@@ -1137,24 +1176,27 @@ func TestControlMessageDispatcherHandleServiceHealthReport(testingObject *testin
 		State:       registry.SessionActive,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-2001",
-		ServiceKey:      "order-service/http",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ServiceName:     "order-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 1,
-		HealthStatus:    pb.HealthStatusUnknown,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		time.Now().UTC(),
+		"ls-2001",
+		"inst-2001",
+		"order-service",
+		"connector-1",
+		"session-2001",
+		2,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusUnknown,
+	)
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
 		serviceRegistry: serviceRegistry,
 	})
 
 	healthPayload := pb.ServiceHealthReport{
-		ServiceID:           "svc-2001",
-		ServiceKey:          "order-service/http",
+		InstanceID:          "inst-2001",
+		LogicalServiceID:    "ls-2001",
 		ServiceHealthStatus: pb.HealthStatusUnhealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	}
@@ -1177,14 +1219,14 @@ func TestControlMessageDispatcherHandleServiceHealthReport(testingObject *testin
 		testingObject.Fatalf("service health report should not generate ack envelope")
 	}
 
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-2001")
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-2001")
 	if !exists {
-		testingObject.Fatalf("expected service snapshot exists")
+		testingObject.Fatalf("expected instance snapshot exists")
 	}
-	if serviceSnapshot.HealthStatus != pb.HealthStatusUnhealthy {
+	if instanceSnapshot.Instance.HealthStatus != pb.HealthStatusUnhealthy {
 		testingObject.Fatalf(
 			"unexpected health status: got=%s want=%s",
-			serviceSnapshot.HealthStatus,
+			instanceSnapshot.Instance.HealthStatus,
 			pb.HealthStatusUnhealthy,
 		)
 	}
@@ -1370,13 +1412,19 @@ func TestControlMessageDispatcherSessionTakeoverLifecycle(testingObject *testing
 		UpdatedAt:     now,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "svc-old",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-old",
+		"inst-old",
+		"order-service",
+		"connector-1",
+		"session-old",
+		1,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
 	tunnelRegistry := registry.NewTunnelRegistry()
 	oldTunnel := &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-old"}
 	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-old", oldTunnel); err != nil {
@@ -1414,12 +1462,23 @@ func TestControlMessageDispatcherSessionTakeoverLifecycle(testingObject *testing
 	if newSession.State != registry.SessionActive {
 		testingObject.Fatalf("unexpected new session state: got=%s want=%s", newSession.State, registry.SessionActive)
 	}
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-old")
+	logicalServiceSnapshot, exists := serviceRegistry.GetLogicalServiceByID("ls-old")
 	if !exists {
-		testingObject.Fatalf("expected service snapshot exists")
+		testingObject.Fatalf("expected logical service snapshot exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusInactive {
-		testingObject.Fatalf("unexpected service status after takeover: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusInactive)
+	if logicalServiceSnapshot.Status != pb.ServiceStatusInactive {
+		testingObject.Fatalf("unexpected service status after takeover: got=%s want=%s", logicalServiceSnapshot.Status, pb.ServiceStatusInactive)
+	}
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-old")
+	if !exists {
+		testingObject.Fatalf("expected instance snapshot exists")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusInactive {
+		testingObject.Fatalf(
+			"unexpected instance status after takeover: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusInactive,
+		)
 	}
 	if _, exists := tunnelRegistry.Get("tunnel-old"); exists {
 		testingObject.Fatalf("expected old session tunnel purged")
@@ -1445,20 +1504,32 @@ func TestControlMessageDispatcherSessionTakeoverDoesNotDowngradeNewSessionInstan
 		UpdatedAt:     now,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.UpsertWithRuntime(now, pb.Service{
-		ServiceID:    "svc-takeover",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-old")
-	serviceRegistry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:    "svc-takeover",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-new")
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-takeover",
+		"inst-takeover-old",
+		"order-service",
+		"connector-1",
+		"session-old",
+		1,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now.Add(time.Second),
+		"ls-takeover",
+		"inst-takeover-new",
+		"order-service",
+		"connector-1",
+		"session-new",
+		2,
+		2,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
 
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
@@ -1475,15 +1546,15 @@ func TestControlMessageDispatcherSessionTakeoverDoesNotDowngradeNewSessionInstan
 		ResourceVersion: 9,
 	})
 
-	instances := serviceRegistry.ListInstancesByServiceID("svc-takeover")
+	instances := serviceRegistry.ListInstancesByLogicalServiceID("ls-takeover")
 	if len(instances) != 2 {
 		testingObject.Fatalf("unexpected instance count: got=%d want=2", len(instances))
 	}
 	instanceStatusBySession := make(map[string]pb.ServiceStatus, len(instances))
 	instanceHealthBySession := make(map[string]pb.HealthStatus, len(instances))
 	for _, instance := range instances {
-		instanceStatusBySession[instance.SessionID] = instance.Service.Status
-		instanceHealthBySession[instance.SessionID] = instance.Service.HealthStatus
+		instanceStatusBySession[instance.Instance.SessionID] = instance.Instance.InstanceStatus
+		instanceHealthBySession[instance.Instance.SessionID] = instance.Instance.HealthStatus
 	}
 	if instanceStatusBySession["session-old"] != pb.ServiceStatusInactive ||
 		instanceHealthBySession["session-old"] != pb.HealthStatusUnknown {
@@ -1519,30 +1590,32 @@ func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObjec
 		UpdatedAt:     now.Add(-2 * time.Minute),
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:       "svc-epoch-reset",
-		ServiceKey:      "order-service/http",
-		ConnectorID:     "connector-1",
-		Status:          pb.ServiceStatusStale,
-		HealthStatus:    pb.HealthStatusUnknown,
-		ResourceVersion: 10,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-epoch-reset",
+		"inst-epoch-reset",
+		"order-service",
+		"connector-1",
+		"session-old",
+		9,
+		10,
+		pb.ServiceStatusStale,
+		pb.HealthStatusUnknown,
+	)
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
 		serviceRegistry: serviceRegistry,
 	})
 
-	encodedPayload, err := json.Marshal(pb.PublishService{
-		ServiceID:   "svc-epoch-reset",
-		ServiceKey:  "order-service/http",
-		Namespace:   "dev",
-		Environment: "demo",
-		ServiceName: "order-service",
-		ServiceType: "http",
-		Endpoints: []pb.ServiceEndpoint{
+	encodedPayload, err := json.Marshal(buildPublishServiceForTest(
+		"inst-epoch-reset",
+		"order-service",
+		"http",
+		[]pb.ServiceEndpoint{
 			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
 		},
-	})
+	))
 	if err != nil {
 		testingObject.Fatalf("marshal publish payload failed: %v", err)
 	}
@@ -1556,7 +1629,7 @@ func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObjec
 		SessionEpoch:    1,
 		ConnectorID:     "connector-1",
 		ResourceType:    "service",
-		ResourceID:      "svc-epoch-reset",
+		ResourceID:      "inst-epoch-reset",
 		EventID:         "evt-epoch-reset",
 		ResourceVersion: 11,
 		Payload:         encodedPayload,
@@ -1589,12 +1662,23 @@ func TestControlMessageDispatcherEpochResetTakeoverFromStaleSession(testingObjec
 	if connectorSession.SessionID != "session-new" {
 		testingObject.Fatalf("unexpected connector session owner: got=%s want=%s", connectorSession.SessionID, "session-new")
 	}
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-epoch-reset")
+	logicalServiceSnapshot, exists := serviceRegistry.GetLogicalServiceByID("ls-epoch-reset")
 	if !exists {
-		testingObject.Fatalf("expected service snapshot exists")
+		testingObject.Fatalf("expected logical service snapshot exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusActive {
-		testingObject.Fatalf("unexpected service status after reconnect publish: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusActive)
+	if logicalServiceSnapshot.Status != pb.ServiceStatusActive {
+		testingObject.Fatalf("unexpected service status after reconnect publish: got=%s want=%s", logicalServiceSnapshot.Status, pb.ServiceStatusActive)
+	}
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-epoch-reset")
+	if !exists {
+		testingObject.Fatalf("expected instance snapshot exists")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusActive {
+		testingObject.Fatalf(
+			"unexpected instance status after reconnect publish: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusActive,
+		)
 	}
 }
 
@@ -1613,13 +1697,19 @@ func TestControlMessageDispatcherSweepSessionLifecycle(testingObject *testing.T)
 		UpdatedAt:     now.Add(-2 * time.Minute),
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "svc-4001",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-4001",
+		"inst-4001",
+		"order-service",
+		"connector-1",
+		"session-4001",
+		1,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
 	tunnelRegistry := registry.NewTunnelRegistry()
 	staleTunnel := &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-4001"}
 	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-4001", staleTunnel); err != nil {
@@ -1640,12 +1730,23 @@ func TestControlMessageDispatcherSweepSessionLifecycle(testingObject *testing.T)
 	if staleSession.State != registry.SessionStale {
 		testingObject.Fatalf("unexpected session state after first sweep: got=%s want=%s", staleSession.State, registry.SessionStale)
 	}
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-4001")
+	logicalServiceSnapshot, exists := serviceRegistry.GetLogicalServiceByID("ls-4001")
 	if !exists {
-		testingObject.Fatalf("expected service snapshot exists")
+		testingObject.Fatalf("expected logical service snapshot exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusStale {
-		testingObject.Fatalf("unexpected service status after stale: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusStale)
+	if logicalServiceSnapshot.Status != pb.ServiceStatusInactive {
+		testingObject.Fatalf("unexpected logical service status after stale: got=%s want=%s", logicalServiceSnapshot.Status, pb.ServiceStatusInactive)
+	}
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-4001")
+	if !exists {
+		testingObject.Fatalf("expected instance snapshot exists")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusStale {
+		testingObject.Fatalf(
+			"unexpected instance status after stale: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusStale,
+		)
 	}
 	if _, exists := tunnelRegistry.Get("tunnel-4001"); exists {
 		testingObject.Fatalf("expected stale session tunnel purged")
@@ -1690,13 +1791,19 @@ func TestControlMessageDispatcherStaleOldSessionDoesNotDowngradeCurrentServices(
 	})
 
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "svc-new",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-new",
+		"inst-new",
+		"order-service",
+		"connector-1",
+		"session-new",
+		2,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
 
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
@@ -1710,14 +1817,14 @@ func TestControlMessageDispatcherStaleOldSessionDoesNotDowngradeCurrentServices(
 		"heartbeat_timeout",
 	)
 
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-new")
+	logicalServiceSnapshot, exists := serviceRegistry.GetLogicalServiceByID("ls-new")
 	if !exists {
 		testingObject.Fatalf("expected current service exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusActive {
+	if logicalServiceSnapshot.Status != pb.ServiceStatusActive {
 		testingObject.Fatalf(
 			"old session stale should not downgrade current service: got=%s want=%s",
-			serviceSnapshot.Status,
+			logicalServiceSnapshot.Status,
 			pb.ServiceStatusActive,
 		)
 	}
@@ -1740,22 +1847,27 @@ func TestControlMessageDispatcherResourceEventDoesNotReactivateDrainingSession(t
 		UpdatedAt:     now,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:       "svc-1",
-		ServiceKey:      "order-service/http",
-		ConnectorID:     "connector-1",
-		Status:          pb.ServiceStatusInactive,
-		HealthStatus:    pb.HealthStatusUnknown,
-		ResourceVersion: 1,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-1",
+		"inst-1",
+		"order-service",
+		"connector-1",
+		"session-draining",
+		9,
+		1,
+		pb.ServiceStatusInactive,
+		pb.HealthStatusUnknown,
+	)
 	dispatcher := newControlMessageDispatcher(controlMessageDispatcherOptions{
 		sessionRegistry: sessionRegistry,
 		serviceRegistry: serviceRegistry,
 	})
 
 	encodedPayload, err := json.Marshal(pb.ServiceHealthReport{
-		ServiceID:           "svc-1",
-		ServiceKey:          "order-service/http",
+		InstanceID:          "inst-1",
+		LogicalServiceID:    "ls-1",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       now.Unix(),
 	})
@@ -1845,13 +1957,19 @@ func TestControlMessageDispatcherMarkSessionFailedPurgesTunnel(testingObject *te
 		UpdatedAt:     now,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "svc-failed",
-		ServiceKey:   "dev/demo/failover-service",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	})
+	upsertControlPlaneServiceInstanceForTest(
+		serviceRegistry,
+		now,
+		"ls-failed",
+		"inst-failed",
+		"failover-service",
+		"connector-1",
+		"session-failed",
+		7,
+		1,
+		pb.ServiceStatusActive,
+		pb.HealthStatusHealthy,
+	)
 	tunnelRegistry := registry.NewTunnelRegistry()
 	failedTunnel := &controlPlaneLifecycleTestTunnel{tunnelID: "tunnel-failed"}
 	if _, err := tunnelRegistry.UpsertIdle(now, "connector-1", "session-failed", failedTunnel); err != nil {
@@ -1875,12 +1993,23 @@ func TestControlMessageDispatcherMarkSessionFailedPurgesTunnel(testingObject *te
 	if sessionSnapshot.State != registry.SessionFailed {
 		testingObject.Fatalf("unexpected session state after failed transition: got=%s want=%s", sessionSnapshot.State, registry.SessionFailed)
 	}
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-failed")
+	logicalServiceSnapshot, exists := serviceRegistry.GetLogicalServiceByID("ls-failed")
 	if !exists {
-		testingObject.Fatalf("expected service snapshot exists")
+		testingObject.Fatalf("expected logical service snapshot exists")
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusStale {
-		testingObject.Fatalf("unexpected service status after failed transition: got=%s want=%s", serviceSnapshot.Status, pb.ServiceStatusStale)
+	if logicalServiceSnapshot.Status != pb.ServiceStatusInactive {
+		testingObject.Fatalf("unexpected logical service status after failed transition: got=%s want=%s", logicalServiceSnapshot.Status, pb.ServiceStatusInactive)
+	}
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-failed")
+	if !exists {
+		testingObject.Fatalf("expected instance snapshot exists")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusStale {
+		testingObject.Fatalf(
+			"unexpected instance status after failed transition: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusStale,
+		)
 	}
 	if _, exists := tunnelRegistry.Get("tunnel-failed"); exists {
 		testingObject.Fatalf("expected failed session tunnel purged")

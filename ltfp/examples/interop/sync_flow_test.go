@@ -44,7 +44,17 @@ func TestPublishServiceFlow(t *testing.T) {
 		t.Fatalf("validate publish service failed: %v", err)
 	}
 
-	ack := consistency.BuildPublishServiceAck(pb.EventStatusAccepted, decoded.ServiceID, decoded.ServiceKey, 10, 10, "", "")
+	ack := consistency.BuildPublishServiceAck(
+		pb.EventStatusAccepted,
+		"ls_01J8Z6C4X9K7M2P4",
+		decoded.InstanceID,
+		decoded.ServiceName,
+		decoded.Scope,
+		10,
+		10,
+		"",
+		"",
+	)
 	// 成功发布场景下 ACK 必须为 accepted=true。
 	if !ack.Accepted {
 		t.Fatalf("expected publish ack accepted")
@@ -56,8 +66,8 @@ func TestServiceHealthReportFlow(t *testing.T) {
 	t.Parallel()
 
 	report := pb.ServiceHealthReport{
-		ServiceID:           "svc_01J8Z6C4X9K7M2P4",
-		ServiceKey:          "dev/alice/order-service",
+		InstanceID:          "si_01J8Z6C4X9K7M2P4",
+		LogicalServiceID:    "ls_01J8Z6C4X9K7M2P4",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       time.Now().Unix(),
 		EndpointStatuses: []pb.EndpointHealthStatus{

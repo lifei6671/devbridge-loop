@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 // TestParseConfigYAMLAppliesDefaultsAndOverrides 验证 YAML 仅覆盖显式字段，其余字段保持默认值。
@@ -37,6 +38,21 @@ control_plane:
   tls_mode: plaintext
 observability:
   log_level: debug
+ingress:
+  base_domain: dev.example.internal
+default_scope:
+  namespace: default
+  environment: shared
+fallback_policies:
+  - policy_id: fallback-dev
+    namespace: dev
+    enabled: true
+    chain:
+      - target_scope:
+          namespace: dev
+          environment: base
+    external:
+      enabled: true
 `
 	config, err := ParseConfigYAML([]byte(configYAML))
 	if err != nil {
@@ -71,8 +87,20 @@ observability:
 	if config.Ingress.GRPCAddr != ":38081" {
 		testingObject.Fatalf("unexpected ingress grpc addr default: got=%s want=%s", config.Ingress.GRPCAddr, ":38081")
 	}
+	if config.Ingress.BaseDomain != "dev.example.internal" {
+		testingObject.Fatalf("unexpected ingress base_domain: got=%s want=%s", config.Ingress.BaseDomain, "dev.example.internal")
+	}
 	if len(config.Admin.AuthTokens) != 3 {
 		testingObject.Fatalf("unexpected admin token count: got=%d want=%d", len(config.Admin.AuthTokens), 3)
+	}
+	if config.DefaultScope.Namespace != "default" || config.DefaultScope.Environment != "shared" {
+		testingObject.Fatalf("unexpected default scope: %+v", config.DefaultScope)
+	}
+	if len(config.FallbackPolicies) != 1 {
+		testingObject.Fatalf("unexpected fallback policy count: got=%d want=1", len(config.FallbackPolicies))
+	}
+	if config.FallbackPolicies[0].Namespace != "dev" || !config.FallbackPolicies[0].External.Enabled {
+		testingObject.Fatalf("unexpected fallback policy: %+v", config.FallbackPolicies[0])
 	}
 }
 
@@ -89,6 +117,35 @@ unknown_root: true
 	}
 	if !strings.Contains(err.Error(), "unknown_root") {
 		testingObject.Fatalf("unexpected parse error: %v", err)
+	}
+}
+
+// TestParseConfigYAMLRejectsInvalidFallbackPolicies 验证 scope 降级配置会执行去重与空 scope 校验。
+func TestParseConfigYAMLRejectsInvalidFallbackPolicies(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	configYAML := `
+default_scope:
+  namespace: default
+  environment: base
+fallback_policies:
+  - policy_id: fallback-dev
+    namespace: dev
+    enabled: true
+    chain:
+      - target_scope:
+          namespace: dev
+          environment: base
+      - target_scope:
+          namespace: dev
+          environment: base
+`
+	_, err := ParseConfigYAML([]byte(configYAML))
+	if err == nil {
+		testingObject.Fatalf("expected invalid fallback policies to fail")
+	}
+	if !strings.Contains(err.Error(), "duplicated target_scope") {
+		testingObject.Fatalf("unexpected fallback policy error: %v", err)
 	}
 }
 
@@ -157,6 +214,21 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	config.ControlPlane.TLSServerCertRenewBefore = 12 * time.Hour
 	config.Admin.BasePath = "/console"
 	config.Observability.LogLevel = "debug"
+	config.DefaultScope.Namespace = "tenant"
+	config.DefaultScope.Environment = "shared"
+	config.FallbackPolicies = []pb.ScopeFallbackPolicy{
+		{
+			PolicyID:  "fallback-tenant",
+			Namespace: "tenant",
+			Enabled:   true,
+			Chain: []pb.FallbackStep{
+				{
+					TargetScope: pb.Scope{Namespace: "tenant", Environment: "base"},
+				},
+			},
+			External: pb.ExternalFallbackConfig{Enabled: true},
+		},
+	}
 
 	if err := SaveConfigToYAMLFile(config, configFilePath); err != nil {
 		testingObject.Fatalf("save config yaml failed: %v", err)
@@ -167,6 +239,9 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	}
 	if loadedConfig.Ingress.HTTPAddr != config.Ingress.HTTPAddr {
 		testingObject.Fatalf("unexpected ingress.http_addr: got=%s want=%s", loadedConfig.Ingress.HTTPAddr, config.Ingress.HTTPAddr)
+	}
+	if loadedConfig.Ingress.BaseDomain != config.Ingress.BaseDomain {
+		testingObject.Fatalf("unexpected ingress.base_domain: got=%s want=%s", loadedConfig.Ingress.BaseDomain, config.Ingress.BaseDomain)
 	}
 	if loadedConfig.ControlPlane.HeartbeatTimeout != config.ControlPlane.HeartbeatTimeout {
 		testingObject.Fatalf(
@@ -211,5 +286,11 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	}
 	if loadedConfig.Observability.LogLevel != config.Observability.LogLevel {
 		testingObject.Fatalf("unexpected observability.log_level: got=%s want=%s", loadedConfig.Observability.LogLevel, config.Observability.LogLevel)
+	}
+	if loadedConfig.DefaultScope != config.DefaultScope {
+		testingObject.Fatalf("unexpected default_scope: got=%+v want=%+v", loadedConfig.DefaultScope, config.DefaultScope)
+	}
+	if len(loadedConfig.FallbackPolicies) != 1 || loadedConfig.FallbackPolicies[0].PolicyID != "fallback-tenant" {
+		testingObject.Fatalf("unexpected fallback_policies round trip: %+v", loadedConfig.FallbackPolicies)
 	}
 }

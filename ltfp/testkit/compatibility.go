@@ -69,24 +69,33 @@ func GoldenFullSyncSnapshot() pb.FullSyncSnapshot {
 		RequestID:       "full-sync-001",
 		SessionEpoch:    1,
 		SnapshotVersion: 10,
-		Services: []pb.Service{
+		LogicalServices: []pb.LogicalService{
 			{
-				ServiceID:       "svc_01J8Z6C4X9K7M2P4",
-				ServiceKey:      "dev/alice/order-service",
-				Namespace:       "dev",
-				Environment:     "alice",
-				ConnectorID:     "connector-dev-01",
-				ServiceName:     "order-service",
-				Status:          pb.ServiceStatusActive,
-				ResourceVersion: 10,
-				HealthStatus:    pb.HealthStatusHealthy,
+				LogicalServiceID: "ls_01J8Z6C4X9K7M2P4",
+				Scope: pb.Scope{
+					Namespace:   "dev",
+					Environment: "alice",
+				},
+				ServiceName:          "order-service",
+				Status:               pb.ServiceStatusActive,
+				ResourceVersion:      10,
+				HealthyInstanceCount: 1,
+			},
+		},
+		ServiceInstances: []pb.ServiceInstance{
+			{
+				InstanceID:       "si_01J8Z6C4X9K7M2P4",
+				LogicalServiceID: "ls_01J8Z6C4X9K7M2P4",
+				ConnectorID:      "connector-dev-01",
+				InstanceStatus:   pb.ServiceStatusActive,
+				ResourceVersion:  10,
+				HealthStatus:     pb.HealthStatusHealthy,
 			},
 		},
 		Routes: []pb.Route{
 			{
 				RouteID:         "route-001",
-				Namespace:       "dev",
-				Environment:     "alice",
+				Scope:           pb.Scope{Namespace: "dev", Environment: "alice"},
 				ResourceVersion: 10,
 				Target: pb.RouteTarget{
 					Type: pb.RouteTargetTypeConnectorService,

@@ -13,7 +13,6 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
-	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/routing"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
@@ -227,15 +226,26 @@ func newRuntimeWithDataPlaneDependenciesForTest(
 ) *Runtime {
 	testingObject.Helper()
 	cfg := DefaultConfig()
+	return newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, dependencies)
+}
+
+// newRuntimeWithConfigAndDataPlaneDependenciesForTest 构造带指定配置的数据面测试 runtime。
+func newRuntimeWithConfigAndDataPlaneDependenciesForTest(
+	testingObject *testing.T,
+	cfg Config,
+	dependencies runtimeDataPlaneDependencies,
+) *Runtime {
+	testingObject.Helper()
 	dataPlane, err := newRuntimeDataPlaneWithDependencies(cfg, dependencies)
 	if err != nil {
 		testingObject.Fatalf("new runtime data plane failed: %v", err)
 	}
 	controlServer, err := newControlPlaneServer(cfg.ControlPlane, controlPlaneDependencies{
-		sessionRegistry: dataPlane.sessionRegistry,
-		serviceRegistry: dataPlane.serviceRegistry,
-		routeRegistry:   dataPlane.routeRegistry,
-		tunnelRegistry:  dataPlane.tunnelRegistry,
+		sessionRegistry:      dataPlane.sessionRegistry,
+		serviceRegistry:      dataPlane.serviceRegistry,
+		routeRegistry:        dataPlane.routeRegistry,
+		tunnelRegistry:       dataPlane.tunnelRegistry,
+		hostDerivationDomain: cfg.Ingress.BaseDomain,
 	})
 	if err != nil {
 		testingObject.Fatalf("new control server failed: %v", err)
@@ -247,6 +257,19 @@ func newRuntimeWithDataPlaneDependenciesForTest(
 	}
 }
 
+// enableExternalFallbackPolicyForTest 为测试 runtime 开启指定 namespace 的 external fallback。
+func enableExternalFallbackPolicyForTest(cfg *Config, namespace string) {
+	if cfg == nil {
+		return
+	}
+	cfg.FallbackPolicies = []pb.ScopeFallbackPolicy{{
+		PolicyID:  "fallback-" + strings.TrimSpace(namespace),
+		Namespace: strings.TrimSpace(namespace),
+		Enabled:   true,
+		External:  pb.ExternalFallbackConfig{Enabled: true},
+	}}
+}
+
 // seedConnectorServiceAndSession 写入 connector 解析所需的服务与会话快照。
 func seedConnectorServiceAndSession(runtime *Runtime, now time.Time) {
 	runtime.dataPlane.sessionRegistry.Upsert(now, registry.SessionRuntime{
@@ -256,14 +279,24 @@ func seedConnectorServiceAndSession(runtime *Runtime, now time.Time) {
 		State:         registry.SessionActive,
 		LastHeartbeat: now,
 	})
-	runtime.dataPlane.serviceRegistry.Upsert(now, pb.Service{
-		ServiceID:    "svc-1",
-		ServiceKey:   "dev/demo/order-service",
-		Namespace:    "dev",
-		Environment:  "demo",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	runtime.dataPlane.serviceRegistry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-1",
+		ServiceName:      "order-service",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Status:               pb.ServiceStatusActive,
+		ActiveInstanceCount:  1,
+		HealthyInstanceCount: 1,
+	}, pb.ServiceInstance{
+		InstanceID:       "inst-1",
+		LogicalServiceID: "ls-1",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-1",
+		SessionEpoch:     1,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
 	})
 }
 
@@ -302,9 +335,11 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 
 	// 写入 L7 路由，模拟 API 请求命中 connector_service。
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.dev.local",
@@ -313,7 +348,9 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 		Metadata: map[string]string{
@@ -347,9 +384,9 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 		Namespace:   "dev",
 		Environment: "demo",
 	}, pb.TrafficOpen{
-		TrafficID: "traffic-1",
-		RouteID:   "route-1",
-		ServiceID: "svc-1",
+		TrafficID:        "traffic-1",
+		RouteID:          "route-1",
+		LogicalServiceID: "ls-1",
 	})
 	if err != nil {
 		testingObject.Fatalf("dispatch http ingress failed: %v", err)
@@ -377,31 +414,31 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 	if writes[0].OpenReq == nil || writes[0].OpenReq.TrafficID != "traffic-1" {
 		testingObject.Fatalf("expected first payload to be open req with traffic-1")
 	}
-	if writes[0].OpenReq.Metadata[trafficMetadataServiceIDKey] != "svc-1" {
+	if writes[0].OpenReq.Metadata[trafficMetadataLogicalServiceIDKey] != "ls-1" {
 		testingObject.Fatalf(
-			"unexpected open req service_id metadata: got=%s want=%s",
-			writes[0].OpenReq.Metadata[trafficMetadataServiceIDKey],
-			"svc-1",
+			"unexpected open req logical_service_id metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataLogicalServiceIDKey],
+			"ls-1",
 		)
 	}
-	if writes[0].OpenReq.Metadata[trafficMetadataServiceKeyKey] != "dev/demo/order-service" {
+	if writes[0].OpenReq.Metadata[trafficMetadataServiceNameKey] != "order-service" {
 		testingObject.Fatalf(
-			"unexpected open req service_key metadata: got=%s want=%s",
-			writes[0].OpenReq.Metadata[trafficMetadataServiceKeyKey],
-			"dev/demo/order-service",
+			"unexpected open req service_name metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataServiceNameKey],
+			"order-service",
 		)
 	}
-	if writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey] == "" {
-		testingObject.Fatalf("expected open req service_instance_id metadata not empty")
+	if writes[0].OpenReq.Metadata[trafficMetadataInstanceIDKey] == "" {
+		testingObject.Fatalf("expected open req instance_id metadata not empty")
 	}
 	if result.Resolution.Connector == nil {
 		testingObject.Fatalf("expected connector resolution for service identity assert")
 	}
-	if writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey] != result.Resolution.Connector.ServiceInstanceID {
+	if writes[0].OpenReq.Metadata[trafficMetadataInstanceIDKey] != result.Resolution.Connector.Instance.InstanceID {
 		testingObject.Fatalf(
-			"unexpected open req service_instance_id metadata: got=%s want=%s",
-			writes[0].OpenReq.Metadata[trafficMetadataServiceInstanceIDKey],
-			result.Resolution.Connector.ServiceInstanceID,
+			"unexpected open req instance_id metadata: got=%s want=%s",
+			writes[0].OpenReq.Metadata[trafficMetadataInstanceIDKey],
+			result.Resolution.Connector.Instance.InstanceID,
 		)
 	}
 	if writes[1].CloseAck == nil || writes[1].CloseAck.TrafficID != "traffic-1" || !writes[1].CloseAck.Accepted {
@@ -434,18 +471,30 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 	if !ownershipExists {
 		testingObject.Fatalf("expected traffic ownership exists for traffic-1")
 	}
-	if ownership.ServiceID != "svc-1" {
-		testingObject.Fatalf("unexpected ownership service_id: got=%s want=svc-1", ownership.ServiceID)
+	if ownership.LogicalServiceID != "ls-1" {
+		testingObject.Fatalf("unexpected ownership logical_service_id: got=%s want=ls-1", ownership.LogicalServiceID)
 	}
 	if result.Resolution.Connector == nil {
 		testingObject.Fatalf("expected connector resolution exists for ownership assert")
 	}
-	if ownership.ServiceInstanceID != result.Resolution.Connector.ServiceInstanceID {
+	if ownership.InstanceID != result.Resolution.Connector.Instance.InstanceID {
 		testingObject.Fatalf(
-			"unexpected ownership service_instance_id: got=%s want=%s",
-			ownership.ServiceInstanceID,
-			result.Resolution.Connector.ServiceInstanceID,
+			"unexpected ownership instance_id: got=%s want=%s",
+			ownership.InstanceID,
+			result.Resolution.Connector.Instance.InstanceID,
 		)
+	}
+	if ownership.Scope.Namespace != "dev" || ownership.Scope.Environment != "demo" {
+		testingObject.Fatalf("unexpected ownership scope: %+v", ownership.Scope)
+	}
+	if ownership.RequestScope.Namespace != "dev" || ownership.RequestScope.Environment != "demo" {
+		testingObject.Fatalf("unexpected ownership request_scope: %+v", ownership.RequestScope)
+	}
+	if ownership.MatchedScope.Namespace != "dev" || ownership.MatchedScope.Environment != "demo" {
+		testingObject.Fatalf("unexpected ownership matched_scope: %+v", ownership.MatchedScope)
+	}
+	if ownership.IsExternalFallback {
+		testingObject.Fatalf("expected connector ownership not marked as external fallback")
 	}
 	if ownership.ConnectorID != "connector-1" || ownership.SessionID != "session-1" {
 		testingObject.Fatalf(
@@ -464,15 +513,19 @@ func TestDispatchHTTPIngressExternalServicePath(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	directDialer := &runtimeDataPlaneTestDirectDialer{}
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{
 		directUpstreamDialer: directDialer,
 	})
 	now := time.Now().UTC()
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-external-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-external-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.direct.local",
@@ -527,85 +580,18 @@ func TestDispatchHTTPIngressExternalServicePath(testingObject *testing.T) {
 	if calls[0].Address != "127.0.0.1:19090" {
 		testingObject.Fatalf("unexpected dial target address: %s", calls[0].Address)
 	}
-}
-
-// TestDispatchHTTPIngressHybridFallbackPreOpenNoTunnel 验证 hybrid pre-open no-idle 回退到 direct path。
-func TestDispatchHTTPIngressHybridFallbackPreOpenNoTunnel(testingObject *testing.T) {
-	testingObject.Parallel()
-
-	directDialer := &runtimeDataPlaneTestDirectDialer{}
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{
-		directUpstreamDialer: directDialer,
-	})
-	now := time.Now().UTC()
-	seedConnectorServiceAndSession(runtime, now)
-
-	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-hybrid-1",
-		Namespace:   "dev",
-		Environment: "demo",
-		Match: pb.RouteMatch{
-			Protocol:   "http",
-			Host:       "api.hybrid.local",
-			PathPrefix: "/",
-		},
-		Target: pb.RouteTarget{
-			Type: pb.RouteTargetTypeHybridGroup,
-			HybridGroup: &pb.HybridGroupTarget{
-				PrimaryConnectorService: pb.ConnectorServiceTarget{
-					ServiceKey: "dev/demo/order-service",
-				},
-				FallbackExternalService: pb.ExternalServiceTarget{
-					Namespace:   "dev",
-					Environment: "demo",
-					ServiceName: "pay-fallback",
-					Selector: map[string]string{
-						"endpoint": "127.0.0.1:29090",
-					},
-				},
-				FallbackPolicy: pb.FallbackPolicyPreOpenOnly,
-			},
-		},
-		Metadata: map[string]string{
-			"ingress_mode": string(pb.IngressModeL7Shared),
-		},
-	})
-
-	result, err := runtime.DispatchHTTPIngress(context.Background(), ingress.HTTPGatewayRequest{
-		Host:        "api.hybrid.local",
-		Path:        "/fallback",
-		Namespace:   "dev",
-		Environment: "demo",
-	}, pb.TrafficOpen{
-		TrafficID: "traffic-hybrid-1",
-	})
-	if err != nil {
-		testingObject.Fatalf("dispatch hybrid ingress failed: %v", err)
+	if !result.Resolution.IsExternalFallback {
+		testingObject.Fatalf("expected external resolution marked as fallback")
 	}
-	if result.Resolution.TargetKind != pb.RouteTargetTypeHybridGroup {
-		testingObject.Fatalf("unexpected resolved target kind: %s", result.Resolution.TargetKind)
+	ownership, exists := runtime.dataPlane.resolveTrafficOwnership("traffic-external-1")
+	if !exists {
+		testingObject.Fatalf("expected traffic ownership exists for external traffic")
 	}
-	if !result.Execute.UsedHybridFallback {
-		testingObject.Fatalf("expected hybrid fallback used")
+	if !ownership.IsExternalFallback {
+		testingObject.Fatalf("expected external ownership marked as fallback")
 	}
-	if result.Execute.HybridFallbackStage != routing.HybridFallbackStagePreOpenNoTunnel {
-		testingObject.Fatalf("unexpected hybrid fallback stage: %s", result.Execute.HybridFallbackStage)
-	}
-	if result.Execute.DirectResult == nil {
-		testingObject.Fatalf("expected direct fallback result")
-	}
-	if result.Execute.DirectResult.Endpoint.Address != "127.0.0.1:29090" {
-		testingObject.Fatalf("unexpected hybrid fallback endpoint: %s", result.Execute.DirectResult.Endpoint.Address)
-	}
-	if result.Execute.HTTPStatus != 200 {
-		testingObject.Fatalf("unexpected execute http status: %d", result.Execute.HTTPStatus)
-	}
-	calls := directDialer.Calls()
-	if len(calls) != 1 {
-		testingObject.Fatalf("expected one direct dial call from hybrid fallback, got=%d", len(calls))
-	}
-	if calls[0].Address != "127.0.0.1:29090" {
-		testingObject.Fatalf("unexpected hybrid dial target: %s", calls[0].Address)
+	if ownership.RequestScope.Namespace != "dev" || ownership.MatchedScope.Environment != "demo" {
+		testingObject.Fatalf("unexpected external ownership scopes: request=%+v matched=%+v", ownership.RequestScope, ownership.MatchedScope)
 	}
 }
 
@@ -623,9 +609,11 @@ func TestDispatchHTTPIngressConnectorOpenAckTimeoutLifecycle(testingObject *test
 	seedConnectorServiceAndSession(runtime, now)
 
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-timeout-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-timeout-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "http",
 			Host:       "api.timeout.local",
@@ -634,7 +622,9 @@ func TestDispatchHTTPIngressConnectorOpenAckTimeoutLifecycle(testingObject *test
 		Target: pb.RouteTarget{
 			Type: pb.RouteTargetTypeConnectorService,
 			ConnectorService: &pb.ConnectorServiceTarget{
-				ServiceKey: "dev/demo/order-service",
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
 			},
 		},
 		Metadata: map[string]string{
@@ -661,9 +651,9 @@ func TestDispatchHTTPIngressConnectorOpenAckTimeoutLifecycle(testingObject *test
 		Namespace:   "dev",
 		Environment: "demo",
 	}, pb.TrafficOpen{
-		TrafficID: "traffic-timeout-1",
-		RouteID:   "route-timeout-1",
-		ServiceID: "svc-1",
+		TrafficID:        "traffic-timeout-1",
+		RouteID:          "route-timeout-1",
+		LogicalServiceID: "ls-1",
 	})
 	if !errors.Is(err, connectorproxy.ErrOpenAckTimeout) {
 		testingObject.Fatalf("expected open_ack timeout error, got=%v", err)

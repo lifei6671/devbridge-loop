@@ -138,9 +138,9 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		defer handoff.Lease.Release()
 	}
 	baseLogFields := obs.LogFields{
-		TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
-		ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
-		TunnelID:  strings.TrimSpace(handoff.TunnelID),
+		TrafficID:        strings.TrimSpace(handoff.Open.TrafficID),
+		LogicalServiceID: strings.TrimSpace(handoff.Open.LogicalServiceID),
+		TunnelID:         strings.TrimSpace(handoff.TunnelID),
 	}
 	if err := validateTrafficOpen(handoff.Open); err != nil {
 		errorCode := ltfperrors.ExtractCode(err)
@@ -162,7 +162,11 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		return HandleResult{}, errors.Join(err, ackError)
 	}
 
-	selectedEndpoint, err := opener.selector.SelectEndpoint(executionContext, handoff.Open.ServiceID, copyStringMap(handoff.Open.EndpointSelectionHint))
+	selectedEndpoint, err := opener.selector.SelectEndpoint(
+		executionContext,
+		handoff.Open.LogicalServiceID,
+		copyStringMap(handoff.Open.EndpointSelectionHint),
+	)
 	if err != nil {
 		ackError := opener.writeOpenAck(terminalWriteContext, tunnel, pb.TrafficOpenAck{
 			TrafficID: handoff.Open.TrafficID,
@@ -195,9 +199,9 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		log.Printf(
 			"agent traffic open rejected event=dial_upstream_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
-				TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
-				ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
-				TunnelID:  strings.TrimSpace(handoff.TunnelID),
+				TrafficID:        strings.TrimSpace(handoff.Open.TrafficID),
+				LogicalServiceID: strings.TrimSpace(handoff.Open.LogicalServiceID),
+				TunnelID:         strings.TrimSpace(handoff.TunnelID),
 			}),
 			err,
 		)
@@ -221,7 +225,7 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			"agent traffic open failed event=write_open_ack_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
-				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				LogicalServiceID:   strings.TrimSpace(handoff.Open.LogicalServiceID),
 				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
 				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
 				TunnelID:           strings.TrimSpace(handoff.TunnelID),
@@ -251,7 +255,7 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			resetCode,
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
-				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				LogicalServiceID:   strings.TrimSpace(handoff.Open.LogicalServiceID),
 				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
 				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
 				TunnelID:           strings.TrimSpace(handoff.TunnelID),
@@ -262,7 +266,7 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			"agent traffic open failed event=relay_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
-				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				LogicalServiceID:   strings.TrimSpace(handoff.Open.LogicalServiceID),
 				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
 				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
 				TunnelID:           strings.TrimSpace(handoff.TunnelID),
@@ -283,7 +287,7 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 			"agent traffic open failed event=write_close_failed %s err=%v",
 			obs.FormatLogFields(obs.LogFields{
 				TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
-				ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+				LogicalServiceID:   strings.TrimSpace(handoff.Open.LogicalServiceID),
 				ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
 				ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
 				TunnelID:           strings.TrimSpace(handoff.TunnelID),
@@ -296,7 +300,7 @@ func (opener *Opener) Handle(ctx context.Context, handoff OpenHandoff, tunnel Tu
 		"agent traffic terminal event=write_close state=closed reason=relay_completed %s",
 		obs.FormatLogFields(obs.LogFields{
 			TrafficID:          strings.TrimSpace(handoff.Open.TrafficID),
-			ServiceID:          strings.TrimSpace(handoff.Open.ServiceID),
+			LogicalServiceID:   strings.TrimSpace(handoff.Open.LogicalServiceID),
 			ActualEndpointID:   strings.TrimSpace(selectedEndpoint.ID),
 			ActualEndpointAddr: strings.TrimSpace(selectedEndpoint.Addr),
 			TunnelID:           strings.TrimSpace(handoff.TunnelID),
@@ -323,8 +327,8 @@ func validateTrafficOpen(open pb.TrafficOpen) error {
 	if normalizedTrafficID == "" {
 		return ltfperrors.New(ltfperrors.CodeMissingRequiredField, "trafficId is required")
 	}
-	if strings.TrimSpace(open.ServiceID) == "" {
-		return ltfperrors.New(ltfperrors.CodeTrafficInvalidServiceID, "serviceId is required")
+	if strings.TrimSpace(open.LogicalServiceID) == "" {
+		return ltfperrors.New(ltfperrors.CodeTrafficInvalidLogicalServiceID, "logicalServiceId is required")
 	}
 	return nil
 }

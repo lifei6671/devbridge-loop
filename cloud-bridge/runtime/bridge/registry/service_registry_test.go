@@ -7,55 +7,64 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-// TestServiceRegistryUpsertReplaceServiceKeyAlias 验证 serviceKey 变更时旧别名会被清理。
-func TestServiceRegistryUpsertReplaceServiceKeyAlias(testingObject *testing.T) {
+// TestServiceRegistryFindLogicalServiceByNameScope 验证 name+scope 到 logicalServiceID 映射查询。
+func TestServiceRegistryFindLogicalServiceByNameScope(testingObject *testing.T) {
 	testingObject.Parallel()
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.Upsert(now, pb.Service{
-		ServiceID:       "svc-1",
-		ServiceKey:      "old-service/http",
-		ResourceVersion: 1,
-	})
-	registry.Upsert(now.Add(time.Second), pb.Service{
-		ServiceID:       "svc-1",
-		ServiceKey:      "new-service/http",
-		ResourceVersion: 2,
-	})
+	logicalService := pb.LogicalService{
+		LogicalServiceID: "ls-1",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		ResourceVersion:  1,
+	}
+	instance := pb.ServiceInstance{
+		InstanceID:       "si-1",
+		LogicalServiceID: "ls-1",
+		ConnectorID:      "connector-1",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  1,
+	}
+	registry.Upsert(now, logicalService, instance)
 
-	if _, exists := registry.GetByServiceKey("old-service/http"); exists {
-		testingObject.Fatalf("expected old service key alias removed")
-	}
-	service, exists := registry.GetByServiceKey("new-service/http")
+	loaded, exists := registry.FindLogicalServiceByNameScope("order-service", pb.Scope{Namespace: "dev", Environment: "alice"})
 	if !exists {
-		testingObject.Fatalf("expected new service key alias exists")
+		testingObject.Fatalf("expected logical service exists")
 	}
-	if service.ServiceID != "svc-1" {
-		testingObject.Fatalf("unexpected service ID: got=%s want=svc-1", service.ServiceID)
-	}
-	if removed := registry.RemoveByServiceKey("old-service/http"); removed {
-		testingObject.Fatalf("expected remove by old key returns false")
+	if loaded.LogicalServiceID != "ls-1" {
+		testingObject.Fatalf("unexpected logical service id: got=%s want=ls-1", loaded.LogicalServiceID)
 	}
 }
 
-// TestServiceRegistryMarkLifecycleByConnector 验证按 connector 批量更新服务生命周期状态。
+// TestServiceRegistryMarkLifecycleByConnector 验证按 connector 批量更新实例生命周期状态。
 func TestServiceRegistryMarkLifecycleByConnector(testingObject *testing.T) {
 	testingObject.Parallel()
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.Upsert(now, pb.Service{
-		ServiceID:    "svc-1",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	registry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-1",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+	}, pb.ServiceInstance{
+		InstanceID:       "si-1",
+		LogicalServiceID: "ls-1",
+		ConnectorID:      "connector-1",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
 	})
-	registry.Upsert(now, pb.Service{
-		ServiceID:    "svc-2",
-		ServiceKey:   "pay-service/http",
-		ConnectorID:  "connector-2",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	registry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-2",
+		ServiceName:      "pay-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+	}, pb.ServiceInstance{
+		InstanceID:       "si-2",
+		LogicalServiceID: "ls-2",
+		ConnectorID:      "connector-2",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
 	})
 
 	updatedCount := registry.MarkLifecycleByConnector(
@@ -67,158 +76,117 @@ func TestServiceRegistryMarkLifecycleByConnector(testingObject *testing.T) {
 	if updatedCount != 1 {
 		testingObject.Fatalf("unexpected updated count: got=%d want=1", updatedCount)
 	}
-	serviceOne, exists := registry.GetByServiceID("svc-1")
+	instanceOne, exists := registry.GetInstanceByID("si-1")
 	if !exists {
-		testingObject.Fatalf("expected svc-1 exists")
+		testingObject.Fatalf("expected si-1 exists")
 	}
-	if serviceOne.Status != pb.ServiceStatusStale || serviceOne.HealthStatus != pb.HealthStatusUnknown {
+	if instanceOne.Instance.InstanceStatus != pb.ServiceStatusStale || instanceOne.Instance.HealthStatus != pb.HealthStatusUnknown {
 		testingObject.Fatalf(
-			"unexpected svc-1 lifecycle: status=%s health=%s",
-			serviceOne.Status,
-			serviceOne.HealthStatus,
+			"unexpected si-1 lifecycle: status=%s health=%s",
+			instanceOne.Instance.InstanceStatus,
+			instanceOne.Instance.HealthStatus,
 		)
 	}
-	serviceTwo, exists := registry.GetByServiceID("svc-2")
+	instanceTwo, exists := registry.GetInstanceByID("si-2")
 	if !exists {
-		testingObject.Fatalf("expected svc-2 exists")
+		testingObject.Fatalf("expected si-2 exists")
 	}
-	if serviceTwo.Status != pb.ServiceStatusActive || serviceTwo.HealthStatus != pb.HealthStatusHealthy {
+	if instanceTwo.Instance.InstanceStatus != pb.ServiceStatusActive || instanceTwo.Instance.HealthStatus != pb.HealthStatusHealthy {
 		testingObject.Fatalf(
-			"unexpected svc-2 lifecycle: status=%s health=%s",
-			serviceTwo.Status,
-			serviceTwo.HealthStatus,
+			"unexpected si-2 lifecycle: status=%s health=%s",
+			instanceTwo.Instance.InstanceStatus,
+			instanceTwo.Instance.HealthStatus,
 		)
 	}
 }
 
-// TestServiceRegistryUpsertWithRuntimeKeepsMultiInstancesInOnePool 验证同一 service_key/service_id 可挂接多实例且不互相覆盖。
-func TestServiceRegistryUpsertWithRuntimeKeepsMultiInstancesInOnePool(testingObject *testing.T) {
+// TestServiceRegistryUpsertKeepsMultiInstancesInOnePool 验证同一 logicalService 可挂接多实例且不互相覆盖。
+func TestServiceRegistryUpsertKeepsMultiInstancesInOnePool(testingObject *testing.T) {
 	testingObject.Parallel()
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.UpsertWithRuntime(now, pb.Service{
-		ServiceID:    "svc-pool-1",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-a",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-a")
-	registry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:    "svc-pool-1",
-		ServiceKey:   "order-service/http",
-		ConnectorID:  "connector-b",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-b")
-
-	// 池级列表保持一条逻辑服务，兼容旧接口语义。
-	if services := registry.List(); len(services) != 1 {
-		testingObject.Fatalf("unexpected service pool size: got=%d want=1", len(services))
+	logicalService := pb.LogicalService{
+		LogicalServiceID: "ls-pool-1",
+		ServiceName:      "order-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		ResourceVersion:  1,
 	}
-	instances := registry.ListInstancesByServiceKey("order-service/http")
+	registry.Upsert(now, logicalService, pb.ServiceInstance{
+		InstanceID:       "si-a",
+		LogicalServiceID: "ls-pool-1",
+		ConnectorID:      "connector-a",
+		SessionID:        "session-a",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  1,
+	})
+	registry.Upsert(now.Add(time.Second), logicalService, pb.ServiceInstance{
+		InstanceID:       "si-b",
+		LogicalServiceID: "ls-pool-1",
+		ConnectorID:      "connector-b",
+		SessionID:        "session-b",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+		ResourceVersion:  2,
+	})
+
+	if services := registry.List(); len(services) != 1 {
+		testingObject.Fatalf("unexpected logical service count: got=%d want=1", len(services))
+	}
+	instances := registry.ListInstancesByLogicalServiceID("ls-pool-1")
 	if len(instances) != 2 {
 		testingObject.Fatalf("unexpected instance count: got=%d want=2", len(instances))
 	}
-	serviceByKey, exists := registry.GetByServiceKey("order-service/http")
+	serviceByScope, exists := registry.FindLogicalServiceByNameScope("order-service", pb.Scope{Namespace: "dev", Environment: "alice"})
 	if !exists {
-		testingObject.Fatalf("expected service by key exists")
+		testingObject.Fatalf("expected logical service by scope exists")
 	}
-	if serviceByKey.ServiceID != "svc-pool-1" {
-		testingObject.Fatalf("unexpected service_id by key: got=%s want=svc-pool-1", serviceByKey.ServiceID)
-	}
-}
-
-// TestServiceRegistryUpsertWithRuntimeCollapsesLegacyEmptySessionInstance
-// 验证 full-sync 产生的空 session 实例会在同 runtime 上报会话后被收敛。
-func TestServiceRegistryUpsertWithRuntimeCollapsesLegacyEmptySessionInstance(testingObject *testing.T) {
-	testingObject.Parallel()
-
-	registry := NewServiceRegistry()
-	now := time.Now().UTC()
-	registry.ReplaceAll(now, []pb.Service{
-		{
-			ServiceID:       "svc-collapse",
-			ServiceKey:      "billing-service/http",
-			ConnectorID:     "connector-collapse",
-			Status:          pb.ServiceStatusActive,
-			HealthStatus:    pb.HealthStatusUnknown,
-			ResourceVersion: 10,
-		},
-	})
-	legacyInstances := registry.ListInstancesByServiceID("svc-collapse")
-	if len(legacyInstances) != 1 {
-		testingObject.Fatalf("unexpected legacy instance count: got=%d want=1", len(legacyInstances))
-	}
-	if legacyInstances[0].SessionID != "" {
-		testingObject.Fatalf("expected legacy instance session_id empty, got=%s", legacyInstances[0].SessionID)
-	}
-
-	serviceInstanceID := registry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:       "svc-collapse",
-		ServiceKey:      "billing-service/http",
-		ConnectorID:     "connector-collapse",
-		Status:          pb.ServiceStatusActive,
-		HealthStatus:    pb.HealthStatusHealthy,
-		ResourceVersion: 11,
-	}, "session-collapse")
-	if serviceInstanceID == "" {
-		testingObject.Fatalf("expected service_instance_id not empty")
-	}
-
-	instances := registry.ListInstancesByServiceID("svc-collapse")
-	if len(instances) != 1 {
-		testingObject.Fatalf("unexpected collapsed instance count: got=%d want=1", len(instances))
-	}
-	if instances[0].SessionID != "session-collapse" {
-		testingObject.Fatalf("expected session-bound instance only, got session=%s", instances[0].SessionID)
-	}
-	if instances[0].ServiceInstanceID != serviceInstanceID {
-		testingObject.Fatalf(
-			"unexpected service_instance_id after collapse: got=%s want=%s",
-			instances[0].ServiceInstanceID,
-			serviceInstanceID,
-		)
-	}
-	if serviceIDs := registry.ListServiceIDsByRuntime("connector-collapse", "session-collapse"); len(serviceIDs) != 1 ||
-		serviceIDs[0] != "svc-collapse" {
-		testingObject.Fatalf("unexpected service ids by runtime after collapse: got=%v want=[svc-collapse]", serviceIDs)
+	if serviceByScope.LogicalServiceID != "ls-pool-1" {
+		testingObject.Fatalf("unexpected logical_service_id by scope: got=%s want=ls-pool-1", serviceByScope.LogicalServiceID)
 	}
 }
 
-// TestServiceRegistryRemoveInstanceByRuntime 验证按 connector/session 删除仅影响目标实例而不删除整个服务池。
+// TestServiceRegistryRemoveInstanceByRuntime 验证按 connector/session 删除仅影响目标实例而不删除整个逻辑服务。
 func TestServiceRegistryRemoveInstanceByRuntime(testingObject *testing.T) {
 	testingObject.Parallel()
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.UpsertWithRuntime(now, pb.Service{
-		ServiceID:    "svc-pool-2",
-		ServiceKey:   "pay-service/http",
-		ConnectorID:  "connector-a",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-a")
-	registry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:    "svc-pool-2",
-		ServiceKey:   "pay-service/http",
-		ConnectorID:  "connector-b",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-b")
+	logicalService := pb.LogicalService{
+		LogicalServiceID: "ls-pool-2",
+		ServiceName:      "pay-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		ResourceVersion:  1,
+	}
+	registry.Upsert(now, logicalService, pb.ServiceInstance{
+		InstanceID:       "si-a",
+		LogicalServiceID: "ls-pool-2",
+		ConnectorID:      "connector-a",
+		SessionID:        "session-a",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+	})
+	registry.Upsert(now.Add(time.Second), logicalService, pb.ServiceInstance{
+		InstanceID:       "si-b",
+		LogicalServiceID: "ls-pool-2",
+		ConnectorID:      "connector-b",
+		SessionID:        "session-b",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+	})
 
-	removed := registry.RemoveInstanceByServiceKeyAndRuntime("pay-service/http", "connector-a", "session-a")
+	removed := registry.RemoveInstanceByLogicalServiceAndRuntime("ls-pool-2", "connector-a", "session-a")
 	if !removed {
 		testingObject.Fatalf("expected remove target instance success")
 	}
-	if instances := registry.ListInstancesByServiceID("svc-pool-2"); len(instances) != 1 {
+	if instances := registry.ListInstancesByLogicalServiceID("ls-pool-2"); len(instances) != 1 {
 		testingObject.Fatalf("unexpected remaining instance count: got=%d want=1", len(instances))
 	}
-	// 删除最后一个实例后，逻辑服务池应自动清理。
-	removed = registry.RemoveInstanceByServiceIDAndRuntime("svc-pool-2", "connector-b", "session-b")
+	removed = registry.RemoveInstanceByLogicalServiceAndRuntime("ls-pool-2", "connector-b", "session-b")
 	if !removed {
 		testingObject.Fatalf("expected remove last instance success")
 	}
-	if services := registry.List(); len(services) != 0 {
-		testingObject.Fatalf("expected empty service pool after removing all instances, got=%d", len(services))
+	if instances := registry.ListInstancesByLogicalServiceID("ls-pool-2"); len(instances) != 0 {
+		testingObject.Fatalf("expected empty instance list after removing all instances, got=%d", len(instances))
 	}
 }
 
@@ -227,20 +195,28 @@ func TestServiceRegistryMarkLifecycleByConnectorAndSession(testingObject *testin
 	testingObject.Parallel()
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.UpsertWithRuntime(now, pb.Service{
-		ServiceID:    "svc-session-scope",
-		ServiceKey:   "inventory-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-old")
-	registry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:    "svc-session-scope",
-		ServiceKey:   "inventory-service/http",
-		ConnectorID:  "connector-1",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-new")
+	logicalService := pb.LogicalService{
+		LogicalServiceID: "ls-session-scope",
+		ServiceName:      "inventory-service",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		Status:           pb.ServiceStatusActive,
+	}
+	registry.Upsert(now, logicalService, pb.ServiceInstance{
+		InstanceID:       "si-old",
+		LogicalServiceID: "ls-session-scope",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-old",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+	})
+	registry.Upsert(now.Add(time.Second), logicalService, pb.ServiceInstance{
+		InstanceID:       "si-new",
+		LogicalServiceID: "ls-session-scope",
+		ConnectorID:      "connector-1",
+		SessionID:        "session-new",
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     pb.HealthStatusHealthy,
+	})
 
 	updatedCount := registry.MarkLifecycleByConnectorAndSession(
 		now.Add(2*time.Second),
@@ -253,109 +229,68 @@ func TestServiceRegistryMarkLifecycleByConnectorAndSession(testingObject *testin
 		testingObject.Fatalf("unexpected updated count: got=%d want=1", updatedCount)
 	}
 
-	instances := registry.ListInstancesByServiceID("svc-session-scope")
+	instances := registry.ListInstancesByLogicalServiceID("ls-session-scope")
 	if len(instances) != 2 {
 		testingObject.Fatalf("unexpected instance count: got=%d want=2", len(instances))
 	}
 	instanceStatusBySession := make(map[string]pb.ServiceStatus, len(instances))
-	instanceHealthBySession := make(map[string]pb.HealthStatus, len(instances))
 	for _, instance := range instances {
-		instanceStatusBySession[instance.SessionID] = instance.Service.Status
-		instanceHealthBySession[instance.SessionID] = instance.Service.HealthStatus
+		instanceStatusBySession[instance.Instance.SessionID] = instance.Instance.InstanceStatus
 	}
-	if instanceStatusBySession["session-old"] != pb.ServiceStatusInactive ||
-		instanceHealthBySession["session-old"] != pb.HealthStatusUnknown {
-		testingObject.Fatalf(
-			"unexpected old session lifecycle: status=%s health=%s",
-			instanceStatusBySession["session-old"],
-			instanceHealthBySession["session-old"],
-		)
+	if instanceStatusBySession["session-old"] != pb.ServiceStatusInactive {
+		testingObject.Fatalf("unexpected old session status: %+v", instanceStatusBySession)
 	}
-	if instanceStatusBySession["session-new"] != pb.ServiceStatusActive ||
-		instanceHealthBySession["session-new"] != pb.HealthStatusHealthy {
-		testingObject.Fatalf(
-			"unexpected new session lifecycle: status=%s health=%s",
-			instanceStatusBySession["session-new"],
-			instanceHealthBySession["session-new"],
-		)
+	if instanceStatusBySession["session-new"] != pb.ServiceStatusActive {
+		testingObject.Fatalf("unexpected new session status: %+v", instanceStatusBySession)
 	}
 }
 
-// TestServiceRegistryMarkLifecycleByConnectorAndSessionFallbackLegacy 验证会话命中失败时仅回收空 session 的历史实例。
-func TestServiceRegistryMarkLifecycleByConnectorAndSessionFallbackLegacy(testingObject *testing.T) {
+// TestServiceRegistryListLogicalServiceIDsByRuntime 验证可按 connector/session 反查受影响 logical_service_id。
+func TestServiceRegistryListLogicalServiceIDsByRuntime(testingObject *testing.T) {
 	testingObject.Parallel()
+
 	registry := NewServiceRegistry()
 	now := time.Now().UTC()
-	registry.Upsert(now, pb.Service{
-		ServiceID:    "svc-legacy",
-		ServiceKey:   "legacy-service/http",
-		ConnectorID:  "connector-legacy",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
+	registry.Upsert(now, pb.LogicalService{
+		LogicalServiceID: "ls-x-1",
+		ServiceName:      "svc-1",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+	}, pb.ServiceInstance{
+		InstanceID:       "si-x-1",
+		LogicalServiceID: "ls-x-1",
+		ConnectorID:      "connector-x",
+		SessionID:        "session-x-1",
+	})
+	registry.Upsert(now.Add(time.Second), pb.LogicalService{
+		LogicalServiceID: "ls-x-2",
+		ServiceName:      "svc-2",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+	}, pb.ServiceInstance{
+		InstanceID:       "si-x-2",
+		LogicalServiceID: "ls-x-2",
+		ConnectorID:      "connector-x",
+		SessionID:        "session-x-2",
+	})
+	registry.Upsert(now.Add(2*time.Second), pb.LogicalService{
+		LogicalServiceID: "ls-y-1",
+		ServiceName:      "svc-3",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+	}, pb.ServiceInstance{
+		InstanceID:       "si-y-1",
+		LogicalServiceID: "ls-y-1",
+		ConnectorID:      "connector-y",
+		SessionID:        "session-y-1",
 	})
 
-	updatedCount := registry.MarkLifecycleByConnectorAndSession(
-		now.Add(time.Second),
-		"connector-legacy",
-		"session-not-found",
-		pb.ServiceStatusStale,
-		pb.HealthStatusUnknown,
-	)
-	if updatedCount != 1 {
-		testingObject.Fatalf("unexpected updated count for legacy fallback: got=%d want=1", updatedCount)
+	logicalServiceIDs := registry.ListLogicalServiceIDsByRuntime("connector-x", "session-x-1")
+	if len(logicalServiceIDs) != 1 || logicalServiceIDs[0] != "ls-x-1" {
+		testingObject.Fatalf("unexpected logical service ids by runtime: got=%v want=[ls-x-1]", logicalServiceIDs)
 	}
-	serviceSnapshot, exists := registry.GetByServiceID("svc-legacy")
-	if !exists {
-		testingObject.Fatalf("expected legacy service exists")
+	logicalServiceIDs = registry.ListLogicalServiceIDsByRuntime("connector-x", "")
+	if len(logicalServiceIDs) != 2 {
+		testingObject.Fatalf("unexpected logical service ids by connector: got=%v want=2 items", logicalServiceIDs)
 	}
-	if serviceSnapshot.Status != pb.ServiceStatusStale || serviceSnapshot.HealthStatus != pb.HealthStatusUnknown {
-		testingObject.Fatalf(
-			"unexpected legacy service lifecycle after fallback: status=%s health=%s",
-			serviceSnapshot.Status,
-			serviceSnapshot.HealthStatus,
-		)
-	}
-}
-
-// TestServiceRegistryListServiceIDsByRuntime 验证可按 connector/session 反查受影响 service_id。
-func TestServiceRegistryListServiceIDsByRuntime(testingObject *testing.T) {
-	testingObject.Parallel()
-
-	registry := NewServiceRegistry()
-	now := time.Now().UTC()
-	registry.UpsertWithRuntime(now, pb.Service{
-		ServiceID:    "svc-runtime-1",
-		ServiceKey:   "runtime-1/http",
-		ConnectorID:  "connector-x",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-x-1")
-	registry.UpsertWithRuntime(now.Add(time.Second), pb.Service{
-		ServiceID:    "svc-runtime-1",
-		ServiceKey:   "runtime-1/http",
-		ConnectorID:  "connector-x",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-x-2")
-	registry.UpsertWithRuntime(now.Add(2*time.Second), pb.Service{
-		ServiceID:    "svc-runtime-2",
-		ServiceKey:   "runtime-2/http",
-		ConnectorID:  "connector-y",
-		Status:       pb.ServiceStatusActive,
-		HealthStatus: pb.HealthStatusHealthy,
-	}, "session-y-1")
-
-	serviceIDs := registry.ListServiceIDsByRuntime("connector-x", "session-x-1")
-	if len(serviceIDs) != 1 || serviceIDs[0] != "svc-runtime-1" {
-		testingObject.Fatalf("unexpected service ids by runtime: got=%v want=[svc-runtime-1]", serviceIDs)
-	}
-
-	serviceIDs = registry.ListServiceIDsByRuntime("connector-x", "")
-	if len(serviceIDs) != 1 || serviceIDs[0] != "svc-runtime-1" {
-		testingObject.Fatalf("unexpected service ids by connector: got=%v want=[svc-runtime-1]", serviceIDs)
-	}
-
-	if serviceIDs = registry.ListServiceIDsByRuntime("", "session-x-1"); len(serviceIDs) != 0 {
-		testingObject.Fatalf("expected empty result when connector is empty, got=%v", serviceIDs)
+	if logicalServiceIDs = registry.ListLogicalServiceIDsByRuntime("", "session-x-1"); len(logicalServiceIDs) != 0 {
+		testingObject.Fatalf("unexpected logical service ids for empty connector: got=%v want=[]", logicalServiceIDs)
 	}
 }

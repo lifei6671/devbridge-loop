@@ -473,8 +473,9 @@ func TestOpenHandshakeRejectError(testingObject *testing.T) {
 		OpenTimeout: time.Second,
 	})
 	_, err := handshake.Execute(context.Background(), tunnel, pb.TrafficOpen{
-		TrafficID: "traffic-1",
-		ServiceID: "svc-1",
+		TrafficID:        "traffic-1",
+		LogicalServiceID: "svc-1",
+		InstanceID:       "inst-1",
 	})
 	var openRejectedError *OpenRejectedError
 	if !errors.As(err, &openRejectedError) {
@@ -496,8 +497,9 @@ func TestOpenHandshakeTimeoutFallbackClose(testingObject *testing.T) {
 	})
 
 	_, err := handshake.Execute(context.Background(), tunnel, pb.TrafficOpen{
-		TrafficID: "traffic-timeout-close",
-		ServiceID: "svc-1",
+		TrafficID:        "traffic-timeout-close",
+		LogicalServiceID: "svc-1",
+		InstanceID:       "inst-1",
 	})
 	if !errors.Is(err, ErrOpenAckTimeout) {
 		testingObject.Fatalf("expected open ack timeout error, got: %v", err)
@@ -521,8 +523,9 @@ func TestOpenHandshakeTimeoutReturnsWithoutDrainDelay(testingObject *testing.T) 
 
 	start := time.Now()
 	_, err := handshake.Execute(context.Background(), tunnel, pb.TrafficOpen{
-		TrafficID: "traffic-timeout-fast-return",
-		ServiceID: "svc-1",
+		TrafficID:        "traffic-timeout-fast-return",
+		LogicalServiceID: "svc-1",
+		InstanceID:       "inst-1",
 	})
 	if !errors.Is(err, ErrOpenAckTimeout) {
 		testingObject.Fatalf("expected open ack timeout error, got: %v", err)
@@ -570,8 +573,9 @@ func TestDispatcherOpenRejectedMetrics(testingObject *testing.T) {
 	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-open-reject",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-open-reject",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if !errors.Is(err, ErrTrafficOpenRejected) {
@@ -626,8 +630,9 @@ func TestDispatcherConnectorDialFailureDoesNotCountAsOpenReject(testingObject *t
 	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-dial-failed",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-dial-failed",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if !errors.Is(err, ErrTrafficOpenRejected) {
@@ -705,8 +710,9 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 		result, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
 			ConnectorID: "connector-1",
 			TrafficOpen: pb.TrafficOpen{
-				TrafficID: "traffic-1",
-				ServiceID: "svc-1",
+				TrafficID:        "traffic-1",
+				LogicalServiceID: "svc-1",
+				InstanceID:       "inst-1",
 				EndpointSelectionHint: map[string]string{
 					"endpoint_id": "endpoint-1",
 				},
@@ -805,8 +811,9 @@ func TestDispatcherDispatchFallsBackToCloseWhenTunnelNotRecyclable(testingObject
 	result, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-no-recycle",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-no-recycle",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if dispatchErr != nil {
@@ -884,8 +891,9 @@ func TestDispatcherDispatchRecordsRecycleRejectMetrics(testingObject *testing.T)
 	_, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-recycle-reject",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-recycle-reject",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if dispatchErr == nil {
@@ -950,8 +958,9 @@ func TestDispatcherDispatchRecycleSurvivesParentCancel(testingObject *testing.T)
 	result, err := dispatcher.Dispatch(dispatchContext, DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-parent-cancel",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-parent-cancel",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if err != nil {
@@ -1007,8 +1016,9 @@ func TestDispatcherNoIdleReturns503(testingObject *testing.T) {
 	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-no-idle",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-no-idle",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if !errors.Is(err, ErrNoIdleTunnel) {
@@ -1068,8 +1078,9 @@ func TestDispatcherOpenAckTimeoutDropsLateAck(testingObject *testing.T) {
 	result, err := dispatcher.Dispatch(context.Background(), DispatchRequest{
 		ConnectorID: "connector-1",
 		TrafficOpen: pb.TrafficOpen{
-			TrafficID: "traffic-timeout-late-ack",
-			ServiceID: "svc-1",
+			TrafficID:        "traffic-timeout-late-ack",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-1",
 		},
 	})
 	if !errors.Is(err, ErrOpenAckTimeout) {

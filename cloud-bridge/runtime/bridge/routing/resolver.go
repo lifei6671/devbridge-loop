@@ -1,7 +1,10 @@
 package routing
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,17 +19,24 @@ import (
 const (
 	// RouteLookupMetadataTrafficIDKey 定义 route lookup metadata 中的 traffic_id 键。
 	RouteLookupMetadataTrafficIDKey = "traffic_id"
+	// RouteLookupMetadataClientIPKey 定义 route lookup metadata 中的 client_ip 键。
+	RouteLookupMetadataClientIPKey = "client_ip"
 )
+
+type connectorSelectionPolicy struct {
+	StickyBy string `json:"sticky_by,omitempty"`
+}
 
 // ResolverOptions 定义 Resolver 依赖。
 type ResolverOptions struct {
 	Matcher                          *Matcher
 	Selector                         *Selector
-	HybridResolver                   *HybridResolver
 	RouteRegistry                    *registry.RouteRegistry
 	ServiceRegistry                  *registry.ServiceRegistry
 	SessionRegistry                  *registry.SessionRegistry
 	Metrics                          *obs.Metrics
+	DefaultScope                     pb.Scope
+	FallbackPolicies                 []pb.ScopeFallbackPolicy
 	ServiceInstanceSelector          ServiceInstanceSelector
 	ServiceInstanceSelectorAlgorithm string
 	TrafficAffinityTTL               time.Duration
@@ -35,39 +45,38 @@ type ResolverOptions struct {
 
 // ConnectorResolution 描述 connector_service 解析结果。
 type ConnectorResolution struct {
-	Service           pb.Service
-	Session           registry.SessionRuntime
-	ServiceInstanceID string
-}
-
-// HybridResolution 描述 hybrid_group 解析结果。
-type HybridResolution struct {
-	Primary        ConnectorResolution
-	Fallback       pb.ExternalServiceTarget
-	FallbackPolicy pb.FallbackPolicy
+	LogicalService pb.LogicalService
+	Instance       pb.ServiceInstance
+	Session        registry.SessionRuntime
 }
 
 // ResolveResult 描述 RouteResolver 输出。
 type ResolveResult struct {
-	Route       pb.Route
-	TargetKind  pb.RouteTargetType
-	IngressMode pb.IngressMode
-	Connector   *ConnectorResolution
-	External    *pb.ExternalServiceTarget
-	Hybrid      *HybridResolution
+	Route              pb.Route
+	TargetKind         pb.RouteTargetType
+	IngressMode        pb.IngressMode
+	Connector          *ConnectorResolution
+	External           *pb.ExternalServiceTarget
+	IsExternalFallback bool
+	RequestScope       pb.Scope
+	MatchedScope       pb.Scope
+	ScopeFallbackPath  []pb.Scope
 }
 
 // Resolver 负责入口请求到目标类型的分类和过滤。
 type Resolver struct {
 	matcher                 *Matcher
 	selector                *Selector
-	hybridResolver          *HybridResolver
 	routeRegistry           *registry.RouteRegistry
 	serviceRegistry         *registry.ServiceRegistry
 	sessionRegistry         *registry.SessionRegistry
 	metrics                 *obs.Metrics
 	serviceInstanceSelector ServiceInstanceSelector
+	selectorByAlgorithm     map[string]ServiceInstanceSelector
+	defaultSelectorKey      string
 	trafficAffinity         *trafficAffinityStore
+	defaultScope            pb.Scope
+	fallbackPolicies        map[string]pb.ScopeFallbackPolicy
 }
 
 // NewResolver 创建 RouteResolver。
@@ -79,10 +88,6 @@ func NewResolver(options ResolverOptions) *Resolver {
 	selector := options.Selector
 	if selector == nil {
 		selector = NewSelector()
-	}
-	hybridResolver := options.HybridResolver
-	if hybridResolver == nil {
-		hybridResolver = NewHybridResolver(pb.FallbackPolicyPreOpenOnly)
 	}
 	routeRegistry := options.RouteRegistry
 	if routeRegistry == nil {
@@ -96,22 +101,20 @@ func NewResolver(options ResolverOptions) *Resolver {
 	if sessionRegistry == nil {
 		sessionRegistry = registry.NewSessionRegistry()
 	}
-	serviceInstanceSelector := options.ServiceInstanceSelector
-	if serviceInstanceSelector == nil {
-		// 未显式注入选择器时按算法名构造，默认回退轮询。
-		serviceInstanceSelector = NewServiceInstanceSelectorByAlgorithm(options.ServiceInstanceSelectorAlgorithm)
-	}
 	trafficAffinity := newTrafficAffinityStore(options.TrafficAffinityTTL, options.TrafficAffinityCapacity)
 	return &Resolver{
 		matcher:                 matcher,
 		selector:                selector,
-		hybridResolver:          hybridResolver,
 		routeRegistry:           routeRegistry,
 		serviceRegistry:         serviceRegistry,
 		sessionRegistry:         sessionRegistry,
 		metrics:                 normalizeResolverMetrics(options.Metrics),
-		serviceInstanceSelector: serviceInstanceSelector,
+		serviceInstanceSelector: options.ServiceInstanceSelector,
+		selectorByAlgorithm:     buildServiceInstanceSelectorSet(options.ServiceInstanceSelectorAlgorithm),
+		defaultSelectorKey:      normalizeDefaultLoadBalancePolicy(options.ServiceInstanceSelectorAlgorithm),
 		trafficAffinity:         trafficAffinity,
+		defaultScope:            normalizeResolverScope(options.DefaultScope),
+		fallbackPolicies:        buildFallbackPolicyIndex(options.FallbackPolicies),
 	}
 }
 
@@ -127,32 +130,56 @@ func (resolver *Resolver) Resolve(request ingress.RouteLookupRequest) (ResolveRe
 			"no route matches current ingress request",
 		)
 	}
-	orderedCandidates := make([]pb.Route, 0, len(candidates))
-	orderedCandidates = append(orderedCandidates, candidates...)
+	requestScope := resolver.resolveRequestScope(request)
+	scopeChain := resolver.buildScopeChain(requestScope)
+	orderedCandidates := append([]pb.Route(nil), candidates...)
 	var firstFilterError error
-	for len(orderedCandidates) > 0 {
-		route, selected := resolver.selector.Select(orderedCandidates)
-		if !selected {
-			break
+	var externalFallbackCandidates []scopedRouteCandidate
+	for scopeIndex, matchedScope := range scopeChain {
+		scopedCandidates := filterRoutesByScope(orderedCandidates, matchedScope)
+		connectorCandidates, externalCandidates := partitionRouteCandidatesByTarget(scopedCandidates)
+		for _, route := range externalCandidates {
+			externalFallbackCandidates = append(externalFallbackCandidates, scopedRouteCandidate{
+				Route:        route,
+				MatchedScope: matchedScope,
+				ScopeIndex:   scopeIndex,
+			})
 		}
-		if err := validateRequestScope(route, request); err != nil {
-			if firstFilterError == nil {
-				firstFilterError = err
+		for len(connectorCandidates) > 0 {
+			route, selected := resolver.selector.Select(connectorCandidates)
+			if !selected {
+				break
 			}
-			orderedCandidates = orderedCandidates[1:]
-			continue
-		}
-		result, err := resolver.resolveTarget(route, request)
-		if err != nil {
-			if firstFilterError == nil {
-				firstFilterError = err
+			result, err := resolver.resolveTarget(route, request)
+			if err != nil {
+				if shouldContinueScopeFallback(err) {
+					connectorCandidates = removeRouteByID(connectorCandidates, route.RouteID)
+					continue
+				}
+				if firstFilterError == nil {
+					firstFilterError = err
+				}
+				break
 			}
-			orderedCandidates = orderedCandidates[1:]
-			continue
+			result.Route = route
+			result.IngressMode = resolveRouteIngressMode(route)
+			result.RequestScope = requestScope
+			result.MatchedScope = matchedScope
+			result.ScopeFallbackPath = append([]pb.Scope(nil), scopeChain[:scopeIndex+1]...)
+			if scopeIndex > 0 && resolver.metrics != nil {
+				resolver.metrics.IncBridgeScopeFallbackTotal()
+			}
+			return result, nil
 		}
-		result.Route = route
-		result.IngressMode = resolveRouteIngressMode(route)
-		return result, nil
+	}
+	if len(externalFallbackCandidates) > 0 {
+		result, err := resolver.resolveExternalFallback(externalFallbackCandidates, request, requestScope, scopeChain)
+		if err == nil {
+			return result, nil
+		}
+		if firstFilterError == nil {
+			firstFilterError = err
+		}
 	}
 	if firstFilterError != nil {
 		return ResolveResult{}, firstFilterError
@@ -184,36 +211,6 @@ func (resolver *Resolver) resolveTarget(route pb.Route, request ingress.RouteLoo
 			TargetKind: pb.RouteTargetTypeExternalService,
 			External:   external,
 		}, nil
-	case pb.RouteTargetTypeHybridGroup:
-		if route.Target.HybridGroup == nil {
-			return ResolveResult{}, ltfperrors.New(
-				ltfperrors.CodeInvalidPayload,
-				"route target type is hybrid_group but hybrid_group payload is empty",
-			)
-		}
-		primary, err := resolver.resolveConnectorTarget(route, &route.Target.HybridGroup.PrimaryConnectorService, request)
-		if err != nil {
-			return ResolveResult{}, err
-		}
-		fallback, err := resolveExternalTarget(route, &route.Target.HybridGroup.FallbackExternalService)
-		if err != nil {
-			return ResolveResult{}, err
-		}
-		fallbackPolicy := route.Target.HybridGroup.FallbackPolicy
-		if !resolver.hybridResolver.AllowPreOpenFallback(fallbackPolicy) {
-			return ResolveResult{}, ltfperrors.New(
-				ltfperrors.CodeHybridFallbackForbidden,
-				"hybrid fallback policy forbids pre-open fallback",
-			)
-		}
-		return ResolveResult{
-			TargetKind: pb.RouteTargetTypeHybridGroup,
-			Hybrid: &HybridResolution{
-				Primary:        *primary,
-				Fallback:       *fallback,
-				FallbackPolicy: fallbackPolicy,
-			},
-		}, nil
 	default:
 		return ResolveResult{}, ltfperrors.New(
 			ltfperrors.CodeUnsupportedValue,
@@ -233,64 +230,63 @@ func (resolver *Resolver) resolveConnectorTarget(
 			"connector_service target payload is empty",
 		)
 	}
-	normalizedServiceKey := strings.TrimSpace(target.ServiceKey)
-	if normalizedServiceKey == "" {
-		return nil, ltfperrors.New(
-			ltfperrors.CodeMissingRequiredField,
-			"connector_service.service_key is required",
-		)
+	logicalService, err := resolver.resolveLogicalService(target.Selector, route.Scope)
+	if err != nil {
+		return nil, err
 	}
-	serviceInstances := resolver.serviceRegistry.ListInstancesByServiceKey(normalizedServiceKey)
-	serviceIDForMetrics := resolveServiceIDFromInstanceSnapshots(serviceInstances)
-	if serviceIDForMetrics == "" {
-		if serviceSnapshot, exists := resolver.serviceRegistry.GetByServiceKey(normalizedServiceKey); exists {
-			serviceIDForMetrics = strings.TrimSpace(serviceSnapshot.ServiceID)
-		}
+	if err := validate.ValidateRouteScope(route.Scope, logicalService.Scope); err != nil {
+		resolver.observeRouteFailure(logicalService.LogicalServiceID, "", err)
+		return nil, err
 	}
+	if !matchLabels(logicalService.Labels, target.Selector.MatchLabels) {
+		resolveErr := ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service does not match selector labels")
+		resolver.observeRouteFailure(logicalService.LogicalServiceID, "", resolveErr)
+		return nil, resolveErr
+	}
+	if logicalService.Status != pb.ServiceStatusActive {
+		resolveErr := ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "logical service is not active")
+		resolver.observeRouteFailure(logicalService.LogicalServiceID, "", resolveErr)
+		return nil, resolveErr
+	}
+
+	instanceSelector := mergeStringMaps(target.Selector.InstanceLabels, target.InstanceSelector)
+	serviceInstances := resolver.serviceRegistry.ListInstancesByLogicalServiceID(logicalService.LogicalServiceID)
 	if len(serviceInstances) == 0 {
 		resolveErr := ltfperrors.New(
 			ltfperrors.CodeResolveServiceNotFound,
-			fmt.Sprintf("service not found for key=%s", normalizedServiceKey),
+			fmt.Sprintf("no service instances found for logical_service_id=%s", logicalService.LogicalServiceID),
 		)
-		// 无实例时只记录服务池维度失败原因，实例维度不存在。
-		resolver.observeRouteFailure(serviceIDForMetrics, "", resolveErr)
+		resolver.observeRouteFailure(logicalService.LogicalServiceID, "", resolveErr)
 		return nil, resolveErr
 	}
+
 	var firstFilterError error
 	candidates := make([]ConnectorResolution, 0, len(serviceInstances))
 	for _, serviceInstance := range serviceInstances {
-		serviceSnapshot := serviceInstance.Service
-		if err := validate.ValidateRouteScope(
-			route.Namespace,
-			route.Environment,
-			serviceSnapshot.Namespace,
-			serviceSnapshot.Environment,
-		); err != nil {
-			if firstFilterError == nil {
-				firstFilterError = err
-			}
-			continue
-		}
-		if serviceSnapshot.Status != pb.ServiceStatusActive || serviceSnapshot.HealthStatus != pb.HealthStatusHealthy {
+		instance := serviceInstance.Instance
+		if instance.InstanceStatus != pb.ServiceStatusActive || instance.HealthStatus != pb.HealthStatusHealthy {
 			if firstFilterError == nil {
 				firstFilterError = ltfperrors.New(
 					ltfperrors.CodeResolveServiceUnavailable,
 					fmt.Sprintf(
-						"service unavailable for key=%s status=%s health=%s",
-						normalizedServiceKey,
-						serviceSnapshot.Status,
-						serviceSnapshot.HealthStatus,
+						"instance unavailable for logical_service_id=%s status=%s health=%s",
+						logicalService.LogicalServiceID,
+						instance.InstanceStatus,
+						instance.HealthStatus,
 					),
 				)
 			}
 			continue
 		}
-		normalizedConnectorID := strings.TrimSpace(serviceSnapshot.ConnectorID)
+		if !matchLabels(instance.Labels, instanceSelector) {
+			continue
+		}
+		normalizedConnectorID := strings.TrimSpace(instance.ConnectorID)
 		if normalizedConnectorID == "" {
 			if firstFilterError == nil {
 				firstFilterError = ltfperrors.New(
 					ltfperrors.CodeResolveServiceUnavailable,
-					fmt.Sprintf("service key=%s has empty connector_id", normalizedServiceKey),
+					fmt.Sprintf("instance=%s has empty connector_id", instance.InstanceID),
 				)
 			}
 			continue
@@ -315,84 +311,113 @@ func (resolver *Resolver) resolveConnectorTarget(
 			continue
 		}
 		candidates = append(candidates, ConnectorResolution{
-			Service:           serviceSnapshot,
-			Session:           sessionSnapshot,
-			ServiceInstanceID: strings.TrimSpace(serviceInstance.ServiceInstanceID),
+			LogicalService: logicalService,
+			Instance:       instance,
+			Session:        sessionSnapshot,
 		})
 	}
-	// 每次解析都回刷服务池可用实例快照，保持可用数与路由过滤口径一致。
-	resolver.observeServiceAvailability(serviceIDForMetrics, candidates)
+
+	resolver.observeServiceAvailability(logicalService.LogicalServiceID, candidates)
 	if len(candidates) == 0 {
 		if firstFilterError != nil {
-			resolver.observeRouteFailure(serviceIDForMetrics, "", firstFilterError)
+			resolver.observeRouteFailure(logicalService.LogicalServiceID, "", firstFilterError)
 			return nil, firstFilterError
 		}
 		resolveErr := ltfperrors.New(
 			ltfperrors.CodeResolveServiceUnavailable,
-			fmt.Sprintf("service unavailable for key=%s", normalizedServiceKey),
+			fmt.Sprintf("logical service unavailable for logical_service_id=%s", logicalService.LogicalServiceID),
 		)
-		resolver.observeRouteFailure(serviceIDForMetrics, "", resolveErr)
+		resolver.observeRouteFailure(logicalService.LogicalServiceID, "", resolveErr)
 		return nil, resolveErr
 	}
-	selected, err := resolver.selectConnectorResolution(candidates, normalizedServiceKey, request)
+	selected, err := resolver.selectConnectorResolution(route, target, candidates, logicalService.LogicalServiceID, request)
 	if err != nil {
 		return nil, err
 	}
-	resolver.observeRouteHit(strings.TrimSpace(selected.Service.ServiceID), strings.TrimSpace(selected.ServiceInstanceID))
+	resolver.observeRouteHit(selected.LogicalService.LogicalServiceID, selected.Instance.InstanceID)
 	return &selected, nil
 }
 
 // selectConnectorResolution 在候选实例内选择目标，并维持同 traffic_id 的实例粘性。
 func (resolver *Resolver) selectConnectorResolution(
+	route pb.Route,
+	target *pb.ConnectorServiceTarget,
 	candidates []ConnectorResolution,
-	serviceKey string,
+	logicalServiceID string,
 	request ingress.RouteLookupRequest,
 ) (ConnectorResolution, error) {
 	if len(candidates) == 0 {
 		return ConnectorResolution{}, ltfperrors.New(
 			ltfperrors.CodeResolveServiceUnavailable,
-			fmt.Sprintf("service unavailable for key=%s", strings.TrimSpace(serviceKey)),
+			fmt.Sprintf("logical service unavailable for logical_service_id=%s", strings.TrimSpace(logicalServiceID)),
 		)
 	}
+	orderedCandidates := append([]ConnectorResolution(nil), candidates...)
+	sort.Slice(orderedCandidates, func(left, right int) bool {
+		leftInstanceID := strings.TrimSpace(orderedCandidates[left].Instance.InstanceID)
+		rightInstanceID := strings.TrimSpace(orderedCandidates[right].Instance.InstanceID)
+		if leftInstanceID == rightInstanceID {
+			return strings.TrimSpace(orderedCandidates[left].Session.ConnectorID) < strings.TrimSpace(orderedCandidates[right].Session.ConnectorID)
+		}
+		return leftInstanceID < rightInstanceID
+	})
 	trafficID := resolveLookupTrafficID(request)
 	if trafficID != "" && resolver != nil && resolver.trafficAffinity != nil {
-		// 已建立粘性映射时必须复用同一实例，避免单条 traffic 在生命周期中漂移。
 		if stickyInstanceID, exists := resolver.trafficAffinity.Load(trafficID, time.Now().UTC()); exists {
-			for _, candidate := range candidates {
-				if strings.TrimSpace(candidate.ServiceInstanceID) == stickyInstanceID {
+			for _, candidate := range orderedCandidates {
+				if strings.TrimSpace(candidate.Instance.InstanceID) == stickyInstanceID {
 					return candidate, nil
 				}
 			}
 			resolveErr := ltfperrors.New(
 				ltfperrors.CodeResolveServiceUnavailable,
 				fmt.Sprintf(
-					"sticky traffic target unavailable for traffic_id=%s service_key=%s service_instance_id=%s",
+					"sticky traffic target unavailable for traffic_id=%s logical_service_id=%s instance_id=%s",
 					trafficID,
-					strings.TrimSpace(serviceKey),
+					strings.TrimSpace(logicalServiceID),
 					stickyInstanceID,
 				),
 			)
-			// 粘性实例失活时补记实例级失败原因，便于排障定位。
-			resolver.observeRouteFailure(resolveServiceIDFromCandidates(candidates), stickyInstanceID, resolveErr)
+			resolver.observeRouteFailure(logicalServiceID, stickyInstanceID, resolveErr)
 			return ConnectorResolution{}, resolveErr
 		}
 	}
-	selected := candidates[0]
-	if resolver != nil && resolver.serviceInstanceSelector != nil {
-		selected = resolver.serviceInstanceSelector.Select(candidates)
+	selected := orderedCandidates[0]
+	policy := normalizeLoadBalancePolicy(resolveTargetLoadBalancePolicy(target))
+	selector := resolver.resolveServiceInstanceSelector(policy)
+	if selector != nil {
+		selected = selector.Select(orderedCandidates, ServiceInstanceSelectionRequest{
+			Policy:    policy,
+			StickyKey: resolveStickySelectionKey(route, request),
+		})
 	}
-	if trafficID != "" &&
-		resolver != nil &&
-		resolver.trafficAffinity != nil &&
-		strings.TrimSpace(selected.ServiceInstanceID) != "" {
-		// 首次命中后写入粘性映射，后续同 traffic_id 解析将固定到同一实例。
-		resolver.trafficAffinity.Store(
-			trafficID,
-			strings.TrimSpace(selected.ServiceInstanceID),
-			time.Now().UTC(),
-		)
+	if trafficID != "" && resolver != nil && resolver.trafficAffinity != nil && strings.TrimSpace(selected.Instance.InstanceID) != "" {
+		resolver.trafficAffinity.Store(trafficID, strings.TrimSpace(selected.Instance.InstanceID), time.Now().UTC())
+	}
+	if resolver != nil && resolver.metrics != nil {
+		resolver.metrics.ObserveBridgeInstanceSelectorPick(strings.TrimSpace(selected.Instance.InstanceID), policy)
 	}
 	return selected, nil
+}
+
+func (resolver *Resolver) resolveServiceInstanceSelector(policy string) ServiceInstanceSelector {
+	if resolver == nil {
+		return nil
+	}
+	if resolver.serviceInstanceSelector != nil {
+		return resolver.serviceInstanceSelector
+	}
+	if strings.TrimSpace(policy) == "" {
+		if selector, exists := resolver.selectorByAlgorithm[resolver.defaultSelectorKey]; exists && selector != nil {
+			return selector
+		}
+		return resolver.selectorByAlgorithm[ServiceInstanceSelectorAlgorithmRoundRobin]
+	}
+	normalizedPolicy := normalizeLoadBalancePolicy(policy)
+	if selector, exists := resolver.selectorByAlgorithm[normalizedPolicy]; exists && selector != nil {
+		return selector
+	}
+	return resolver.selectorByAlgorithm[ServiceInstanceSelectorAlgorithmRoundRobin]
 }
 
 // resolveServiceSession 解析服务实例对应会话，优先命中实例记录的 session_id。
@@ -400,7 +425,7 @@ func (resolver *Resolver) resolveServiceSession(
 	serviceInstance registry.ServiceInstanceSnapshot,
 	connectorID string,
 ) (registry.SessionRuntime, bool) {
-	normalizedSessionID := strings.TrimSpace(serviceInstance.SessionID)
+	normalizedSessionID := strings.TrimSpace(serviceInstance.Instance.SessionID)
 	if normalizedSessionID != "" {
 		sessionSnapshot, exists := resolver.sessionRegistry.GetBySession(normalizedSessionID)
 		if !exists {
@@ -411,7 +436,6 @@ func (resolver *Resolver) resolveServiceSession(
 		}
 		return sessionSnapshot, true
 	}
-	// 兼容历史记录：实例未带 session_id 时回退 connector_id 反查。
 	return resolver.sessionRegistry.GetByConnector(connectorID)
 }
 
@@ -430,13 +454,16 @@ func resolveExternalTarget(route pb.Route, target *pb.ExternalServiceTarget) (*p
 	}
 	targetNamespace := strings.TrimSpace(target.Namespace)
 	if targetNamespace == "" {
-		targetNamespace = strings.TrimSpace(route.Namespace)
+		targetNamespace = strings.TrimSpace(route.Scope.Namespace)
 	}
 	targetEnvironment := strings.TrimSpace(target.Environment)
 	if targetEnvironment == "" {
-		targetEnvironment = strings.TrimSpace(route.Environment)
+		targetEnvironment = strings.TrimSpace(route.Scope.Environment)
 	}
-	if err := validate.ValidateRouteScope(route.Namespace, route.Environment, targetNamespace, targetEnvironment); err != nil {
+	if err := validate.ValidateRouteScope(route.Scope, pb.Scope{
+		Namespace:   targetNamespace,
+		Environment: targetEnvironment,
+	}); err != nil {
 		return nil, err
 	}
 	copied := *target
@@ -446,43 +473,79 @@ func resolveExternalTarget(route pb.Route, target *pb.ExternalServiceTarget) (*p
 	return &copied, nil
 }
 
-func validateRequestScope(route pb.Route, request ingress.RouteLookupRequest) error {
-	normalizedNamespace := strings.TrimSpace(request.Namespace)
-	routeNamespace := strings.TrimSpace(route.Namespace)
-	if normalizedNamespace != "" && routeNamespace != "" && normalizedNamespace != routeNamespace {
-		return ltfperrors.New(
-			ltfperrors.CodeInvalidScope,
-			fmt.Sprintf("request namespace=%s mismatches route namespace=%s", normalizedNamespace, route.Namespace),
-		)
-	}
-	normalizedEnvironment := strings.TrimSpace(request.Environment)
-	routeEnvironment := strings.TrimSpace(route.Environment)
-	if normalizedEnvironment != "" && routeEnvironment != "" && normalizedEnvironment != routeEnvironment {
-		return ltfperrors.New(
-			ltfperrors.CodeInvalidScope,
-			fmt.Sprintf("request environment=%s mismatches route environment=%s", normalizedEnvironment, route.Environment),
-		)
-	}
-	return nil
-}
-
 func normalizeRouteTargetType(target pb.RouteTarget) pb.RouteTargetType {
 	normalizedType := pb.RouteTargetType(strings.TrimSpace(string(target.Type)))
 	switch normalizedType {
-	case pb.RouteTargetTypeConnectorService, pb.RouteTargetTypeExternalService, pb.RouteTargetTypeHybridGroup:
+	case pb.RouteTargetTypeConnectorService, pb.RouteTargetTypeExternalService:
 		return normalizedType
 	}
-	// 兼容早期 route target 未设置 type 的场景，按 payload 推断。
 	switch {
 	case target.ConnectorService != nil:
 		return pb.RouteTargetTypeConnectorService
 	case target.ExternalService != nil:
 		return pb.RouteTargetTypeExternalService
-	case target.HybridGroup != nil:
-		return pb.RouteTargetTypeHybridGroup
 	default:
 		return normalizedType
 	}
+}
+
+func filterRoutesByScope(routes []pb.Route, scope pb.Scope) []pb.Route {
+	if len(routes) == 0 {
+		return nil
+	}
+	filtered := make([]pb.Route, 0, len(routes))
+	for _, route := range routes {
+		if scopesEqual(route.Scope, scope) {
+			filtered = append(filtered, route)
+		}
+	}
+	return filtered
+}
+
+func removeRouteByID(routes []pb.Route, routeID string) []pb.Route {
+	normalizedRouteID := strings.TrimSpace(routeID)
+	if normalizedRouteID == "" || len(routes) == 0 {
+		return routes
+	}
+	for index, route := range routes {
+		if strings.TrimSpace(route.RouteID) != normalizedRouteID {
+			continue
+		}
+		return append(routes[:index], routes[index+1:]...)
+	}
+	return routes
+}
+
+func shouldContinueScopeFallback(err error) bool {
+	switch ltfperrors.ExtractCode(err) {
+	case ltfperrors.CodeResolveServiceNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+type scopedRouteCandidate struct {
+	Route        pb.Route
+	MatchedScope pb.Scope
+	ScopeIndex   int
+}
+
+func partitionRouteCandidatesByTarget(routes []pb.Route) ([]pb.Route, []pb.Route) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	connectorRoutes := make([]pb.Route, 0, len(routes))
+	externalRoutes := make([]pb.Route, 0, len(routes))
+	for _, route := range routes {
+		switch normalizeRouteTargetType(route.Target) {
+		case pb.RouteTargetTypeConnectorService:
+			connectorRoutes = append(connectorRoutes, route)
+		case pb.RouteTargetTypeExternalService:
+			externalRoutes = append(externalRoutes, route)
+		}
+	}
+	return connectorRoutes, externalRoutes
 }
 
 func copyStringMap(source map[string]string) map[string]string {
@@ -496,7 +559,6 @@ func copyStringMap(source map[string]string) map[string]string {
 	return copied
 }
 
-// resolveLookupTrafficID 从 route lookup metadata 提取 traffic_id。
 func resolveLookupTrafficID(request ingress.RouteLookupRequest) string {
 	if len(request.Metadata) == 0 {
 		return ""
@@ -504,7 +566,6 @@ func resolveLookupTrafficID(request ingress.RouteLookupRequest) string {
 	return strings.TrimSpace(request.Metadata[RouteLookupMetadataTrafficIDKey])
 }
 
-// normalizeResolverMetrics 归一化 resolver 指标依赖，未注入时回落默认容器。
 func normalizeResolverMetrics(metrics *obs.Metrics) *obs.Metrics {
 	if metrics == nil {
 		return obs.DefaultMetrics
@@ -512,16 +573,122 @@ func normalizeResolverMetrics(metrics *obs.Metrics) *obs.Metrics {
 	return metrics
 }
 
-// observeRouteHit 记录路由命中指标（服务池+实例维度）。
-func (resolver *Resolver) observeRouteHit(serviceID string, serviceInstanceID string) {
+func buildFallbackPolicyIndex(policies []pb.ScopeFallbackPolicy) map[string]pb.ScopeFallbackPolicy {
+	if len(policies) == 0 {
+		return nil
+	}
+	index := make(map[string]pb.ScopeFallbackPolicy, len(policies))
+	for _, policy := range policies {
+		normalizedNamespace := strings.TrimSpace(policy.Namespace)
+		if normalizedNamespace == "" {
+			continue
+		}
+		copiedPolicy := policy
+		copiedPolicy.PolicyID = strings.TrimSpace(policy.PolicyID)
+		copiedPolicy.Namespace = normalizedNamespace
+		copiedPolicy.Chain = append([]pb.FallbackStep(nil), policy.Chain...)
+		copiedPolicy.External = policy.External
+		index[normalizedNamespace] = copiedPolicy
+	}
+	return index
+}
+
+func normalizeResolverScope(scope pb.Scope) pb.Scope {
+	return pb.Scope{
+		Namespace:   strings.TrimSpace(scope.Namespace),
+		Environment: strings.TrimSpace(scope.Environment),
+	}
+}
+
+func scopesEqual(left pb.Scope, right pb.Scope) bool {
+	normalizedLeft := normalizeResolverScope(left)
+	normalizedRight := normalizeResolverScope(right)
+	return normalizedLeft.Namespace == normalizedRight.Namespace &&
+		normalizedLeft.Environment == normalizedRight.Environment
+}
+
+func (resolver *Resolver) resolveRequestScope(request ingress.RouteLookupRequest) pb.Scope {
+	requestScope := pb.Scope{
+		Namespace:   strings.TrimSpace(request.Namespace),
+		Environment: strings.TrimSpace(request.Environment),
+	}
+	defaultScope := normalizeResolverScope(resolver.defaultScope)
+	if requestScope.Namespace == "" {
+		requestScope.Namespace = defaultScope.Namespace
+	}
+	if requestScope.Environment == "" {
+		requestScope.Environment = defaultScope.Environment
+	}
+	return requestScope
+}
+
+func (resolver *Resolver) buildScopeChain(requestScope pb.Scope) []pb.Scope {
+	normalizedRequestScope := normalizeResolverScope(requestScope)
+	if normalizedRequestScope.Namespace == "" || normalizedRequestScope.Environment == "" {
+		return nil
+	}
+	chain := []pb.Scope{normalizedRequestScope}
+	if resolver == nil || len(resolver.fallbackPolicies) == 0 {
+		return chain
+	}
+	policy, exists := resolver.fallbackPolicies[normalizedRequestScope.Namespace]
+	if !exists || !policy.Enabled {
+		return chain
+	}
+	seenScopes := map[string]struct{}{
+		buildResolverScopeKey(normalizedRequestScope): {},
+	}
+	for _, step := range policy.Chain {
+		normalizedTargetScope := normalizeResolverScope(step.TargetScope)
+		if normalizedTargetScope.Namespace == "" || normalizedTargetScope.Environment == "" {
+			continue
+		}
+		targetScopeKey := buildResolverScopeKey(normalizedTargetScope)
+		if _, exists := seenScopes[targetScopeKey]; exists {
+			continue
+		}
+		seenScopes[targetScopeKey] = struct{}{}
+		chain = append(chain, normalizedTargetScope)
+	}
+	return chain
+}
+
+func (resolver *Resolver) lookupFallbackPolicy(scope pb.Scope) (pb.ScopeFallbackPolicy, bool) {
+	if resolver == nil || len(resolver.fallbackPolicies) == 0 {
+		return pb.ScopeFallbackPolicy{}, false
+	}
+	normalizedScope := normalizeResolverScope(scope)
+	if normalizedScope.Namespace == "" {
+		return pb.ScopeFallbackPolicy{}, false
+	}
+	policy, exists := resolver.fallbackPolicies[normalizedScope.Namespace]
+	if !exists {
+		return pb.ScopeFallbackPolicy{}, false
+	}
+	return policy, true
+}
+
+func (resolver *Resolver) isExternalFallbackEnabled(requestScope pb.Scope) bool {
+	policy, exists := resolver.lookupFallbackPolicy(requestScope)
+	if !exists || !policy.Enabled {
+		return false
+	}
+	return policy.External.Enabled
+}
+
+func buildResolverScopeKey(scope pb.Scope) string {
+	normalizedScope := normalizeResolverScope(scope)
+	return normalizedScope.Namespace + "|" + normalizedScope.Environment
+}
+
+func (resolver *Resolver) observeRouteHit(logicalServiceID string, serviceInstanceID string) {
 	if resolver == nil || resolver.metrics == nil {
 		return
 	}
-	resolver.metrics.ObserveBridgeRouteHit(serviceID, serviceInstanceID)
+	resolver.metrics.ObserveBridgeRouteHit(logicalServiceID, serviceInstanceID)
 }
 
-// observeRouteFailure 记录路由失败原因指标（服务池+实例维度）。
-func (resolver *Resolver) observeRouteFailure(serviceID string, serviceInstanceID string, err error) {
+func (resolver *Resolver) observeRouteFailure(logicalServiceID string, serviceInstanceID string, err error) {
 	if resolver == nil || resolver.metrics == nil {
 		return
 	}
@@ -529,47 +696,258 @@ func (resolver *Resolver) observeRouteFailure(serviceID string, serviceInstanceI
 	if strings.TrimSpace(reason) == "" {
 		reason = "resolve_failed"
 	}
-	resolver.metrics.ObserveBridgeRouteFailureReason(serviceID, serviceInstanceID, reason)
+	resolver.metrics.ObserveBridgeRouteFailureReason(logicalServiceID, serviceInstanceID, reason)
 }
 
-// observeServiceAvailability 刷新服务池当前可用实例快照。
-func (resolver *Resolver) observeServiceAvailability(serviceID string, candidates []ConnectorResolution) {
+func (resolver *Resolver) observeServiceAvailability(logicalServiceID string, candidates []ConnectorResolution) {
 	if resolver == nil || resolver.metrics == nil {
 		return
 	}
-	normalizedServiceID := strings.TrimSpace(serviceID)
-	if normalizedServiceID == "" {
+	normalizedLogicalServiceID := strings.TrimSpace(logicalServiceID)
+	if normalizedLogicalServiceID == "" {
 		return
 	}
 	availableServiceInstanceIDs := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		normalizedServiceInstanceID := strings.TrimSpace(candidate.ServiceInstanceID)
+		normalizedServiceInstanceID := strings.TrimSpace(candidate.Instance.InstanceID)
 		if normalizedServiceInstanceID == "" {
 			continue
 		}
 		availableServiceInstanceIDs = append(availableServiceInstanceIDs, normalizedServiceInstanceID)
 	}
-	resolver.metrics.SetBridgeServiceAvailableInstances(normalizedServiceID, availableServiceInstanceIDs)
+	resolver.metrics.SetBridgeServiceAvailableInstances(normalizedLogicalServiceID, availableServiceInstanceIDs)
 }
 
-// resolveServiceIDFromInstanceSnapshots 从实例快照切片提取服务池主键。
-func resolveServiceIDFromInstanceSnapshots(serviceInstances []registry.ServiceInstanceSnapshot) string {
-	for _, serviceInstance := range serviceInstances {
-		normalizedServiceID := strings.TrimSpace(serviceInstance.Service.ServiceID)
-		if normalizedServiceID != "" {
-			return normalizedServiceID
+func (resolver *Resolver) resolveLogicalService(selector pb.ServiceSelector, fallbackScope pb.Scope) (pb.LogicalService, error) {
+	if strings.TrimSpace(selector.LogicalServiceID) != "" {
+		service, exists := resolver.serviceRegistry.GetLogicalServiceByID(selector.LogicalServiceID)
+		if !exists {
+			return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service is not found by logicalServiceId")
 		}
+		return service, nil
 	}
-	return ""
+	if strings.TrimSpace(selector.ServiceName) == "" {
+		if len(selector.MatchLabels) == 0 {
+			return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "connector_service.selector is required")
+		}
+		return resolver.resolveLogicalServiceByLabels(selector, fallbackScope)
+	}
+	scope := selector.Scope
+	if strings.TrimSpace(scope.Namespace) == "" {
+		scope.Namespace = strings.TrimSpace(fallbackScope.Namespace)
+	}
+	if strings.TrimSpace(scope.Environment) == "" {
+		scope.Environment = strings.TrimSpace(fallbackScope.Environment)
+	}
+	service, exists := resolver.serviceRegistry.FindLogicalServiceByNameScope(selector.ServiceName, scope)
+	if !exists {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service is not found by selector")
+	}
+	return service, nil
 }
 
-// resolveServiceIDFromCandidates 从候选实例切片提取服务池主键。
-func resolveServiceIDFromCandidates(candidates []ConnectorResolution) string {
+func (resolver *Resolver) resolveLogicalServiceByLabels(selector pb.ServiceSelector, fallbackScope pb.Scope) (pb.LogicalService, error) {
+	scope := selector.Scope
+	if strings.TrimSpace(scope.Namespace) == "" {
+		scope.Namespace = strings.TrimSpace(fallbackScope.Namespace)
+	}
+	if strings.TrimSpace(scope.Environment) == "" {
+		scope.Environment = strings.TrimSpace(fallbackScope.Environment)
+	}
+	if strings.TrimSpace(scope.Namespace) == "" || strings.TrimSpace(scope.Environment) == "" {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "selector.scope is required for match_labels lookup")
+	}
+	matchedServices := make([]pb.LogicalService, 0, 1)
+	for _, logicalService := range resolver.serviceRegistry.List() {
+		if strings.TrimSpace(logicalService.Scope.Namespace) != strings.TrimSpace(scope.Namespace) ||
+			strings.TrimSpace(logicalService.Scope.Environment) != strings.TrimSpace(scope.Environment) {
+			continue
+		}
+		if !matchLabels(logicalService.Labels, selector.MatchLabels) {
+			continue
+		}
+		matchedServices = append(matchedServices, logicalService)
+	}
+	if len(matchedServices) == 0 {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service is not found by selector.match_labels")
+	}
+	if len(matchedServices) > 1 {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeUnsupportedValue, "selector.match_labels matches multiple logical services")
+	}
+	return matchedServices[0], nil
+}
+
+func (resolver *Resolver) resolveExternalFallback(
+	candidates []scopedRouteCandidate,
+	request ingress.RouteLookupRequest,
+	requestScope pb.Scope,
+	scopeChain []pb.Scope,
+) (ResolveResult, error) {
+	if len(candidates) == 0 {
+		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeIngressRouteMismatch, "no external fallback route candidates")
+	}
+	if !resolver.isExternalFallbackEnabled(requestScope) {
+		return ResolveResult{}, ltfperrors.New(
+			ltfperrors.CodeIngressRouteMismatch,
+			fmt.Sprintf(
+				"external fallback is disabled for namespace=%s",
+				strings.TrimSpace(requestScope.Namespace),
+			),
+		)
+	}
 	for _, candidate := range candidates {
-		normalizedServiceID := strings.TrimSpace(candidate.Service.ServiceID)
-		if normalizedServiceID != "" {
-			return normalizedServiceID
+		result, err := resolver.resolveTarget(candidate.Route, request)
+		if err != nil {
+			if shouldContinueScopeFallback(err) {
+				continue
+			}
+			return ResolveResult{}, err
+		}
+		result.Route = candidate.Route
+		result.IngressMode = resolveRouteIngressMode(candidate.Route)
+		result.IsExternalFallback = true
+		result.RequestScope = requestScope
+		result.MatchedScope = candidate.MatchedScope
+		result.ScopeFallbackPath = append([]pb.Scope(nil), scopeChain[:candidate.ScopeIndex+1]...)
+		if candidate.ScopeIndex > 0 && resolver.metrics != nil {
+			resolver.metrics.IncBridgeScopeFallbackTotal()
+		}
+		return result, nil
+	}
+	return ResolveResult{}, ltfperrors.New(
+		ltfperrors.CodeIngressRouteMismatch,
+		"no external fallback route passes resolver filters",
+	)
+}
+
+func matchLabels(labels map[string]string, selector map[string]string) bool {
+	for key, expected := range selector {
+		if strings.TrimSpace(labels[key]) != strings.TrimSpace(expected) {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeStringMaps(left map[string]string, right map[string]string) map[string]string {
+	if len(left) == 0 && len(right) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(left)+len(right))
+	for key, value := range left {
+		merged[key] = value
+	}
+	for key, value := range right {
+		merged[key] = value
+	}
+	return merged
+}
+
+func buildServiceInstanceSelectorSet(defaultAlgorithm string) map[string]ServiceInstanceSelector {
+	return map[string]ServiceInstanceSelector{
+		ServiceInstanceSelectorAlgorithmRoundRobin: NewRoundRobinServiceInstanceSelector(),
+		ServiceInstanceSelectorAlgorithmRandom:     NewRandomServiceInstanceSelector(),
+		ServiceInstanceSelectorAlgorithmSticky:     NewStickyServiceInstanceSelector(),
+		ServiceInstanceSelectorAlgorithmWeighted:   NewWeightedServiceInstanceSelector(),
+	}
+}
+
+func normalizeDefaultLoadBalancePolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case ServiceInstanceSelectorAlgorithmRandom:
+		return ServiceInstanceSelectorAlgorithmRandom
+	case ServiceInstanceSelectorAlgorithmSticky:
+		return ServiceInstanceSelectorAlgorithmSticky
+	case ServiceInstanceSelectorAlgorithmWeighted:
+		return ServiceInstanceSelectorAlgorithmWeighted
+	default:
+		return ServiceInstanceSelectorAlgorithmRoundRobin
+	}
+}
+
+func resolveTargetLoadBalancePolicy(target *pb.ConnectorServiceTarget) string {
+	if target == nil {
+		return ""
+	}
+	return strings.TrimSpace(target.LoadBalancePolicy)
+}
+
+func normalizeLoadBalancePolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case ServiceInstanceSelectorAlgorithmRandom:
+		return ServiceInstanceSelectorAlgorithmRandom
+	case ServiceInstanceSelectorAlgorithmSticky:
+		return ServiceInstanceSelectorAlgorithmSticky
+	case ServiceInstanceSelectorAlgorithmWeighted:
+		return ServiceInstanceSelectorAlgorithmWeighted
+	case "", ServiceInstanceSelectorAlgorithmRoundRobin:
+		return ServiceInstanceSelectorAlgorithmRoundRobin
+	default:
+		return ServiceInstanceSelectorAlgorithmRoundRobin
+	}
+}
+
+func resolveStickySelectionKey(route pb.Route, request ingress.RouteLookupRequest) string {
+	stickyBy := "client_ip"
+	if parsedPolicy, ok := parseConnectorSelectionPolicy(route.PolicyJSON); ok && strings.TrimSpace(parsedPolicy.StickyBy) != "" {
+		stickyBy = strings.TrimSpace(parsedPolicy.StickyBy)
+	}
+	switch {
+	case strings.EqualFold(stickyBy, "client_ip"):
+		return strings.TrimSpace(request.Metadata[RouteLookupMetadataClientIPKey])
+	case strings.HasPrefix(strings.ToLower(stickyBy), "header:"):
+		return resolveHeaderStickyValue(request.Headers, strings.TrimSpace(stickyBy[len("header:"):]))
+	case strings.HasPrefix(strings.ToLower(stickyBy), "cookie:"):
+		return resolveCookieStickyValue(request.Headers, strings.TrimSpace(stickyBy[len("cookie:"):]))
+	default:
+		return ""
+	}
+}
+
+func parseConnectorSelectionPolicy(rawPolicy string) (connectorSelectionPolicy, bool) {
+	normalizedPolicy := strings.TrimSpace(rawPolicy)
+	if normalizedPolicy == "" {
+		return connectorSelectionPolicy{}, false
+	}
+	var parsed connectorSelectionPolicy
+	if err := json.Unmarshal([]byte(normalizedPolicy), &parsed); err != nil {
+		return connectorSelectionPolicy{}, false
+	}
+	return parsed, true
+}
+
+func resolveHeaderStickyValue(headers map[string][]string, headerName string) string {
+	normalizedHeaderName := strings.TrimSpace(headerName)
+	if normalizedHeaderName == "" {
+		return ""
+	}
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), normalizedHeaderName) {
+			continue
+		}
+		for _, value := range values {
+			normalizedValue := strings.TrimSpace(value)
+			if normalizedValue != "" {
+				return normalizedValue
+			}
 		}
 	}
 	return ""
+}
+
+func resolveCookieStickyValue(headers map[string][]string, cookieName string) string {
+	normalizedCookieName := strings.TrimSpace(cookieName)
+	if normalizedCookieName == "" {
+		return ""
+	}
+	cookieHeaderValue := resolveHeaderStickyValue(headers, "Cookie")
+	if cookieHeaderValue == "" {
+		return ""
+	}
+	cookieRequest := &http.Request{Header: http.Header{"Cookie": []string{cookieHeaderValue}}}
+	cookie, err := cookieRequest.Cookie(normalizedCookieName)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cookie.Value)
 }

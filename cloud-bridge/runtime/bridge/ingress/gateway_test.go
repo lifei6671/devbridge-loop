@@ -153,6 +153,7 @@ func TestGatewayBuildRouteLookupRequestCarriesHeaders(testingObject *testing.T) 
 		Host:     "api.dev.example.com",
 		Path:     "/v1/orders",
 		Headers:  httpRequestHeaders,
+		Queries:  map[string][]string{"tenant": {"alice"}, "debug": {"true"}},
 		Protocol: "http",
 	})
 	if err != nil {
@@ -169,6 +170,9 @@ func TestGatewayBuildRouteLookupRequestCarriesHeaders(testingObject *testing.T) 
 	if httpLookupRequest.Headers["X-Tenant"][0] != "alice" {
 		testingObject.Fatalf("lookup headers should be isolated copy, got=%s", httpLookupRequest.Headers["X-Tenant"][0])
 	}
+	if queryValues := httpLookupRequest.Queries["tenant"]; len(queryValues) != 1 || queryValues[0] != "alice" {
+		testingObject.Fatalf("unexpected http lookup query tenant: %v", queryValues)
+	}
 
 	grpcRequestHeaders := map[string][]string{
 		"x-feature": []string{"beta"},
@@ -177,11 +181,15 @@ func TestGatewayBuildRouteLookupRequestCarriesHeaders(testingObject *testing.T) 
 		Authority: "grpc.dev.example.com:443",
 		Path:      "/demo.Service/Call",
 		Headers:   grpcRequestHeaders,
+		Queries:   map[string][]string{"env": {"canary"}},
 	})
 	if err != nil {
 		testingObject.Fatalf("build grpc lookup request failed: %v", err)
 	}
 	if headerValues := grpcLookupRequest.Headers["x-feature"]; len(headerValues) != 1 || headerValues[0] != "beta" {
 		testingObject.Fatalf("unexpected grpc lookup header x-feature: %v", headerValues)
+	}
+	if queryValues := grpcLookupRequest.Queries["env"]; len(queryValues) != 1 || queryValues[0] != "canary" {
+		testingObject.Fatalf("unexpected grpc lookup query env: %v", queryValues)
 	}
 }

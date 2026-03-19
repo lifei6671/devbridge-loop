@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/connectorproxy"
@@ -20,12 +19,8 @@ var (
 )
 
 const (
-	// HybridFallbackStagePreOpenNoTunnel 表示 pre-open 失败且未分配 tunnel 的 fallback。
-	HybridFallbackStagePreOpenNoTunnel = "pre_open_no_tunnel"
-	// HybridFallbackStagePreOpenWithTunnel 表示 pre-open 失败且已分配 tunnel 的 fallback。
-	HybridFallbackStagePreOpenWithTunnel = "pre_open_with_tunnel"
-	// trafficOpenMetadataServiceInstanceIDKey 定义 TrafficOpen 元数据中的 service_instance_id 键。
-	trafficOpenMetadataServiceInstanceIDKey = "service_instance_id"
+	// trafficOpenMetadataInstanceIDKey 定义 TrafficOpen 元数据中的 instance_id 键。
+	trafficOpenMetadataInstanceIDKey = "instance_id"
 )
 
 // ConnectorDispatcher 定义 connector 路径执行入口。
@@ -46,31 +41,27 @@ type PathExecuteRequest struct {
 
 // PathExecuteResult 描述路径执行结果。
 type PathExecuteResult struct {
-	TargetKind          pb.RouteTargetType
-	ConnectorResult     *connectorproxy.DispatchResult
-	DirectResult        *directproxy.ExecuteResult
-	UsedHybridFallback  bool
-	HybridFallbackStage string
-	HTTPStatus          int
-	ErrorCode           string
+	TargetKind      pb.RouteTargetType
+	ConnectorResult *connectorproxy.DispatchResult
+	DirectResult    *directproxy.ExecuteResult
+	HTTPStatus      int
+	ErrorCode       string
 }
 
 // PathExecutorOptions 定义路径执行器参数。
 type PathExecutorOptions struct {
-	Connector      ConnectorDispatcher
-	Direct         DirectExecutor
-	HybridResolver *HybridResolver
-	FailureMapper  *FailureMapper
-	Metrics        *obs.Metrics
+	Connector     ConnectorDispatcher
+	Direct        DirectExecutor
+	FailureMapper *FailureMapper
+	Metrics       *obs.Metrics
 }
 
 // PathExecutor 统一编排 connector/direct/hybrid 三路径。
 type PathExecutor struct {
-	connector      ConnectorDispatcher
-	direct         DirectExecutor
-	hybridResolver *HybridResolver
-	failureMapper  *FailureMapper
-	metrics        *obs.Metrics
+	connector     ConnectorDispatcher
+	direct        DirectExecutor
+	failureMapper *FailureMapper
+	metrics       *obs.Metrics
 }
 
 // NewPathExecutor 创建路径执行器。
@@ -78,20 +69,15 @@ func NewPathExecutor(options PathExecutorOptions) (*PathExecutor, error) {
 	if options.Connector == nil || options.Direct == nil {
 		return nil, ErrPathExecutorDependencyMissing
 	}
-	hybridResolver := options.HybridResolver
-	if hybridResolver == nil {
-		hybridResolver = NewHybridResolver(pb.FallbackPolicyPreOpenOnly)
-	}
 	failureMapper := options.FailureMapper
 	if failureMapper == nil {
 		failureMapper = NewFailureMapper()
 	}
 	return &PathExecutor{
-		connector:      options.Connector,
-		direct:         options.Direct,
-		hybridResolver: hybridResolver,
-		failureMapper:  failureMapper,
-		metrics:        normalizeRoutingMetrics(options.Metrics),
+		connector:     options.Connector,
+		direct:        options.Direct,
+		failureMapper: failureMapper,
+		metrics:       normalizeRoutingMetrics(options.Metrics),
 	}, nil
 }
 
@@ -109,8 +95,6 @@ func (executor *PathExecutor) Execute(ctx context.Context, request PathExecuteRe
 		return executor.executeConnector(normalizedContext, request)
 	case pb.RouteTargetTypeExternalService:
 		return executor.executeExternal(normalizedContext, request)
-	case pb.RouteTargetTypeHybridGroup:
-		return executor.executeHybrid(normalizedContext, request)
 	default:
 		return PathExecuteResult{}, ltfperrors.New(
 			ltfperrors.CodeUnsupportedValue,
@@ -148,8 +132,12 @@ func (executor *PathExecutor) executeExternal(ctx context.Context, request PathE
 		return PathExecuteResult{}, ErrPathExecutorDependencyMissing
 	}
 	directResult, err := executor.direct.Execute(ctx, directproxy.ExecuteRequest{
-		TrafficID: strings.TrimSpace(request.TrafficOpen.TrafficID),
-		Target:    *request.Resolution.External,
+		TrafficID:          strings.TrimSpace(request.TrafficOpen.TrafficID),
+		Target:             *request.Resolution.External,
+		RequestScope:       request.Resolution.RequestScope,
+		MatchedScope:       request.Resolution.MatchedScope,
+		RouteID:            strings.TrimSpace(request.Resolution.Route.RouteID),
+		IsExternalFallback: request.Resolution.IsExternalFallback,
 	})
 	result := PathExecuteResult{
 		TargetKind:   pb.RouteTargetTypeExternalService,
@@ -166,76 +154,6 @@ func (executor *PathExecutor) executeExternal(ctx context.Context, request PathE
 	return result, nil
 }
 
-func (executor *PathExecutor) executeHybrid(ctx context.Context, request PathExecuteRequest) (PathExecuteResult, error) {
-	if request.Resolution.Hybrid == nil {
-		return PathExecuteResult{}, ErrPathExecutorDependencyMissing
-	}
-	if !executor.hybridResolver.AllowPreOpenFallback(request.Resolution.Hybrid.FallbackPolicy) {
-		return PathExecuteResult{}, ltfperrors.New(
-			ltfperrors.CodeHybridFallbackForbidden,
-			"hybrid fallback policy forbids pre-open fallback",
-		)
-	}
-	primaryConnectorID := strings.TrimSpace(request.Resolution.Hybrid.Primary.Session.ConnectorID)
-	primaryResult, primaryErr := executor.connector.Dispatch(ctx, connectorproxy.DispatchRequest{
-		ConnectorID: primaryConnectorID,
-		TrafficOpen: request.TrafficOpen,
-	})
-	result := PathExecuteResult{
-		TargetKind:      pb.RouteTargetTypeHybridGroup,
-		ConnectorResult: &primaryResult,
-		HTTPStatus:      primaryResult.HTTPStatus,
-		ErrorCode:       primaryResult.ErrorCode,
-	}
-	if primaryErr == nil {
-		if result.HTTPStatus <= 0 {
-			result.HTTPStatus = 200
-		}
-		return result, nil
-	}
-
-	fallbackStage, allowFallback := classifyHybridFallback(primaryResult, primaryErr)
-	if !allowFallback {
-		return executor.failResult(result, primaryErr, request.TrafficOpen)
-	}
-	fallbackResult, fallbackErr := executor.direct.Execute(ctx, directproxy.ExecuteRequest{
-		TrafficID: strings.TrimSpace(request.TrafficOpen.TrafficID),
-		Target:    request.Resolution.Hybrid.Fallback,
-	})
-	result.DirectResult = &fallbackResult
-	if fallbackResult.HTTPStatus > 0 {
-		result.HTTPStatus = fallbackResult.HTTPStatus
-		result.ErrorCode = fallbackResult.ErrorCode
-	}
-	if fallbackErr != nil {
-		log.Printf(
-			"bridge hybrid fallback failed event=hybrid_fallback_execute_failed %s err=%v",
-			obs.FormatLogFields(obs.LogFields{
-				TrafficID:         strings.TrimSpace(request.TrafficOpen.TrafficID),
-				ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
-				ServiceInstanceID: strings.TrimSpace(request.TrafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
-			}),
-			fallbackErr,
-		)
-		return executor.failResult(result, errors.Join(primaryErr, fallbackErr), request.TrafficOpen)
-	}
-	executor.metrics.IncBridgeHybridFallbackTotal()
-	result.UsedHybridFallback = true
-	result.HybridFallbackStage = fallbackStage
-	result.HTTPStatus = 200
-	result.ErrorCode = ""
-	log.Printf(
-		"bridge hybrid fallback success event=hybrid_fallback_used stage=%s %s",
-		fallbackStage,
-		obs.FormatLogFields(obs.LogFields{
-			TrafficID:         strings.TrimSpace(request.TrafficOpen.TrafficID),
-			ServiceID:         strings.TrimSpace(request.TrafficOpen.ServiceID),
-			ServiceInstanceID: strings.TrimSpace(request.TrafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
-		}),
-	)
-	return result, nil
-}
-
 func (executor *PathExecutor) failResult(
 	result PathExecuteResult,
 	err error,
@@ -249,31 +167,11 @@ func (executor *PathExecutor) failResult(
 	result.ErrorCode = mappedFailure.Code
 	// 路由执行失败统一记录失败原因维度，便于按服务池/实例做故障归因。
 	executor.metrics.ObserveBridgeRouteFailureReason(
-		strings.TrimSpace(trafficOpen.ServiceID),
-		strings.TrimSpace(trafficOpen.Metadata[trafficOpenMetadataServiceInstanceIDKey]),
+		strings.TrimSpace(trafficOpen.LogicalServiceID),
+		strings.TrimSpace(trafficOpen.InstanceID),
 		strings.TrimSpace(result.ErrorCode),
 	)
 	return result, err
-}
-
-func classifyHybridFallback(dispatchResult connectorproxy.DispatchResult, dispatchErr error) (string, bool) {
-	if dispatchErr == nil {
-		return "", false
-	}
-	if dispatchResult.OpenAck != nil && dispatchResult.OpenAck.Success {
-		return "", false
-	}
-	if errors.Is(dispatchErr, connectorproxy.ErrNoIdleTunnel) {
-		return HybridFallbackStagePreOpenNoTunnel, true
-	}
-	if errors.Is(dispatchErr, connectorproxy.ErrTrafficOpenRejected) || errors.Is(dispatchErr, connectorproxy.ErrOpenAckTimeout) {
-		return HybridFallbackStagePreOpenWithTunnel, true
-	}
-	// 保守兜底：有 tunnel_id 且未进入 open_ack success，可按 pre-open 已分配处理。
-	if strings.TrimSpace(dispatchResult.TunnelID) != "" && (dispatchResult.OpenAck == nil || !dispatchResult.OpenAck.Success) {
-		return HybridFallbackStagePreOpenWithTunnel, true
-	}
-	return "", false
 }
 
 // normalizeRoutingMetrics 归一化 PathExecutor 指标依赖，未注入时回落默认指标容器。

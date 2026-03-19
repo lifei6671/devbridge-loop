@@ -11,15 +11,15 @@ import (
 // TrafficMeta 描述一次数据面流量的核心元数据。
 //
 // 约束：
-// 1. 仅允许使用 ServiceID，不允许重新引入 service_key。
+// 1. 仅允许使用 LogicalServiceID，不允许重新引入旧服务主键语义。
 // 2. 字段面向 runtime/protocol 层，不暴露 transport 内部实现细节。
 type TrafficMeta struct {
-	TrafficID    string
-	SessionID    string
-	SessionEpoch uint64
-	ServiceID    string
-	Labels       map[string]string
-	DeadlineAt   *time.Time
+	TrafficID        string
+	SessionID        string
+	SessionEpoch     uint64
+	LogicalServiceID string
+	Labels           map[string]string
+	DeadlineAt       *time.Time
 }
 
 // Validate 校验 TrafficMeta 的最小语义约束。
@@ -28,9 +28,9 @@ func (meta TrafficMeta) Validate() error {
 		// traffic_id 为空时无法建立稳定的流量追踪键。
 		return fmt.Errorf("validate traffic meta: %w: empty traffic_id", transport.ErrInvalidArgument)
 	}
-	if strings.TrimSpace(meta.ServiceID) == "" {
-		// runtime 层必须依赖 service_id 做路由和审计。
-		return fmt.Errorf("validate traffic meta: %w: empty service_id", transport.ErrInvalidArgument)
+	if strings.TrimSpace(meta.LogicalServiceID) == "" {
+		// runtime 层必须依赖 logical_service_id 做路由和审计。
+		return fmt.Errorf("validate traffic meta: %w: empty logical_service_id", transport.ErrInvalidArgument)
 	}
 	return nil
 }

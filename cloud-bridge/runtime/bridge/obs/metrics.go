@@ -17,8 +17,10 @@ const (
 	MetricBridgeTrafficOpenRejectTotal = "bridge_traffic_open_reject_total"
 	// MetricBridgeTrafficOpenAckLateTotal 统计超时后被丢弃的迟到 open_ack 数量。
 	MetricBridgeTrafficOpenAckLateTotal = "bridge_traffic_open_ack_late_total"
-	// MetricBridgeHybridFallbackTotal 统计 hybrid fallback 成功次数。
-	MetricBridgeHybridFallbackTotal = "bridge_hybrid_fallback_total"
+	// MetricBridgeScopeFallbackTotal 统计 scope fallback 成功次数。
+	MetricBridgeScopeFallbackTotal = "bridge_scope_fallback_total"
+	// MetricBridgeHostDeriveTotal 统计 Host 自动派生次数。
+	MetricBridgeHostDeriveTotal = "bridge_host_derive_total"
 	// MetricBridgeActualEndpointOverrideTotal 统计实际 endpoint 覆盖次数。
 	MetricBridgeActualEndpointOverrideTotal = "bridge_actual_endpoint_override_total"
 	// MetricBridgeAuthSuccessTotal 统计认证成功次数。
@@ -51,6 +53,10 @@ const (
 	MetricBridgeRouteFailureReasonTotal = "bridge_route_failure_reason_total"
 	// MetricBridgeServiceInstanceRouteFailureReasonTotal 统计实例维度路由失败原因次数。
 	MetricBridgeServiceInstanceRouteFailureReasonTotal = "bridge_service_instance_route_failure_reason_total"
+	// MetricBridgeInstanceSelectorPickTotal 统计实例选择次数。
+	MetricBridgeInstanceSelectorPickTotal = "bridge_instance_selector_pick_total"
+	// MetricBridgeRouteConflictRejectionTotal 统计路由冲突拒绝次数。
+	MetricBridgeRouteConflictRejectionTotal = "bridge_route_conflict_rejection_total"
 )
 
 // Metrics holds metric collectors for the bridge runtime.
@@ -63,8 +69,11 @@ type Metrics struct {
 
 	bridgeTrafficOpenAckLateTotal atomic.Uint64
 
-	bridgeHybridFallbackTotal       atomic.Uint64
+	bridgeScopeFallbackTotal        atomic.Uint64
+	bridgeHostDeriveSuccessTotal    atomic.Uint64
+	bridgeHostDeriveFailureTotal    atomic.Uint64
 	bridgeActualEndpointOverrideTot atomic.Uint64
+	bridgeRouteConflictRejectTotal  atomic.Uint64
 
 	bridgeAuthSuccessTotal atomic.Uint64
 	bridgeAuthFailureTotal atomic.Uint64
@@ -89,6 +98,7 @@ type Metrics struct {
 	serviceInstanceRouteHitTotals           map[string]map[string]uint64
 	serviceRouteFailureReasonTotals         map[string]map[string]uint64
 	serviceInstanceRouteFailureReasonTotals map[string]map[string]map[string]uint64
+	instanceSelectorPickTotals              map[string]map[string]uint64
 }
 
 // NewMetrics 创建桥接运行时指标容器。
@@ -103,6 +113,7 @@ func NewMetrics() *Metrics {
 		serviceInstanceRouteHitTotals:           make(map[string]map[string]uint64),
 		serviceRouteFailureReasonTotals:         make(map[string]map[string]uint64),
 		serviceInstanceRouteFailureReasonTotals: make(map[string]map[string]map[string]uint64),
+		instanceSelectorPickTotals:              make(map[string]map[string]uint64),
 	}
 }
 
@@ -185,20 +196,43 @@ func (metrics *Metrics) BridgeTrafficOpenRejectTotal() uint64 {
 	return metrics.bridgeTrafficOpenRejectTotal.Load()
 }
 
-// IncBridgeHybridFallbackTotal 增加一次 hybrid fallback 成功计数。
-func (metrics *Metrics) IncBridgeHybridFallbackTotal() {
+// IncBridgeScopeFallbackTotal 增加一次 scope fallback 成功计数。
+func (metrics *Metrics) IncBridgeScopeFallbackTotal() {
 	if metrics == nil {
 		return
 	}
-	metrics.bridgeHybridFallbackTotal.Add(1)
+	metrics.bridgeScopeFallbackTotal.Add(1)
 }
 
-// BridgeHybridFallbackTotal 返回 hybrid fallback 成功总次数。
-func (metrics *Metrics) BridgeHybridFallbackTotal() uint64 {
+// BridgeScopeFallbackTotal 返回 scope fallback 成功总次数。
+func (metrics *Metrics) BridgeScopeFallbackTotal() uint64 {
 	if metrics == nil {
 		return 0
 	}
-	return metrics.bridgeHybridFallbackTotal.Load()
+	return metrics.bridgeScopeFallbackTotal.Load()
+}
+
+// ObserveBridgeHostDerive 记录一次 Host 自动派生结果。
+func (metrics *Metrics) ObserveBridgeHostDerive(success bool) {
+	if metrics == nil {
+		return
+	}
+	if success {
+		metrics.bridgeHostDeriveSuccessTotal.Add(1)
+		return
+	}
+	metrics.bridgeHostDeriveFailureTotal.Add(1)
+}
+
+// BridgeHostDeriveTotal 返回 Host 自动派生累计值。
+func (metrics *Metrics) BridgeHostDeriveTotal(success bool) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	if success {
+		return metrics.bridgeHostDeriveSuccessTotal.Load()
+	}
+	return metrics.bridgeHostDeriveFailureTotal.Load()
 }
 
 // IncBridgeActualEndpointOverrideTotal 增加一次 endpoint 覆盖计数。
@@ -215,6 +249,22 @@ func (metrics *Metrics) BridgeActualEndpointOverrideTotal() uint64 {
 		return 0
 	}
 	return metrics.bridgeActualEndpointOverrideTot.Load()
+}
+
+// IncBridgeRouteConflictRejectionTotal 增加一次路由冲突拒绝计数。
+func (metrics *Metrics) IncBridgeRouteConflictRejectionTotal() {
+	if metrics == nil {
+		return
+	}
+	metrics.bridgeRouteConflictRejectTotal.Add(1)
+}
+
+// BridgeRouteConflictRejectionTotal 返回路由冲突拒绝总次数。
+func (metrics *Metrics) BridgeRouteConflictRejectionTotal() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.bridgeRouteConflictRejectTotal.Load()
 }
 
 // IncBridgeAuthSuccessTotal 增加一次认证成功计数。
@@ -576,6 +626,39 @@ func (metrics *Metrics) BridgeServiceInstanceRouteHitTotal(serviceID string, ser
 		return 0
 	}
 	return instanceTotals[normalizedServiceInstanceID]
+}
+
+// ObserveBridgeInstanceSelectorPick 记录一次实例选择命中。
+func (metrics *Metrics) ObserveBridgeInstanceSelectorPick(serviceInstanceID string, policy string) {
+	if metrics == nil {
+		return
+	}
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	normalizedPolicy := strings.TrimSpace(policy)
+	if normalizedServiceInstanceID == "" || normalizedPolicy == "" {
+		return
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	if metrics.instanceSelectorPickTotals[normalizedServiceInstanceID] == nil {
+		metrics.instanceSelectorPickTotals[normalizedServiceInstanceID] = make(map[string]uint64)
+	}
+	metrics.instanceSelectorPickTotals[normalizedServiceInstanceID][normalizedPolicy]++
+}
+
+// BridgeInstanceSelectorPickTotal 返回指定实例+策略的选择次数。
+func (metrics *Metrics) BridgeInstanceSelectorPickTotal(serviceInstanceID string, policy string) uint64 {
+	if metrics == nil {
+		return 0
+	}
+	normalizedServiceInstanceID := strings.TrimSpace(serviceInstanceID)
+	normalizedPolicy := strings.TrimSpace(policy)
+	if normalizedServiceInstanceID == "" || normalizedPolicy == "" {
+		return 0
+	}
+	metrics.serviceDimensionMu.Lock()
+	defer metrics.serviceDimensionMu.Unlock()
+	return metrics.instanceSelectorPickTotals[normalizedServiceInstanceID][normalizedPolicy]
 }
 
 // ObserveBridgeRouteFailureReason 记录一次路由失败原因的服务池/实例维度计数。

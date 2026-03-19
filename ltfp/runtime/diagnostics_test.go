@@ -15,10 +15,10 @@ func TestBuildTrafficDiagnosticFields(testingObject *testing.T) {
 
 	fields := BuildTrafficDiagnosticFields(
 		TrafficMeta{
-			TrafficID:    "traffic-1",
-			ServiceID:    "svc-1",
-			SessionID:    "session-1",
-			SessionEpoch: 9,
+			TrafficID:        "traffic-1",
+			LogicalServiceID: "ls-1",
+			SessionID:        "session-1",
+			SessionEpoch:     9,
 		},
 		tunnel,
 		TrafficFrameData,
@@ -27,8 +27,8 @@ func TestBuildTrafficDiagnosticFields(testingObject *testing.T) {
 	if fields.TrafficID != "traffic-1" {
 		testingObject.Fatalf("unexpected traffic id: %s", fields.TrafficID)
 	}
-	if fields.ServiceID != "svc-1" {
-		testingObject.Fatalf("unexpected service id: %s", fields.ServiceID)
+	if fields.LogicalServiceID != "ls-1" {
+		testingObject.Fatalf("unexpected logical service id: %s", fields.LogicalServiceID)
 	}
 	if fields.SessionID != "session-1" {
 		testingObject.Fatalf("unexpected session id: %s", fields.SessionID)
@@ -60,8 +60,8 @@ func TestBuildTrafficDiagnosticFieldsFallbackFromTunnelMeta(testingObject *testi
 	tunnel.id = "tunnel-fallback"
 	fields := BuildTrafficDiagnosticFields(
 		TrafficMeta{
-			TrafficID: "traffic-2",
-			ServiceID: "svc-2",
+			TrafficID:        "traffic-2",
+			LogicalServiceID: "ls-2",
 		},
 		&mockTunnelWithMeta{
 			mockTunnel: tunnel,

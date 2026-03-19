@@ -7,24 +7,13 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-// TestBuildServiceKey 验证 service_key 生成格式。
-func TestBuildServiceKey(t *testing.T) {
-	t.Parallel()
-
-	serviceKey := BuildServiceKey("order-service", " HTTP ")
-	if serviceKey != "order-service/http" {
-		t.Fatalf("unexpected service key: %s", serviceKey)
-	}
-}
-
 // TestToPublishService 验证本地注册到 PublishService 的转换。
 func TestToPublishService(t *testing.T) {
 	t.Parallel()
 
 	publish := ToPublishService(LocalRegistration{
-		ServiceID:   "svc-001",
-		Namespace:   "dev",
-		Environment: "alice",
+		InstanceID:  "si-001",
+		Scope:       pb.Scope{Namespace: "dev", Environment: "alice"},
 		ServiceName: "order-service",
 		ServiceType: "http",
 		Endpoints: []pb.ServiceEndpoint{
@@ -38,11 +27,11 @@ func TestToPublishService(t *testing.T) {
 			Enabled: true,
 		},
 	})
-	if publish.ServiceKey != "order-service/http" {
-		t.Fatalf("unexpected service key: %s", publish.ServiceKey)
-	}
-	if publish.ServiceID != "svc-001" || publish.ServiceType != "http" {
+	if publish.InstanceID != "si-001" || publish.ServiceType != "http" {
 		t.Fatalf("unexpected publish payload: %+v", publish)
+	}
+	if publish.Scope.Namespace != "dev" || publish.Scope.Environment != "alice" {
+		t.Fatalf("unexpected publish scope: %+v", publish.Scope)
 	}
 }
 
@@ -51,13 +40,13 @@ func TestToUnpublishService(t *testing.T) {
 	t.Parallel()
 
 	unpublish := ToUnpublishService(LocalRegistration{
-		ServiceID:   "svc-001",
-		Namespace:   "dev",
-		Environment: "alice",
-		ServiceName: "order-service",
-		ServiceType: "http",
+		LogicalServiceID: "ls-001",
+		InstanceID:       "si-001",
+		Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+		ServiceName:      "order-service",
+		ServiceType:      "http",
 	}, "service removed")
-	if unpublish.ServiceKey != "order-service/http" || unpublish.Reason != "service removed" {
+	if unpublish.InstanceID != "si-001" || unpublish.Reason != "service removed" {
 		t.Fatalf("unexpected unpublish payload: %+v", unpublish)
 	}
 }
@@ -67,8 +56,8 @@ func TestToHealthReport(t *testing.T) {
 	t.Parallel()
 
 	report := ToHealthReport(
-		"svc-001",
-		"order-service/http",
+		"si-001",
+		"ls-001",
 		[]pb.EndpointHealthStatus{
 			{EndpointID: "ep-1", HealthStatus: pb.HealthStatusHealthy},
 			{EndpointID: "ep-2", HealthStatus: pb.HealthStatusUnknown},

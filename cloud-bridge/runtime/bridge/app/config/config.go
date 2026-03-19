@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 // controlPlaneTLSMode 表示控制面 TLS 接入模式。
@@ -66,6 +67,9 @@ type Config struct {
 	Observability ObservabilityConfig `yaml:"observability"`
 	ControlPlane  ControlPlaneConfig  `yaml:"control_plane"`
 	TunnelReuse   TunnelReuseConfig   `yaml:"tunnel_reuse"`
+	DefaultScope  pb.Scope            `yaml:"default_scope"`
+	// FallbackPolicies 定义按 namespace 生效的 scope 降级链。
+	FallbackPolicies []pb.ScopeFallbackPolicy `yaml:"fallback_policies"`
 	// RuntimeConfigFilePath 记录当前配置来源文件路径（仅运行时使用，不参与 YAML 编解码）。
 	RuntimeConfigFilePath string `yaml:"-"`
 }
@@ -76,6 +80,7 @@ type IngressConfig struct {
 	HTTPSAddr    string `yaml:"https_addr"`
 	TLSSNIAddr   string `yaml:"tls_sni_addr"`
 	TCPPortRange string `yaml:"tcp_port_range"`
+	BaseDomain   string `yaml:"base_domain"`
 }
 
 type AdminConfig struct {
@@ -148,6 +153,7 @@ func DefaultConfig() Config {
 			HTTPSAddr:    ":8443",
 			TLSSNIAddr:   ":8443",
 			TCPPortRange: "9000-9100",
+			BaseDomain:   "example.com",
 		},
 		Admin: AdminConfig{
 			Enabled:             true,
@@ -199,6 +205,10 @@ func DefaultConfig() Config {
 			RecycleTimeout:    3 * time.Second,
 			CloseAckTimeout:   3 * time.Second,
 			EnforceFinalClose: true,
+		},
+		DefaultScope: pb.Scope{
+			Namespace:   "default",
+			Environment: "base",
 		},
 	}
 }
@@ -355,6 +365,12 @@ func (c Config) Validate() error {
 	if c.TunnelReuse.CloseAckTimeout <= 0 {
 		return fmt.Errorf("validate config: invalid tunnel_reuse.close_ack_timeout=%v", c.TunnelReuse.CloseAckTimeout)
 	}
+	if err := validateNamedScope("default_scope", c.DefaultScope); err != nil {
+		return err
+	}
+	if err := validateFallbackPolicies(c.FallbackPolicies); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -451,4 +467,75 @@ func normalizeNonEmptyStringSlice(rawItems []string) []string {
 		normalizedItems = append(normalizedItems, normalizedItem)
 	}
 	return normalizedItems
+}
+
+func validateNamedScope(fieldName string, scope pb.Scope) error {
+	normalizedScope := normalizeScope(scope)
+	if normalizedScope.Namespace == "" || normalizedScope.Environment == "" {
+		return fmt.Errorf(
+			"validate config: %s requires non-empty namespace and environment",
+			strings.TrimSpace(fieldName),
+		)
+	}
+	return nil
+}
+
+func validateFallbackPolicies(policies []pb.ScopeFallbackPolicy) error {
+	if len(policies) == 0 {
+		return nil
+	}
+	policyIDSet := make(map[string]struct{}, len(policies))
+	namespaceSet := make(map[string]struct{}, len(policies))
+	for policyIndex, policy := range policies {
+		normalizedPolicyID := strings.TrimSpace(policy.PolicyID)
+		if normalizedPolicyID == "" {
+			return fmt.Errorf("validate config: fallback_policies[%d].policy_id is required", policyIndex)
+		}
+		if _, exists := policyIDSet[normalizedPolicyID]; exists {
+			return fmt.Errorf("validate config: duplicated fallback policy_id=%s", normalizedPolicyID)
+		}
+		policyIDSet[normalizedPolicyID] = struct{}{}
+
+		normalizedNamespace := strings.TrimSpace(policy.Namespace)
+		if normalizedNamespace == "" {
+			return fmt.Errorf("validate config: fallback_policies[%d].namespace is required", policyIndex)
+		}
+		if _, exists := namespaceSet[normalizedNamespace]; exists {
+			return fmt.Errorf("validate config: duplicated fallback policy namespace=%s", normalizedNamespace)
+		}
+		namespaceSet[normalizedNamespace] = struct{}{}
+
+		targetScopeSet := make(map[string]struct{}, len(policy.Chain))
+		for stepIndex, step := range policy.Chain {
+			if err := validateNamedScope(
+				fmt.Sprintf("fallback_policies[%d].chain[%d].target_scope", policyIndex, stepIndex),
+				step.TargetScope,
+			); err != nil {
+				return err
+			}
+			targetScopeKey := buildScopeKey(step.TargetScope)
+			if _, exists := targetScopeSet[targetScopeKey]; exists {
+				return fmt.Errorf(
+					"validate config: fallback_policies[%d] contains duplicated target_scope=%s/%s",
+					policyIndex,
+					strings.TrimSpace(step.TargetScope.Namespace),
+					strings.TrimSpace(step.TargetScope.Environment),
+				)
+			}
+			targetScopeSet[targetScopeKey] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func normalizeScope(scope pb.Scope) pb.Scope {
+	return pb.Scope{
+		Namespace:   strings.TrimSpace(scope.Namespace),
+		Environment: strings.TrimSpace(scope.Environment),
+	}
+}
+
+func buildScopeKey(scope pb.Scope) string {
+	normalizedScope := normalizeScope(scope)
+	return normalizedScope.Namespace + "|" + normalizedScope.Environment
 }

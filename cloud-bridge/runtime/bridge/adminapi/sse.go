@@ -220,14 +220,14 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 	switch topic {
 	case sseTopicDashboard:
 		sessions := safeListSessions(server.dependencies)
-		services := safeListServices(server.dependencies)
+		logicalServices := safeListLogicalServices(server.dependencies)
 		routes := safeListRoutes(server.dependencies)
 		tunnelSnapshot := safeTunnelSnapshot(server.dependencies)
 		return map[string]any{
 			"overview": adminview.BuildBridgeOverview(
 				server.now(),
 				sessions,
-				services,
+				logicalServices,
 				routes,
 				tunnelSnapshot,
 				safeBuildConfigSnapshot(server.dependencies),
@@ -247,7 +247,8 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 	case sseTopicServices:
 		serviceItems := adminview.BuildServiceItems(
 			server.now(),
-			safeListServices(server.dependencies),
+			safeListLogicalServices(server.dependencies),
+			safeListServiceInstances(server.dependencies),
 			safeListSessions(server.dependencies),
 		)
 		if query.tunnelConnectorID != "" ||
@@ -276,8 +277,8 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 				if query.serviceQueryText != "" {
 					searchText := strings.ToLower(
 						strings.Join([]string{
-							item.ServiceID,
-							item.ServiceKey,
+							item.LogicalServiceID,
+							item.InstanceID,
 							item.ServiceName,
 							item.ConnectorID,
 							item.SessionID,
@@ -308,7 +309,7 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 	case sseTopicConnectors:
 		connectorItems := adminview.BuildConnectorItems(
 			safeListSessions(server.dependencies),
-			safeListServices(server.dependencies),
+			safeListServiceInstances(server.dependencies),
 		)
 		if len(connectorItems) > sseDefaultConnectorLimit {
 			connectorItems = connectorItems[:sseDefaultConnectorLimit]
@@ -358,7 +359,7 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 		}
 		connectorItems := adminview.BuildConnectorItems(
 			safeListSessions(server.dependencies),
-			safeListServices(server.dependencies),
+			safeListServiceInstances(server.dependencies),
 		)
 		if len(connectorItems) > sseDefaultConnectorLimit {
 			connectorItems = connectorItems[:sseDefaultConnectorLimit]
@@ -383,7 +384,7 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 		}
 		connectorItems := adminview.BuildConnectorItems(
 			safeListSessions(server.dependencies),
-			safeListServices(server.dependencies),
+			safeListServiceInstances(server.dependencies),
 		)
 		if len(connectorItems) > sseDefaultConnectorLimit {
 			connectorItems = connectorItems[:sseDefaultConnectorLimit]
@@ -416,14 +417,17 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 			"logs":    pagedLogs,
 			"metrics": []map[string]any{
 				{
-					"ts_ms":                   toMS,
-					"acquire_wait_count":      trafficSummary.AcquireWaitCount,
-					"acquire_wait_total_ms":   trafficSummary.AcquireWaitTotalMS,
-					"open_timeout_total":      trafficSummary.OpenTimeoutTotal,
-					"open_reject_total":       trafficSummary.OpenRejectTotal,
-					"open_ack_late_total":     trafficSummary.OpenAckLateTotal,
-					"hybrid_fallback_total":   trafficSummary.HybridFallbackTotal,
-					"endpoint_override_total": trafficSummary.EndpointOverrideTotal,
+					"ts_ms":                          toMS,
+					"acquire_wait_count":             trafficSummary.AcquireWaitCount,
+					"acquire_wait_total_ms":          trafficSummary.AcquireWaitTotalMS,
+					"open_timeout_total":             trafficSummary.OpenTimeoutTotal,
+					"open_reject_total":              trafficSummary.OpenRejectTotal,
+					"open_ack_late_total":            trafficSummary.OpenAckLateTotal,
+					"scope_fallback_total":           trafficSummary.ScopeFallbackTotal,
+					"route_conflict_rejection_total": trafficSummary.RouteConflictRejectionTotal,
+					"host_derive_success_total":      trafficSummary.HostDeriveSuccessTotal,
+					"host_derive_failure_total":      trafficSummary.HostDeriveFailureTotal,
+					"endpoint_override_total":        trafficSummary.EndpointOverrideTotal,
 				},
 			},
 			"diagnose_summary":   adminview.BuildDiagnoseSummary(now, safeListSessions(server.dependencies), safeTunnelSnapshot(server.dependencies), server.dependencies.Metrics),

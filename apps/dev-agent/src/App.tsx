@@ -171,10 +171,12 @@ interface SessionSnapshot {
 }
 
 interface ServiceListItem {
-  service_id: string;
-  service_key: string;
-  namespace: string;
-  environment: string;
+  logical_service_id: string;
+  instance_id: string;
+  scope: {
+    namespace?: string;
+    environment?: string;
+  };
   service_name: string;
   protocol: string;
   host: string;
@@ -188,7 +190,8 @@ interface ServiceListItem {
 
 interface TunnelListItem {
   tunnel_id: string;
-  service_id: string;
+  logical_service_id: string;
+  instance_id: string;
   state: string;
   protocol: string;
   local_addr: string;
@@ -200,10 +203,12 @@ interface TunnelListItem {
 }
 
 interface ServiceAddInput {
-  service_id?: string;
+  instance_id?: string;
+  scope?: {
+    namespace?: string;
+    environment?: string;
+  };
   service_name: string;
-  namespace?: string;
-  environment?: string;
   protocol: string;
   host: string;
   port: number;
@@ -211,23 +216,25 @@ interface ServiceAddInput {
 }
 
 interface ServiceDeleteInput {
-  service_id?: string;
-  service_key?: string;
-  namespace?: string;
-  environment?: string;
+  logical_service_id?: string;
+  instance_id?: string;
+  scope?: {
+    namespace?: string;
+    environment?: string;
+  };
   service_name?: string;
 }
 
 interface ServiceDeleteResult {
   accepted: boolean;
   deleted: boolean;
-  service_id: string;
-  service_key: string;
+  logical_service_id: string;
+  instance_id: string;
   updated_at_ms: number;
 }
 
 interface ServiceCreateDraft {
-  serviceId: string;
+  instanceId: string;
   serviceName: string;
   namespace: string;
   environment: string;
@@ -238,7 +245,7 @@ interface ServiceCreateDraft {
 }
 
 const DEFAULT_SERVICE_CREATE_DRAFT: ServiceCreateDraft = {
-  serviceId: "",
+  instanceId: "",
   serviceName: "",
   namespace: "",
   environment: "",
@@ -375,9 +382,9 @@ const SERVICE_FORM_FIELD_HELP: Record<string, SettingsFieldHelp> = {
     usage: "填写业务服务名称，建议与真实服务名一致，例如 order-service。",
     impact: "用于服务展示与管理识别；后续排障、编辑、删除都会依赖该名称。",
   },
-  serviceId: {
-    usage: "可选稳定 ID；留空时由运行时根据服务标识自动回填，编辑模式固定不可改。",
-    impact: "用于幂等更新同一服务记录；修改 ID 可能被识别为新的服务实体。",
+  instanceId: {
+    usage: "可选实例 ID；留空时由运行时生成并在控制面回写，编辑模式固定不可改。",
+    impact: "用于复用同一实例记录；修改实例 ID 可能触发新的实例身份。",
   },
   namespace: {
     usage: "可选隔离域，例如 dev / stage / prod。",
@@ -683,6 +690,18 @@ function formatTunnelIDForDisplay(rawTunnelID: string): string {
     }
   }
   return normalizedTunnelID;
+}
+
+function formatScopeText(scope?: { namespace?: string; environment?: string } | null): string {
+  const namespace = scope?.namespace?.trim() ?? "";
+  const environment = scope?.environment?.trim() ?? "";
+  if (!namespace && !environment) {
+    return "--";
+  }
+  if (namespace && environment) {
+    return `${namespace}/${environment}`;
+  }
+  return namespace || environment;
 }
 
 function formatUptime(startedAtMs: number | null): string {
@@ -2040,12 +2059,12 @@ export default function App(): JSX.Element {
 
   const openEditServiceForm = useCallback((item: ServiceListItem) => {
     setServiceFormMode("edit");
-    setServiceEditingID(item.service_id);
+    setServiceEditingID(item.instance_id);
     setServiceCreateDraft({
-      serviceId: item.service_id,
+      instanceId: item.instance_id,
       serviceName: item.service_name,
-      namespace: item.namespace || "",
-      environment: item.environment || "",
+      namespace: item.scope?.namespace || "",
+      environment: item.scope?.environment || "",
       protocol: item.protocol || "tcp",
       host: item.host || "127.0.0.1",
       portText: String(item.port > 0 ? item.port : 8080),
@@ -2084,18 +2103,20 @@ export default function App(): JSX.Element {
       notify("warning", "参数不合法", "port 不能超过 65535");
       return;
     }
-    const normalizedServiceID = serviceFormMode === "edit"
-      ? (serviceEditingID?.trim() || serviceCreateDraft.serviceId.trim())
-      : serviceCreateDraft.serviceId.trim();
-    if (serviceFormMode === "edit" && !normalizedServiceID) {
-      notify("warning", "参数不完整", "编辑模式缺少 service_id");
+    const normalizedInstanceID = serviceFormMode === "edit"
+      ? (serviceEditingID?.trim() || serviceCreateDraft.instanceId.trim())
+      : serviceCreateDraft.instanceId.trim();
+    if (serviceFormMode === "edit" && !normalizedInstanceID) {
+      notify("warning", "参数不完整", "编辑模式缺少 instance_id");
       return;
     }
     const payload: ServiceAddInput = {
-      service_id: normalizedServiceID || undefined,
+      instance_id: normalizedInstanceID || undefined,
+      scope: {
+        namespace: namespace || undefined,
+        environment: environment || undefined,
+      },
       service_name: serviceName,
-      namespace: namespace || undefined,
-      environment: environment || undefined,
       protocol: serviceCreateDraft.protocol.trim().toLowerCase(),
       host: serviceCreateDraft.host.trim(),
       port,
@@ -2105,7 +2126,7 @@ export default function App(): JSX.Element {
     try {
       const created = await invoke<ServiceListItem>("service_add", { input: payload });
       setServiceItems((prev) => {
-        const next = [created, ...prev.filter((item) => item.service_id !== created.service_id)];
+        const next = [created, ...prev.filter((item) => item.instance_id !== created.instance_id)];
         return next.sort((left, right) => right.updated_at_ms - left.updated_at_ms);
       });
       await refreshServiceList();
@@ -2124,24 +2145,26 @@ export default function App(): JSX.Element {
 
   const deleteService = useCallback(async (item: ServiceListItem) => {
     const confirmed = globalThis.confirm(
-      `确认删除服务「${item.service_name}」吗？\nservice_id=${item.service_id}`,
+      `确认删除服务「${item.service_name}」吗？\ninstance_id=${item.instance_id}`,
     );
     if (!confirmed) {
       return;
     }
-    setDeletingServiceID(item.service_id);
+    setDeletingServiceID(item.instance_id);
     try {
       const payload: ServiceDeleteInput = {
-        service_id: item.service_id || undefined,
-        service_key: item.service_key || undefined,
-        namespace: item.namespace || undefined,
-        environment: item.environment || undefined,
+        logical_service_id: item.logical_service_id || undefined,
+        instance_id: item.instance_id || undefined,
+        scope: {
+          namespace: item.scope?.namespace || undefined,
+          environment: item.scope?.environment || undefined,
+        },
         service_name: item.service_name || undefined,
       };
       const result = await invoke<ServiceDeleteResult>("service_delete", { input: payload });
       if (result.deleted) {
-        setServiceItems((prev) => prev.filter((service) => service.service_id !== item.service_id));
-        if (serviceEditingID === item.service_id) {
+        setServiceItems((prev) => prev.filter((service) => service.instance_id !== item.instance_id));
+        if (serviceEditingID === item.instance_id) {
           closeServiceForm();
         }
         notify("success", "服务删除成功", item.service_name);
@@ -2175,7 +2198,9 @@ export default function App(): JSX.Element {
           <table className="min-w-full border-separate border-spacing-0">
             <thead>
               <tr className="bg-[#f4f6fb]">
-                <th className={TABLE_HEAD_CLASS}>服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>逻辑服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>实例 ID</th>
+                <th className={TABLE_HEAD_CLASS}>Scope</th>
                 <th className={TABLE_HEAD_CLASS}>名称</th>
                 <th className={TABLE_HEAD_CLASS}>协议</th>
                 <th className={TABLE_HEAD_CLASS}>地址</th>
@@ -2189,14 +2214,16 @@ export default function App(): JSX.Element {
             <tbody>
               {filteredServices.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={9}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={11}>
                     当前没有可展示的服务
                   </td>
                 </tr>
               ) : null}
               {filteredServices.map((item) => (
-                <tr key={item.service_id} className="border-t border-[#edf1f8]">
-                  <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
+                <tr key={item.instance_id} className="border-t border-[#edf1f8]">
+                  <td className={TABLE_CELL_CLASS}>{item.logical_service_id || "--"}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.instance_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{formatScopeText(item.scope)}</td>
                   <td className={TABLE_CELL_CLASS}>{item.service_name}</td>
                   <td className={TABLE_CELL_CLASS}>{item.protocol || "--"}</td>
                   <td className={TABLE_CELL_CLASS}>
@@ -2216,17 +2243,17 @@ export default function App(): JSX.Element {
                         variant="outline"
                         className="h-7 rounded-md px-2.5 text-xs"
                         onClick={() => openEditServiceForm(item)}
-                        disabled={deletingServiceID === item.service_id}
+                        disabled={deletingServiceID === item.instance_id}
                       >
                         编辑
                       </Button>
                       <Button
                         variant="destructive"
                         className="h-7 rounded-md px-2.5 text-xs"
-                        disabled={deletingServiceID === item.service_id}
+                        disabled={deletingServiceID === item.instance_id}
                         onClick={() => void deleteService(item)}
                       >
-                        {deletingServiceID === item.service_id ? "删除中..." : "删除"}
+                        {deletingServiceID === item.instance_id ? "删除中..." : "删除"}
                       </Button>
                     </div>
                   </td>
@@ -2250,7 +2277,7 @@ export default function App(): JSX.Element {
       <div className="space-y-4">
         {serviceFormMode === "edit" && serviceEditingID ? (
           <div className="inline-flex rounded-md border border-[#d9e2f2] bg-[#f7faff] px-2.5 py-1 text-[11px] text-[#657391]">
-            service_id: {serviceEditingID}
+            instance_id: {serviceEditingID}
           </div>
         ) : null}
         <form
@@ -2271,15 +2298,15 @@ export default function App(): JSX.Element {
             />
           </SettingsField>
           <SettingsField
-            label="服务 ID"
+            label="实例 ID"
             hint={serviceFormMode === "edit" ? "编辑模式固定" : "可选"}
-            help={SERVICE_FORM_FIELD_HELP.serviceId}
+            help={SERVICE_FORM_FIELD_HELP.instanceId}
           >
             <Input
-              placeholder="例如 svc-order"
-              value={serviceCreateDraft.serviceId}
+              placeholder="例如 inst-order"
+              value={serviceCreateDraft.instanceId}
               onChange={(event) =>
-                setServiceCreateDraft((prev) => ({ ...prev, serviceId: event.target.value }))
+                setServiceCreateDraft((prev) => ({ ...prev, instanceId: event.target.value }))
               }
               className="h-9 rounded-lg bg-white"
               disabled={serviceFormMode === "edit"}
@@ -2495,7 +2522,8 @@ export default function App(): JSX.Element {
             <thead>
               <tr className="bg-[#f4f6fb]">
                 <th className={TABLE_HEAD_CLASS}>隧道 ID</th>
-                <th className={TABLE_HEAD_CLASS}>服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>逻辑服务 ID</th>
+                <th className={TABLE_HEAD_CLASS}>实例 ID</th>
                 <th className={TABLE_HEAD_CLASS}>连接协议</th>
                 <th className={TABLE_HEAD_CLASS}>本地地址</th>
                 <th className={TABLE_HEAD_CLASS}>远端地址</th>
@@ -2507,7 +2535,7 @@ export default function App(): JSX.Element {
             <tbody>
               {filteredTunnels.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={8}>
+                  <td className="px-4 py-8 text-center text-sm text-[#7c879e]" colSpan={9}>
                     当前没有可展示的隧道
                   </td>
                 </tr>
@@ -2515,7 +2543,8 @@ export default function App(): JSX.Element {
               {filteredTunnels.map((item) => (
                 <tr key={item.tunnel_id} className="border-t border-[#edf1f8]">
                   <td className={TABLE_CELL_CLASS}>{formatTunnelIDForDisplay(item.tunnel_id)}</td>
-                  <td className={TABLE_CELL_CLASS}>{item.service_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.logical_service_id}</td>
+                  <td className={TABLE_CELL_CLASS}>{item.instance_id}</td>
                   <td className={TABLE_CELL_CLASS}>
                     {formatTransportLabel(item.protocol || hostConfig?.bridge_transport || "")}
                   </td>

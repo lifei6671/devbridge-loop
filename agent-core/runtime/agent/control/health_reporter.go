@@ -80,8 +80,8 @@ func (reporter *HealthReporter) BuildServiceReport(
 	checkTime := reporter.now().UTC()
 	probeMode := resolveServiceProbeMode(normalizedService)
 	return adapter.ToHealthReport(
-		normalizedService.ServiceID,
-		normalizedService.ServiceKey,
+		normalizedService.InstanceID,
+		normalizedService.LogicalServiceID,
 		endpointStatuses,
 		checkTime,
 		"agent.endpoint_probe",
@@ -289,10 +289,12 @@ func resolveEndpointID(endpoint pb.ServiceEndpoint) string {
 // normalizeLocalRegistration 归一化并深拷贝本地 service 对象。
 func normalizeLocalRegistration(service adapter.LocalRegistration) adapter.LocalRegistration {
 	normalized := adapter.LocalRegistration{
-		ServiceID:       strings.TrimSpace(service.ServiceID),
-		ServiceKey:      strings.TrimSpace(service.ServiceKey),
-		Namespace:       strings.TrimSpace(service.Namespace),
-		Environment:     strings.TrimSpace(service.Environment),
+		LogicalServiceID: strings.TrimSpace(service.LogicalServiceID),
+		InstanceID:       strings.TrimSpace(service.InstanceID),
+		Scope: pb.Scope{
+			Namespace:   strings.TrimSpace(service.Scope.Namespace),
+			Environment: strings.TrimSpace(service.Scope.Environment),
+		},
 		ServiceName:     strings.TrimSpace(service.ServiceName),
 		ServiceType:     strings.TrimSpace(service.ServiceType),
 		Endpoints:       cloneEndpoints(service.Endpoints),
@@ -302,16 +304,11 @@ func normalizeLocalRegistration(service adapter.LocalRegistration) adapter.Local
 		Labels:          cloneStringMap(service.Labels),
 		Metadata:        cloneStringMap(service.Metadata),
 	}
-	if normalized.ServiceKey == "" {
-		// service_key 缺失时按协议推荐格式自动补齐。
-		normalized.ServiceKey = adapter.BuildServiceKey(
-			normalized.ServiceName,
-			adapter.ResolveServiceProtocol(normalized.ServiceType, normalized.Endpoints),
-		)
+	if normalized.InstanceID == "" {
+		normalized.InstanceID = strings.TrimSpace(normalized.LogicalServiceID)
 	}
-	if normalized.ServiceID == "" {
-		// service_id 缺失时回退 service_key，便于资源定位。
-		normalized.ServiceID = normalized.ServiceKey
+	if normalized.InstanceID == "" {
+		normalized.InstanceID = strings.TrimSpace(normalized.ServiceName)
 	}
 	return normalized
 }

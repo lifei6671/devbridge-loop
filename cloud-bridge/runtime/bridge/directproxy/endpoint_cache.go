@@ -54,7 +54,7 @@ func NewEndpointCache(options EndpointCacheOptions) *EndpointCache {
 }
 
 // BuildCacheKey 构建 external_service 的缓存 key。
-func BuildCacheKey(target pb.ExternalServiceTarget) string {
+func BuildCacheKey(target pb.ExternalServiceTarget, requestScope pb.Scope) string {
 	selectorKeys := make([]string, 0, len(target.Selector))
 	for key := range target.Selector {
 		selectorKeys = append(selectorKeys, key)
@@ -66,8 +66,8 @@ func BuildCacheKey(target pb.ExternalServiceTarget) string {
 	}
 	return strings.Join([]string{
 		strings.TrimSpace(target.Provider),
-		strings.TrimSpace(target.Namespace),
-		strings.TrimSpace(target.Environment),
+		strings.TrimSpace(requestScope.Namespace),
+		strings.TrimSpace(requestScope.Environment),
 		strings.TrimSpace(target.ServiceName),
 		strings.TrimSpace(target.Group),
 		strings.Join(selectorParts, "&"),
@@ -75,11 +75,11 @@ func BuildCacheKey(target pb.ExternalServiceTarget) string {
 }
 
 // Get 查询 endpoint cache；当超出 stale 窗口时返回 miss。
-func (cache *EndpointCache) Get(target pb.ExternalServiceTarget) CacheLookup {
+func (cache *EndpointCache) Get(target pb.ExternalServiceTarget, requestScope pb.Scope) CacheLookup {
 	if cache == nil {
 		return CacheLookup{}
 	}
-	cacheKey := BuildCacheKey(target)
+	cacheKey := BuildCacheKey(target, requestScope)
 	nowTime := cache.now()
 	cache.mutex.RLock()
 	record, exists := cache.records[cacheKey]
@@ -106,11 +106,11 @@ func (cache *EndpointCache) Get(target pb.ExternalServiceTarget) CacheLookup {
 }
 
 // Put 写入 endpoint cache。
-func (cache *EndpointCache) Put(target pb.ExternalServiceTarget, endpoints []ExternalEndpoint) {
+func (cache *EndpointCache) Put(target pb.ExternalServiceTarget, requestScope pb.Scope, endpoints []ExternalEndpoint) {
 	if cache == nil {
 		return
 	}
-	cacheKey := BuildCacheKey(target)
+	cacheKey := BuildCacheKey(target, requestScope)
 	nowTime := cache.now()
 	freshTTL := normalizeCacheTTL(target.CacheTTLSeconds)
 	staleTTL := normalizeStaleTTL(target.StaleIfErrorSec)

@@ -12,8 +12,8 @@ const (
 	LogFieldTrafficID = "traffic_id"
 	// LogFieldRouteID 表示 route ID 字段名。
 	LogFieldRouteID = "route_id"
-	// LogFieldServiceID 表示 service ID 字段名。
-	LogFieldServiceID = "service_id"
+	// LogFieldLogicalServiceID 表示逻辑服务 ID 字段名。
+	LogFieldLogicalServiceID = "logical_service_id"
 	// LogFieldActualEndpointID 表示实际 endpoint ID 字段名。
 	LogFieldActualEndpointID = "actual_endpoint_id"
 	// LogFieldActualEndpointAddr 表示实际 endpoint 地址字段名。
@@ -33,7 +33,7 @@ type LogFields struct {
 	TraceID            string
 	TrafficID          string
 	RouteID            string
-	ServiceID          string
+	LogicalServiceID   string
 	ActualEndpointID   string
 	ActualEndpointAddr string
 	SessionID          string
@@ -53,7 +53,7 @@ func FormatLogFields(fields LogFields) string {
 		LogFieldTraceID, normalizedFields.TraceID,
 		LogFieldTrafficID, normalizedFields.TrafficID,
 		LogFieldRouteID, normalizedFields.RouteID,
-		LogFieldServiceID, normalizedFields.ServiceID,
+		LogFieldLogicalServiceID, normalizedFields.LogicalServiceID,
 		LogFieldActualEndpointID, normalizedFields.ActualEndpointID,
 		LogFieldActualEndpointAddr, normalizedFields.ActualEndpointAddr,
 		LogFieldSessionID, normalizedFields.SessionID,
@@ -69,7 +69,7 @@ func normalizeLogFields(fields LogFields) LogFields {
 		TraceID:            strings.TrimSpace(fields.TraceID),
 		TrafficID:          strings.TrimSpace(fields.TrafficID),
 		RouteID:            strings.TrimSpace(fields.RouteID),
-		ServiceID:          strings.TrimSpace(fields.ServiceID),
+		LogicalServiceID:   strings.TrimSpace(fields.LogicalServiceID),
 		ActualEndpointID:   strings.TrimSpace(fields.ActualEndpointID),
 		ActualEndpointAddr: strings.TrimSpace(fields.ActualEndpointAddr),
 		SessionID:          strings.TrimSpace(fields.SessionID),

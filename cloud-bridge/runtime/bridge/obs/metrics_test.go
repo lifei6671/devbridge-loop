@@ -56,6 +56,14 @@ func TestMetricsServiceDimensions(testingObject *testing.T) {
 			metrics.BridgeServiceInstanceRouteHitTotal("svc-1", "inst-1"),
 		)
 	}
+	metrics.ObserveBridgeInstanceSelectorPick("inst-1", "sticky")
+	metrics.ObserveBridgeInstanceSelectorPick("inst-1", "sticky")
+	if metrics.BridgeInstanceSelectorPickTotal("inst-1", "sticky") != 2 {
+		testingObject.Fatalf(
+			"unexpected instance selector pick total: got=%d want=2",
+			metrics.BridgeInstanceSelectorPickTotal("inst-1", "sticky"),
+		)
+	}
 
 	// 失败原因维度：空 reason 会归一化为 unknown。
 	metrics.ObserveBridgeRouteFailureReason("svc-1", "inst-1", "")
@@ -70,6 +78,24 @@ func TestMetricsServiceDimensions(testingObject *testing.T) {
 		testingObject.Fatalf(
 			"unexpected instance failure reason total: got=%d want=1",
 			metrics.BridgeServiceInstanceRouteFailureReasonTotal("svc-1", "inst-1", "resolve_service_unavailable"),
+		)
+	}
+
+	metrics.ObserveBridgeHostDerive(true)
+	metrics.ObserveBridgeHostDerive(false)
+	if metrics.BridgeHostDeriveTotal(true) != 1 || metrics.BridgeHostDeriveTotal(false) != 1 {
+		testingObject.Fatalf(
+			"unexpected host derive totals: success=%d failure=%d",
+			metrics.BridgeHostDeriveTotal(true),
+			metrics.BridgeHostDeriveTotal(false),
+		)
+	}
+
+	metrics.IncBridgeRouteConflictRejectionTotal()
+	if metrics.BridgeRouteConflictRejectionTotal() != 1 {
+		testingObject.Fatalf(
+			"unexpected route conflict rejection total: got=%d want=1",
+			metrics.BridgeRouteConflictRejectionTotal(),
 		)
 	}
 }

@@ -68,8 +68,9 @@ func TestJSONCodecStreamPayloadRoundTrip(t *testing.T) {
 	codec := NewJSONCodec()
 	payload := pb.StreamPayload{
 		OpenReq: &pb.TrafficOpen{
-			TrafficID: "traffic-001",
-			ServiceID: "svc-001",
+			TrafficID:        "traffic-001",
+			LogicalServiceID: "ls-001",
+			InstanceID:       "si-001",
 		},
 	}
 
@@ -98,8 +99,9 @@ func TestJSONCodecStreamPayloadRejectInvalidOneof(t *testing.T) {
 	codec := NewJSONCodec()
 	invalidPayload := pb.StreamPayload{
 		OpenReq: &pb.TrafficOpen{
-			TrafficID: "traffic-001",
-			ServiceID: "svc-001",
+			TrafficID:        "traffic-001",
+			LogicalServiceID: "ls-001",
+			InstanceID:       "si-001",
 		},
 		Close: &pb.TrafficClose{
 			TrafficID: "traffic-001",

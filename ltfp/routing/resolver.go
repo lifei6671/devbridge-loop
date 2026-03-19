@@ -8,13 +8,14 @@ import (
 
 	"github.com/lifei6671/devbridge-loop/ltfp/discovery"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
-	"github.com/lifei6671/devbridge-loop/ltfp/fallback"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
 // RegistryReader 定义 resolver 依赖的最小 registry 读取接口。
 type RegistryReader interface {
-	GetServiceByKey(serviceKey string) (pb.Service, bool)
+	GetLogicalServiceByID(logicalServiceID string) (pb.LogicalService, bool)
+	FindLogicalServiceByNameScope(serviceName string, scope pb.Scope) (pb.LogicalService, bool)
+	ListServiceInstancesByLogicalService(logicalServiceID string) []pb.ServiceInstance
 	GetConnectorByID(connectorID string) (pb.Connector, bool)
 	FindActiveSessionByConnector(connectorID string) (pb.Session, bool)
 }
@@ -33,7 +34,8 @@ type ResolveRequest struct {
 type ResolveResult struct {
 	PathKind         pb.RouteTargetType
 	RouteID          string
-	ServiceID        string
+	LogicalServiceID string
+	InstanceID       string
 	ConnectorID      string
 	SessionID        string
 	SessionEpoch     uint64
@@ -56,18 +58,13 @@ func NewResolver(registry RegistryReader) *Resolver {
 
 // Resolve 根据 route target 解析 connector 或 direct proxy 执行计划。
 func (resolver *Resolver) Resolve(ctx context.Context, request ResolveRequest) (ResolveResult, error) {
-	_ = ctx // 当前实现无阻塞操作，先保留 context 便于后续扩展。
+	_ = ctx
 	route := request.Route
 	switch route.Target.Type {
 	case pb.RouteTargetTypeConnectorService:
-		// connector_service 由 server 选择 service 与 connector，不选 endpoint。
 		return resolver.resolveConnector(route, route.Target.ConnectorService, request)
 	case pb.RouteTargetTypeExternalService:
-		// external_service 由 server 自己查询并直连代理，不向 agent 发 TrafficOpen。
 		return resolver.resolveExternal(route, route.Target.ExternalService)
-	case pb.RouteTargetTypeHybridGroup:
-		// hybrid_group 先走 connector，满足 pre-open 信号才允许回退 external。
-		return resolver.resolveHybrid(route, request)
 	default:
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeUnsupportedValue, fmt.Sprintf("unsupported route target type: %s", route.Target.Type))
 	}
@@ -78,64 +75,52 @@ func (resolver *Resolver) resolveConnector(route pb.Route, target *pb.ConnectorS
 	if target == nil {
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "route.target.connectorService is required")
 	}
-	serviceKey := strings.TrimSpace(target.ServiceKey)
-	if serviceKey == "" {
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "connectorService.serviceKey is required")
+	logicalService, err := resolver.resolveLogicalService(target.Selector, route.Scope)
+	if err != nil {
+		return ResolveResult{}, err
+	}
+	if err := validateRouteToLogicalServiceScope(route.Scope, logicalService.Scope); err != nil {
+		return ResolveResult{}, err
+	}
+	if logicalService.Status != pb.ServiceStatusActive {
+		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "logical service is not active")
+	}
+	instance, err := resolver.pickHealthyInstance(logicalService.LogicalServiceID, target.InstanceSelector)
+	if err != nil {
+		return ResolveResult{}, err
 	}
 
-	service, exists := resolver.registry.GetServiceByKey(serviceKey)
-	if !exists {
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "service is not found by serviceKey")
-	}
-	routeNamespace := strings.TrimSpace(route.Namespace)
-	serviceNamespace := strings.TrimSpace(service.Namespace)
-	if routeNamespace != "" && serviceNamespace != "" && routeNamespace != serviceNamespace {
-		// route 与 service 同时声明 namespace 时必须一致，空值视为不约束。
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match service scope")
-	}
-	routeEnvironment := strings.TrimSpace(route.Environment)
-	serviceEnvironment := strings.TrimSpace(service.Environment)
-	if routeEnvironment != "" && serviceEnvironment != "" && routeEnvironment != serviceEnvironment {
-		// route 与 service 同时声明 environment 时必须一致，空值视为不约束。
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match service scope")
-	}
-	if service.Status != pb.ServiceStatusActive || service.HealthStatus != pb.HealthStatusHealthy {
-		// service 非 ACTIVE 或健康非 HEALTHY 时不得参与 connector 解析。
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "service is not active or healthy")
-	}
-
-	connector, exists := resolver.registry.GetConnectorByID(service.ConnectorID)
+	connector, exists := resolver.registry.GetConnectorByID(instance.ConnectorID)
 	if !exists {
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "connector is not found")
 	}
 	if isConnectorOffline(connector) {
-		// connector 离线时必须按 service unavailable 处理。
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "connector is offline")
 	}
-
-	session, exists := resolver.registry.FindActiveSessionByConnector(service.ConnectorID)
+	session, exists := resolver.registry.FindActiveSessionByConnector(instance.ConnectorID)
 	if !exists || session.State != pb.SessionStateActive {
-		// session 非 ACTIVE 时不得给 agent 下发新流量。
 		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeResolveSessionNotActive, "connector session is not active")
 	}
 
 	trafficOpen := pb.TrafficOpen{
 		TrafficID:             strings.TrimSpace(request.TrafficID),
 		RouteID:               strings.TrimSpace(route.RouteID),
-		ServiceID:             strings.TrimSpace(service.ServiceID),
+		LogicalServiceID:      strings.TrimSpace(logicalService.LogicalServiceID),
+		InstanceID:            strings.TrimSpace(instance.InstanceID),
 		SourceAddr:            strings.TrimSpace(request.SourceAddr),
 		ProtocolHint:          strings.TrimSpace(request.ProtocolHint),
 		TraceID:               strings.TrimSpace(request.TraceID),
 		EndpointSelectionHint: request.EndpointSelectionHint,
 	}
 	return ResolveResult{
-		PathKind:     pb.RouteTargetTypeConnectorService,
-		RouteID:      strings.TrimSpace(route.RouteID),
-		ServiceID:    strings.TrimSpace(service.ServiceID),
-		ConnectorID:  strings.TrimSpace(service.ConnectorID),
-		SessionID:    strings.TrimSpace(session.SessionID),
-		SessionEpoch: session.SessionEpoch,
-		TrafficOpen:  &trafficOpen,
+		PathKind:         pb.RouteTargetTypeConnectorService,
+		RouteID:          strings.TrimSpace(route.RouteID),
+		LogicalServiceID: strings.TrimSpace(logicalService.LogicalServiceID),
+		InstanceID:       strings.TrimSpace(instance.InstanceID),
+		ConnectorID:      strings.TrimSpace(instance.ConnectorID),
+		SessionID:        strings.TrimSpace(session.SessionID),
+		SessionEpoch:     session.SessionEpoch,
+		TrafficOpen:      &trafficOpen,
 	}, nil
 }
 
@@ -151,13 +136,11 @@ func (resolver *Resolver) resolveExternal(route pb.Route, target *pb.ExternalSer
 
 	namespace := strings.TrimSpace(target.Namespace)
 	if namespace == "" {
-		// target 未显式声明 namespace 时默认继承 route scope。
-		namespace = strings.TrimSpace(route.Namespace)
+		namespace = strings.TrimSpace(route.Scope.Namespace)
 	}
 	environment := strings.TrimSpace(target.Environment)
 	if environment == "" {
-		// target 未显式声明 environment 时默认继承 route scope。
-		environment = strings.TrimSpace(route.Environment)
+		environment = strings.TrimSpace(route.Scope.Environment)
 	}
 
 	query := discovery.QueryRequest{
@@ -176,55 +159,70 @@ func (resolver *Resolver) resolveExternal(route pb.Route, target *pb.ExternalSer
 	}, nil
 }
 
-// resolveHybrid 解析 hybrid_group 并在 pre-open 场景下执行 fallback 判定。
-func (resolver *Resolver) resolveHybrid(route pb.Route, request ResolveRequest) (ResolveResult, error) {
-	if route.Target.HybridGroup == nil {
-		return ResolveResult{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "route.target.hybridGroup is required")
+// resolveLogicalService 根据 selector 查找逻辑服务。
+func (resolver *Resolver) resolveLogicalService(selector pb.ServiceSelector, fallbackScope pb.Scope) (pb.LogicalService, error) {
+	if strings.TrimSpace(selector.LogicalServiceID) != "" {
+		service, exists := resolver.registry.GetLogicalServiceByID(selector.LogicalServiceID)
+		if !exists {
+			return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service is not found by logicalServiceId")
+		}
+		return service, nil
 	}
-	hybrid := route.Target.HybridGroup
-	primaryResult, primaryErr := resolver.resolveConnector(route, &hybrid.PrimaryConnectorService, request)
-	if primaryErr == nil {
-		// primary 解析成功时保持 connector 路径。
-		primaryResult.PathKind = pb.RouteTargetTypeConnectorService
-		return primaryResult, nil
+	if strings.TrimSpace(selector.ServiceName) == "" {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeMissingRequiredField, "connectorService.selector is required")
 	}
-
-	signal, signalErr := mapFallbackSignal(primaryErr)
-	if signalErr != nil {
-		return ResolveResult{}, primaryErr
+	scope := selector.Scope
+	if strings.TrimSpace(scope.Namespace) == "" {
+		scope.Namespace = strings.TrimSpace(fallbackScope.Namespace)
 	}
-	allowed, allowErr := fallback.CanFallback(hybrid.FallbackPolicy, signal)
-	if allowErr != nil || !allowed {
-		// policy 不允许回退时直接返回 primary 错误，避免静默降级。
-		return ResolveResult{}, primaryErr
+	if strings.TrimSpace(scope.Environment) == "" {
+		scope.Environment = strings.TrimSpace(fallbackScope.Environment)
 	}
-
-	fallbackResult, fallbackErr := resolver.resolveExternal(route, &hybrid.FallbackExternalService)
-	if fallbackErr != nil {
-		return ResolveResult{}, fallbackErr
+	service, exists := resolver.registry.FindLogicalServiceByNameScope(selector.ServiceName, scope)
+	if !exists {
+		return pb.LogicalService{}, ltfperrors.New(ltfperrors.CodeResolveServiceNotFound, "logical service is not found by selector")
 	}
-	fallbackResult.FallbackUsed = true
-	fallbackResult.FallbackReason = string(signal)
-	fallbackResult.PrimaryErrorCode = ltfperrors.ExtractCode(primaryErr)
-	fallbackResult.PathKind = pb.RouteTargetTypeExternalService
-	return fallbackResult, nil
+	return service, nil
 }
 
-// mapFallbackSignal 将 primary 失败映射为 hybrid fallback 信号。
-func mapFallbackSignal(resolveErr error) (fallback.Signal, error) {
-	switch {
-	case ltfperrors.IsCode(resolveErr, ltfperrors.CodeResolveServiceNotFound):
-		// service miss 属于 route resolve miss，可参与 pre-open fallback。
-		return fallback.SignalResolveMiss, nil
-	case ltfperrors.IsCode(resolveErr, ltfperrors.CodeResolveServiceUnavailable):
-		// service unavailable 属于 pre-open 信号，可参与 fallback。
-		return fallback.SignalServiceUnavailable, nil
-	case ltfperrors.IsCode(resolveErr, ltfperrors.CodeResolveSessionNotActive):
-		// session 非 ACTIVE 也视为 service unavailable 信号。
-		return fallback.SignalServiceUnavailable, nil
-	default:
-		return "", ltfperrors.New(ltfperrors.CodeUnsupportedValue, "resolve error is not fallback eligible")
+// pickHealthyInstance 选择一个可路由实例。
+func (resolver *Resolver) pickHealthyInstance(logicalServiceID string, instanceSelector map[string]string) (pb.ServiceInstance, error) {
+	instances := resolver.registry.ListServiceInstancesByLogicalService(logicalServiceID)
+	for _, instance := range instances {
+		if instance.InstanceStatus != pb.ServiceStatusActive || instance.HealthStatus != pb.HealthStatusHealthy {
+			continue
+		}
+		if !matchInstanceLabels(instance.Labels, instanceSelector) {
+			continue
+		}
+		return instance, nil
 	}
+	return pb.ServiceInstance{}, ltfperrors.New(ltfperrors.CodeResolveServiceUnavailable, "no healthy instance is available")
+}
+
+// validateRouteToLogicalServiceScope 校验 route 与 logical service scope 一致性。
+func validateRouteToLogicalServiceScope(routeScope pb.Scope, serviceScope pb.Scope) error {
+	normalizedRouteNamespace := strings.TrimSpace(routeScope.Namespace)
+	normalizedServiceNamespace := strings.TrimSpace(serviceScope.Namespace)
+	if normalizedRouteNamespace != "" && normalizedServiceNamespace != "" && normalizedRouteNamespace != normalizedServiceNamespace {
+		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match logical service scope")
+	}
+	normalizedRouteEnvironment := strings.TrimSpace(routeScope.Environment)
+	normalizedServiceEnvironment := strings.TrimSpace(serviceScope.Environment)
+	if normalizedRouteEnvironment != "" && normalizedServiceEnvironment != "" && normalizedRouteEnvironment != normalizedServiceEnvironment {
+		return ltfperrors.New(ltfperrors.CodeInvalidScope, "route scope does not match logical service scope")
+	}
+	return nil
+}
+
+// matchInstanceLabels 校验实例标签是否满足选择条件。
+func matchInstanceLabels(labels map[string]string, selector map[string]string) bool {
+	for key, expected := range selector {
+		if strings.TrimSpace(labels[key]) != strings.TrimSpace(expected) {
+			return false
+		}
+	}
+	return true
 }
 
 // isConnectorOffline 判断 connector 当前是否离线。

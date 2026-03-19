@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,10 +50,12 @@ func ParseConfigYAML(rawConfigData []byte) (Config, error) {
 }
 
 type persistedConfigYAML struct {
-	Ingress       IngressConfig       `yaml:"ingress"`
-	Admin         AdminConfig         `yaml:"admin"`
-	Observability ObservabilityConfig `yaml:"observability"`
-	ControlPlane  struct {
+	Ingress          IngressConfig            `yaml:"ingress"`
+	Admin            AdminConfig              `yaml:"admin"`
+	Observability    ObservabilityConfig      `yaml:"observability"`
+	DefaultScope     pb.Scope                 `yaml:"default_scope"`
+	FallbackPolicies []pb.ScopeFallbackPolicy `yaml:"fallback_policies"`
+	ControlPlane     struct {
 		ListenAddr               string   `yaml:"listen_addr"`
 		GRPCH2ListenAddr         string   `yaml:"grpc_h2_listen_addr"`
 		HeartbeatTimeout         string   `yaml:"heartbeat_timeout"`
@@ -87,9 +90,11 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	}
 
 	persisted := persistedConfigYAML{
-		Ingress:       configToPersist.Ingress,
-		Admin:         configToPersist.Admin,
-		Observability: configToPersist.Observability,
+		Ingress:          configToPersist.Ingress,
+		Admin:            configToPersist.Admin,
+		Observability:    configToPersist.Observability,
+		DefaultScope:     configToPersist.DefaultScope,
+		FallbackPolicies: append([]pb.ScopeFallbackPolicy(nil), configToPersist.FallbackPolicies...),
 	}
 	persisted.ControlPlane.ListenAddr = configToPersist.ControlPlane.ListenAddr
 	persisted.ControlPlane.GRPCH2ListenAddr = configToPersist.ControlPlane.GRPCH2ListenAddr

@@ -5,8 +5,8 @@ import "time"
 // Connector 描述 connector 的静态与能力属性。
 type Connector struct {
 	ConnectorID  string            `json:"connectorId"`
-	Namespace    string            `json:"namespace"`
-	Environment  string            `json:"environment"`
+	Namespace    string            `json:"namespace,omitempty"`
+	Environment  string            `json:"environment,omitempty"`
 	NodeName     string            `json:"nodeName,omitempty"`
 	DisplayName  string            `json:"displayName,omitempty"`
 	Version      string            `json:"version,omitempty"`
@@ -31,31 +31,41 @@ type Session struct {
 	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
-// Service 描述 connector 发布后的服务快照。
-type Service struct {
-	ServiceID       string            `json:"serviceId"`
-	ServiceKey      string            `json:"serviceKey"`
-	Namespace       string            `json:"namespace"`
-	Environment     string            `json:"environment"`
-	ConnectorID     string            `json:"connectorId"`
-	ServiceName     string            `json:"serviceName"`
-	ServiceType     string            `json:"serviceType,omitempty"`
-	Status          ServiceStatus     `json:"status"`
-	ResourceVersion uint64            `json:"resourceVersion"`
-	Endpoints       []ServiceEndpoint `json:"endpoints,omitempty"`
-	Exposure        ServiceExposure   `json:"exposure,omitempty"`
-	HealthCheck     HealthCheckConfig `json:"healthCheck,omitempty"`
-	HealthStatus    HealthStatus      `json:"healthStatus"`
-	DiscoveryPolicy DiscoveryPolicy   `json:"discoveryPolicy,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
+// LogicalService 描述逻辑服务快照。
+type LogicalService struct {
+	LogicalServiceID     string            `json:"logicalServiceId"`
+	ServiceName          string            `json:"serviceName"`
+	Scope                Scope             `json:"scope"`
+	Status               ServiceStatus     `json:"status"`
+	ActiveInstanceCount  int32             `json:"activeInstanceCount,omitempty"`
+	HealthyInstanceCount int32             `json:"healthyInstanceCount,omitempty"`
+	Labels               map[string]string `json:"labels,omitempty"`
+	ResourceVersion      uint64            `json:"resourceVersion"`
+	Metadata             map[string]string `json:"metadata,omitempty"`
+}
+
+// ServiceInstance 描述逻辑服务下的单个实例快照。
+type ServiceInstance struct {
+	InstanceID       string            `json:"instanceId"`
+	LogicalServiceID string            `json:"logicalServiceId"`
+	ConnectorID      string            `json:"connectorId"`
+	SessionID        string            `json:"sessionId,omitempty"`
+	SessionEpoch     uint64            `json:"sessionEpoch,omitempty"`
+	InstanceStatus   ServiceStatus     `json:"instanceStatus"`
+	HealthStatus     HealthStatus      `json:"healthStatus"`
+	ResourceVersion  uint64            `json:"resourceVersion"`
+	Endpoints        []ServiceEndpoint `json:"endpoints,omitempty"`
+	Exposure         ServiceExposure   `json:"exposure,omitempty"`
+	HealthCheck      HealthCheckConfig `json:"healthCheck,omitempty"`
+	DiscoveryPolicy  DiscoveryPolicy   `json:"discoveryPolicy,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
 // Route 描述路由配置快照。
 type Route struct {
 	RouteID         string            `json:"routeId"`
-	Namespace       string            `json:"namespace"`
-	Environment     string            `json:"environment"`
+	Scope           Scope             `json:"scope,omitempty"`
 	ResourceVersion uint64            `json:"resourceVersion"`
 	Match           RouteMatch        `json:"match"`
 	Target          RouteTarget       `json:"target"`
@@ -83,27 +93,32 @@ const (
 
 // Traffic 描述运行态流量信息。
 type Traffic struct {
-	TrafficID   string            `json:"trafficId"`
-	RouteID     string            `json:"routeId,omitempty"`
-	TargetKind  RouteTargetType   `json:"targetKind"`
-	ServiceID   string            `json:"serviceId,omitempty"`
-	ConnectorID string            `json:"connectorId,omitempty"`
-	SourceAddr  string            `json:"sourceAddr,omitempty"`
-	TargetAddr  string            `json:"targetAddr,omitempty"`
-	TraceID     string            `json:"traceId,omitempty"`
-	State       TrafficState      `json:"state"`
-	StartedAt   time.Time         `json:"startedAt,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	TrafficID         string            `json:"trafficId"`
+	RouteID           string            `json:"routeId,omitempty"`
+	TargetKind        RouteTargetType   `json:"targetKind"`
+	LogicalServiceID  string            `json:"logicalServiceId,omitempty"`
+	InstanceID        string            `json:"instanceId,omitempty"`
+	ConnectorID       string            `json:"connectorId,omitempty"`
+	SourceAddr        string            `json:"sourceAddr,omitempty"`
+	TargetAddr        string            `json:"targetAddr,omitempty"`
+	TraceID           string            `json:"traceId,omitempty"`
+	RequestScope      Scope             `json:"requestScope,omitempty"`
+	MatchedScope      Scope             `json:"matchedScope,omitempty"`
+	ScopeFallbackPath []Scope           `json:"scopeFallbackPath,omitempty"`
+	State             TrafficState      `json:"state"`
+	StartedAt         time.Time         `json:"startedAt,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
 }
 
 // DiscoveryProjection 描述导出到第三方发现系统的投影视图元信息。
 type DiscoveryProjection struct {
-	ProjectionID string            `json:"projectionId"`
-	ServiceID    string            `json:"serviceId"`
-	Provider     string            `json:"provider"`
-	Namespace    string            `json:"namespace,omitempty"`
-	Environment  string            `json:"environment,omitempty"`
-	ExportedAddr string            `json:"exportedAddr,omitempty"`
-	Status       string            `json:"status,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	ProjectionID     string            `json:"projectionId"`
+	LogicalServiceID string            `json:"logicalServiceId"`
+	InstanceID       string            `json:"instanceId,omitempty"`
+	Provider         string            `json:"provider"`
+	Namespace        string            `json:"namespace,omitempty"`
+	Environment      string            `json:"environment,omitempty"`
+	ExportedAddr     string            `json:"exportedAddr,omitempty"`
+	Status           string            `json:"status,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
 }

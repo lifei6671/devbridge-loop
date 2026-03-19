@@ -108,13 +108,17 @@ func TestIngressGRPCHandlerExternalProxyRelaysResponse(testingObject *testing.T)
 	)
 	defer shutdownUpstream()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressGRPCServer = newIngressGRPCServer(runtime, ":0")
 	now := time.Now().UTC()
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-grpc-external-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-grpc-external-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "grpc",
 			Host:       "api.grpc.local",
@@ -137,8 +141,8 @@ func TestIngressGRPCHandlerExternalProxyRelaysResponse(testingObject *testing.T)
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/devbridge.loop.v1.Runtime/Ping", bytes.NewReader(requestBody))
 	request.Host = "api.grpc.local"
 	request.Header.Set("Content-Type", "application/grpc")
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressGRPCServer.Handler.ServeHTTP(recorder, request)
 
@@ -178,34 +182,32 @@ func TestIngressGRPCHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 	)
 	defer shutdownUpstream()
 
-	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{})
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
 	runtime.ingressGRPCServer = newIngressGRPCServer(runtime, ":0")
 	now := time.Now().UTC()
 	seedConnectorServiceAndSession(runtime, now)
 	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
-		RouteID:     "route-grpc-hybrid-1",
-		Namespace:   "dev",
-		Environment: "demo",
+		RouteID: "route-grpc-hybrid-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
 		Match: pb.RouteMatch{
 			Protocol:   "grpc",
 			Host:       "api.grpc.hybrid.local",
 			PathPrefix: "/",
 		},
 		Target: pb.RouteTarget{
-			Type: pb.RouteTargetTypeHybridGroup,
-			HybridGroup: &pb.HybridGroupTarget{
-				PrimaryConnectorService: pb.ConnectorServiceTarget{
-					ServiceKey: "dev/demo/order-service",
+			Type: pb.RouteTargetTypeExternalService,
+			ExternalService: &pb.ExternalServiceTarget{
+				Namespace:   "dev",
+				Environment: "demo",
+				ServiceName: "grpc-order-fallback",
+				Selector: map[string]string{
+					"endpoint": endpointAddress,
 				},
-				FallbackExternalService: pb.ExternalServiceTarget{
-					Namespace:   "dev",
-					Environment: "demo",
-					ServiceName: "grpc-order-fallback",
-					Selector: map[string]string{
-						"endpoint": endpointAddress,
-					},
-				},
-				FallbackPolicy: pb.FallbackPolicyPreOpenOnly,
 			},
 		},
 	})
@@ -213,8 +215,8 @@ func TestIngressGRPCHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/devbridge.loop.v1.Runtime/Ping", bytes.NewReader([]byte{0x00, 0, 0, 0, 0}))
 	request.Host = "api.grpc.hybrid.local"
 	request.Header.Set("Content-Type", "application/grpc")
-	request.Header.Set("X-Namespace", "dev")
-	request.Header.Set("X-Env", "demo")
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
 	recorder := httptest.NewRecorder()
 	runtime.ingressGRPCServer.Handler.ServeHTTP(recorder, request)
 
@@ -222,16 +224,10 @@ func TestIngressGRPCHandlerHybridFallsBackToExternal(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected status code: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	if recorder.Body.String() != "grpc-hybrid-fallback-ok" {
-		testingObject.Fatalf("unexpected grpc hybrid fallback body: %s", recorder.Body.String())
+		testingObject.Fatalf("unexpected grpc external body: %s", recorder.Body.String())
 	}
-	if recorder.Header().Get("X-DevBridge-Target-Kind") != string(pb.RouteTargetTypeHybridGroup) {
+	if recorder.Header().Get("X-DevBridge-Target-Kind") != string(pb.RouteTargetTypeExternalService) {
 		testingObject.Fatalf("unexpected target kind header: %s", recorder.Header().Get("X-DevBridge-Target-Kind"))
-	}
-	if recorder.Header().Get("X-DevBridge-Hybrid-Path") != "fallback" {
-		testingObject.Fatalf("unexpected hybrid path header: %s", recorder.Header().Get("X-DevBridge-Hybrid-Path"))
-	}
-	if recorder.Header().Get("X-DevBridge-Hybrid-Fallback-Stage") == "" {
-		testingObject.Fatalf("expected non-empty hybrid fallback stage")
 	}
 }
 

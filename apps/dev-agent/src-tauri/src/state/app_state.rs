@@ -38,7 +38,7 @@ fn default_diagnose_category_enabled() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualServiceConfig {
     #[serde(default)]
-    pub service_id: Option<String>,
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
@@ -79,8 +79,8 @@ impl ManualServiceConfig {
             return None;
         }
         Some(Self {
-            service_id: self
-                .service_id
+            instance_id: self
+                .instance_id
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
@@ -96,9 +96,9 @@ impl ManualServiceConfig {
 }
 
 /// 判断两个手动服务配置是否指向同一条逻辑服务记录。
-/// 优先按 service_id，对无 service_id 的配置按 namespace/environment/service_name/sni 组合匹配。
+/// 优先按 instance_id，对无 instance_id 的配置按 namespace/environment/service_name/sni 组合匹配。
 fn same_manual_service_identity(left: &ManualServiceConfig, right: &ManualServiceConfig) -> bool {
-    match (&left.service_id, &right.service_id) {
+    match (&left.instance_id, &right.instance_id) {
         (Some(left_id), Some(right_id)) => left_id == right_id,
         _ => {
             left.namespace == right.namespace
@@ -974,7 +974,7 @@ pub fn update_runtime_config(
     Ok(())
 }
 
-/// 持久化手动服务配置：按 `service_id` 或 `namespace/environment/service_name/sni` 执行 upsert。
+/// 持久化手动服务配置：按 `instance_id` 或 `namespace/environment/service_name/sni` 执行 upsert。
 pub fn upsert_manual_service_config(
     state: &Arc<AppRuntimeState>,
     service: ManualServiceConfig,
@@ -997,49 +997,31 @@ pub fn upsert_manual_service_config(
     Ok(persisted_size)
 }
 
-/// 删除手动服务配置：优先按 service_id 匹配；其次按 service_key；最后按 service_name + 可选 scope 匹配。
+/// 删除手动服务配置：优先按 instance_id 匹配；其次按 service_name + 可选 scope 匹配。
 pub fn remove_manual_service_config(
     state: &Arc<AppRuntimeState>,
-    service_id: &str,
-    service_key: Option<&str>,
+    instance_id: &str,
     namespace: Option<&str>,
     environment: Option<&str>,
     service_name: Option<&str>,
 ) -> Result<usize, String> {
-    let normalized_service_id = service_id.trim().to_string();
-    let normalized_service_key = service_key.unwrap_or_default().trim().to_string();
+    let normalized_instance_id = instance_id.trim().to_string();
     let normalized_namespace = namespace.unwrap_or_default().trim().to_string();
     let normalized_environment = environment.unwrap_or_default().trim().to_string();
     let normalized_service_name = service_name.unwrap_or_default().trim().to_string();
 
-    let build_manual_service_key = |item: &ManualServiceConfig| {
-        format!(
-            "{}/{}/{}",
-            item.namespace.as_deref().unwrap_or_default().trim(),
-            item.environment.as_deref().unwrap_or_default().trim(),
-            item.service_name.trim()
-        )
-    };
-
     let mut next_runtime_config = current_runtime_config(state)?;
     next_runtime_config.manual_services.retain(|item| {
-        if !normalized_service_id.is_empty()
+        if !normalized_instance_id.is_empty()
             && item
-                .service_id
+                .instance_id
                 .as_ref()
-                .map(|value| value == &normalized_service_id)
+                .map(|value| value == &normalized_instance_id)
                 .unwrap_or(false)
         {
             return false;
         }
-        if normalized_service_id.is_empty()
-            && !normalized_service_key.is_empty()
-            && build_manual_service_key(item) == normalized_service_key
-        {
-            return false;
-        }
-        if normalized_service_id.is_empty()
-            && normalized_service_key.is_empty()
+        if normalized_instance_id.is_empty()
             && !normalized_service_name.is_empty()
             && item.service_name == normalized_service_name
         {

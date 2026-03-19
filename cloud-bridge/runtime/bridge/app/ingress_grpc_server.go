@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/connectorproxy"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
@@ -69,20 +70,37 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		writeIngressError(writer, http.StatusServiceUnavailable, "RUNTIME_DATAPLANE_UNAVAILABLE", "bridge runtime data plane unavailable", trafficID, traceID)
 		return
 	}
-	namespace := firstNonEmptyHeader(request.Header, "X-DevBridge-Namespace", "X-Namespace")
-	environment := firstNonEmptyHeader(request.Header, "X-DevBridge-Environment", "X-Environment", "X-Env")
+	requestScope, resolveScopeErr := resolveIngressScope(request.Header, runtime.cfg.DefaultScope)
+	if resolveScopeErr != nil {
+		errorCode := ltfperrors.ExtractCode(resolveScopeErr)
+		if strings.TrimSpace(errorCode) == "" {
+			errorCode = ltfperrors.CodeInvalidPayload
+		}
+		writeIngressError(writer, http.StatusBadRequest, errorCode, resolveScopeErr.Error(), trafficID, traceID)
+		log.Printf(
+			"bridge ingress grpc scope resolve failed path=%s code=%s traffic_id=%s trace_id=%s err=%v",
+			request.URL.Path,
+			errorCode,
+			trafficID,
+			traceID,
+			resolveScopeErr,
+		)
+		return
+	}
 	authority := resolveIngressAuthority(request)
 
 	lookupRequest, lookupErr := runtime.dataPlane.grpcGateway.BuildRouteLookupRequest(ingress.GRPCGatewayRequest{
 		Authority:   authority,
 		Path:        request.URL.Path,
-		Namespace:   namespace,
-		Environment: environment,
+		Namespace:   requestScope.Namespace,
+		Environment: requestScope.Environment,
 		Metadata: map[string]string{
 			routing.RouteLookupMetadataTrafficIDKey: trafficID,
+			routing.RouteLookupMetadataClientIPKey:  appauth.NormalizeSourceIP(request.RemoteAddr),
 			"grpc_path":                             request.URL.Path,
 		},
 		Headers: cloneHTTPHeaderValues(request.Header),
+		Queries: cloneURLQueryValues(request.URL.Query()),
 	})
 	if lookupErr != nil {
 		mappedFailure := ingressHTTPFailureMapper.Map(lookupErr, routing.PathExecuteResult{})
@@ -115,16 +133,17 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		)
 		return
 	}
-	resolvedServiceID := resolveTrafficServiceIDFromResolution(resolution)
+	resolvedLogicalServiceID := resolveTrafficServiceIDFromResolution(resolution)
 	resolvedServiceKey := resolveTrafficServiceKeyFromResolution(resolution)
 	resolvedServiceInstanceID := resolveTrafficServiceInstanceIDFromResolution(resolution)
 	trafficOpen := pb.TrafficOpen{
-		TrafficID:    trafficID,
-		RouteID:      strings.TrimSpace(resolution.Route.RouteID),
-		ServiceID:    resolvedServiceID,
-		SourceAddr:   strings.TrimSpace(request.RemoteAddr),
-		ProtocolHint: "grpc",
-		TraceID:      traceID,
+		TrafficID:        trafficID,
+		RouteID:          strings.TrimSpace(resolution.Route.RouteID),
+		LogicalServiceID: resolvedLogicalServiceID,
+		InstanceID:       resolvedServiceInstanceID,
+		SourceAddr:       strings.TrimSpace(request.RemoteAddr),
+		ProtocolHint:     "grpc",
+		TraceID:          traceID,
 		Metadata: map[string]string{
 			"grpc_path": request.URL.Path,
 		},
@@ -132,7 +151,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 	// 统一补齐服务身份元数据，便于后续日志链路直接复用。
 	enrichTrafficOpenServiceIdentity(
 		&trafficOpen,
-		resolvedServiceID,
+		resolvedLogicalServiceID,
 		resolvedServiceKey,
 		resolvedServiceInstanceID,
 	)
@@ -161,8 +180,6 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 			"",
 			"",
 		)
-	case pb.RouteTargetTypeHybridGroup:
-		proxyErr = runtime.proxyGRPCIngressHybrid(request.Context(), writer, request, resolution, trafficOpen)
 	default:
 		proxyErr = ltfperrors.New(
 			ltfperrors.CodeUnsupportedValue,
@@ -174,13 +191,13 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 	}
 	if errors.Is(proxyErr, errIngressResponseCommitted) {
 		log.Printf(
-			"bridge ingress grpc proxy post-commit error ignored authority=%s path=%s target_kind=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
+			"bridge ingress grpc proxy post-commit error ignored authority=%s path=%s target_kind=%s traffic_id=%s trace_id=%s logical_service_id=%s instance_id=%s err=%v",
 			authority,
 			request.URL.Path,
 			resolution.TargetKind,
 			trafficID,
 			traceID,
-			resolvedServiceID,
+			resolvedLogicalServiceID,
 			resolvedServiceInstanceID,
 			proxyErr,
 		)
@@ -189,7 +206,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 	mappedFailure := ingressHTTPFailureMapper.Map(proxyErr, pathExecuteResult)
 	writeIngressError(writer, mappedFailure.HTTPStatus, mappedFailure.Code, mappedFailure.Message, trafficID, traceID)
 	log.Printf(
-		"bridge ingress grpc proxy failed authority=%s path=%s target_kind=%s http=%d code=%s traffic_id=%s trace_id=%s service_id=%s service_instance_id=%s err=%v",
+		"bridge ingress grpc proxy failed authority=%s path=%s target_kind=%s http=%d code=%s traffic_id=%s trace_id=%s logical_service_id=%s instance_id=%s err=%v",
 		authority,
 		request.URL.Path,
 		resolution.TargetKind,
@@ -197,7 +214,7 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 		mappedFailure.Code,
 		trafficID,
 		traceID,
-		resolvedServiceID,
+		resolvedLogicalServiceID,
 		resolvedServiceInstanceID,
 		proxyErr,
 	)
@@ -206,58 +223,6 @@ func (runtime *Runtime) handleGRPCIngress(writer http.ResponseWriter, request *h
 func isGRPCContentType(rawContentType string) bool {
 	normalizedContentType := strings.ToLower(strings.TrimSpace(rawContentType))
 	return strings.HasPrefix(normalizedContentType, "application/grpc")
-}
-
-func (runtime *Runtime) proxyGRPCIngressHybrid(
-	ctx context.Context,
-	writer http.ResponseWriter,
-	request *http.Request,
-	resolution routing.ResolveResult,
-	trafficOpen pb.TrafficOpen,
-) error {
-	if resolution.Hybrid == nil {
-		return ErrRuntimeDataPlaneDependencyMissing
-	}
-	primaryResolution := routing.ResolveResult{
-		Route:       resolution.Route,
-		TargetKind:  pb.RouteTargetTypeConnectorService,
-		IngressMode: resolution.IngressMode,
-		Connector:   &resolution.Hybrid.Primary,
-	}
-	primaryErr := runtime.proxyGRPCIngressConnectorTarget(
-		ctx,
-		writer,
-		request,
-		primaryResolution,
-		trafficOpen,
-		string(pb.RouteTargetTypeHybridGroup),
-		"primary",
-		"",
-	)
-	if primaryErr == nil {
-		return nil
-	}
-	if errors.Is(primaryErr, errIngressResponseCommitted) {
-		return primaryErr
-	}
-	fallbackStage, allowFallback := classifyIngressHybridFallback(primaryErr)
-	if !allowFallback {
-		return primaryErr
-	}
-	fallbackErr := runtime.proxyGRPCIngressExternalTarget(
-		ctx,
-		writer,
-		request,
-		resolution.Hybrid.Fallback,
-		trafficOpen,
-		string(pb.RouteTargetTypeHybridGroup),
-		"fallback",
-		fallbackStage,
-	)
-	if fallbackErr != nil {
-		return errors.Join(primaryErr, fallbackErr)
-	}
-	return nil
 }
 
 func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
@@ -314,10 +279,10 @@ func (runtime *Runtime) proxyGRPCIngressConnectorTarget(
 				// close_ack 闭环未完成时把 tunnel 标记为不可安全回收，后续由 dispatcher 直接关闭。
 				recycleErrorCode := ltfperrors.ExtractTunnelRecycleCode(closeErr)
 				log.Printf(
-					"bridge ingress grpc close-ack wait failed, fallback close traffic_id=%s service_id=%s service_instance_id=%s recycle_error_code=%s err=%v",
+					"bridge ingress grpc close-ack wait failed, fallback close traffic_id=%s logical_service_id=%s instance_id=%s recycle_error_code=%s err=%v",
 					strings.TrimSpace(trafficID),
-					strings.TrimSpace(trafficOpen.ServiceID),
-					strings.TrimSpace(trafficOpen.Metadata[trafficMetadataServiceInstanceIDKey]),
+					strings.TrimSpace(trafficOpen.LogicalServiceID),
+					strings.TrimSpace(trafficOpen.InstanceID),
 					recycleErrorCode,
 					closeErr,
 				)

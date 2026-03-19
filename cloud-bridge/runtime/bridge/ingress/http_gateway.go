@@ -21,6 +21,7 @@ type RouteLookupRequest struct {
 	Environment string
 	Metadata    map[string]string
 	Headers     map[string][]string
+	Queries     map[string][]string
 }
 
 // HTTPGatewayRequest 描述 HTTP 入口请求上下文。
@@ -33,6 +34,7 @@ type HTTPGatewayRequest struct {
 	Environment string
 	Metadata    map[string]string
 	Headers     map[string][]string
+	Queries     map[string][]string
 }
 
 type l7GatewayRequest struct {
@@ -44,6 +46,7 @@ type l7GatewayRequest struct {
 	Environment string
 	Metadata    map[string]string
 	Headers     map[string][]string
+	Queries     map[string][]string
 }
 
 // HTTPGateway 负责把 HTTP 入口请求转换为路由匹配输入。
@@ -67,6 +70,7 @@ func (gateway *HTTPGateway) BuildRouteLookupRequest(request HTTPGatewayRequest) 
 		Environment: request.Environment,
 		Metadata:    request.Metadata,
 		Headers:     request.Headers,
+		Queries:     request.Queries,
 	})
 }
 
@@ -109,6 +113,7 @@ func buildL7RouteLookupRequest(
 		Environment: strings.TrimSpace(request.Environment),
 		Metadata:    copyStringMap(request.Metadata),
 		Headers:     copyStringSliceMap(request.Headers),
+		Queries:     copyStringSliceMap(request.Queries),
 	}, nil
 }
 

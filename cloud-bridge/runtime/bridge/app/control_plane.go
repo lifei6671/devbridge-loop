@@ -18,6 +18,7 @@ import (
 
 	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/ingress/hostderiver"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
@@ -270,6 +271,7 @@ type controlMessageDispatcherOptions struct {
 	authCoordinator       appauth.Coordinator
 	handshakeGuard        appauth.HandshakeGuard
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	hostDerivationDomain  string
 	tlsMode               string
 	metrics               *obs.Metrics
 }
@@ -312,6 +314,10 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 	if handshakeGuard == nil {
 		handshakeGuard = appauth.NewHandshakeGuard(appauth.HandshakeGuardOptions{})
 	}
+	var hostDeriver bridgecontrol.HostDeriver
+	if strings.TrimSpace(options.hostDerivationDomain) != "" {
+		hostDeriver = hostderiver.New(options.hostDerivationDomain, metrics)
+	}
 	eventGuard := consistency.NewResourceEventGuard(4096)
 	sessionHandler := bridgecontrol.NewSessionHandler(bridgecontrol.SessionHandlerOptions{
 		SessionRegistry: sessionRegistry,
@@ -338,6 +344,7 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 			SessionRegistry: sessionRegistry,
 			ServiceRegistry: serviceRegistry,
 			Metrics:         metrics,
+			HostDeriver:     hostDeriver,
 		}),
 		healthHandler: bridgecontrol.NewHealthHandler(bridgecontrol.HealthHandlerOptions{
 			SessionRegistry: sessionRegistry,
@@ -352,7 +359,10 @@ func newControlMessageDispatcher(options controlMessageDispatcherOptions) *contr
 		routeHandler: bridgecontrol.NewRouteHandler(bridgecontrol.RouteHandlerOptions{
 			Guard:           eventGuard,
 			SessionRegistry: sessionRegistry,
+			ServiceRegistry: serviceRegistry,
 			RouteRegistry:   routeRegistry,
+			Metrics:         metrics,
+			HostDeriver:     hostDeriver,
 		}),
 		sessionHandler: sessionHandler,
 	}
@@ -1248,7 +1258,7 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 		shouldMarkConnectorInactive := normalizedReason == "session_epoch_takeover" ||
 			dispatcher.isCurrentConnectorSession(sessionRuntime)
 		if dispatcher.serviceRegistry != nil && shouldMarkConnectorInactive {
-			affectedServiceIDs := dispatcher.serviceRegistry.ListServiceIDsByRuntime(
+			affectedServiceIDs := dispatcher.serviceRegistry.ListLogicalServiceIDsByRuntime(
 				sessionRuntime.ConnectorID,
 				"",
 			)
@@ -1276,7 +1286,7 @@ func (dispatcher *controlMessageDispatcher) applySessionLifecycleEffects(
 			dispatcher.tunnelPoolReportStore.RemoveBySession(sessionRuntime.SessionID, sessionRuntime.Epoch)
 		}
 		if dispatcher.serviceRegistry != nil && dispatcher.isCurrentConnectorSession(sessionRuntime) {
-			affectedServiceIDs := dispatcher.serviceRegistry.ListServiceIDsByRuntime(
+			affectedServiceIDs := dispatcher.serviceRegistry.ListLogicalServiceIDsByRuntime(
 				sessionRuntime.ConnectorID,
 				"",
 			)
@@ -1600,6 +1610,7 @@ type controlPlaneDependencies struct {
 	tunnelRegistry        *registry.TunnelRegistry
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
 	metrics               *obs.Metrics
+	hostDerivationDomain  string
 	managedCAIssuer       apptls.ManagedCACertificateIssuer
 }
 
@@ -1676,6 +1687,7 @@ func newControlPlaneServer(
 			routeRegistry:         dependencies.routeRegistry,
 			tunnelRegistry:        dependencies.tunnelRegistry,
 			tunnelPoolReportStore: dependencies.tunnelPoolReportStore,
+			hostDerivationDomain:  dependencies.hostDerivationDomain,
 			tlsMode:               string(normalizedTLSMode),
 			metrics:               metrics,
 		}),

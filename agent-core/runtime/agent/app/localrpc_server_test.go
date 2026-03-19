@@ -131,9 +131,9 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 	_, failure := server.dispatchRequest(localRPCRequestBody{
 		Method: "service.add",
 		Payload: json.RawMessage(`{
+			"instance_id":"inst-order-service",
 			"service_name":"order-service",
-			"namespace":"dev",
-			"environment":"demo",
+			"scope":{"namespace":"dev","environment":"demo"},
 			"protocol":"http",
 			"host":"127.0.0.1",
 			"port":18080,
@@ -180,6 +180,9 @@ func TestDispatchRequestServiceAdd(testingObject *testing.T) {
 	if services[0]["health_check_path"] != "/healthz" {
 		testingObject.Fatalf("unexpected health_check_path: %+v", services[0]["health_check_path"])
 	}
+	if services[0]["instance_id"] != "inst-order-service" {
+		testingObject.Fatalf("unexpected instance_id: %+v", services[0]["instance_id"])
+	}
 }
 
 // TestDispatchRequestServiceDelete 验证 localrpc service.delete 可删除本地服务目录项。
@@ -194,9 +197,9 @@ func TestDispatchRequestServiceDelete(testingObject *testing.T) {
 	_, failure := server.dispatchRequest(localRPCRequestBody{
 		Method: "service.add",
 		Payload: json.RawMessage(`{
+			"instance_id":"inst-order-service",
 			"service_name":"order-service",
-			"namespace":"dev",
-			"environment":"demo",
+			"scope":{"namespace":"dev","environment":"demo"},
 			"protocol":"http",
 			"host":"127.0.0.1",
 			"port":18080
@@ -221,16 +224,16 @@ func TestDispatchRequestServiceDelete(testingObject *testing.T) {
 	if !ok || len(services) != 1 {
 		testingObject.Fatalf("unexpected services payload: %+v", listBody["services"])
 	}
-	serviceID, _ := services[0]["service_id"].(string)
-	if serviceID == "" {
-		testingObject.Fatalf("unexpected empty service_id: %+v", services[0]["service_id"])
+	instanceID, _ := services[0]["instance_id"].(string)
+	if instanceID == "" {
+		testingObject.Fatalf("unexpected empty instance_id: %+v", services[0]["instance_id"])
 	}
 
 	_, failure = server.dispatchRequest(localRPCRequestBody{
 		Method: "service.delete",
 		Payload: json.RawMessage(fmt.Sprintf(`{
-			"service_id":"%s"
-		}`, serviceID)),
+			"instance_id":"%s"
+		}`, instanceID)),
 	}, &localRPCConnectionAuthState{authenticated: true})
 	if failure != nil {
 		testingObject.Fatalf("dispatch service.delete failed: code=%s message=%s", failure.code, failure.message)

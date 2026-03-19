@@ -51,17 +51,24 @@ func TestBuildServiceItemsIncludesConnectorAndAccessHint(testingObject *testing.
 	sessionUpdatedAt := now.Add(-2 * time.Minute)
 	items := BuildServiceItems(
 		now,
-		[]pb.Service{
+		[]pb.LogicalService{
 			{
-				ServiceID:    "svc-order",
-				ServiceKey:   "dev/demo/order-service",
-				Namespace:    "dev",
-				Environment:  "demo",
-				ConnectorID:  "agent-a",
-				ServiceName:  "order-service",
-				ServiceType:  "https",
-				Status:       pb.ServiceStatusActive,
-				HealthStatus: pb.HealthStatusHealthy,
+				LogicalServiceID:     "ls-order",
+				ServiceName:          "order-service",
+				Scope:                pb.Scope{Namespace: "dev", Environment: "demo"},
+				Status:               pb.ServiceStatusActive,
+				ActiveInstanceCount:  1,
+				HealthyInstanceCount: 1,
+			},
+		},
+		[]pb.ServiceInstance{
+			{
+				InstanceID:       "inst-order-1",
+				LogicalServiceID: "ls-order",
+				ConnectorID:      "agent-a",
+				SessionID:        "session-a",
+				InstanceStatus:   pb.ServiceStatusActive,
+				HealthStatus:     pb.HealthStatusHealthy,
 				Endpoints: []pb.ServiceEndpoint{
 					{
 						EndpointID: "ep-order-1",
@@ -97,8 +104,11 @@ func TestBuildServiceItemsIncludesConnectorAndAccessHint(testingObject *testing.
 	if item.SNIName != "order.demo.example.com" {
 		testingObject.Fatalf("unexpected sni name: %+v", item.SNIName)
 	}
-	if item.RouteTarget != "connector_service.service_key=dev/demo/order-service" {
+	if item.RouteTarget != "connector_service.selector={serviceName:order-service,scope:dev/demo}" {
 		testingObject.Fatalf("unexpected route target: %+v", item.RouteTarget)
+	}
+	if item.Scope.Namespace != "dev" || item.Scope.Environment != "demo" {
+		testingObject.Fatalf("unexpected scope: %+v", item.Scope)
 	}
 	if item.UpdatedAtMS != uint64(sessionUpdatedAt.UnixMilli()) {
 		testingObject.Fatalf(
@@ -119,7 +129,7 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 		[]registry.SessionRuntime{
 			{SessionID: "session-a", ConnectorID: "agent-a", State: registry.SessionActive},
 		},
-		[]pb.Service{{ServiceID: "svc-a"}},
+		[]pb.LogicalService{{LogicalServiceID: "ls-a"}},
 		[]pb.Route{{RouteID: "route-a"}},
 		registry.TunnelSnapshot{IdleCount: 2, ActiveCount: 1, BrokenCount: 0},
 		map[string]any{

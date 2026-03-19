@@ -21,11 +21,12 @@ func TestCheckEligibilitySuccess(t *testing.T) {
 			ConnectorID: "conn-001",
 			State:       pb.SessionStateActive,
 		},
-		Service: pb.Service{
-			ServiceID:    "svc-001",
-			ConnectorID:  "conn-001",
-			Status:       pb.ServiceStatusActive,
-			HealthStatus: pb.HealthStatusHealthy,
+		ServiceInstance: pb.ServiceInstance{
+			InstanceID:       "si-001",
+			LogicalServiceID: "ls-001",
+			ConnectorID:      "conn-001",
+			InstanceStatus:   pb.ServiceStatusActive,
+			HealthStatus:     pb.HealthStatusHealthy,
 			Exposure: pb.ServiceExposure{
 				AllowExport: true,
 			},
@@ -40,7 +41,7 @@ func TestCheckEligibilitySuccess(t *testing.T) {
 	}
 }
 
-// TestCheckEligibilityRejectUnhealthy 验证 unhealthy service 不允许 export。
+// TestCheckEligibilityRejectUnhealthy 验证 unhealthy service instance 不允许 export。
 func TestCheckEligibilityRejectUnhealthy(t *testing.T) {
 	t.Parallel()
 
@@ -51,10 +52,10 @@ func TestCheckEligibilityRejectUnhealthy(t *testing.T) {
 			ConnectorID: "conn-001",
 			State:       pb.SessionStateActive,
 		},
-		Service: pb.Service{
-			ConnectorID:  "conn-001",
-			Status:       pb.ServiceStatusActive,
-			HealthStatus: pb.HealthStatusUnhealthy,
+		ServiceInstance: pb.ServiceInstance{
+			ConnectorID:    "conn-001",
+			InstanceStatus: pb.ServiceStatusActive,
+			HealthStatus:   pb.HealthStatusUnhealthy,
 			Exposure: pb.ServiceExposure{
 				AllowExport: true,
 			},
@@ -73,7 +74,7 @@ func TestCheckEligibilityRejectUnhealthy(t *testing.T) {
 func TestBuildEndpointL7Shared(t *testing.T) {
 	t.Parallel()
 
-	result, err := BuildEndpoint(pb.Service{
+	result, err := BuildEndpoint(pb.ServiceInstance{
 		Exposure: pb.ServiceExposure{
 			IngressMode: pb.IngressModeL7Shared,
 			Host:        "api.dev.example.com",
@@ -93,7 +94,7 @@ func TestBuildEndpointL7Shared(t *testing.T) {
 func TestBuildEndpointTLSSNIShared(t *testing.T) {
 	t.Parallel()
 
-	result, err := BuildEndpoint(pb.Service{
+	result, err := BuildEndpoint(pb.ServiceInstance{
 		Exposure: pb.ServiceExposure{
 			IngressMode: pb.IngressModeTLSSNIShared,
 			SNIName:     "order.dev.example.com",
@@ -114,7 +115,7 @@ func TestBuildEndpointTLSSNIShared(t *testing.T) {
 func TestBuildEndpointL4DedicatedPort(t *testing.T) {
 	t.Parallel()
 
-	result, err := BuildEndpoint(pb.Service{
+	result, err := BuildEndpoint(pb.ServiceInstance{
 		Exposure: pb.ServiceExposure{
 			IngressMode: pb.IngressModeL4DedicatedPort,
 			ListenPort:  18081,
@@ -134,7 +135,7 @@ func TestBuildEndpointL4DedicatedPort(t *testing.T) {
 func TestBuildEndpointRejectUpstreamAddr(t *testing.T) {
 	t.Parallel()
 
-	_, err := BuildEndpoint(pb.Service{
+	_, err := BuildEndpoint(pb.ServiceInstance{
 		Endpoints: []pb.ServiceEndpoint{
 			{Host: "api.dev.example.com", Port: 443},
 		},
@@ -153,10 +154,9 @@ func TestBuildEndpointRejectUpstreamAddr(t *testing.T) {
 func TestBuildDesiredProjections(t *testing.T) {
 	t.Parallel()
 
-	projections := BuildDesiredProjections(pb.Service{
-		ServiceID:   "svc-001",
-		Namespace:   "dev",
-		Environment: "alice",
+	projections := BuildDesiredProjections(pb.ServiceInstance{
+		LogicalServiceID: "ls-001",
+		InstanceID:       "si-001",
 		DiscoveryPolicy: pb.DiscoveryPolicy{
 			Enabled:   true,
 			Providers: []string{"consul", "nacos"},
@@ -174,7 +174,6 @@ func TestBuildDesiredProjections(t *testing.T) {
 	if len(projections) != 2 {
 		t.Fatalf("unexpected projection count: %d", len(projections))
 	}
-	// providers 会排序，确保 reconcile 结果稳定。
 	if projections[0].Provider != "consul" || projections[1].Provider != "nacos" {
 		t.Fatalf("unexpected projection order: %+v", projections)
 	}

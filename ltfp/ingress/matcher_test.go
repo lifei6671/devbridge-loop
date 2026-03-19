@@ -47,16 +47,18 @@ func TestMatchRouteRejectSNI(t *testing.T) {
 func TestValidateDedicatedPortAssignments(t *testing.T) {
 	t.Parallel()
 
-	err := ValidateDedicatedPortAssignments([]pb.Service{
+	err := ValidateDedicatedPortAssignments([]pb.ServiceInstance{
 		{
-			ServiceID: "svc-1",
+			InstanceID:       "si-1",
+			LogicalServiceID: "ls-1",
 			Exposure: pb.ServiceExposure{
 				IngressMode: pb.IngressModeL4DedicatedPort,
 				ListenPort:  18080,
 			},
 		},
 		{
-			ServiceID: "svc-2",
+			InstanceID:       "si-2",
+			LogicalServiceID: "ls-2",
 			Exposure: pb.ServiceExposure{
 				IngressMode: pb.IngressModeL4DedicatedPort,
 				ListenPort:  18080,
@@ -68,7 +70,7 @@ func TestValidateDedicatedPortAssignments(t *testing.T) {
 	}
 }
 
-// TestBuildRouteMappings 验证 route/service/exposure 映射构建。
+// TestBuildRouteMappings 验证 route/logical_service/instance/exposure 映射构建。
 func TestBuildRouteMappings(t *testing.T) {
 	t.Parallel()
 
@@ -79,7 +81,9 @@ func TestBuildRouteMappings(t *testing.T) {
 				Target: pb.RouteTarget{
 					Type: pb.RouteTargetTypeConnectorService,
 					ConnectorService: &pb.ConnectorServiceTarget{
-						ServiceKey: "dev/alice/order-service",
+						Selector: pb.ServiceSelector{
+							LogicalServiceID: "ls-1",
+						},
 					},
 				},
 			},
@@ -93,12 +97,17 @@ func TestBuildRouteMappings(t *testing.T) {
 				},
 			},
 		},
-		[]pb.Service{
+		[]pb.LogicalService{
 			{
-				ServiceID:   "svc-1",
-				ServiceKey:  "dev/alice/order-service",
-				Namespace:   "dev",
-				Environment: "alice",
+				LogicalServiceID: "ls-1",
+				ServiceName:      "order-service",
+				Scope:            pb.Scope{Namespace: "dev", Environment: "alice"},
+			},
+		},
+		[]pb.ServiceInstance{
+			{
+				InstanceID:       "si-1",
+				LogicalServiceID: "ls-1",
 				Exposure: pb.ServiceExposure{
 					IngressMode: pb.IngressModeL7Shared,
 					Host:        "api.dev.example.com",
@@ -109,10 +118,10 @@ func TestBuildRouteMappings(t *testing.T) {
 	if len(mappings) != 2 {
 		t.Fatalf("unexpected mapping count: %d", len(mappings))
 	}
-	if mappings[0].ServiceID != "svc-1" || mappings[0].IngressMode != pb.IngressModeL7Shared {
+	if mappings[0].LogicalServiceID != "ls-1" || mappings[0].IngressMode != pb.IngressModeL7Shared {
 		t.Fatalf("unexpected mapping[0]: %+v", mappings[0])
 	}
-	if mappings[1].TargetType != pb.RouteTargetTypeExternalService || mappings[1].ServiceID != "" {
+	if mappings[1].TargetType != pb.RouteTargetTypeExternalService || mappings[1].LogicalServiceID != "" {
 		t.Fatalf("unexpected mapping[1]: %+v", mappings[1])
 	}
 }

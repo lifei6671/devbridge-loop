@@ -26,12 +26,13 @@ type ExternalEndpoint struct {
 
 // DiscoveryRequest 描述外部发现查询输入。
 type DiscoveryRequest struct {
-	Provider    string
-	Namespace   string
-	Environment string
-	ServiceName string
-	Group       string
-	Selector    map[string]string
+	Provider     string
+	Namespace    string
+	Environment  string
+	ServiceName  string
+	Group        string
+	Selector     map[string]string
+	RequestScope pb.Scope
 }
 
 // DiscoveryProvider 定义底层 discovery provider 能力。
@@ -60,7 +61,11 @@ func NewDiscoveryAdapter(options DiscoveryAdapterOptions) (*DiscoveryAdapter, er
 }
 
 // Discover 调用 provider 查询目标 service 的 endpoint 列表。
-func (adapter *DiscoveryAdapter) Discover(ctx context.Context, target pb.ExternalServiceTarget) ([]ExternalEndpoint, error) {
+func (adapter *DiscoveryAdapter) Discover(
+	ctx context.Context,
+	target pb.ExternalServiceTarget,
+	requestScope pb.Scope,
+) ([]ExternalEndpoint, error) {
 	if adapter == nil || adapter.provider == nil {
 		return nil, ErrDiscoveryAdapterDependencyMissing
 	}
@@ -75,13 +80,21 @@ func (adapter *DiscoveryAdapter) Discover(ctx context.Context, target pb.Externa
 	if normalizedContext == nil {
 		normalizedContext = context.Background()
 	}
+	normalizedRequestScope := normalizeDiscoveryScope(requestScope)
+	if normalizedRequestScope.Namespace == "" {
+		normalizedRequestScope.Namespace = strings.TrimSpace(target.Namespace)
+	}
+	if normalizedRequestScope.Environment == "" {
+		normalizedRequestScope.Environment = strings.TrimSpace(target.Environment)
+	}
 	endpoints, err := adapter.provider.Discover(normalizedContext, DiscoveryRequest{
-		Provider:    strings.TrimSpace(target.Provider),
-		Namespace:   strings.TrimSpace(target.Namespace),
-		Environment: strings.TrimSpace(target.Environment),
-		ServiceName: normalizedServiceName,
-		Group:       strings.TrimSpace(target.Group),
-		Selector:    copyStringMap(target.Selector),
+		Provider:     strings.TrimSpace(target.Provider),
+		Namespace:    normalizedRequestScope.Namespace,
+		Environment:  normalizedRequestScope.Environment,
+		ServiceName:  normalizedServiceName,
+		Group:        strings.TrimSpace(target.Group),
+		Selector:     copyStringMap(target.Selector),
+		RequestScope: normalizedRequestScope,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("direct discovery failed: %w", err)
@@ -102,13 +115,20 @@ func (adapter *DiscoveryAdapter) Discover(ctx context.Context, target pb.Externa
 			"direct discovery failed: %w: provider=%s namespace=%s environment=%s service=%s group=%s",
 			ErrDiscoveryNoEndpoint,
 			strings.TrimSpace(target.Provider),
-			strings.TrimSpace(target.Namespace),
-			strings.TrimSpace(target.Environment),
+			normalizedRequestScope.Namespace,
+			normalizedRequestScope.Environment,
 			normalizedServiceName,
 			strings.TrimSpace(target.Group),
 		)
 	}
 	return filtered, nil
+}
+
+func normalizeDiscoveryScope(scope pb.Scope) pb.Scope {
+	return pb.Scope{
+		Namespace:   strings.TrimSpace(scope.Namespace),
+		Environment: strings.TrimSpace(scope.Environment),
+	}
 }
 
 func copyStringMap(source map[string]string) map[string]string {

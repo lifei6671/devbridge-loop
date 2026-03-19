@@ -52,7 +52,8 @@ const (
 type tunnelAssociation struct {
 	TunnelID              string
 	TrafficID             string
-	ServiceID             string
+	LogicalServiceID      string
+	InstanceID            string
 	LocalAddr             string
 	OpenAckLatencyMS      uint64
 	UpstreamDialLatencyMS uint64
@@ -264,9 +265,10 @@ func (r *Runtime) runTrafficAcceptorWorker(ctx context.Context, tunnelID string,
 			return
 		}
 		r.upsertTunnelAssociation(tunnelAssociation{
-			TunnelID:  tunnelID,
-			TrafficID: strings.TrimSpace(handoff.Open.TrafficID),
-			ServiceID: strings.TrimSpace(handoff.Open.ServiceID),
+			TunnelID:         tunnelID,
+			TrafficID:        strings.TrimSpace(handoff.Open.TrafficID),
+			LogicalServiceID: strings.TrimSpace(handoff.Open.LogicalServiceID),
+			InstanceID:       strings.TrimSpace(handoff.Open.InstanceID),
 			// open 阶段先写入 hint 地址，后续以实际选中的 endpoint 地址覆盖。
 			LocalAddr: resolveTrafficHintEndpointAddr(handoff.Open.EndpointSelectionHint),
 			UpdatedAt: time.Now().UTC(),
@@ -279,7 +281,8 @@ func (r *Runtime) runTrafficAcceptorWorker(ctx context.Context, tunnelID string,
 		r.upsertTunnelAssociation(tunnelAssociation{
 			TunnelID:              tunnelID,
 			TrafficID:             strings.TrimSpace(handleResult.TrafficID),
-			ServiceID:             strings.TrimSpace(handoff.Open.ServiceID),
+			LogicalServiceID:      strings.TrimSpace(handoff.Open.LogicalServiceID),
+			InstanceID:            strings.TrimSpace(handoff.Open.InstanceID),
 			LocalAddr:             strings.TrimSpace(handleResult.Endpoint.Addr),
 			OpenAckLatencyMS:      handleResult.OpenAckLatencyMS,
 			UpstreamDialLatencyMS: handleResult.UpstreamDialLatencyMS,
@@ -714,8 +717,11 @@ func (r *Runtime) upsertTunnelAssociation(association tunnelAssociation) {
 	if strings.TrimSpace(association.TrafficID) == "" {
 		association.TrafficID = existingAssociation.TrafficID
 	}
-	if strings.TrimSpace(association.ServiceID) == "" {
-		association.ServiceID = existingAssociation.ServiceID
+	if strings.TrimSpace(association.LogicalServiceID) == "" {
+		association.LogicalServiceID = existingAssociation.LogicalServiceID
+	}
+	if strings.TrimSpace(association.InstanceID) == "" {
+		association.InstanceID = existingAssociation.InstanceID
 	}
 	if strings.TrimSpace(association.LocalAddr) == "" {
 		association.LocalAddr = existingAssociation.LocalAddr
@@ -775,7 +781,7 @@ type runtimeHintEndpointSelector struct {
 	serviceCatalog *service.Catalog
 }
 
-// SelectEndpoint 基于 service_id 与 hint 选择最终 endpoint。
+// SelectEndpoint 基于 logical_service_id / instance_id 与 hint 选择最终 endpoint。
 func (selector *runtimeHintEndpointSelector) SelectEndpoint(
 	ctx context.Context,
 	serviceID string,
@@ -842,9 +848,9 @@ func (selector *runtimeHintEndpointSelector) selectEndpointFromCatalog(
 	}
 	records := selector.serviceCatalog.List()
 	for _, record := range records {
-		candidateServiceID := strings.TrimSpace(record.Registration.ServiceID)
-		candidateServiceKey := strings.TrimSpace(record.Registration.ServiceKey)
-		if normalizedServiceID != candidateServiceID && normalizedServiceID != candidateServiceKey {
+		candidateLogicalServiceID := strings.TrimSpace(record.Registration.LogicalServiceID)
+		candidateInstanceID := strings.TrimSpace(record.Registration.InstanceID)
+		if normalizedServiceID != candidateLogicalServiceID && normalizedServiceID != candidateInstanceID {
 			continue
 		}
 		if endpointIDHint != "" {

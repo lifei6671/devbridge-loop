@@ -9,7 +9,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-// TestHealthHandlerHandleReport 验证健康上报可更新服务注册表状态。
+// TestHealthHandlerHandleReport 验证健康上报可更新实例状态。
 func TestHealthHandlerHandleReport(t *testing.T) {
 	t.Parallel()
 
@@ -21,16 +21,7 @@ func TestHealthHandlerHandleReport(t *testing.T) {
 		State:       registry.SessionActive,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-1",
-		ServiceKey:      "dev/demo/order-service",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ServiceName:     "order-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 1,
-		HealthStatus:    pb.HealthStatusUnknown,
-	})
+	upsertInstance(serviceRegistry, "ls-1", "inst-1", "order-service", "connector-1", "session-1", 4, 1, pb.HealthStatusUnknown)
 	handler := NewHealthHandler(HealthHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		ServiceRegistry: serviceRegistry,
@@ -43,19 +34,20 @@ func TestHealthHandlerHandleReport(t *testing.T) {
 		MessageType:  pb.ControlMessageServiceHealthReport,
 		SessionID:    "session-1",
 		SessionEpoch: 4,
+		ConnectorID:  "connector-1",
 	}, pb.ServiceHealthReport{
-		ServiceID:           "svc-1",
-		ServiceKey:          "dev/demo/order-service",
+		InstanceID:          "inst-1",
+		LogicalServiceID:    "ls-1",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	})
 
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-1")
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-1")
 	if !exists {
-		t.Fatalf("expected service snapshot exists")
+		t.Fatalf("expected instance snapshot exists")
 	}
-	if serviceSnapshot.HealthStatus != pb.HealthStatusHealthy {
-		t.Fatalf("unexpected health status: got=%s want=%s", serviceSnapshot.HealthStatus, pb.HealthStatusHealthy)
+	if instanceSnapshot.Instance.HealthStatus != pb.HealthStatusHealthy {
+		t.Fatalf("unexpected health status: got=%s want=%s", instanceSnapshot.Instance.HealthStatus, pb.HealthStatusHealthy)
 	}
 }
 
@@ -71,16 +63,7 @@ func TestHealthHandlerIgnoreStaleEpoch(t *testing.T) {
 		State:       registry.SessionActive,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-2",
-		ServiceKey:      "dev/demo/pay-service",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ServiceName:     "pay-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 3,
-		HealthStatus:    pb.HealthStatusUnknown,
-	})
+	upsertInstance(serviceRegistry, "ls-2", "inst-2", "pay-service", "connector-1", "session-1", 6, 3, pb.HealthStatusUnknown)
 	handler := NewHealthHandler(HealthHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		ServiceRegistry: serviceRegistry,
@@ -92,19 +75,20 @@ func TestHealthHandlerIgnoreStaleEpoch(t *testing.T) {
 		MessageType:  pb.ControlMessageServiceHealthReport,
 		SessionID:    "session-1",
 		SessionEpoch: 5,
+		ConnectorID:  "connector-1",
 	}, pb.ServiceHealthReport{
-		ServiceID:           "svc-2",
-		ServiceKey:          "dev/demo/pay-service",
+		InstanceID:          "inst-2",
+		LogicalServiceID:    "ls-2",
 		ServiceHealthStatus: pb.HealthStatusUnhealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	})
 
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-2")
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-2")
 	if !exists {
-		t.Fatalf("expected service snapshot exists")
+		t.Fatalf("expected instance snapshot exists")
 	}
-	if serviceSnapshot.HealthStatus != pb.HealthStatusUnknown {
-		t.Fatalf("stale epoch should be ignored, got=%s", serviceSnapshot.HealthStatus)
+	if instanceSnapshot.Instance.HealthStatus != pb.HealthStatusUnknown {
+		t.Fatalf("stale epoch should be ignored, got=%s", instanceSnapshot.Instance.HealthStatus)
 	}
 }
 
@@ -120,16 +104,7 @@ func TestHealthHandlerIgnoreNonActiveSession(t *testing.T) {
 		State:       registry.SessionDraining,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.Upsert(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-draining",
-		ServiceKey:      "dev/demo/pay-service",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ServiceName:     "pay-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 3,
-		HealthStatus:    pb.HealthStatusUnknown,
-	})
+	upsertInstance(serviceRegistry, "ls-draining", "inst-draining", "pay-service", "connector-1", "session-draining", 7, 3, pb.HealthStatusUnknown)
 	handler := NewHealthHandler(HealthHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		ServiceRegistry: serviceRegistry,
@@ -141,19 +116,20 @@ func TestHealthHandlerIgnoreNonActiveSession(t *testing.T) {
 		MessageType:  pb.ControlMessageServiceHealthReport,
 		SessionID:    "session-draining",
 		SessionEpoch: 7,
+		ConnectorID:  "connector-1",
 	}, pb.ServiceHealthReport{
-		ServiceID:           "svc-draining",
-		ServiceKey:          "dev/demo/pay-service",
+		InstanceID:          "inst-draining",
+		LogicalServiceID:    "ls-draining",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	})
 
-	serviceSnapshot, exists := serviceRegistry.GetByServiceID("svc-draining")
+	instanceSnapshot, exists := serviceRegistry.GetInstanceByID("inst-draining")
 	if !exists {
-		t.Fatalf("expected service snapshot exists")
+		t.Fatalf("expected instance snapshot exists")
 	}
-	if serviceSnapshot.HealthStatus != pb.HealthStatusUnknown {
-		t.Fatalf("draining session should be ignored, got=%s", serviceSnapshot.HealthStatus)
+	if instanceSnapshot.Instance.HealthStatus != pb.HealthStatusUnknown {
+		t.Fatalf("draining session should be ignored, got=%s", instanceSnapshot.Instance.HealthStatus)
 	}
 }
 
@@ -175,28 +151,8 @@ func TestHealthHandlerUpdatesMatchedInstanceOnly(t *testing.T) {
 		State:       registry.SessionActive,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-shared",
-		ServiceKey:      "order-service/http",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ConnectorID:     "connector-a",
-		ServiceName:     "order-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 1,
-		HealthStatus:    pb.HealthStatusUnknown,
-	}, "session-a")
-	serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-shared",
-		ServiceKey:      "order-service/http",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ConnectorID:     "connector-b",
-		ServiceName:     "order-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 2,
-		HealthStatus:    pb.HealthStatusUnknown,
-	}, "session-b")
+	upsertInstance(serviceRegistry, "ls-shared", "inst-a", "order-service", "connector-a", "session-a", 8, 1, pb.HealthStatusUnknown)
+	upsertInstance(serviceRegistry, "ls-shared", "inst-b", "order-service", "connector-b", "session-b", 9, 2, pb.HealthStatusUnknown)
 	handler := NewHealthHandler(HealthHandlerOptions{
 		SessionRegistry: sessionRegistry,
 		ServiceRegistry: serviceRegistry,
@@ -210,25 +166,25 @@ func TestHealthHandlerUpdatesMatchedInstanceOnly(t *testing.T) {
 		SessionEpoch: 8,
 		ConnectorID:  "connector-a",
 	}, pb.ServiceHealthReport{
-		ServiceID:           "svc-shared",
-		ServiceKey:          "order-service/http",
+		InstanceID:          "inst-a",
+		LogicalServiceID:    "ls-shared",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	})
 
-	instances := serviceRegistry.ListInstancesByServiceKey("order-service/http")
-	if len(instances) != 2 {
-		t.Fatalf("unexpected instance count: got=%d want=2", len(instances))
+	instanceA, exists := serviceRegistry.GetInstanceByID("inst-a")
+	if !exists {
+		t.Fatalf("expected inst-a exists")
 	}
-	healthByConnector := map[string]pb.HealthStatus{}
-	for _, instance := range instances {
-		healthByConnector[instance.Service.ConnectorID] = instance.Service.HealthStatus
+	instanceB, exists := serviceRegistry.GetInstanceByID("inst-b")
+	if !exists {
+		t.Fatalf("expected inst-b exists")
 	}
-	if healthByConnector["connector-a"] != pb.HealthStatusHealthy {
-		t.Fatalf("expected connector-a health updated to healthy, got=%s", healthByConnector["connector-a"])
+	if instanceA.Instance.HealthStatus != pb.HealthStatusHealthy {
+		t.Fatalf("expected inst-a updated to healthy, got=%s", instanceA.Instance.HealthStatus)
 	}
-	if healthByConnector["connector-b"] != pb.HealthStatusUnknown {
-		t.Fatalf("expected connector-b health remains unknown, got=%s", healthByConnector["connector-b"])
+	if instanceB.Instance.HealthStatus != pb.HealthStatusUnknown {
+		t.Fatalf("expected inst-b remains unknown, got=%s", instanceB.Instance.HealthStatus)
 	}
 }
 
@@ -250,28 +206,8 @@ func TestHealthHandlerRefreshesServiceAvailabilityMetrics(t *testing.T) {
 		State:       registry.SessionActive,
 	})
 	serviceRegistry := registry.NewServiceRegistry()
-	instanceA := serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-availability",
-		ServiceKey:      "availability-service/http",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ConnectorID:     "connector-a",
-		ServiceName:     "availability-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 1,
-		HealthStatus:    pb.HealthStatusUnknown,
-	}, "session-a")
-	instanceB := serviceRegistry.UpsertWithRuntime(time.Now().UTC(), pb.Service{
-		ServiceID:       "svc-availability",
-		ServiceKey:      "availability-service/http",
-		Namespace:       "dev",
-		Environment:     "demo",
-		ConnectorID:     "connector-b",
-		ServiceName:     "availability-service",
-		Status:          pb.ServiceStatusActive,
-		ResourceVersion: 2,
-		HealthStatus:    pb.HealthStatusUnknown,
-	}, "session-b")
+	upsertInstance(serviceRegistry, "ls-availability", "inst-availability-a", "availability-service", "connector-a", "session-a", 10, 1, pb.HealthStatusUnknown)
+	upsertInstance(serviceRegistry, "ls-availability", "inst-availability-b", "availability-service", "connector-b", "session-b", 11, 2, pb.HealthStatusUnknown)
 	metrics := obs.NewMetrics()
 	handler := NewHealthHandler(HealthHandlerOptions{
 		SessionRegistry: sessionRegistry,
@@ -287,28 +223,60 @@ func TestHealthHandlerRefreshesServiceAvailabilityMetrics(t *testing.T) {
 		SessionEpoch: 10,
 		ConnectorID:  "connector-a",
 	}, pb.ServiceHealthReport{
-		ServiceID:           "svc-availability",
-		ServiceKey:          "availability-service/http",
+		InstanceID:          "inst-availability-a",
+		LogicalServiceID:    "ls-availability",
 		ServiceHealthStatus: pb.HealthStatusHealthy,
 		CheckTimeUnix:       time.Now().UTC().Unix(),
 	})
 
-	if metrics.BridgeServiceAvailableInstanceTotal("svc-availability") != 1 {
+	if metrics.BridgeServiceAvailableInstanceTotal("ls-availability") != 1 {
 		t.Fatalf(
 			"unexpected service available instance total: got=%d want=1",
-			metrics.BridgeServiceAvailableInstanceTotal("svc-availability"),
+			metrics.BridgeServiceAvailableInstanceTotal("ls-availability"),
 		)
 	}
-	if metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceA) != 1 {
+	if metrics.BridgeServiceInstanceAvailableTotal("ls-availability", "inst-availability-a") != 1 {
 		t.Fatalf(
 			"expected instance-a available metric is 1, got=%d",
-			metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceA),
+			metrics.BridgeServiceInstanceAvailableTotal("ls-availability", "inst-availability-a"),
 		)
 	}
-	if metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceB) != 0 {
+	if metrics.BridgeServiceInstanceAvailableTotal("ls-availability", "inst-availability-b") != 0 {
 		t.Fatalf(
 			"expected instance-b available metric is 0, got=%d",
-			metrics.BridgeServiceInstanceAvailableTotal("svc-availability", instanceB),
+			metrics.BridgeServiceInstanceAvailableTotal("ls-availability", "inst-availability-b"),
 		)
 	}
+}
+
+func upsertInstance(
+	serviceRegistry *registry.ServiceRegistry,
+	logicalServiceID string,
+	instanceID string,
+	serviceName string,
+	connectorID string,
+	sessionID string,
+	sessionEpoch uint64,
+	resourceVersion uint64,
+	healthStatus pb.HealthStatus,
+) {
+	serviceRegistry.Upsert(time.Now().UTC(), pb.LogicalService{
+		LogicalServiceID: logicalServiceID,
+		ServiceName:      serviceName,
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Status:          pb.ServiceStatusActive,
+		ResourceVersion: resourceVersion,
+	}, pb.ServiceInstance{
+		InstanceID:       instanceID,
+		LogicalServiceID: logicalServiceID,
+		ConnectorID:      connectorID,
+		SessionID:        sessionID,
+		SessionEpoch:     sessionEpoch,
+		InstanceStatus:   pb.ServiceStatusActive,
+		HealthStatus:     healthStatus,
+		ResourceVersion:  resourceVersion,
+	})
 }

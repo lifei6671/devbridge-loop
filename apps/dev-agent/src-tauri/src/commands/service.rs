@@ -9,13 +9,19 @@ use crate::state::app_state::{
     with_rpc_metrics, AppRuntimeState, ManualServiceConfig,
 };
 
+/// 服务 scope：前后端统一使用 namespace/environment 二元组表达。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ServiceScope {
+    pub namespace: Option<String>,
+    pub environment: Option<String>,
+}
+
 /// 服务列表项：供前端“服务列表”页面展示。
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceListItem {
-    pub service_id: String,
-    pub service_key: String,
-    pub namespace: String,
-    pub environment: String,
+    pub logical_service_id: String,
+    pub instance_id: String,
+    pub scope: ServiceScope,
     pub service_name: String,
     pub protocol: String,
     pub host: String,
@@ -30,23 +36,21 @@ pub struct ServiceListItem {
 /// 新增服务输入体：由前端“服务菜单”提交。
 #[derive(Debug, Deserialize)]
 pub struct ServiceAddInput {
-    pub service_id: Option<String>,
+    pub instance_id: Option<String>,
     pub service_name: String,
-    pub namespace: Option<String>,
-    pub environment: Option<String>,
+    pub scope: Option<ServiceScope>,
     pub protocol: String,
     pub host: String,
     pub port: u16,
     pub sni_name: Option<String>,
 }
 
-/// 删除服务输入体：支持按 service_id 或 service_key 删除。
+/// 删除服务输入体：支持按 logical_service_id 或 instance_id 删除。
 #[derive(Debug, Deserialize)]
 pub struct ServiceDeleteInput {
-    pub service_id: Option<String>,
-    pub service_key: Option<String>,
-    pub namespace: Option<String>,
-    pub environment: Option<String>,
+    pub logical_service_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub scope: Option<ServiceScope>,
     pub service_name: Option<String>,
 }
 
@@ -55,8 +59,8 @@ pub struct ServiceDeleteInput {
 pub struct ServiceDeleteResult {
     pub accepted: bool,
     pub deleted: bool,
-    pub service_id: String,
-    pub service_key: String,
+    pub logical_service_id: String,
+    pub instance_id: String,
     pub updated_at_ms: u64,
 }
 
@@ -89,6 +93,24 @@ fn value_u16_or(payload: &Value, key: &str, default_value: u16) -> u16 {
         .and_then(Value::as_u64)
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or(default_value)
+}
+
+fn value_scope(payload: &Value, key: &str) -> ServiceScope {
+    let Some(scope_payload) = payload.get(key) else {
+        return ServiceScope::default();
+    };
+    ServiceScope {
+        namespace: scope_payload
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        environment: scope_payload
+            .get("environment")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
 }
 
 /// 从 `endpoints` 数组推断协议字段，兼容 `service_type` 未填场景。
@@ -166,12 +188,12 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
         .iter()
         .enumerate()
         .map(|(index, item)| {
-            let service_id = value_str_or(item, &["service_id", "id", "service"], "");
-            let normalized_service_id = if service_id.is_empty() {
-                // 保证列表 key 稳定，不因后端字段缺失导致 React key 冲突。
+            let logical_service_id = value_str_or(item, &["logical_service_id"], "");
+            let instance_id = value_str_or(item, &["instance_id"], "");
+            let normalized_instance_id = if instance_id.is_empty() {
                 format!("service-{}", index + 1)
             } else {
-                service_id
+                instance_id
             };
             let health_status = value_str_or(item, &["health_status"], "");
             let lifecycle_status = value_str_or(item, &["status"], "unknown");
@@ -185,14 +207,13 @@ fn parse_service_list(payload: &Value) -> Vec<ServiceListItem> {
             let inferred_host_port = infer_primary_endpoint_host_port(item);
             let inferred_sni_name = infer_primary_endpoint_sni(item);
             ServiceListItem {
-                service_id: normalized_service_id.clone(),
-                service_key: value_str_or(item, &["service_key", "key"], ""),
-                namespace: value_str_or(item, &["namespace"], ""),
-                environment: value_str_or(item, &["environment"], ""),
+                logical_service_id,
+                instance_id: normalized_instance_id.clone(),
+                scope: value_scope(item, "scope"),
                 service_name: value_str_or(
                     item,
-                    &["service_name", "name", "display_name", "service_key"],
-                    &normalized_service_id,
+                    &["service_name", "name", "display_name"],
+                    &normalized_instance_id,
                 ),
                 protocol: infer_protocol_from_endpoints(item)
                     .unwrap_or_else(|| value_str_or(item, &["protocol", "service_type"], "tcp")),
@@ -234,20 +255,23 @@ fn validate_add_input(input: ServiceAddInput) -> Result<ServiceAddInput, String>
     if input.port == 0 {
         return Err("port 必须大于 0".to_string());
     }
-    let normalized_namespace = normalize_optional_trimmed_text(input.namespace);
-    let normalized_environment = normalize_optional_trimmed_text(input.environment);
+    let input_scope = input.scope.unwrap_or_default();
+    let normalized_namespace = normalize_optional_trimmed_text(input_scope.namespace);
+    let normalized_environment = normalize_optional_trimmed_text(input_scope.environment);
     let normalized_sni_name = normalize_optional_trimmed_text(input.sni_name);
     if normalized_namespace.is_none() && normalized_environment.is_none() && normalized_sni_name.is_none() {
-        return Err("namespace、environment、sni_name 至少填写一个".to_string());
+        return Err("scope.namespace、scope.environment、sni_name 至少填写一个".to_string());
     }
     Ok(ServiceAddInput {
-        service_id: input
-            .service_id
+        instance_id: input
+            .instance_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         service_name,
-        namespace: normalized_namespace,
-        environment: normalized_environment,
+        scope: Some(ServiceScope {
+            namespace: normalized_namespace,
+            environment: normalized_environment,
+        }),
         protocol,
         host,
         port: input.port,
@@ -260,16 +284,19 @@ fn normalize_optional_trimmed_text(value: Option<String>) -> Option<String> {
 }
 
 fn validate_delete_input(input: ServiceDeleteInput) -> Result<ServiceDeleteInput, String> {
-    let service_id = normalize_optional_trimmed_text(input.service_id);
-    let service_key = normalize_optional_trimmed_text(input.service_key);
-    if service_id.is_none() && service_key.is_none() {
-        return Err("service_id 或 service_key 至少填写一个".to_string());
+    let logical_service_id = normalize_optional_trimmed_text(input.logical_service_id);
+    let instance_id = normalize_optional_trimmed_text(input.instance_id);
+    if logical_service_id.is_none() && instance_id.is_none() {
+        return Err("logical_service_id 或 instance_id 至少填写一个".to_string());
     }
+    let normalized_scope = input.scope.unwrap_or_default();
     Ok(ServiceDeleteInput {
-        service_id,
-        service_key,
-        namespace: normalize_optional_trimmed_text(input.namespace),
-        environment: normalize_optional_trimmed_text(input.environment),
+        logical_service_id,
+        instance_id,
+        scope: Some(ServiceScope {
+            namespace: normalize_optional_trimmed_text(normalized_scope.namespace),
+            environment: normalize_optional_trimmed_text(normalized_scope.environment),
+        }),
         service_name: normalize_optional_trimmed_text(input.service_name),
     })
 }
@@ -292,10 +319,9 @@ fn request_service_add_payload(
     let request_result = ipc_client.request(
         "service.add",
         json!({
-            "service_id": input.service_id,
+            "instance_id": input.instance_id,
             "service_name": input.service_name,
-            "namespace": input.namespace,
-            "environment": input.environment,
+            "scope": input.scope,
             "protocol": input.protocol,
             "host": input.host,
             "port": input.port,
@@ -369,8 +395,8 @@ fn request_service_delete_payload(
     let request_result = ipc_client.request(
         "service.delete",
         json!({
-            "service_id": input.service_id,
-            "service_key": input.service_key,
+            "logical_service_id": input.logical_service_id,
+            "instance_id": input.instance_id,
         }),
         LOCAL_RPC_DEFAULT_TIMEOUT_MS,
     );
@@ -473,13 +499,19 @@ pub fn service_add(
         let persisted_size = upsert_manual_service_config(
             &shared,
             ManualServiceConfig {
-                service_id: if added_item.service_id.trim().is_empty() {
-                    normalized_input.service_id.clone()
+                instance_id: if added_item.instance_id.trim().is_empty() {
+                    normalized_input.instance_id.clone()
                 } else {
-                    Some(added_item.service_id.clone())
+                    Some(added_item.instance_id.clone())
                 },
-                namespace: normalized_input.namespace.clone(),
-                environment: normalized_input.environment.clone(),
+                namespace: normalized_input
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.namespace.clone()),
+                environment: normalized_input
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.environment.clone()),
                 service_name: normalized_input.service_name.clone(),
                 protocol: normalized_input.protocol.clone(),
                 host: normalized_input.host.clone(),
@@ -499,8 +531,9 @@ pub fn service_add(
                 "commands.service",
                 "SERVICE_ADD_SUCCEEDED",
                 format!(
-                    "服务新增成功 service_id={} service_name={} endpoint_count={} persisted_manual_services={}",
-                    added_item.service_id,
+                    "服务新增成功 logical_service_id={} instance_id={} service_name={} endpoint_count={} persisted_manual_services={}",
+                    added_item.logical_service_id,
+                    added_item.instance_id,
                     added_item.service_name,
                     added_item.endpoint_count,
                     persisted_size
@@ -549,23 +582,28 @@ pub fn service_delete(
             .get("deleted")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let result_service_id = value_str_or(
+        let result_logical_service_id = value_str_or(
             &payload,
-            &["service_id"],
-            normalized_input.service_id.as_deref().unwrap_or(""),
+            &["logical_service_id"],
+            normalized_input.logical_service_id.as_deref().unwrap_or(""),
         );
-        let result_service_key = value_str_or(
+        let result_instance_id = value_str_or(
             &payload,
-            &["service_key"],
-            normalized_input.service_key.as_deref().unwrap_or(""),
+            &["instance_id"],
+            normalized_input.instance_id.as_deref().unwrap_or(""),
         );
         let updated_at_ms = value_u64_or(&payload, "updated_at_ms", now_ms());
         let persisted_size = remove_manual_service_config(
             &shared,
-            result_service_id.as_str(),
-            normalized_input.service_key.as_deref(),
-            normalized_input.namespace.as_deref(),
-            normalized_input.environment.as_deref(),
+            result_instance_id.as_str(),
+            normalized_input
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.namespace.as_deref()),
+            normalized_input
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.environment.as_deref()),
             normalized_input.service_name.as_deref(),
         )?;
 
@@ -580,8 +618,8 @@ pub fn service_delete(
                 "commands.service",
                 "SERVICE_DELETE_SUCCEEDED",
                 format!(
-                    "服务删除已处理 service_id={} service_key={} deleted={} persisted_manual_services={}",
-                    result_service_id, result_service_key, deleted, persisted_size
+                    "服务删除已处理 logical_service_id={} instance_id={} deleted={} persisted_manual_services={}",
+                    result_logical_service_id, result_instance_id, deleted, persisted_size
                 ),
             );
         }
@@ -589,8 +627,8 @@ pub fn service_delete(
         Ok(ServiceDeleteResult {
             accepted,
             deleted,
-            service_id: result_service_id,
-            service_key: result_service_key,
+            logical_service_id: result_logical_service_id,
+            instance_id: result_instance_id,
             updated_at_ms,
         })
     })
@@ -607,7 +645,9 @@ mod tests {
         let payload = json!({
             "services": [
                 {
-                    "service_id": "svc-1",
+                    "logical_service_id": "ls-1",
+                    "instance_id": "inst-1",
+                    "scope": {"namespace": "dev", "environment": "demo"},
                     "service_name": "order-service",
                     "service_type": "http",
                     "status": "ACTIVE",
@@ -623,7 +663,8 @@ mod tests {
 
         let items = parse_service_list(&payload);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].service_id, "svc-1");
+        assert_eq!(items[0].logical_service_id, "ls-1");
+        assert_eq!(items[0].instance_id, "inst-1");
         assert_eq!(items[0].service_name, "order-service");
         assert_eq!(items[0].protocol, "http");
         assert_eq!(items[0].status, "HEALTHY");
@@ -635,8 +676,8 @@ mod tests {
     fn parse_service_list_fallback_endpoint_count() {
         let payload = json!([
             {
-                "service_id": "svc-2",
-                "service_key": "dev/demo/pay-service",
+                "logical_service_id": "ls-2",
+                "instance_id": "inst-2",
                 "status": "ACTIVE",
                 "endpoints": [{"protocol": "tcp", "host": "127.0.0.1", "port": 19090}]
             }
