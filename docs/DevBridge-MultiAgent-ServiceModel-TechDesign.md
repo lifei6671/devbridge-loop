@@ -1,10 +1,12 @@
 # DevBridge 多 Agent 服务模型演进技术方案
 
 **文档状态**：Draft for Review  
-**版本**：v1.3  
+**版本**：v1.5  
 **依赖文档**：LTFP-v1-Draft.md (v2.1)、LTFP-TransportAbstraction.md (v2.1)、Agent_and_Bridge_Implementation_Technical_Design.md
 
 ---
+
+> 本文档为多 Agent 服务模型重构的最终态规范。若与上述依赖文档存在冲突，以本文为准。
 
 ## 1. 背景与动机
 
@@ -53,15 +55,16 @@ service_key → service_id → connector_id（单 Agent 持有）
 3. 明确 namespace/environment 在配置阶段的作用（派生 host、隔离边界），与运行时路由完全解耦
 4. 扩展 RouteMatch 支持 Header/Query 级别匹配条件，覆盖内容路由场景
 5. 在 Admission Pipeline 增加 Route 冲突检测，防止多个服务抢占同一入口
-6. 保持对现有单 Agent 场景的完全兼容（零感知升级路径）
+6. 明确废弃 `service_key` 模型，不提供兼容路径，直接切换到新协议重构
 7. 为后续跨 scope 引用、灰度发布、流量权重分配预留扩展空间
+8. 重构 Transport/Binding 相关协议承载与适配实现，使其完整承载新模型字段与语义
 
 ### 1.3 非目标
 
 - 不实现完整 RBAC 与租户系统
 - 不实现跨 scope 引用授权（预留扩展点，本版不落地）
 - 不实现 mid-stream 级别的实例切换（failover 仍限于 pre-open 阶段）
-- 不改变 Transport 层和 Binding 层的任何接口
+- 不提供旧协议兼容层（包括 `service_key` 解析兼容、双写、双栈协商）
 
 ---
 
@@ -392,7 +395,7 @@ agent-bob   发布：payment-service, scope{dev,bob},   exposure.host=api.exampl
 两个不同 LogicalService 绑定到完全相同的 RouteMatch。
 ```
 
-处理：Admission Pipeline 在注册阶段检测冲突，拒绝后注册的 Route，返回明确错误。详见第 5.7 节。
+处理：Admission Pipeline 在注册阶段检测冲突，拒绝后注册的 Route，返回明确错误。详见第 5.8 节。
 
 **场景三：同一入口按请求内容分发（主动设计，需 Header 匹配）**
 
@@ -418,12 +421,12 @@ Route B：host=api.example.com, path_prefix=/api/orders/
 
 **四种场景决策表：**
 
-| 场景 | host+path 唯一性 | 解决机制 |
-|------|-----------------|----------|
-| 多 Agent HA | 唯一（同一 LogicalService） | InstanceSelector |
-| 不同服务抢占同一入口 | 冲突 | Admission 拦截，注册时报错 |
-| 按请求内容路由到不同服务 | 不唯一，有意为之 | RouteMatch HeaderMatcher |
-| 路由前缀重叠 | 不唯一，最长匹配 | Route priority + path 长度 |
+| 场景 | 冲突判定 | 解决机制 |
+|------|---------|----------|
+| 多 Agent HA（同一 LogicalService） | 不冲突（target 相同） | InstanceSelector |
+| 不同服务，path/headers/priority 完全相同 | **冲突**，Admission 拒绝 | 注册时报错 |
+| 相同 path，但 Header 条件不同 | 不冲突（条件可区分） | RouteMatch HeaderMatcher |
+| path_prefix 存在包含关系 | 不冲突（最长前缀保证确定性） | Route priority + path 长度降序 |
 
 ### 3.6 与现有资源的关系
 
@@ -470,18 +473,7 @@ message PublishService {
 
 **废弃字段：** `service_key`、`namespace`、`environment`（这两个字段的信息移入 `scope`）。
 
-**兼容说明：** 如果收到仍携带旧版 `service_key` 的消息，server 侧做解析兼容：
-
-```go
-// server 侧兼容逻辑（过渡期）
-if msg.ServiceKey != "" && msg.ServiceName == "" {
-    parts := strings.SplitN(msg.ServiceKey, "/", 3)
-    if len(parts) == 3 {
-        msg.Scope = &Scope{Namespace: parts[0], Environment: parts[1]}
-        msg.ServiceName = parts[2]
-    }
-}
-```
+**重构约束：** 本版不做旧字段兼容。若收到仍携带旧版 `service_key` 的消息，server 直接拒绝并返回 `UNSUPPORTED_LEGACY_PROTOCOL`。
 
 ### 4.2 PublishServiceAck（Bridge → Agent）
 
@@ -926,54 +918,84 @@ type StickySelector     struct{ hashFunc func(TrafficMeta) uint64 }
 
 ### 5.8 Admission Pipeline：Route 冲突检测
 
-`RouteAssign` 消息写入 Registry 前，必须执行冲突检测，防止不同服务抢占同一入口（场景二）。
+`RouteAssign` 消息写入 Registry 前，必须执行冲突检测，防止不同服务在无法区分的条件下抢占同一入口。
+
+**冲突的核心定义：** 对于任意一个可能的请求，两条 Route 都能匹配它，且现有规则（priority + 最长前缀 + header 条件）无法唯一确定选哪条，且两条 Route 指向不同的 LogicalService。
 
 **冲突判定条件（以下全部满足时视为冲突）：**
-- `protocol` 相同，或其中一条未指定 protocol
-- `host` 完全相同，或其中一条通配符覆盖另一条
-- `path_prefix` 存在包含关系（A 是 B 的前缀，或完全相同）
-- `headers` 条件**完全相同**（均为空，或逐一相同）
-- `target` 指向**不同的 LogicalService**
 
-满足全部条件时，后注册的 Route 被拒绝，返回含冲突 route_id 的错误信息。
+| 字段 | 判定规则 | 说明 |
+|------|---------|------|
+| `host` | 完全相同，或通配符覆盖 | — |
+| `path_prefix` | **完全相同**（不是包含关系，是逐字符相同） | path_prefix 不同时，最长前缀规则保证确定性，不构成冲突 |
+| `headers` | 条件完全相同（均为空，或逐一相同） | headers 不同时，匹配条件可区分，不构成冲突 |
+| `priority` | 完全相同 | priority 不同时，高优先级永远赢，不构成歧义冲突（但见下方 shadow warning） |
+| `target` | 指向**不同的 LogicalService** | 同一 LogicalService 的多条路径不冲突（HA 场景） |
+
+满足全部条件时，后注册的 Route 被拒绝，返回含冲突 `route_id` 的错误信息。
 
 ```go
-type RouteConflictAdmissionHandler struct {
-    registry RouteRegistry
-}
-
 func (h *RouteConflictAdmissionHandler) Handle(ctx context.Context, op AdmissionOp, resource any) (any, error) {
     if op != OpCreate && op != OpUpdate {
         return resource, nil
     }
     route := resource.(*Route)
 
-    overlapping := h.registry.FindOverlapping(route.Match)
-    for _, existing := range overlapping {
+    // 只查找 host + path_prefix 完全相同的 Route（不是包含关系）
+    exactOverlapping := h.registry.FindExactPathOverlap(route.Match)
+    for _, existing := range exactOverlapping {
         if existing.RouteID == route.RouteID {
             continue
         }
-        if headersConflict(existing.Match.Headers, route.Match.Headers) {
-            existingTarget := h.registry.ResolveLogicalServiceID(existing.Target)
-            newTarget      := h.registry.ResolveLogicalServiceID(route.Target)
-            if existingTarget != newTarget {
-                return nil, fmt.Errorf(
-                    "route conflict: overlaps with existing route %s targeting different service %s",
-                    existing.RouteID, existingTarget,
-                )
-            }
+        if !headersConflict(existing.Match.Headers, route.Match.Headers) {
+            continue  // headers 条件不同，可区分，不冲突
         }
+        if existing.Priority != route.Priority {
+            // priority 不同，不是冲突，但发出 shadow warning
+            h.emitShadowWarning(route, existing)
+            continue
+        }
+        existingTarget := h.registry.ResolveLogicalServiceID(existing.Target)
+        newTarget      := h.registry.ResolveLogicalServiceID(route.Target)
+        if existingTarget == newTarget {
+            continue  // 同一 LogicalService，HA 场景，不冲突
+        }
+        return nil, fmt.Errorf(
+            "route conflict: identical match conditions (host=%s path=%s headers=%v priority=%d) with existing route %s targeting different service %s",
+            route.Match.Host, route.Match.PathPrefix, route.Match.Headers,
+            route.Priority, existing.RouteID, existingTarget,
+        )
     }
     return resource, nil
 }
 ```
 
-**不触发冲突检测的合法情况：**
-- 同一入口指向同一 LogicalService（多 Agent HA，场景一）
-- path_prefix 重叠但 Header 条件不同（场景三）
-- path_prefix 完全不同（场景四）
+**Shadow Warning（Priority 遮蔽警告）：**
 
-**Host 自动派生时的前置检查：** Bridge 执行 host 派生时，若生成的 host 与已有 Route 的 host 相同且 path_prefix 重叠，直接在派生阶段报错，不进入 Admission 流程。
+当两条 Route 的 host、path_prefix、headers 完全相同，但 priority 不同，且指向不同 LogicalService 时，不拒绝注册，但在 `RouteAssignAck` 的 `warnings` 字段中返回提示：
+
+```proto
+message RouteAssignAck {
+  bool     accepted                 = 1;
+  string   route_id                 = 2;
+  uint64   accepted_resource_version = 3;
+  uint64   current_resource_version  = 4;
+  string   error_code               = 5;
+  string   error_message            = 6;
+  repeated string warnings          = 7;  // 新增：非致命警告
+}
+```
+
+```
+warning: "route rt_yyy has identical match conditions with higher priority route rt_xxx,
+          this route may never be matched unless rt_xxx is removed or its priority is lowered"
+```
+
+**合法情况总结（不触发冲突检测）：**
+- target 指向同一 LogicalService（HA 场景）
+- path_prefix 不同（前缀重叠但不完全相同，由最长前缀规则处理）
+- headers 条件不同（内容路由场景）
+- priority 不同（发出 shadow warning，不拒绝）
 
 ---
 
@@ -1158,52 +1180,43 @@ TrafficClose → tunnel 关闭 → Agent 补池
 
 ---
 
-## 9. 数据模型迁移与兼容策略
+## 9. 重构实施策略（无兼容）
 
-### 9.1 字段兼容映射
+### 9.1 字段替换总览（最终态）
 
-| 旧字段 | 新字段 | 说明 |
+| 废弃字段 | 新字段 | 处理策略 |
 |--------|--------|------|
-| `service_key` | `service_name` + `scope` | server 侧自动解析旧格式 |
-| `service_id` | `logical_service_id` | 语义提升：从实例 ID 升级为逻辑服务 ID |
-| `connector_service.service_key` | `connector_service.selector` | Route 引用方式变更 |
-| `TrafficOpen.service_id` | `TrafficOpen.logical_service_id` + `instance_id` | 新增 instance 维度 |
+| `service_key` | `service_name` + `scope` | 不兼容旧字段；收到旧字段直接拒绝 |
+| `service_id` | `logical_service_id` | 语义升级为逻辑服务身份 |
+| `connector_service.service_key` | `connector_service.selector` | Route 目标引用全面切换 |
+| `TrafficOpen.service_id` | `TrafficOpen.logical_service_id` + `instance_id` | 数据面增加实例维度 |
 
-### 9.2 迁移阶段
+### 9.2 重构原则
 
-**阶段 0（当前）：** 单 Agent，service_key 模式，保持不变。
+- 不提供双写、双读、灰度切换、版本协商等兼容路径
+- 不保留旧协议 fallback 逻辑（包括 `service_key` 解析兼容）
+- Bridge 与 Agent 必须同时切换到新协议
+- 控制面、路由层、数据面、观测面一次性收敛到新字段语义
 
-**阶段一：server 侧双写（无 Agent 感知）**
-- server 解析 `service_key` 时同时写入 `service_name + scope`
-- 内部索引从 `service_key` 切换为 `(name, scope)` 二元组
-- 对外 API 继续兼容 `service_key`
-- LogicalService + ServiceInstance 两层结构落地，但 LogicalService 下只有 1 个实例
-- `TrafficOpen` 暂不发送 `instance_id`（Agent 侧不做校验）
+### 9.3 实施阶段（工程分解，不是兼容迁移）
 
-**阶段二：新版 Proto 发布（Agent 侧感知）**
-- Agent 升级到新版：`PublishService` 发送 `service_name + scope`，接收 `instance_id`
-- `TrafficOpen` 开始携带 `instance_id`，Agent 开始做实例校验
-- 旧版 Agent 通过 server 侧兼容逻辑继续工作
-- 此时多 Agent 发布同一服务的能力已完整
+**阶段 A：协议与数据模型重构**
+- 更新 proto / pb / validate：移除旧字段，落地 `Scope`、`ServiceSelector`、`logical_service_id`、`instance_id`
+- 控制面 ACK 与错误码对齐（包含 `UNSUPPORTED_LEGACY_PROTOCOL`）
 
-**阶段三：废弃 `service_key`（清理）**
-- 明确 deprecation 期限
-- 移除 server 侧 `service_key` 解析兼容代码
-- 彻底清理 `service_key` 字段
+**阶段 B：Bridge 核心重构**
+- Registry 切换到 `LogicalService + ServiceInstance` 两层模型
+- Route Resolver 切换到 `scope 解析 -> ScopeFallbackPolicy -> RouteMatch -> InstanceSelector`
+- Admission Pipeline 落地冲突检测（`path_prefix` 完全相同才判冲突）
 
-### 9.3 Agent 版本协商
+**阶段 C：Agent 与数据面重构**
+- Agent catalog 增加 `instance_id` 生命周期管理与持久化
+- TrafficOpen 按 `instance_id` 校验归属并选择本地 endpoint
+- HealthReport/Unpublish 全量按实例维度上报
 
-通过现有的 `ConnectorHello.capabilities` 字段声明版本能力：
-
-```
-旧版 Agent：capabilities 不含 "instance_aware"
-  → server 不发送 instance_id 字段（TrafficOpen 保持旧格式）
-  → server 内部仍维护实例，但 Agent 侧无感知
-
-新版 Agent：capabilities 含 "instance_aware"
-  → server 发送完整的 instance_id
-  → Agent 执行实例校验逻辑
-```
+**阶段 D：联调与验收**
+- 以本文档为唯一验收基线执行端到端回归
+- 所有旧字段路径（发布、路由、开流、健康）必须不可达并返回明确错误
 
 ---
 

@@ -18,6 +18,8 @@
 对应执行清单见 [LTFP-TransportExecutionChecklist.md](./LTFP-TransportExecutionChecklist.md)。
 单 Tunnel 串行复用的专项设计已并入本规范，原方案文档见 [LTFP-TunnelMultiplex-Proposal.md](./LTFP-TunnelMultiplex-Proposal.md)。
 
+> 重要说明（2026-03 同步）：凡与 [DevBridge-MultiAgent-ServiceModel-TechDesign.md](./DevBridge-MultiAgent-ServiceModel-TechDesign.md) 冲突之处，均以该文档为准。本规范仅定义传输抽象，不再定义旧 `service_key/service_id` 身份语义。
+
 ---
 
 ### 1.2 适用范围
@@ -152,8 +154,8 @@ Tunnel 在 Transport 层仅表示**字节管道**，不理解 `TrafficOpen / Tra
 
 * service 路由
 * 权限判断
-* `service_key` 查找
-* `RouteMatch.header_matches` 匹配
+* `ServiceSelector` 解析与查找
+* `RouteMatch.headers/queries` 匹配
 * namespace / env 逻辑
 * traffic 协议状态机
 * `TrafficOpen/OpenAck/Data/Close/CloseAck/Reset/Recycle/RecycleAck` 字段语义
@@ -354,21 +356,21 @@ Transport `SessionState` 不是协议态，但必须能映射到协议态。
 
 ---
 
-### 5.3 `service_key` 与 `service_id` 边界
+### 5.3 服务标识与传输边界
 
 本规范采用以下硬约束：
 
-1. `service_key` 仅用于 Server 侧 route resolve 输入（键格式由协议层定义为 `<service_name>/<protocol>`）
-2. route resolve 必须先完成“`service_key -> service_id -> service_instance_id`”解析，再进入数据面分配
-3. route resolve 完成后，runtime/traffic 主标识只允许使用 `service_id`，可附带 `service_instance_id` 作为实例维度
-4. transport 层不得依赖 `service_key`，也不得参与实例选择算法
-5. 数据面 tunnel 分配后，不得重新触发基于 `service_key` 的 lookup 语义
+1. route resolve 由控制面完成，解析路径为 `ServiceSelector -> logical_service_id -> instance_id`
+2. runtime/traffic 主标识使用 `logical_service_id` 与 `instance_id`
+3. transport 层不得依赖 `ServiceSelector`、`service_name` 或 `scope`，也不得参与实例选择算法
+4. 数据面 tunnel 分配后，不得重新触发任何服务查找语义
+5. 旧 `service_key`/`service_id` 语义在当前实现中废弃，不作为协议输入
 
 结论：
 
-* `service_key` 属于控制面 / 路由决策层输入
-* `service_id` 属于 resolve 结果，也是 runtime/traffic 的唯一服务主标识
-* `service_instance_id` 属于控制面运行时实例调度结果，不属于 transport 抽象边界
+* `ServiceSelector` 属于控制面 / 路由决策层输入
+* `logical_service_id + instance_id` 属于 resolve 结果，也是 runtime/traffic 的服务目标标识
+* transport 抽象只承载流量生命周期，不感知服务发现细节
 
 ---
 
@@ -683,7 +685,7 @@ Server 负责：
 
 首版规范不强制实现按服务拆分的独立 tunnel pool，但要求：
 
-1. 调度层必须为后续按 `service_id`、QoS 或优先级做资源隔离保留演进空间
+1. 调度层必须为后续按 `logical_service_id`、QoS 或优先级做资源隔离保留演进空间
 2. 文档与运维配置必须明确“同 session 服务默认共享 pool”的语义
 3. 若存在强优先级服务，建议通过独立 session、预留容量或实现定义的优先级策略做隔离
 
@@ -1496,7 +1498,7 @@ type Session interface {
 
 ### 18.1 TrafficMeta / TrafficState
 
-`TrafficMeta` 必须只使用 `service_id`，不得再使用 `service_key`。
+`TrafficMeta` 必须使用 `logical_service_id` 与 `instance_id`，不得再使用旧 `service_key/service_id` 语义。
 
 ```go
 package runtime
@@ -1507,7 +1509,8 @@ type TrafficMeta struct {
 	TrafficID    string
 	SessionID    string
 	SessionEpoch uint64
-	ServiceID    string
+	LogicalServiceID string
+	InstanceID       string
 	Labels       map[string]string
 	DeadlineAt   *time.Time
 }
@@ -1887,7 +1890,7 @@ ltfp/
 7. 数据面采用 **framed all the way**，`Data` 也属于 runtime/protocol frame
 8. Transport 数据面不定义 `DataFrame`，所有数据面协议帧由 runtime/protocol 层自行定义与编解码
 9. LTFP 协议层状态机是唯一外部真相源，transport `SessionState` 仅为内部态，必须通过映射表转换
-10. runtime/traffic 只允许使用 `service_id`，不得重新依赖 `service_key`
+10. runtime/traffic 只允许使用 `logical_service_id + instance_id`，不得重新依赖旧 `service_key/service_id`
 11. `Session` 必须作为 transport 聚合根，统一暴露 control / tunnel producer / acceptor / pool 能力
 12. binding 对可选能力若不支持，必须返回 `ErrUnsupported`
 13. Session 级能力查询不得使用 `nil` 表示“不支持”或“未就绪”，必须返回显式错误

@@ -14,6 +14,8 @@
 * 控制面 HOL 规避
 * timeout 预算与状态机一致性  
 
+> 重要说明（2026-03 同步）：凡与 [DevBridge-MultiAgent-ServiceModel-TechDesign.md](./DevBridge-MultiAgent-ServiceModel-TechDesign.md) 冲突，均以该文档为准。旧 `service_key` 与 `hybrid_group.pre_open_only` 语义已废弃，不做兼容。
+
 ---
 
 ## 2. 本期范围
@@ -23,7 +25,7 @@
 本期系统仅包含两个应用：
 
 * **Agent**：部署在内网或受限网络中，负责连接 Bridge、维护 session、发布 service、执行健康检查、预建 tunnel pool、接收 `TrafficOpen` 并代理到本地 upstream。
-* **Bridge**：部署在公网或可被客户端访问的网络中，负责统一入口、route resolve、session/service/tunnel registry、connector proxy、direct proxy 与 hybrid fallback 执行。
+* **Bridge**：部署在公网或可被客户端访问的网络中，负责统一入口、route resolve、session/service/tunnel registry、connector proxy、direct proxy 与 scope fallback 策略执行。
 
 ## 2.2 本期约束
 
@@ -35,8 +37,8 @@
 * Agent 预建 tunnel pool
 * **单 tunnel 单 traffic**
 * traffic 结束后 tunnel 关闭，由 Agent 补池
-* `connector_service` / `external_service` / `hybrid_group` 分路执行
-* `hybrid_group` 仅支持 `pre_open_only` fallback  
+* `connector_service` / `external_service` 分路执行
+* scope 降级由 Bridge 侧 `ScopeFallbackPolicy` 配置驱动  
 * Agent 桌面 UI 层固定使用 Tauri
 * Bridge 管理页面可使用 React + shadcn/ui，但发布包必须将 UI 静态资源内嵌到 Bridge 可执行文件
 
@@ -70,7 +72,7 @@ Transport 层只负责：
 Transport 不负责：
 
 * route 决策
-* `service_key` 查找
+* `ServiceSelector` 查找
 * `TrafficOpen/Ack/Data/Close/Reset` 的业务状态机
 
 ## 3.2 控制面与数据面分离
@@ -127,16 +129,15 @@ Transport 不负责：
 * Bridge 自己选择 endpoint
 * Bridge 自己建立连接并代理转发 
 
-## 3.6 fallback 只允许 pre-open 阶段
+## 3.6 ScopeFallbackPolicy 降级规则
 
-`hybrid_group` 仅在以下阶段失败时允许 fallback：
+Bridge 在路由阶段按 `request_scope` 执行可配置降级链（例如 `dev/* -> dev/base -> default/base`）：
 
-* route resolve miss
-* service unavailable
-* `TrafficOpenAck` 失败
-* agent 侧 pre-open timeout
+* 未配置或 `enabled=false`：只做精确 scope 匹配
+* `enabled=true`：按配置链逐级查找逻辑服务
+* 本地降级链全部 miss 且 `external.enabled=true`：再执行 external fallback
 
-收到 `TrafficOpenAck success` 后禁止 fallback。首版不做 mid-stream failover。
+该降级语义发生在 route resolve 阶段，不依赖 `TrafficOpenAck` 截止点。首版仍不支持 mid-stream failover。
 
 ---
 
@@ -146,11 +147,10 @@ Transport 不负责：
 flowchart LR
     C[Client] --> I[Bridge Ingress]
     I --> R[Route Resolver]
-    R --> T{Target Type}
+    R --> T{Resolve Result}
 
-    T -->|connector_service| CP[Connector Proxy]
-    T -->|external_service| DP[Direct Proxy]
-    T -->|hybrid_group| HY[Hybrid Resolver]
+    T -->|logical service hit| CP[Connector Proxy]
+    T -->|external fallback hit| DP[Direct Proxy]
 
     CP --> SR[Session Registry]
     SR --> TR[Tunnel Registry]
@@ -158,8 +158,6 @@ flowchart LR
     A --> U[Local Upstream]
 
     DP --> E[External Endpoint]
-    HY --> CP
-    HY --> DP
 ```
 
 Bridge 虽然本期是单体应用，但内部逻辑必须至少拆为：
@@ -299,7 +297,7 @@ Agent 负责：
 4. 执行本地健康检查并上报
 5. 预建并维护 tunnel pool
 6. 在 idle tunnel 上等待 `TrafficOpen`
-7. 根据 `service_id` 选择本地 endpoint
+7. 根据 `logical_service_id + instance_id` 选择本地 endpoint
 8. 建立本地 upstream 连接
 9. 在 tunnel 上进行 framed 数据双向转发
 10. traffic 结束后关闭 tunnel，并补充新 tunnel
@@ -460,15 +458,15 @@ agent:
 职责：
 
 * 维护本地 service 配置
-* 将 `service_key`、endpoint、metadata 组织成运行时对象
+* 将 `service_name + scope`、endpoint、metadata 组织成运行时对象
 * 触发 `PublishService`
 * 配置变化时重新发布
-* 在收到 `TrafficOpen(service_id)` 后定位目标 service
+* 在收到 `TrafficOpen(logical_service_id, instance_id)` 后定位目标 service
 
 标识规则：
 
-* `service_key`：lookup key
-* `service_id`：runtime identity key
+* `service_name + scope`：配置查找键
+* `logical_service_id + instance_id`：runtime identity key
 
 ## 7.8 Agent HealthReporter
 
@@ -486,8 +484,8 @@ Bridge 不得主动探测 Agent 本地 upstream，只能依赖 Agent 上报与�
 职责：
 
 1. 接收 `trafficAcceptor` 移交的 tunnel 与 `TrafficOpen`
-2. 校验 `session_epoch`、`service_id`、scope
-3. 用 `service_id` 找到本地 service
+2. 校验 `session_epoch`、`logical_service_id`、`instance_id`、scope
+3. 用 `logical_service_id + instance_id` 找到本地 service
 4. 使用 `endpoint_selection_hint` 作为非权威 hint
 5. 最终由 Agent 选择 endpoint
 6. 本地拨号
@@ -502,7 +500,7 @@ Bridge 不得主动探测 Agent 本地 upstream，只能依赖 Agent 上报与�
 
 ### 关键约束
 
-只有本地 upstream dial 成功后，才允许返回 `TrafficOpenAck success=true`。因为 `pre_open_only` 的 fallback 截止点就是收到 `TrafficOpenAck success` 之前。
+只有本地 upstream dial 成功后，才允许返回 `TrafficOpenAck success=true`，避免建立后立即失败导致无效流量切换。
 
 ---
 
@@ -519,7 +517,7 @@ Bridge 负责：
 5. 发起 `TrafficOpen`
 6. 在 `TrafficOpenAck success` 后 relay 数据
 7. 对 `external_service` 执行 direct proxy
-8. 对 `hybrid_group` 执行 pre-open fallback
+8. 按 `ScopeFallbackPolicy` 执行作用域降级与 external fallback
 
 ## 8.2 Bridge 模块划分
 
@@ -539,7 +537,7 @@ runtime/bridge/
     matcher.go
     resolver.go
     selector.go
-    hybrid.go
+    scope_fallback.go
 
   registry/
     session_registry.go
@@ -586,11 +584,9 @@ Bridge 入口分三类：
 职责：
 
 * 根据 ingress 输入匹配 route
-* 判定 target 类型：
-
+* 判定路由结果类型：
   * `connector_service`
-  * `external_service`
-  * `hybrid_group`
+  * `external_fallback`
 * 过滤 scope 不匹配、service 不健康、connector 离线、session 非 active 等状态
 
 对 `connector_service`：
@@ -695,7 +691,7 @@ sequenceDiagram
 3. 若底层已不可写或无法保证送达，则直接关闭/Reset 该 tunnel
 4. 将该 tunnel 标记为 `broken`
 5. 从 Bridge 的 tunnel registry 移除
-6. 若是 `hybrid_group` 且尚在 pre-open 阶段，可执行 fallback；否则直接失败
+6. 若当前 namespace 启用 `ScopeFallbackPolicy`，可进入下一降级 scope 或 external fallback；否则直接失败
 7. 该 traffic 一旦进入 timeout 终态，后续任何迟到 `TrafficOpenAck`（包括 `success=true`）必须丢弃，不得恢复状态
 8. 记录迟到应答指标（建议：`bridge_traffic_open_ack_late_total`）
 
@@ -733,40 +729,44 @@ Agent 侧 `TrafficRuntime` 必须把以下任一事件视为取消信号：
 * `refresh_on_miss`
 * `stale_if_error` 
 
-## 8.9 Bridge HybridResolver
+## 8.9 Bridge ScopeFallbackResolver
 
-仍然只允许 `pre_open_only`：
+按 `ScopeFallbackPolicy` 执行降级：
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant B as Bridge
     participant A as Agent
+    participant P as PolicyRegistry
     participant E as ExternalEndpoint
 
     C->>B: Request
-    B->>A: TrafficOpen
+    B->>P: BuildScopeChain(request_scope)
+    P-->>B: [request, step1, step2...]
+    B->>A: TrafficOpen (matched scope)
 
-    alt Pre-open failed
-        A-->>B: TrafficOpenAck success=false
-        B->>E: Direct dial
-        B->>E: Forward request
-        E->>B: Return response
-    else Pre-open timeout
-        B->>E: Direct dial
-        B->>E: Forward request
-        E->>B: Return response
-    else Pre-open success
+    alt Local scope hit and pre-open success
         A-->>B: TrafficOpenAck success=true
         B->>A: TrafficData
         A->>B: TrafficData
+    else Local scope hit but pre-open failed
+        A-->>B: TrafficOpenAck success=false
+        B->>P: TryNextScope()
+    else Local scopes all miss and external enabled
+        B->>E: Direct dial
+        B->>E: Forward request
+        E->>B: Return response
+    else All fallback disabled or exhausted
+        B-->>C: No route / unavailable
     end
 ```
 
-- hybrid_group 仅允许在 pre-open failed 或 pre-open timeout 时 fallback
-- 一旦收到 TrafficOpenAck success=true，禁止切换到 direct path
+说明：
 
-收到 `TrafficOpenAck success` 后禁止 fallback。
+* 降级顺序和是否启用由 Bridge 配置决定
+* `TrafficOpenAck` 失败可触发继续尝试下一 scope，但不再依赖旧 `hybrid_group.pre_open_only` 策略字段
+* 收到 `TrafficOpenAck success=true` 后仍不做 mid-stream failover
 
 ---
 
@@ -906,8 +906,8 @@ Transport 只承载字节流，不定义这些帧的业务语义。
 
 ### 处理规则
 
-* pre-open 失败（已分配 tunnel）：关闭/Reset tunnel；若 target 为 `hybrid_group`，允许 fallback
-* pre-open 失败（未分配 tunnel，例如 no idle tunnel）：不执行 tunnel close/reset，直接返回 unavailable；若 target 为 `hybrid_group`，允许 fallback
+* pre-open 失败（已分配 tunnel）：关闭/Reset tunnel；若策略允许，尝试下一降级 scope 或 external fallback
+* pre-open 失败（未分配 tunnel，例如 no idle tunnel）：不执行 tunnel close/reset，直接返回 unavailable；若策略允许，尝试下一降级 scope 或 external fallback
 * post-open 失败：关闭/Reset tunnel，直接中断，不 fallback
 * broken tunnel：立即摘除并补池
 
@@ -965,7 +965,7 @@ Transport 只承载字节流，不定义这些帧的业务语义。
 * `bridge_traffic_open_ack_late_total`
 * `bridge_actual_endpoint_override_total`
 * `bridge_direct_proxy_dial_latency_ms`
-* `bridge_hybrid_fallback_total`
+* `bridge_scope_fallback_total`
 
 ## 13.3 日志字段
 
@@ -974,7 +974,8 @@ Transport 只承载字节流，不定义这些帧的业务语义。
 * `trace_id`
 * `traffic_id`
 * `route_id`
-* `service_id`
+* `logical_service_id`
+* `instance_id`
 * `actual_endpoint_id`
 * `actual_endpoint_addr`
 * `session_id`
@@ -1010,8 +1011,10 @@ agent:
     tunnelOpenBurst: 20
 
   services:
-    - serviceKey: "dev/alice/order-service"
-      protocol: "http"
+    - serviceName: "order-service"
+      scope:
+        namespace: "dev"
+        environment: "alice"
       endpoints:
         - "127.0.0.1:18080"
       healthCheck:
@@ -1042,7 +1045,17 @@ bridge:
   routing:
     acquireWaitHintMs: 150
     trafficOpenTimeoutMs: 3000
-    defaultFallbackPolicy: "pre_open_only"
+    defaultScope:
+      namespace: "default"
+      environment: "base"
+    fallbackPolicies:
+      - namespace: "dev"
+        enabled: true
+        chain:
+          - { namespace: "dev", environment: "base" }
+          - { namespace: "default", environment: "base" }
+        external:
+          enabled: true
 
   discovery:
     mode: "cache_first"
@@ -1079,11 +1092,11 @@ bridge:
 * Agent 自动补池
 * heartbeat / auth / refill / control error 高优先级调度完成
 
-## 阶段三：direct path 与 hybrid
+## 阶段三：direct path 与 scope fallback
 
 * discovery adapter
 * external direct proxy
-* `pre_open_only` fallback
+* `ScopeFallbackPolicy` 降级链与 external fallback
 * `TrafficOpenAck` 超时取消链路
 
 ## 阶段四：稳态优化
@@ -1108,5 +1121,5 @@ bridge:
 7. **no idle tunnel 时采用“短等待 + refill + 超时失败”**
 8. **`TrafficOpenAck` 超时后，Bridge 必须进入取消流程；Agent 必须清理 upstream**
 9. **控制面 HOL 治理前移到阶段二结束前完成**
-10. **connector_service / external_service / hybrid_group 三条路径继续严格分治**
+10. **connector_service / external_service 两条路径继续严格分治，scope 降级由策略统一治理**
 11. **最终 endpoint 选择责任保持不变：connector 由 Agent 选，external 由 Bridge 选**

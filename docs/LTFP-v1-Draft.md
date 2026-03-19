@@ -10,6 +10,20 @@
 
 ---
 
+> 重要说明（2026-03 同步）：本文件为历史方案归档。凡与 [DevBridge-MultiAgent-ServiceModel-TechDesign.md](./DevBridge-MultiAgent-ServiceModel-TechDesign.md) 冲突之处，均以该文档为准。
+>
+> 已同步的强制约束：
+> - 不再使用 `service_key` / `service_id` 作为核心协议模型，不提供兼容路径。
+> - 服务模型统一为 `logical_service_id + instance_id + (service_name, scope)`，Route 通过 `ServiceSelector` 解析目标。
+> - Bridge 侧降级语义统一为可配置 `ScopeFallbackPolicy`（例如 `dev/* -> dev/base -> default/base`），不再使用 `hybrid_group.pre_open_only` 语义作为核心规则。
+> - 第 22 章 protobuf 草案保留为历史记录，不作为当前实现的 canonical schema。
+
+# 0. 历史文档定位
+
+本文件保留 transport/runtime 设计背景与约束推导，供历史追溯使用。当前研发实现与评审一律按 `DevBridge-MultiAgent-ServiceModel-TechDesign.md`（v1.5）执行。
+
+---
+
 # 1. 文档目的
 
 本文档定义一套中心汇聚式连接器路由与转发协议，以及对应的 server/agent 架构边界，用于支撑以下能力：
@@ -56,7 +70,7 @@
 * discovery query
 * discovery projection
 
-`service` 允许省略 `namespace/environment`（例如仅按服务名接入的场景）；当 service scope 为空时，表示该 service 不声明显式作用域约束。scope 是否参与匹配由 route policy 决定，但不影响 `service_key` 身份计算。
+`service` 的作用域由结构化 `scope` 显式承载；身份模型不再计算 `service_key`，统一使用 `(service_name, scope)` 查找与 `logical_service_id` 内部标识。
 
 ---
 
@@ -160,14 +174,11 @@ flowchart TD
     B --> D[Route Resolver]
     F[External Client] --> G[Ingress Manager]
     G --> D
-    D --> H{Target Type}
-    H -->|connector_service| I[Connector Proxy Path]
-    H -->|external_service| J[Direct Proxy Path]
-    H -->|hybrid_group| K[Hybrid Resolver]
+    D --> H{Resolve Result}
+    H -->|logical service hit| I[Connector Proxy Path]
+    H -->|local miss + external fallback enabled| J[Direct Proxy Path]
     I --> L[Agent Upstream]
     J --> M[External Endpoint]
-    K --> I
-    K --> J
 ```
 
 ---
@@ -222,66 +233,45 @@ flowchart TD
 
 这是本版新增的明确约束。
 
-## 6.1 `service_id`
+## 6.1 `logical_service_id`
 
 * 全局唯一 opaque identity
 * 由 server 分配
 * 不带业务语义
-* 用于内部存储、version 管理、traffic 关联、审计
+* 作为逻辑服务主标识，用于路由结果、运行态关联与审计
 
 示例：
 
 ```text
-svc_01J8Z6C4X9K7M2P4
+ls_01J8Z6C4X9K7M2P4
 ```
 
 ---
 
-## 6.2 `service_key`
+## 6.2 `instance_id`
 
-* 稳定服务引用键
-* 格式固定为：
-
-```text
-<service_name>/<protocol>
-```
-
-示例：
-
-```text
-order-service/http
-```
-
-约束：
-
-* `service_name` 必填，且不允许包含 `/`
-* `protocol` 必填，来自 `PublishService.endpoints[*].protocol` 并按 `trim + lower-case` 规范化
-* 同一条 `PublishService` 的全部 endpoint 必须使用同一 `protocol`；多协议必须拆分为多条 service 发布
+* 全局唯一实例标识
+* 由 server 分配并在 `PublishServiceAck` 返回给 Agent
+* 表示某个 connector/session 下的具体服务实例
+* 单条 traffic 在生命周期内固定绑定一个 `instance_id`
 
 ---
 
-## 6.3 主辅关系
+## 6.3 `service_name + scope`
 
-* `service_key` 是 **canonical lookup key**
-* `service_id` 是 **canonical identity key**
-* `service_key -> service_id` 在逻辑服务池维度是一对一映射
-* 同一 `service_key` 可由多个 connector 并发发布，统一归并到同一 `service_id`
-* route target 使用 `service_key`
-* runtime / traffic / ACK / audit 使用 `service_id`
-* 当 `PublishService.service_id` 为空时：
-  * 若 `service_key` 已存在，server **必须复用既有 `service_id`**
-  * 仅当 `service_key` 首次出现时，server 才分配新的 `service_id`
-* `service_id` 下可挂接多个运行时实例（见 `6.4`），用于多 connector 高可用与负载分配
+* `service_name` 与 `scope(namespace, environment)` 共同构成逻辑服务查找键
+* server 内部保证 `(service_name, scope.namespace, scope.environment)` 唯一
+* Route 不再直接引用字符串 key，而是通过 `ServiceSelector` 引用目标服务
+* 旧 `service_key` 模型废弃，不再作为 lookup/identity 输入
 
 ---
 
-## 6.4 `service_instance_id`
+## 6.4 主辅关系
 
-* 运行时内部实例标识（不要求进入控制面协议 schema）
-* 用于区分同一 `service_id` 下来自不同 connector/session 的可用实例
-* 推荐由 server 内部按 `(connector_id, session_id, service_key)` 组合生成稳定键
-* route resolve 先定位 `service_key -> service_id`，再从实例池中选择一个 `service_instance_id`
-* 单条 traffic 生命周期内固定绑定一个 `service_instance_id`，不做 mid-stream failover
+* Route Resolve：`ServiceSelector -> logical_service_id -> instance_id`
+* Runtime/Traffic：使用 `logical_service_id + instance_id` 作为目标标识
+* Transport 层不参与 selector 解析和实例选择算法
+* 首版不做 mid-stream failover
 
 ---
 
@@ -334,12 +324,10 @@ order-service/http
 
 ### 字段
 
-* `service_id`
-* `service_key`
-* `namespace`
-* `environment`
-* `connector_id`
+* `logical_service_id`
 * `service_name`
+* `scope`
+* `connector_id`
 * `service_type`
 * `status`
 * `resource_version`
@@ -353,8 +341,8 @@ order-service/http
 
 ### 说明
 
-* `service_id` 标识逻辑服务池，允许由多个 connector 同时承载
-* server 运行时会维护该服务池下的实例集合（`service_instance_id` 维度）
+* `logical_service_id` 标识逻辑服务池，允许由多个 connector 同时承载
+* server 运行时会维护该服务池下的实例集合（`instance_id` 维度）
 
 ### `status`
 
@@ -400,7 +388,7 @@ order-service/http
 
 ### 说明
 
-* 同一条 `PublishService` 的 endpoint 协议必须一致，用于唯一确定 `service_key` 的 `protocol` 片段
+* 同一条 `PublishService` 的 endpoint 协议必须一致，便于 Route Resolver 与 endpoint 选择保持确定性
 * 首版通常只用一个 endpoint
 * 模型上允许多个 endpoint，为后续扩展留口子
 
@@ -465,15 +453,16 @@ order-service/http
 * `listen_port`
 * `path_prefix`
 * `sni`
-* `header_matches`
+* `headers`
+* `queries`
 
 ### 匹配规则
 
-* `header_matches` 仅在 `L7 Shared Ingress` 生效；`TLS SNI Shared` 与 `L4 Dedicated` 配置该字段时必须拒绝 route
-* header 名按大小写不敏感匹配，server 侧统一按 lower-case 归一化
-* 首版采用“精确值匹配”语义：请求 header 存在且任一值与期望值完全一致（trim 后）即视为命中
-* `header_matches` 的键全部命中才算 route 命中
-* route `priority` 相同场景下，包含更多 `header_matches` 条目的 route 优先级更高（更具体）
+* `headers/queries` 仅在 `L7 Shared Ingress` 生效；`TLS SNI Shared` 与 `L4 Dedicated` 配置该字段时必须拒绝 route
+* Header 名按大小写不敏感匹配，值匹配支持 `exact/prefix/regex/present`
+* Query 参数匹配支持 `exact/prefix/regex/present`
+* 同一 Route 内多个 `headers/queries` 条件为 AND 关系
+* route `priority` 相同场景下，包含更多匹配约束的 route 优先级更高（更具体）
 
 ---
 
@@ -483,16 +472,13 @@ order-service/http
 
 ### 字段
 
-* `type`
 * `connector_service`
-* `external_service`
-* `hybrid_group`
+* （可选）`external_service`，仅用于 external direct proxy 固定路由场景
 
-### `type`
+说明：
 
-* `connector_service`
-* `external_service`
-* `hybrid_group`
+* 默认推荐 `connector_service + ScopeFallbackPolicy.external` 组合
+* 旧 `hybrid_group` 字段废弃，不作为当前 canonical target
 
 ---
 
@@ -500,13 +486,12 @@ order-service/http
 
 ### 字段
 
-* `service_key`
-* `selector`
+* `selector`（`ServiceSelector`）
 
 ### 解析语义
 
-* `service_key` 固定按 `<service_name>/<protocol>` 匹配逻辑服务池
-* 命中服务池后，从 `ACTIVE + HEALTHY` 的实例集合中选择一个实例（随机或等价无状态均衡算法）
+* Route Resolver 先按 `selector` 解析 `logical_service_id`
+* 命中逻辑服务后，从 `ACTIVE + HEALTHY` 实例集合中选择一个 `instance_id`
 * 单条 traffic 在生命周期内固定绑定同一实例，不做中途切换
 
 ---
@@ -533,11 +518,10 @@ order-service/http
 * `fallback_external_service`
 * `fallback_policy`
 
-### `fallback_policy`
+### 说明
 
-首版仅允许：
-
-* `pre_open_only`
+`hybrid_group` 在新模型中不再作为核心降级语义载体。
+统一采用 Bridge 侧 `ScopeFallbackPolicy` 执行作用域降级；外部注册中心仅在本地降级链全部 miss 后启用。
 
 ---
 
@@ -550,7 +534,8 @@ Traffic 是运行态对象，不是配置注册对象。
 * `traffic_id`
 * `route_id`
 * `target_kind`
-* `service_id`
+* `logical_service_id`
+* `instance_id`
 * `connector_id`
 * `source_addr`
 * `target_addr`
@@ -645,7 +630,7 @@ stateDiagram-v2
 ### `resource_version`
 
 表示资源代际。
-同一 `service_id` / `route_id` 的新版本必须大于旧版本。
+同一 `logical_service_id` / `instance_id` / `route_id` 的新版本必须大于旧版本。
 
 ### `event_id`
 
@@ -707,11 +692,11 @@ stateDiagram-v2
 * `Host`
 * `:authority`
 * `path_prefix`
-* `header_matches`（可选）
+* `headers/queries`（可选）
 
 说明：
 
-* 当多个 route 共享同一域名和路径时，可通过 `header_matches` 把请求分流到不同 `connector_service.target.service_key`
+* 当多个 route 共享同一域名和路径时，可通过 `headers/queries` 把请求分流到不同 `connector_service.selector` 目标
 * 该能力用于同入口多服务拆分、灰度流量或按租户 header 分流
 
 ### 可导出方式
@@ -900,33 +885,20 @@ server 只选择 connector 和 service。
 
 ---
 
-## 15.3 hybrid_group
+## 15.3 ScopeFallbackPolicy 路由降级
 
-先尝试 `connector_service`。
-仅当以下阶段失败时允许 fallback 到 `external_service`：
+统一改为作用域降级语义：
 
-* route resolve miss
-* service unavailable
-* `TrafficOpenAck` 失败
-* agent 侧 pre-open timeout
+1. Bridge 从请求 Header 解析 `request_scope`
+2. 按管理员配置的 `ScopeFallbackPolicy` 构建降级链（可禁用）
+3. 在本地按降级链逐级查找可用逻辑服务
+4. 本地全部 miss 后，若 `external.enabled=true`，再查询外部注册中心
 
-### fallback 截止点
+说明：
 
-首版明确规定：
-
-> `pre_open_only` 的截止点为 **收到 `TrafficOpenAck success` 之前**。
-
-一旦 server 收到 `TrafficOpenAck success`，即使 agent 尚未向 upstream 写出第一个业务字节，也**不允许** fallback。
-
-### 明确禁止 fallback 的场景
-
-* 已收到 `TrafficOpenAck success`
-* 已向 upstream 写出任意业务数据
-* mid-stream reset
-* response partial sent
-* 任何 post-open 阶段失败
-
-首版不做 mid-stream failover。
+* 降级策略由 Bridge 配置中心控制，不由 Route target 内联声明
+* 是否允许降级、降级到哪些 scope、是否启用 external fallback，均按 namespace 策略执行
+* 本版仍不支持 mid-stream failover
 
 ---
 
@@ -1206,30 +1178,25 @@ server 与 agent 不得将 `policy_json` 作为长期扩展主通道。
 
 ## 21.1 默认规则
 
-`Route` scope 必须等于 target scope。
+`Route` 与服务目标不再通过固定 `namespace/environment` 直接绑定，而是通过 `ServiceSelector` + 运行时 `request_scope` 共同解析。
 
-也就是：
-
-* route 的 `namespace/environment`
-* 必须与 `connector_service` 或 `external_service` 的 `namespace/environment`
-* 保持一致
+Route 匹配成功后，Bridge 必须按 `ScopeFallbackPolicy` 在候选 scope 链中解析目标逻辑服务。
 
 ---
 
 ## 21.2 首版限制
 
-首版**不允许跨 scope 引用**。
+首版默认仍采用保守策略，但由 Bridge 管理配置决定：
 
-这意味着：
-
-* 不允许 route 在 `dev/alice` 下直接引用 `prod/team-a` 的 target
-* 不允许跨 environment fallback
-
-如后续需要跨 scope，必须新增明确的授权模型和策略字段。
+* 默认禁用降级（精确 scope miss 直接失败）
+* 管理员可按 namespace 显式启用降级链（例如 `dev/* -> dev/base -> default/base`）
+* 跨 scope 可见性完全由降级策略控制，而非硬编码规则
 
 ---
 
-# 22. 最终 protobuf 草案
+# 22. 历史 protobuf 草案（非当前 canonical schema）
+
+> 本章仅用于历史记录。当前实现字段以 `DevBridge-MultiAgent-ServiceModel-TechDesign.md` 为准。
 
 ```proto
 syntax = "proto3";
@@ -1672,10 +1639,10 @@ v2.1 核心路径中，Agent 不要求维护 route 表；只有启用可选 edge
 * discovery export reconciler
 * 健康状态同步
 
-## 阶段五：Hybrid Route + QUIC
+## 阶段五：Scope Fallback + QUIC
 
 实现：
 
-* hybrid pre-open fallback
+* ScopeFallbackPolicy 降级链增强
 * `quic_native`
 * datagram 预研
