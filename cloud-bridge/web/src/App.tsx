@@ -46,6 +46,33 @@ type DetailSummaryRow = {
   value: string;
 };
 
+type NavSection = {
+  title: string;
+  items: AdminPageKey[];
+};
+
+type DashboardMetricCard = {
+  label: string;
+  value: string;
+  hint: string;
+  tone?: StateTone;
+};
+
+type TrendSeriesTone = "blue" | "green" | "orange";
+
+type MultiTrendSeries = {
+  label: string;
+  tone: TrendSeriesTone;
+  items: TrendDatum[];
+  latestValue: number;
+};
+
+type TunnelRingSegment = {
+  label: string;
+  value: number;
+  color: string;
+};
+
 const authStorageKey = "bridge.admin.token";
 const autoRefreshEnabledStorageKey = "bridge.admin.auto_refresh.enabled";
 const autoRefreshIntervalStorageKey = "bridge.admin.auto_refresh.interval_ms";
@@ -88,6 +115,17 @@ const pageCatalog: Array<{
   { key: "traffic", title: "隧道流量", subtitle: "Tunnel Pool 与 Traffic 观测" },
   { key: "ops", title: "配置运维", subtitle: "受控写接口与审计入口" },
   { key: "observability", title: "日志诊断", subtitle: "Logs / Metrics / Diagnose" },
+];
+
+const pageSections: NavSection[] = [
+  {
+    title: "运行视图",
+    items: ["dashboard", "routes", "services", "connectors", "traffic"],
+  },
+  {
+    title: "管理与配置",
+    items: ["ops", "observability"],
+  },
 ];
 
 const configPatchKeyOptions = [
@@ -631,6 +669,101 @@ function summarizeLogActions(items: ApiRecord[], maxCount = 6): ChartDatum[] {
 }
 
 /**
+ * resolveQuickSearchTarget 把顶栏检索词映射到对应页面，提供基础“快速跳页”能力。
+ */
+function resolveQuickSearchTarget(rawQuery: string): AdminPageKey | null {
+  const normalizedQuery = rawQuery.trim().toLowerCase();
+  if (normalizedQuery === "") {
+    return null;
+  }
+  const keywordGroups: Array<{ page: AdminPageKey; keywords: string[] }> = [
+    { page: "dashboard", keywords: ["dashboard", "总览", "overview", "bridge"] },
+    { page: "routes", keywords: ["route", "routes", "路由", "host", "path"] },
+    { page: "services", keywords: ["service", "services", "服务", "logical"] },
+    { page: "connectors", keywords: ["connector", "connectors", "session", "连接", "agent"] },
+    { page: "traffic", keywords: ["traffic", "tunnel", "隧道", "流量"] },
+    { page: "ops", keywords: ["ops", "config", "运维", "配置", "drain"] },
+    { page: "observability", keywords: ["observability", "metric", "metrics", "log", "日志", "诊断"] },
+  ];
+  for (const group of keywordGroups) {
+    if (group.keywords.some((keyword) => normalizedQuery.includes(keyword))) {
+      return group.page;
+    }
+  }
+  const fuzzyMatch = pageCatalog.find((item) => {
+    const haystack = `${item.key} ${item.title} ${item.subtitle}`.toLowerCase();
+    return haystack.includes(normalizedQuery);
+  });
+  return fuzzyMatch?.key ?? null;
+}
+
+/**
+ * describeRealtimeState 统一生成实时链路文案，避免壳层多处分叉。
+ */
+function describeRealtimeState(
+  mode: RealtimeMode,
+  connectionState: SSEConnectionState,
+  isPolling: boolean,
+  intervalMS: number,
+  enabled: boolean
+): { label: string; detail: string; tone: StateTone } {
+  if (!enabled) {
+    return {
+      label: "自动刷新已暂停",
+      detail: "当前仅保留手动刷新。",
+      tone: "normal",
+    };
+  }
+  if (mode === "sse") {
+    if (connectionState === "live") {
+      return {
+        label: "SSE 已连接",
+        detail: "当前页面由实时事件流驱动更新。",
+        tone: "ok",
+      };
+    }
+    if (connectionState === "connecting") {
+      return {
+        label: "SSE 连接中",
+        detail: "等待 ready / snapshot 事件返回。",
+        tone: "warn",
+      };
+    }
+    return {
+      label: "SSE 异常",
+      detail: "正在等待回退轮询或自动重连。",
+      tone: "danger",
+    };
+  }
+  if (mode === "polling") {
+    return {
+      label: isPolling ? "轮询刷新中" : "轮询模式",
+      detail: `每 ${intervalMS / 1000} 秒拉取一次当前页面快照。`,
+      tone: "warn",
+    };
+  }
+  return {
+    label: "待连接",
+    detail: "填写 Token 后可启用实时刷新。",
+    tone: "normal",
+  };
+}
+
+/**
+ * summarizeNamedCounters 把 map[string]number 形式的计数器收敛成可展示的 Top N。
+ */
+function summarizeNamedCounters(value: unknown, maxCount = 3): Array<{ label: string; value: number }> {
+  const items = Object.entries(asRecord(value))
+    .map(([label, counter]) => ({
+      label,
+      value: typeof counter === "number" && Number.isFinite(counter) ? counter : Number(counter),
+    }))
+    .filter((item) => Number.isFinite(item.value) && item.value > 0)
+    .sort((left, right) => right.value - left.value);
+  return items.slice(0, maxCount);
+}
+
+/**
  * buildMetricTrend 构建指定指标的趋势序列。
  */
 function buildMetricTrend(items: ApiRecord[], metricKey: string): TrendDatum[] {
@@ -647,6 +780,7 @@ export default function App() {
     }
     return resolveAdminPageFromLocation(window.location);
   });
+  const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [token, setToken] = useState("");
   const [tokenDraft, setTokenDraft] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -756,6 +890,23 @@ export default function App() {
       syncAdminPageToURL(page, options?.replace ? "replace" : "push");
     },
     [syncAdminPageToURL]
+  );
+
+  /**
+   * handleQuickSearchSubmit 处理顶栏快速检索，当前用于跳转到对应视图。
+   */
+  const handleQuickSearchSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const targetPage = resolveQuickSearchTarget(globalSearchQuery);
+      if (targetPage === null) {
+        toast.error("未识别检索词，可输入 route / connector / traffic / ops 等关键字");
+        return;
+      }
+      navigateToPage(targetPage);
+      toast.success(`已切换到${pickPageMeta(targetPage).title}`);
+    },
+    [globalSearchQuery, navigateToPage]
   );
 
   /**
@@ -964,17 +1115,32 @@ export default function App() {
       setIsLoading(true);
       try {
         if (page === "dashboard") {
-          const [overviewResponse, tunnelSummaryResponse, trafficSummaryResponse, diagnoseResponse] =
+          const nowMS = Date.now();
+          const fromMS = nowMS - 30 * 60 * 1000;
+          const [
+            overviewResponse,
+            tunnelSummaryResponse,
+            trafficSummaryResponse,
+            diagnoseResponse,
+            metricsResponse,
+          ] =
             await Promise.all([
               requestAdmin("/api/admin/bridge/overview"),
               requestAdmin("/api/admin/tunnels/summary"),
               requestAdmin("/api/admin/traffic/summary"),
               requestAdmin("/api/admin/diagnose/summary"),
+              requestAdmin(
+                `/api/admin/metrics/query${encodeQuery({
+                  from: fromMS,
+                  to: nowMS,
+                })}`
+              ),
             ]);
           setOverview(asRecord(overviewResponse.overview));
           setTunnelSummary(asRecord(tunnelSummaryResponse.summary));
           setTrafficSummary(asRecord(trafficSummaryResponse.summary));
           setDiagnoseSummary(asRecord(diagnoseResponse.summary));
+          setMetricPoints(asRecordArray(metricsResponse.points));
         }
 
         if (page === "routes") {
@@ -1600,21 +1766,30 @@ export default function App() {
   }, []);
 
   const activeMeta = pickPageMeta(activePage);
-
-  const dashboardCards = useMemo(
-    () => [
-      { label: "Connector", value: readNumber(overview, "connector_total", 0) },
-      { label: "Session Active", value: readNumber(overview, "session_active", 0) },
-      { label: "Route Total", value: readNumber(overview, "route_total", 0) },
-      { label: "Tunnel Idle", value: readNumber(overview, "tunnel_idle", 0) },
-      { label: "Open Timeout", value: readNumber(trafficSummary, "open_timeout_total", 0) },
-      {
-        label: "Fallback",
-        value: readNumber(trafficSummary, "scope_fallback_total", 0),
-      },
-    ],
-    [overview, trafficSummary]
+  const realtimeSummary = useMemo(
+    () =>
+      describeRealtimeState(
+        realtimeMode,
+        sseConnectionState,
+        isAutoRefreshing,
+        autoRefreshIntervalMS,
+        autoRefreshEnabled
+      ),
+    [autoRefreshEnabled, autoRefreshIntervalMS, isAutoRefreshing, realtimeMode, sseConnectionState]
   );
+
+  const sidebarContext = useMemo(() => {
+    if (activePage === "dashboard") {
+      return {
+        title: "Bridge 主控台",
+        detail: "统一查看运行态、隧道池、异常与受控操作。",
+      };
+    }
+    return {
+      title: activeMeta.title,
+      detail: activeMeta.subtitle,
+    };
+  }, [activeMeta, activePage]);
 
   const diagnoseIssues = useMemo(() => {
     if (!Array.isArray(diagnoseSummary.issues)) {
@@ -1623,7 +1798,131 @@ export default function App() {
     return diagnoseSummary.issues.map((item) => String(item));
   }, [diagnoseSummary]);
 
+  const dashboardMetricCards = useMemo<DashboardMetricCard[]>(
+    () => [
+      {
+        label: "Bridge 状态",
+        value: readText(diagnoseSummary, "health", "unknown"),
+        hint: diagnoseIssues.length === 0 ? "当前无阻断级问题" : `${diagnoseIssues.length} 条诊断提醒`,
+        tone: resolveTone(readText(diagnoseSummary, "health", "unknown")),
+      },
+      {
+        label: "在线 Connector",
+        value: readText(overview, "connector_total", "0"),
+        hint: `Session Active ${readText(overview, "session_active", "0")}`,
+      },
+      {
+        label: "服务发布",
+        value: readText(overview, "service_total", "0"),
+        hint: `Route ${readText(overview, "route_total", "0")}`,
+      },
+      {
+        label: "Idle Tunnel",
+        value: readText(tunnelSummary, "idle", readText(overview, "tunnel_idle", "0")),
+        hint: `Reserved ${readText(tunnelSummary, "reserved", "0")}`,
+      },
+      {
+        label: "Open Timeout",
+        value: readText(trafficSummary, "open_timeout_total", "0"),
+        hint: `Ack Late ${readText(trafficSummary, "open_ack_late_total", "0")}`,
+        tone: readNumber(trafficSummary, "open_timeout_total", 0) > 0 ? "danger" : "ok",
+      },
+      {
+        label: "Fallback",
+        value: readText(trafficSummary, "scope_fallback_total", "0"),
+        hint: `Acquire Wait ${readText(trafficSummary, "acquire_wait_count", "0")}`,
+        tone: readNumber(trafficSummary, "scope_fallback_total", 0) > 0 ? "warn" : "ok",
+      },
+    ],
+    [diagnoseIssues.length, diagnoseSummary, overview, trafficSummary, tunnelSummary]
+  );
+
   const overviewListeners = useMemo(() => asRecordArray(overview.listeners), [overview]);
+
+  const dashboardTrendSeries = useMemo<MultiTrendSeries[]>(
+    () => [
+      {
+        label: "Acquire Wait",
+        tone: "blue",
+        items: buildMetricTrend(metricPoints, "acquire_wait_count"),
+        latestValue: readNumber(metricPoints[metricPoints.length - 1] ?? {}, "acquire_wait_count", 0),
+      },
+      {
+        label: "Open Timeout",
+        tone: "green",
+        items: buildMetricTrend(metricPoints, "open_timeout_total"),
+        latestValue: readNumber(metricPoints[metricPoints.length - 1] ?? {}, "open_timeout_total", 0),
+      },
+      {
+        label: "Fallback",
+        tone: "orange",
+        items: buildMetricTrend(metricPoints, "scope_fallback_total"),
+        latestValue: readNumber(metricPoints[metricPoints.length - 1] ?? {}, "scope_fallback_total", 0),
+      },
+    ],
+    [metricPoints]
+  );
+
+  const tunnelRingSegments = useMemo<TunnelRingSegment[]>(
+    () => [
+      { label: "idle", value: readNumber(tunnelSummary, "idle", 0), color: "#4266ff" },
+      { label: "reserved", value: readNumber(tunnelSummary, "reserved", 0), color: "#16a672" },
+      { label: "active", value: readNumber(tunnelSummary, "active", 0), color: "#f59e0b" },
+      { label: "broken", value: readNumber(tunnelSummary, "broken", 0), color: "#f04461" },
+      { label: "closed", value: readNumber(tunnelSummary, "closed", 0), color: "#a7b3d1" },
+    ],
+    [tunnelSummary]
+  );
+
+  const dashboardHealthBars = useMemo(
+    () => [
+      {
+        label: "Auth Failure",
+        value: readNumber(trafficSummary, "auth_failure_total", 0),
+        tone: readNumber(trafficSummary, "auth_failure_total", 0) > 0 ? "danger" : "ok",
+      },
+      {
+        label: "Ack Late",
+        value: readNumber(trafficSummary, "open_ack_late_total", 0),
+        tone: readNumber(trafficSummary, "open_ack_late_total", 0) > 0 ? "warn" : "ok",
+      },
+      {
+        label: "Route Conflict",
+        value: readNumber(trafficSummary, "route_conflict_rejection_total", 0),
+        tone: readNumber(trafficSummary, "route_conflict_rejection_total", 0) > 0 ? "warn" : "ok",
+      },
+      {
+        label: "Tunnel Recycle Fail",
+        value: readNumber(trafficSummary, "tunnel_recycle_failure_total", 0),
+        tone: readNumber(trafficSummary, "tunnel_recycle_failure_total", 0) > 0 ? "danger" : "ok",
+      },
+    ],
+    [trafficSummary]
+  );
+
+  const dashboardTopCounters = useMemo(() => {
+    const namedCounters = [
+      ...summarizeNamedCounters(trafficSummary.auth_error_code_totals, 2),
+      ...summarizeNamedCounters(trafficSummary.tunnel_recycle_error_code_totals, 2),
+    ];
+    if (namedCounters.length > 0) {
+      return namedCounters.slice(0, 3);
+    }
+    return [
+      {
+        label: "open_timeout",
+        value: readNumber(trafficSummary, "open_timeout_total", 0),
+      },
+      {
+        label: "scope_fallback",
+        value: readNumber(trafficSummary, "scope_fallback_total", 0),
+      },
+      {
+        label: "route_conflict",
+        value: readNumber(trafficSummary, "route_conflict_rejection_total", 0),
+      },
+    ];
+  }, [trafficSummary]);
 
   const metricKeyOptions = useMemo(() => {
     const defaultKeys = [
@@ -1692,65 +1991,188 @@ export default function App() {
   const logActionBars = useMemo(() => summarizeLogActions(logItems), [logItems]);
 
   const renderDashboard = () => (
-    <div className="content-stack">
-      <section className="panel">
-        <header className="panel-head">
-          <h3>关键指标</h3>
-          <span className="panel-sub">更新时间 {asPrettyTime(readNumber(overview, "updated_at_ms"))}</span>
-        </header>
-        <div className="kpi-grid">
-          {dashboardCards.map((card) => (
-            <article key={card.label} className="kpi-card">
-              <p className="kpi-label">{card.label}</p>
-              <p className="kpi-value">{card.value}</p>
-            </article>
-          ))}
+    <div className="dashboard-stack">
+      <section className="panel hero-panel">
+        <div className="hero-copy">
+          <p className="hero-eyebrow">Bridge Runtime Dashboard</p>
+          <h3 className="hero-title">Bridge 运行总览</h3>
+          <p className="hero-sub">
+            面向控制面运维与排障，统一查看连接、隧道池、流量退化与诊断信号。
+          </p>
+          <div className="hero-badges">
+            <StatePill label={readText(diagnoseSummary, "health", "unknown")} />
+            <span className={`shell-status-pill tone-${realtimeSummary.tone}`}>
+              {realtimeSummary.label}
+            </span>
+            <span className="shell-inline-note">
+              最后同步 {lastSyncMS > 0 ? asPrettyTime(lastSyncMS) : "--"}
+            </span>
+          </div>
+        </div>
+        <div className="hero-actions">
+          <button type="button" className="ghost-btn" onClick={() => void performExportDiagnose()}>
+            导出快照
+          </button>
+          <button
+            type="button"
+            className="solid-btn"
+            onClick={() => navigateToPage("observability")}
+          >
+            运行诊断
+          </button>
+          {exportDownloadURL !== "" && (
+            <a className="link-btn" href={exportDownloadURL} target="_blank" rel="noreferrer">
+              下载诊断包
+            </a>
+          )}
         </div>
       </section>
 
-      <section className="panel">
-        <header className="panel-head">
-          <h3>监听入口</h3>
-          <span className="panel-sub">当前 Bridge 已启用的地址、端口与用途</span>
-        </header>
-        {overviewListeners.length === 0 ? (
-          <p className="listener-empty">当前未发现启用中的监听入口。</p>
-        ) : (
-          <div className="listener-grid">
-            {overviewListeners.map((item, index) => (
-              <article
-                key={`${readText(item, "listener_id", "listener")}-${index}`}
-                className="listener-card"
-              >
-                <div className="listener-top">
-                  <div>
-                    <p className="listener-label">{readText(item, "label", "--")}</p>
-                    <code className="listener-addr">{readText(item, "listen_addr", "--")}</code>
+      <section className="metric-strip">
+        {dashboardMetricCards.map((card) => (
+          <article
+            key={card.label}
+            className={`dashboard-metric-card ${card.tone ? `tone-${card.tone}` : ""}`}
+          >
+            <p className="dashboard-metric-label">{card.label}</p>
+            <strong className="dashboard-metric-value">{card.value}</strong>
+            <span className="dashboard-metric-hint">{card.hint}</span>
+          </article>
+        ))}
+      </section>
+
+      <div className="dashboard-core-grid">
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h3>关键计数趋势</h3>
+              <p className="panel-sub">最近 30 分钟的等待、超时与 fallback 形态</p>
+            </div>
+            <span className="panel-sub">metrics={metricPoints.length}</span>
+          </header>
+          <MultiTrendChart
+            series={dashboardTrendSeries}
+            emptyText="当前尚未采集到趋势点位，请刷新后重试。"
+          />
+        </section>
+
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h3>Tunnel / Traffic 状态</h3>
+              <p className="panel-sub">桥侧池状态、退化计数与风险摘要</p>
+            </div>
+            <span className="panel-sub">更新时间 {asPrettyTime(readNumber(tunnelSummary, "updated_at_ms"))}</span>
+          </header>
+          <TunnelStatusRing
+            items={tunnelRingSegments}
+            centerLabel="idle"
+            centerValue={readText(tunnelSummary, "idle", "0")}
+          />
+          <div className="signal-grid">
+            <article className="signal-card">
+              <span className="signal-head">Open Reject</span>
+              <strong className="signal-value">{readText(trafficSummary, "open_reject_total", "0")}</strong>
+              <span className="signal-note">连接打开阶段被拒绝</span>
+            </article>
+            <article className="signal-card">
+              <span className="signal-head">Auth Failure</span>
+              <strong className="signal-value">{readText(trafficSummary, "auth_failure_total", "0")}</strong>
+              <span className="signal-note">认证失败与权限问题</span>
+            </article>
+            <article className="signal-card">
+              <span className="signal-head">Host Derive Fail</span>
+              <strong className="signal-value">{readText(trafficSummary, "host_derive_failure_total", "0")}</strong>
+              <span className="signal-note">Host 推导异常</span>
+            </article>
+          </div>
+        </section>
+      </div>
+
+      <div className="dashboard-lower-grid">
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h3>监听入口</h3>
+              <p className="panel-sub">当前 Bridge 已启用的入口、端口与用途</p>
+            </div>
+            <span className="panel-sub">listeners={overviewListeners.length}</span>
+          </header>
+          {overviewListeners.length === 0 ? (
+            <p className="listener-empty">当前未发现启用中的监听入口。</p>
+          ) : (
+            <div className="listener-grid">
+              {overviewListeners.map((item, index) => (
+                <article
+                  key={`${readText(item, "listener_id", "listener")}-${index}`}
+                  className="listener-card"
+                >
+                  <div className="listener-top">
+                    <div>
+                      <p className="listener-label">{readText(item, "label", "--")}</p>
+                      <code className="listener-addr">{readText(item, "listen_addr", "--")}</code>
+                    </div>
+                    <div className="listener-port-wrap">
+                      <span className="listener-port-label">Port</span>
+                      <strong className="listener-port">{readText(item, "port", "--")}</strong>
+                    </div>
                   </div>
-                  <div className="listener-port-wrap">
-                    <span className="listener-port-label">Port</span>
-                    <strong className="listener-port">{readText(item, "port", "--")}</strong>
-                  </div>
-                </div>
-                <p className="listener-purpose">{readText(item, "purpose", "--")}</p>
+                  <p className="listener-purpose">{readText(item, "purpose", "--")}</p>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h3>Connector / Session 风险</h3>
+              <p className="panel-sub">优先关注认证、Ack 延迟、路由冲突与回收失败</p>
+            </div>
+            <StatePill label={readText(diagnoseSummary, "health", "unknown")} />
+          </header>
+          <BarDistributionChart items={dashboardHealthBars} emptyText="暂无风险分布。" />
+          <ul className="issue-list issue-list-tight">
+            {diagnoseIssues.length === 0 && <li>暂无诊断问题，当前运行状态稳定。</li>}
+            {diagnoseIssues.slice(0, 4).map((issue, index) => (
+              <li key={`${issue}-${index}`}>{issue}</li>
+            ))}
+          </ul>
+        </section>
+
+        <section className="panel">
+          <header className="panel-head">
+            <div>
+              <h3>最近高频错误</h3>
+              <p className="panel-sub">聚焦当前最值得优先处理的异常面</p>
+            </div>
+            <button type="button" className="ghost-btn compact" onClick={() => navigateToPage("ops")}>
+              去运维
+            </button>
+          </header>
+          <div className="error-card-list">
+            {dashboardTopCounters.map((item) => (
+              <article key={item.label} className="error-card">
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
               </article>
             ))}
           </div>
-        )}
-      </section>
-
-      <section className="panel">
-        <header className="panel-head">
-          <h3>健康摘要</h3>
-          <StatePill label={readText(diagnoseSummary, "health", "unknown")} />
-        </header>
-        <ul className="issue-list">
-          {diagnoseIssues.length === 0 && <li>暂无风险告警，运行状态稳定。</li>}
-          {diagnoseIssues.map((issue, index) => (
-            <li key={`${issue}-${index}`}>{issue}</li>
-          ))}
-        </ul>
-      </section>
+          <div className="section-link-row">
+            <button type="button" className="ghost-btn compact" onClick={() => navigateToPage("traffic")}>
+              查看隧道流量
+            </button>
+            <button
+              type="button"
+              className="ghost-btn compact"
+              onClick={() => navigateToPage("observability")}
+            >
+              打开观测面板
+            </button>
+          </div>
+        </section>
+      </div>
     </div>
   );
 
@@ -2595,63 +3017,118 @@ export default function App() {
     <>
       <div className="admin-shell">
         <aside className="sidebar panel">
-        <div className="brand">
-          <p className="brand-eyebrow">Bridge Admin</p>
-          <h1>Control Console</h1>
-          <p className="brand-sub">简洁运维风格 · API 驱动视图</p>
-        </div>
-        <nav className="nav-list">
-          {pageCatalog.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className={`nav-btn ${activePage === item.key ? "active" : ""}`}
-              onClick={() => navigateToPage(item.key)}
-            >
-              <span>{item.title}</span>
-              <small>{item.subtitle}</small>
-            </button>
+          <div className="sidebar-brand">
+            <div className="brand-mark" aria-hidden="true">
+              <span />
+            </div>
+            <div className="brand-copy">
+              <h1>DevBridge</h1>
+              <p>Bridge Admin Console</p>
+            </div>
+          </div>
+
+          <div className="sidebar-scope-card">
+            <span className="sidebar-scope-label">当前视图</span>
+            <strong>{sidebarContext.title}</strong>
+            <p>{sidebarContext.detail}</p>
+          </div>
+
+          {pageSections.map((section) => (
+            <div key={section.title} className="sidebar-section">
+              <p className="sidebar-section-label">{section.title}</p>
+              <nav className="nav-list">
+                {section.items.map((pageKey) => {
+                  const item = pickPageMeta(pageKey);
+                  return (
+                    <button
+                      key={pageKey}
+                      type="button"
+                      className={`nav-btn ${activePage === pageKey ? "active" : ""}`}
+                      onClick={() => navigateToPage(pageKey)}
+                    >
+                      <span>{item.title}</span>
+                      <small>{item.subtitle}</small>
+                    </button>
+                  );
+                })}
+              </nav>
+            </div>
           ))}
-        </nav>
-        <div className="sidebar-foot">
-          <p>Last Sync</p>
-          <strong>{lastSyncMS > 0 ? asPrettyTime(lastSyncMS) : "--"}</strong>
-        </div>
+
+          <div className="sidebar-foot">
+            <div className="sidebar-foot-grid">
+              <div className="sidebar-foot-item">
+                <span>Last Sync</span>
+                <strong className="sidebar-foot-value">
+                  {lastSyncMS > 0 ? asPrettyTime(lastSyncMS) : "--"}
+                </strong>
+              </div>
+              <div className="sidebar-foot-item">
+                <span>Realtime</span>
+                <strong className={`sidebar-foot-value tone-${realtimeSummary.tone}`}>
+                  {realtimeSummary.label}
+                </strong>
+              </div>
+            </div>
+          </div>
         </aside>
 
         <main className={`main-area ${activePage === "traffic" ? "main-area-traffic" : ""}`}>
           <header className="topbar panel">
-            <div>
-              <p className="topbar-title">{activeMeta.title}</p>
-              <p className="topbar-sub">{activeMeta.subtitle}</p>
-            </div>
-            <div className="auth-actions">
-              <label>
-                <span>Bearer Token</span>
+            <div className="topbar-main">
+              <div className="topbar-heading-wrap">
+                <p className="topbar-breadcrumb">首页 / {activeMeta.title}</p>
+                <p className="topbar-title">{activeMeta.title}</p>
+                <p className="topbar-sub">{activeMeta.subtitle}</p>
+              </div>
+              <form className="header-search" onSubmit={handleQuickSearchSubmit}>
                 <input
-                  value={tokenDraft}
-                  onChange={(event) => setTokenDraft(event.target.value)}
-                  placeholder="devbridge-viewer-token"
+                  value={globalSearchQuery}
+                  onChange={(event) => setGlobalSearchQuery(event.target.value)}
+                  placeholder="搜索 route / connector / traffic"
                 />
-              </label>
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={() => {
-                  const normalizedToken = tokenDraft.trim();
-                  setToken(normalizedToken);
-                  toast.success("Token 已更新");
-                }}
-              >
-                应用 Token
-              </button>
-              <button
-                type="button"
-                className="solid-btn"
-                onClick={() => void refreshPageData(activePage)}
-              >
-                {isLoading ? "加载中..." : "刷新"}
-              </button>
+                <button type="submit" className="ghost-btn compact">
+                  跳转
+                </button>
+              </form>
+              <div className="topbar-status-strip">
+                <span className={`shell-status-pill tone-${realtimeSummary.tone}`}>
+                  {realtimeSummary.label}
+                </span>
+                <span className="shell-inline-note">{realtimeSummary.detail}</span>
+              </div>
+            </div>
+
+            <div className="control-rack">
+              <div className="auth-actions">
+                <label className="token-field">
+                  <span>Bearer Token</span>
+                  <input
+                    value={tokenDraft}
+                    onChange={(event) => setTokenDraft(event.target.value)}
+                    placeholder="devbridge-viewer-token"
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={() => {
+                    const normalizedToken = tokenDraft.trim();
+                    setToken(normalizedToken);
+                    toast.success("Token 已更新");
+                  }}
+                >
+                  应用 Token
+                </button>
+                <button
+                  type="button"
+                  className="solid-btn"
+                  onClick={() => void refreshPageData(activePage)}
+                >
+                  {isLoading ? "加载中..." : "刷新"}
+                </button>
+              </div>
+
               <div className="auto-refresh-tools">
                 <button
                   type="button"
@@ -2682,19 +3159,7 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <p className="auto-refresh-hint">
-                  {!autoRefreshEnabled
-                    ? "自动刷新已关闭"
-                    : realtimeMode === "sse"
-                      ? sseConnectionState === "live"
-                        ? "实时流已连接（SSE）"
-                        : sseConnectionState === "connecting"
-                          ? "实时流连接中..."
-                          : "实时流异常，准备回退轮询"
-                      : isAutoRefreshing
-                        ? "轮询刷新中..."
-                        : `轮询模式：每 ${autoRefreshIntervalMS / 1000} 秒刷新当前页（并自动尝试恢复 SSE）`}
-                </p>
+                <p className="auto-refresh-hint">{realtimeSummary.detail}</p>
               </div>
             </div>
           </header>
@@ -2881,6 +3346,129 @@ function SideDetailDrawer(props: {
           <pre>{JSON.stringify(props.record, null, 2)}</pre>
         </section>
       </aside>
+    </div>
+  );
+}
+
+/**
+ * MultiTrendChart 用多折线展示多个关键计数器的变化趋势。
+ */
+function MultiTrendChart(props: { series: MultiTrendSeries[]; emptyText: string }) {
+  const usableSeries = props.series.filter((item) => item.items.length > 0);
+  if (usableSeries.length === 0) {
+    return <p className="chart-empty">{props.emptyText}</p>;
+  }
+
+  const width = 640;
+  const height = 248;
+  const paddingX = 18;
+  const paddingY = 20;
+  const gridLineCount = 4;
+
+  const buildSeriesPoints = (items: TrendDatum[]) => {
+    const values = items.map((item) => item.value);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const valueRange = maxValue - minValue || 1;
+    return items.map((item, index) => {
+      const x =
+        items.length === 1
+          ? width / 2
+          : paddingX + (index / (items.length - 1)) * (width - paddingX * 2);
+      const y = height - paddingY - ((item.value - minValue) / valueRange) * (height - paddingY * 2);
+      return {
+        x,
+        y,
+        label: item.label,
+      };
+    });
+  };
+
+  const firstSeriesPoints = buildSeriesPoints(usableSeries[0].items);
+
+  return (
+    <div className="multi-trend-chart">
+      <div className="multi-trend-legend">
+        {usableSeries.map((item) => (
+          <div key={item.label} className="multi-trend-legend-item">
+            <span className={`legend-dot legend-${item.tone}`} aria-hidden="true" />
+            <span>{item.label}</span>
+            <strong>{item.latestValue}</strong>
+          </div>
+        ))}
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+        {Array.from({ length: gridLineCount }, (_, index) => {
+          const ratio = index / (gridLineCount - 1);
+          const y = paddingY + ratio * (height - paddingY * 2);
+          return <line key={y} className="multi-trend-grid-line" x1={paddingX} x2={width - paddingX} y1={y} y2={y} />;
+        })}
+        {usableSeries.map((item) => {
+          const points = buildSeriesPoints(item.items);
+          const polylinePoints = points.map((point) => `${point.x},${point.y}`).join(" ");
+          return (
+            <g key={item.label}>
+              <polyline className={`multi-trend-line ${item.tone}`} points={polylinePoints} />
+              <circle
+                className={`multi-trend-point ${item.tone}`}
+                cx={points[points.length - 1]?.x ?? width / 2}
+                cy={points[points.length - 1]?.y ?? height / 2}
+                r={4}
+              />
+            </g>
+          );
+        })}
+      </svg>
+      <div className="trend-foot">
+        <span>{firstSeriesPoints[0]?.label ?? "--"}</span>
+        <span>{firstSeriesPoints[firstSeriesPoints.length - 1]?.label ?? "--"}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * TunnelStatusRing 用圆环分布表达 tunnel 状态占比。
+ */
+function TunnelStatusRing(props: {
+  items: TunnelRingSegment[];
+  centerLabel: string;
+  centerValue: string;
+}) {
+  const totalValue = props.items.reduce((sum, item) => sum + item.value, 0);
+  const gradientText =
+    totalValue <= 0
+      ? "conic-gradient(#e6ebfb 0deg 360deg)"
+      : (() => {
+          let currentRatio = 0;
+          return `conic-gradient(${props.items
+            .filter((item) => item.value > 0)
+            .map((item) => {
+              const start = currentRatio * 360;
+              currentRatio += item.value / totalValue;
+              const end = currentRatio * 360;
+              return `${item.color} ${start}deg ${end}deg`;
+            })
+            .join(", ")})`;
+        })();
+
+  return (
+    <div className="tunnel-ring-layout">
+      <div className="tunnel-ring" style={{ background: gradientText }}>
+        <div className="tunnel-ring-inner">
+          <span>{props.centerLabel}</span>
+          <strong>{props.centerValue}</strong>
+        </div>
+      </div>
+      <div className="tunnel-ring-legend">
+        {props.items.map((item) => (
+          <div key={item.label} className="tunnel-ring-legend-item">
+            <span className="legend-dot" style={{ backgroundColor: item.color }} aria-hidden="true" />
+            <span>{item.label}</span>
+            <strong>{item.value}</strong>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
