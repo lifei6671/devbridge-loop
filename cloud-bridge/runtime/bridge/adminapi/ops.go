@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/adminview"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -43,8 +44,8 @@ type DrainResult struct {
 
 // ConfigUpdateRequest 定义 `PUT /api/admin/config` 请求体。
 type ConfigUpdateRequest struct {
-	IfMatchVersion uint64         `json:"if_match_version"`
-	Patch          map[string]any `json:"patch"`
+	IfMatchVersion uint64         `json:"if_match_version" yaml:"if_match_version"`
+	Patch          map[string]any `json:"patch" yaml:"patch"`
 }
 
 // ConfigUpdateResult 定义配置更新响应体。
@@ -157,7 +158,7 @@ func (server *Server) handleConfigUpdate(writer http.ResponseWriter, request *ht
 		return
 	}
 	var updateRequest ConfigUpdateRequest
-	if err := decodeOptionalJSONBody(request, &updateRequest); err != nil {
+	if err := decodeConfigUpdateBody(request, &updateRequest); err != nil {
 		writeError(writer, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -350,6 +351,95 @@ func decodeOptionalJSONBody(request *http.Request, out any) error {
 	if err := json.Unmarshal(rawBody, out); err != nil {
 		return fmt.Errorf("decode request body failed: %w", err)
 	}
+	return nil
+}
+
+func decodeConfigUpdateBody(request *http.Request, out *ConfigUpdateRequest) error {
+	if request == nil || request.Body == nil || out == nil {
+		return nil
+	}
+	rawBody, err := io.ReadAll(io.LimitReader(request.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read request body failed: %w", err)
+	}
+	if len(strings.TrimSpace(string(rawBody))) == 0 {
+		return nil
+	}
+	contentType := normalizeRequestContentType(request.Header.Get("Content-Type"))
+	switch {
+	case contentType == "", contentType == "application/json":
+		if err := json.Unmarshal(rawBody, out); err != nil {
+			return fmt.Errorf("decode request body failed: %w", err)
+		}
+	case isYAMLContentType(contentType):
+		if err := yaml.Unmarshal(rawBody, out); err != nil {
+			return fmt.Errorf("decode request body failed: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported content type: %s", contentType)
+	}
+	normalizedPatch, err := normalizeConfigUpdatePatch(out.Patch)
+	if err != nil {
+		return fmt.Errorf("normalize patch failed: %w", err)
+	}
+	out.Patch = normalizedPatch
+	return nil
+}
+
+func normalizeRequestContentType(rawContentType string) string {
+	contentType := strings.TrimSpace(strings.ToLower(rawContentType))
+	if contentType == "" {
+		return ""
+	}
+	if separatorIndex := strings.Index(contentType, ";"); separatorIndex >= 0 {
+		return strings.TrimSpace(contentType[:separatorIndex])
+	}
+	return contentType
+}
+
+func isYAMLContentType(contentType string) bool {
+	normalizedContentType := normalizeRequestContentType(contentType)
+	if normalizedContentType == "" {
+		return false
+	}
+	return strings.Contains(normalizedContentType, "yaml") || strings.Contains(normalizedContentType, "yml")
+}
+
+func normalizeConfigUpdatePatch(rawPatch map[string]any) (map[string]any, error) {
+	if len(rawPatch) == 0 {
+		return rawPatch, nil
+	}
+	normalizedPatch := make(map[string]any, len(rawPatch))
+	for patchKey, patchValue := range rawPatch {
+		if err := flattenConfigUpdatePatchValue(normalizedPatch, strings.TrimSpace(patchKey), patchValue); err != nil {
+			return nil, err
+		}
+	}
+	return normalizedPatch, nil
+}
+
+func flattenConfigUpdatePatchValue(normalizedPatch map[string]any, patchKey string, patchValue any) error {
+	normalizedKey := strings.TrimSpace(patchKey)
+	if normalizedKey == "" {
+		return fmt.Errorf("patch contains empty key")
+	}
+	nestedPatch, ok := patchValue.(map[string]any)
+	if ok {
+		if len(nestedPatch) == 0 {
+			return fmt.Errorf("patch key %s must not be empty object", normalizedKey)
+		}
+		for childKey, childValue := range nestedPatch {
+			normalizedChildKey := strings.TrimSpace(childKey)
+			if normalizedChildKey == "" {
+				return fmt.Errorf("patch key %s contains empty child key", normalizedKey)
+			}
+			if err := flattenConfigUpdatePatchValue(normalizedPatch, normalizedKey+"."+normalizedChildKey, childValue); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	normalizedPatch[normalizedKey] = patchValue
 	return nil
 }
 

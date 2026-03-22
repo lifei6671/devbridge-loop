@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,8 +16,6 @@ import (
 )
 
 const (
-	defaultRuntimeConfigFileName = "bridge.yaml"
-
 	envControlPlaneTLSMode                  = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_MODE"
 	envControlPlaneTLSCertSource            = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_SOURCE"
 	envControlPlaneTLSCertFile              = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_FILE"
@@ -50,111 +47,21 @@ func main() {
 	}
 }
 
-// loadRuntimeConfigFromFlags 解析命令行参数，并按需从 YAML 文件加载配置。
-// 规则：
-// 1) 显式传入 -config 时，按该路径加载并作为后续后台持久化目标；
-// 2) 未传 -config 时，先使用默认配置，再尝试自动加载 ./bridge.yaml；
-// 3) 若 ./bridge.yaml 不存在，保留默认配置并把该路径作为后台保存目标。
+// loadRuntimeConfigFromFlags 解析命令行参数，并委托 app 层按统一优先级加载运行配置。
 func loadRuntimeConfigFromFlags() (app.Config, error) {
 	configFilePathFlag := flag.String("config", "", "Bridge YAML 配置文件路径")
 	flag.Parse()
-
-	normalizedConfigFilePath := strings.TrimSpace(*configFilePathFlag)
-	if normalizedConfigFilePath != "" {
-		runtimeConfig, err := app.LoadConfigFromYAMLFile(normalizedConfigFilePath)
-		if err != nil {
-			return app.Config{}, err
-		}
-		return applyRuntimeConfigEnvOverrides(runtimeConfig)
-	}
-	defaultConfigFilePath, err := filepath.Abs(defaultRuntimeConfigFileName)
-	if err != nil {
-		return app.Config{}, err
-	}
-	if _, statErr := os.Stat(defaultConfigFilePath); statErr == nil {
-		runtimeConfig, loadErr := app.LoadConfigFromYAMLFile(defaultConfigFilePath)
-		if loadErr != nil {
-			return app.Config{}, loadErr
-		}
-		return applyRuntimeConfigEnvOverrides(runtimeConfig)
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return app.Config{}, statErr
-	}
-	defaultConfig := app.DefaultConfig()
-	defaultConfig.RuntimeConfigFilePath = defaultConfigFilePath
-	return applyRuntimeConfigEnvOverrides(defaultConfig)
+	return app.LoadRuntimeConfig(strings.TrimSpace(*configFilePathFlag))
 }
 
 // applyRuntimeConfigEnvOverrides 将环境变量覆盖到运行配置，并再次执行结构化校验。
 func applyRuntimeConfigEnvOverrides(runtimeConfig app.Config) (app.Config, error) {
-	resolvedConfig := runtimeConfig
-	if err := applyControlPlaneTLSEnvOverrides(&resolvedConfig); err != nil {
-		return app.Config{}, err
-	}
-	// 环境变量覆盖后统一走 Validate，确保与 YAML 路径保持同一校验语义。
-	if err := resolvedConfig.Validate(); err != nil {
-		return app.Config{}, err
-	}
-	return resolvedConfig, nil
+	return app.ApplyRuntimeConfigEnvOverrides(runtimeConfig)
 }
 
 // applyControlPlaneTLSEnvOverrides 处理 control_plane TLS 相关环境变量覆盖（环境变量优先）。
 func applyControlPlaneTLSEnvOverrides(runtimeConfig *app.Config) error {
-	if runtimeConfig == nil {
-		return errors.New("apply control plane tls env overrides: nil config")
-	}
-	runtimeConfig.ControlPlane.TLSMode = stringEnvOrDefault(envControlPlaneTLSMode, runtimeConfig.ControlPlane.TLSMode)
-	runtimeConfig.ControlPlane.TLSCertSource = stringEnvOrDefault(
-		envControlPlaneTLSCertSource,
-		runtimeConfig.ControlPlane.TLSCertSource,
-	)
-	runtimeConfig.ControlPlane.TLSCertFile = stringEnvOrDefault(
-		envControlPlaneTLSCertFile,
-		runtimeConfig.ControlPlane.TLSCertFile,
-	)
-	runtimeConfig.ControlPlane.TLSKeyFile = stringEnvOrDefault(
-		envControlPlaneTLSKeyFile,
-		runtimeConfig.ControlPlane.TLSKeyFile,
-	)
-	runtimeConfig.ControlPlane.TLSCACertFile = stringEnvOrDefault(
-		envControlPlaneTLSCACertFile,
-		runtimeConfig.ControlPlane.TLSCACertFile,
-	)
-	runtimeConfig.ControlPlane.TLSCAKeyFile = stringEnvOrDefault(
-		envControlPlaneTLSCAKeyFile,
-		runtimeConfig.ControlPlane.TLSCAKeyFile,
-	)
-	runtimeConfig.ControlPlane.TLSServerCommonName = stringEnvOrDefault(
-		envControlPlaneTLSServerCommonName,
-		runtimeConfig.ControlPlane.TLSServerCommonName,
-	)
-
-	if sanDNSList, hasValue := commaSeparatedEnvList(envControlPlaneTLSServerSANDNS); hasValue {
-		// 显式设置空字符串时清空列表，便于运维在覆盖层执行回滚。
-		runtimeConfig.ControlPlane.TLSServerSANDNS = sanDNSList
-	}
-	if sanIPList, hasValue := commaSeparatedEnvList(envControlPlaneTLSServerSANIPs); hasValue {
-		runtimeConfig.ControlPlane.TLSServerSANIPs = sanIPList
-	}
-
-	serverCertTTL, err := durationEnvOrDefault(
-		envControlPlaneTLSServerCertTTL,
-		runtimeConfig.ControlPlane.TLSServerCertTTL,
-	)
-	if err != nil {
-		return err
-	}
-	runtimeConfig.ControlPlane.TLSServerCertTTL = serverCertTTL
-
-	serverCertRenewBefore, err := durationEnvOrDefault(
-		envControlPlaneTLSServerCertRenewBefore,
-		runtimeConfig.ControlPlane.TLSServerCertRenewBefore,
-	)
-	if err != nil {
-		return err
-	}
-	runtimeConfig.ControlPlane.TLSServerCertRenewBefore = serverCertRenewBefore
-	return nil
+	return app.ApplyControlPlaneTLSEnvOverrides(runtimeConfig)
 }
 
 // stringEnvOrDefault 读取字符串环境变量，空值时回退到默认值。

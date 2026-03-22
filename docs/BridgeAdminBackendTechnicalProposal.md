@@ -696,7 +696,7 @@ web/bridge-admin/
 当前 `cloud-bridge/web` 已按单页控制台形态收敛为以下固定结构：
 
 1. 左侧固定导航：按“运行视图 / 管理与配置”分组承载一级页面
-2. 顶栏：展示 breadcrumb、页面标题、快速跳页检索、SSE/轮询状态与 Token / 刷新控制
+2. 顶栏：采用吸顶布局，展示 breadcrumb、页面标题、SSE/轮询状态与手动刷新入口；状态说明通过徽章 Tooltip 展示
 3. Dashboard：采用“总览 Hero + KPI 条带 + 趋势/隧道状态双列 + 风险分区”布局
 4. 明细页：继续以表格、过滤器、详情抽屉为主，不把运行时内部对象直接裸露到页面外观层
 
@@ -711,7 +711,7 @@ web/bridge-admin/
 1. **先拿 snapshot，再做增量刷新**
 2. 高频页面使用轮询或 SSE，但只消费聚合事件
 3. 详情页尽量基于结构化对象展示，不拼接自由文本
-4. 顶栏检索优先用于“快速跳页 / 定位资源域”，不直接承载高风险写操作
+4. 顶栏应保持轻量，只承载页面定位、实时状态与手动刷新，不叠加搜索、鉴权录入等额外交互
 5. 所有运维按钮必须二次确认并记录审计信息
 
 ---
@@ -765,6 +765,13 @@ web/bridge-admin/
 
 * `GET /api/admin/config/snapshot`
 
+该快照返回合并后的生效配置，并附带以下稳定字段：
+
+* `config_version`：供 `PUT /api/admin/config` 做乐观并发控制
+* `config_file_path`：当前用户目录 override 配置文件路径
+* `base_config_file_path`：当前基础层配置文件路径（系统目录或显式 `-config` 文件）
+* `field_sources`：逐字段标记当前来源，取值为 `env | user | system | default`
+
 ### Logs / Metrics
 
 * `GET /api/admin/logs/search?from=<ts>&to=<ts>&cursor=<cursor>&limit=<n>`
@@ -798,7 +805,7 @@ web/bridge-admin/
 * `POST /api/admin/ops/session/:sessionId/drain`
 * `POST /api/admin/ops/connector/:connectorId/drain`
 * `POST /api/admin/ops/diagnose/export`
-* `PUT /api/admin/config`（需并发版本校验）
+* `PUT /api/admin/config`（需并发版本校验，支持 `application/json` 与 `application/yaml`）
 
 ### 约束
 
@@ -1022,6 +1029,21 @@ web/bridge-admin/
 * `GET /api/admin/config/snapshot` 返回 `config_version`
 * `PUT /api/admin/config` 必须携带 `if_match_version`
 * 若提交版本与当前版本不一致，返回 `409 Conflict` 并附带最新 `config_version`
+
+配置分层与持久化规则（强制）：
+
+* 运行时生效配置按 `环境变量 > 用户目录 > 系统目录 > 内置默认值` 合并
+* `PUT /api/admin/config` 只将用户修改项写入用户目录 override 文件，不回写系统目录与环境变量
+* `PUT /api/admin/config` 的 patch 值支持 `null`，表示从用户目录 override 中删除该字段并恢复继承更低优先级配置
+* `PUT /api/admin/config` 的 YAML 请求体支持嵌套 patch 结构，服务端会在入站时自动展平成稳定字段路径
+* `GET /api/admin/config/snapshot` 除 `config_file_path`、`base_config_file_path`、`field_sources` 外，还应返回 `editable_user_patch` 与 `field_restore_preview`，分别用于回填当前用户目录中可编辑的 override，以及展示删除 override 后会继承的来源和值
+* Linux 用户配置路径遵循 XDG：`$XDG_CONFIG_HOME/devbridge/bridge.yaml`，未设置时回退 `~/.config/devbridge/bridge.yaml`
+* Linux 系统配置路径为 `/etc/devbridge/bridge.yaml`
+* Windows 用户配置路径遵循 Shell Known Folders：`%APPDATA%\DevBridge\bridge.yaml`
+* Windows 系统配置路径遵循 Shell Known Folders：`%ProgramData%\DevBridge\bridge.yaml`
+* 管理台常用配置页应使用组件化表单展示，并为每个字段提供用途说明 tooltip icon、来源标签、重启提示；当字段被修改但尚未保存时，应直接展示“当前生效值 -> 保存后值”的差异预览；若当前来源为环境变量，预览需明确说明保存只会写入用户目录 override，而不会改变当前生效值；当字段来源为用户目录时，应支持“恢复继承值”按钮，并展示恢复后会继承的来源和值
+* 高级兜底入口应提供 YAML patch 编辑器和 YAML 快照预览，并支持一键回填当前 `editable_user_patch`；预览区域默认自动换行，并展示稳定行号，避免长行横向滚动时影响定位
+* 当前配置修改返回 `ApplyMode=staged_requires_restart`，表示已落盘但通常需要 reload 或 restart 才会完全生效
 
 ---
 

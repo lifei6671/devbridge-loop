@@ -18,22 +18,28 @@ import (
 type adminRuntimeConfigStore struct {
 	mutex sync.RWMutex
 
-	runtimeConfig  Config
-	configFilePath string
-	saveConfigFunc func(config Config, configFilePath string) error
-	configVersion  uint64
-	lastUpdatedAt  time.Time
-	lastOperatorID string
+	runtimeConfig   Config
+	configFilePath  string
+	baseConfigLayer map[string]any
+	userConfigLayer map[string]any
+	saveConfigFunc  func(layer map[string]any, configFilePath string) error
+	configVersion   uint64
+	lastUpdatedAt   time.Time
+	lastOperatorID  string
 }
 
 // newAdminRuntimeConfigStore 构建管理面配置快照存储。
 func newAdminRuntimeConfigStore(config Config) *adminRuntimeConfigStore {
+	userConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeConfigFilePath))
+	baseConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeBaseConfigFilePath))
 	return &adminRuntimeConfigStore{
-		runtimeConfig:  config,
-		configFilePath: strings.TrimSpace(config.RuntimeConfigFilePath),
-		saveConfigFunc: SaveConfigToYAMLFile,
-		configVersion:  1,
-		lastUpdatedAt:  time.Now().UTC(),
+		runtimeConfig:   config,
+		configFilePath:  strings.TrimSpace(config.RuntimeConfigFilePath),
+		baseConfigLayer: cloneRuntimeConfigLayerMap(baseConfigLayer),
+		userConfigLayer: cloneRuntimeConfigLayerMap(userConfigLayer),
+		saveConfigFunc:  saveRuntimeConfigLayerMapToFile,
+		configVersion:   1,
+		lastUpdatedAt:   time.Now().UTC(),
 	}
 }
 
@@ -47,8 +53,10 @@ func (store *adminRuntimeConfigStore) snapshot() map[string]any {
 	configVersion := store.configVersion
 	lastUpdatedAt := store.lastUpdatedAt
 	lastOperatorID := store.lastOperatorID
+	baseConfigLayer := cloneRuntimeConfigLayerMap(store.baseConfigLayer)
+	userConfigLayer := cloneRuntimeConfigLayerMap(store.userConfigLayer)
 	store.mutex.RUnlock()
-	return buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID)
+	return buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, baseConfigLayer, userConfigLayer)
 }
 
 // buildAdminConfigSnapshot 把配置结构转换为管理面稳定快照结构。
@@ -57,6 +65,8 @@ func buildAdminConfigSnapshot(
 	configVersion uint64,
 	lastUpdatedAt time.Time,
 	lastOperatorID string,
+	baseConfigLayer map[string]any,
+	userConfigLayer map[string]any,
 ) map[string]any {
 	authTokens := make([]map[string]any, 0, len(configCopy.Admin.AuthTokens))
 	for _, tokenConfig := range configCopy.Admin.AuthTokens {
@@ -66,9 +76,25 @@ func buildAdminConfigSnapshot(
 			"token": maskAdminToken(tokenConfig.Token),
 		})
 	}
+	fieldSources, err := buildRuntimeConfigFieldSources(baseConfigLayer, userConfigLayer)
+	if err != nil {
+		fieldSources = map[string]any{}
+	}
+	restorePreview, err := buildEditableRuntimeConfigRestorePreview(
+		strings.TrimSpace(configCopy.RuntimeBaseConfigFilePath),
+		baseConfigLayer,
+		userConfigLayer,
+	)
+	if err != nil {
+		restorePreview = map[string]any{}
+	}
 	return map[string]any{
-		"config_version":   configVersion,
-		"config_file_path": strings.TrimSpace(configCopy.RuntimeConfigFilePath),
+		"config_version":        configVersion,
+		"config_file_path":      strings.TrimSpace(configCopy.RuntimeConfigFilePath),
+		"base_config_file_path": strings.TrimSpace(configCopy.RuntimeBaseConfigFilePath),
+		"field_sources":         fieldSources,
+		"editable_user_patch":   buildEditableRuntimeConfigPatch(userConfigLayer),
+		"field_restore_preview": restorePreview,
 		"ingress": map[string]any{
 			"http_addr":      configCopy.Ingress.HTTPAddr,
 			"grpc_addr":      configCopy.Ingress.GRPCAddr,
@@ -130,7 +156,6 @@ func (store *adminRuntimeConfigStore) reload(now time.Time, actor string) (admin
 		normalizedNow = time.Now().UTC()
 	}
 	store.mutex.Lock()
-	// 通过版本自增表达“已执行一次受控重载请求”。
 	store.configVersion++
 	store.lastUpdatedAt = normalizedNow
 	store.lastOperatorID = strings.TrimSpace(actor)
@@ -173,144 +198,31 @@ func (store *adminRuntimeConfigStore) update(
 			request.IfMatchVersion,
 		)
 	}
-	// 仅允许白名单字段，避免管理接口变成任意配置写入器。
 	configCandidate := store.runtimeConfig
+	userConfigLayerCandidate := cloneRuntimeConfigLayerMap(store.userConfigLayer)
 	for _, patchKey := range sortedPatchKeys(request.Patch) {
 		patchValue := request.Patch[patchKey]
-		switch patchKey {
-		case "ingress.http_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.HTTPAddr = listenAddr
-		case "ingress.grpc_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.GRPCAddr = listenAddr
-		case "ingress.https_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.HTTPSAddr = listenAddr
-		case "ingress.tls_sni_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.TLSSNIAddr = listenAddr
-		case "ingress.tcp_port_range":
-			portRange, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.TCPPortRange = portRange
-		case "admin.enabled":
-			enabled, err := parsePatchBool(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Admin.Enabled = enabled
-		case "admin.listen_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Admin.ListenAddr = listenAddr
-		case "admin.allow_shared_listener":
-			allowSharedListener, err := parsePatchBool(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Admin.AllowSharedListener = allowSharedListener
-		case "admin.ui_enabled":
-			enabled, err := parsePatchBool(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Admin.UIEnabled = enabled
-		case "admin.base_path":
-			basePath, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Admin.BasePath = normalizeAdminUIBasePath(basePath)
-		case "ingress.base_domain":
-			baseDomain, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Ingress.BaseDomain = baseDomain
-		case "control_plane.listen_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.ControlPlane.ListenAddr = listenAddr
-		case "control_plane.grpc_h2_listen_addr":
-			listenAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.ControlPlane.GRPCH2ListenAddr = listenAddr
-		case "control_plane.heartbeat_timeout":
-			heartbeatTimeout, err := parsePatchDuration(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
-		case "control_plane.heartbeat_timeout_ms":
-			heartbeatTimeout, err := parsePatchDurationMillis(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
-		case "observability.log_level":
-			logLevel, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Observability.LogLevel = strings.TrimSpace(logLevel)
-		case "observability.metrics_addr":
-			metricsAddr, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.Observability.MetricsAddr = metricsAddr
-		case "default_scope.namespace":
-			namespace, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.DefaultScope.Namespace = namespace
-		case "default_scope.environment":
-			environment, err := parsePatchString(patchValue)
-			if err != nil {
-				return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
-			}
-			configCandidate.DefaultScope.Environment = environment
-		default:
-			return adminapi.ConfigUpdateResult{}, fmt.Errorf(
-				"%w: unsupported patch key=%s",
-				adminapi.ErrAdminInvalidArgument,
-				patchKey,
-			)
+		if err := applyRuntimeConfigPatch(&configCandidate, userConfigLayerCandidate, patchKey, patchValue); err != nil {
+			return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 		}
 	}
-	if err := configCandidate.Validate(); err != nil {
+	resolvedConfig, err := buildRuntimeConfigFromLayers(
+		strings.TrimSpace(store.runtimeConfig.RuntimeBaseConfigFilePath),
+		store.baseConfigLayer,
+		strings.TrimSpace(store.configFilePath),
+		userConfigLayerCandidate,
+	)
+	if err != nil {
 		return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 	}
 	configFilePath := strings.TrimSpace(store.configFilePath)
 	if configFilePath != "" && store.saveConfigFunc != nil {
-		configCandidate.RuntimeConfigFilePath = configFilePath
-		if saveErr := store.saveConfigFunc(configCandidate, configFilePath); saveErr != nil {
+		if saveErr := store.saveConfigFunc(userConfigLayerCandidate, configFilePath); saveErr != nil {
 			return adminapi.ConfigUpdateResult{}, fmt.Errorf("persist config file failed: %w", saveErr)
 		}
 	}
-	store.runtimeConfig = configCandidate
+	store.userConfigLayer = cloneRuntimeConfigLayerMap(userConfigLayerCandidate)
+	store.runtimeConfig = resolvedConfig
 	store.configVersion++
 	store.lastUpdatedAt = normalizedNow
 	store.lastOperatorID = strings.TrimSpace(actor)
@@ -318,9 +230,11 @@ func (store *adminRuntimeConfigStore) update(
 	configVersion := store.configVersion
 	lastUpdatedAt := store.lastUpdatedAt
 	lastOperatorID := store.lastOperatorID
+	baseConfigLayer := cloneRuntimeConfigLayerMap(store.baseConfigLayer)
+	userConfigLayer := cloneRuntimeConfigLayerMap(store.userConfigLayer)
 	return adminapi.ConfigUpdateResult{
 		ConfigVersion:   configVersion,
-		Snapshot:        buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID),
+		Snapshot:        buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, baseConfigLayer, userConfigLayer),
 		ApplyMode:       "staged_requires_restart",
 		RequiresRestart: true,
 	}, nil

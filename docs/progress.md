@@ -123,6 +123,146 @@
   - `docs/task_plan.md`（modified）
   - `docs/progress.md`（updated）
 
+## Session: 2026-03-22
+
+### Phase 10: 运维配置组件化与分层配置持久化
+- **Status:** complete
+- Actions taken:
+  - 新增运行时配置分层加载：`环境变量 > 用户目录 > 系统目录 > 默认值`，并按 Linux XDG / Windows Known Folders 解析配置路径。
+  - `adminRuntimeConfigStore` 改为只把用户 patch 写回用户目录 override 文件，`/api/admin/config/snapshot` 同步返回 `config_file_path`、`base_config_file_path`、`field_sources`、`editable_user_patch`、`field_restore_preview`。
+  - `PUT /api/admin/config` 支持用 `null` 删除用户目录 override 字段，恢复继承系统目录或默认值。
+  - 运维页重构为组件化常用配置表单：每项展示说明 tooltip icon、来源 badge、重启提示；字段有未保存改动时会直接展示“当前值 -> 保存后值”的差异预览，且环境变量来源会额外提示保存仅写入用户目录 override；来源为用户目录的字段支持“恢复继承值”，并直接展示恢复后会继承的来源和值；高级区新增 YAML patch 编辑器、用户 patch 回填和 YAML 快照预览。
+- Files created/modified:
+  - `cloud-bridge/runtime/bridge/app/runtime_config_loader.go`（created）
+  - `cloud-bridge/runtime/bridge/app/runtime_config_loader_test.go`（created）
+  - `cloud-bridge/runtime/bridge/app/admin_runtime_config_store_test.go`（created）
+  - `cloud-bridge/runtime/bridge/app/admin_runtime_ops.go`（modified）
+  - `cloud-bridge/cmd/cloud-bridge/main.go`（modified）
+  - `cloud-bridge/web/src/admin/components/pages/OpsPage.tsx`（modified）
+  - `cloud-bridge/web/src/admin/components/ops/ConfigFieldRow.tsx`（modified）
+  - `cloud-bridge/web/src/admin/components/ops/ConfigSectionCard.tsx`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminOpsActions.ts`（modified）
+  - `cloud-bridge/web/src/admin/model/ops-config.ts`（created）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/BridgeAdminBackendTechnicalProposal.md`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 11: 管理台吸顶头部精简
+- **Status:** complete
+- Actions taken:
+  - 管理台统一头部重构为吸顶布局，滚动页面时始终固定在顶部。
+  - 移除顶栏搜索框、Bearer Token 应用入口、自动刷新开关与刷新间隔选择，只保留页面标题、实时状态和手动刷新。
+  - 清理前端 view model 中已不再使用的快速跳页、token 草稿与相关动作出口，并避免旧 localStorage 自动刷新偏好导致隐藏状态残留。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/AdminShell.tsx`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminConsole.ts`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminConsoleActions.ts`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminConsoleState.ts`（modified）
+  - `cloud-bridge/web/src/admin/model/pages.ts`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/BridgeAdminBackendTechnicalProposal.md`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 12: 实时状态提示改为徽章 Tooltip
+- **Status:** complete
+- Actions taken:
+  - 移除顶栏实时状态旁的常显说明文本，避免和页面标题区争抢视觉焦点。
+  - 将实时状态徽章改为 Tooltip 触发器，鼠标悬浮时再展示状态说明。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/AdminShell.tsx`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/BridgeAdminBackendTechnicalProposal.md`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 13: 隧道流量摘要头部信息分离
+- **Status:** complete
+- Actions taken:
+  - 将 `Tunnel Pool 摘要` 右侧的视图来源与更新时间拆成两个独立信息块，避免视觉黏连。
+  - 为流量页摘要头部补充独立布局样式，并在较窄宽度下允许自然换行。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/pages/TrafficPage.tsx`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 14: 侧边栏当前视图卡片移除
+- **Status:** complete
+- Actions taken:
+  - 移除左上角“当前视图”卡片，让侧边栏从品牌区直接进入菜单分组。
+  - 清理壳层派生状态里的 `sidebarContext` 以及对应无用样式，避免留下悬空结构。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/AdminShell.tsx`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminConsole.ts`（modified）
+  - `cloud-bridge/web/src/admin/hooks/useAdminConsoleDerived.ts`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 15: YAML 预览自动换行与行号
+- **Status:** complete
+- Actions taken:
+  - 将配置运维页的 YAML 示例与当前快照预览改成自动换行显示，避免长行触发横向滚动。
+  - 为预览区域增加稳定行号列，帮助用户在自动换行后仍然明确定位内容。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/ops/LineNumberCodeBlock.tsx`（created）
+  - `cloud-bridge/web/src/admin/components/pages/OpsPage.tsx`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 16: 配置运维页横向溢出收口
+- **Status:** complete
+- Actions taken:
+  - 定位到整页横向滚动来自配置运维页嵌套 grid 子项默认 `min-width: auto`，导致 YAML 卡片与快照容器会把外层页面一起撑宽。
+  - 为 `panel`、`snapshot-box`、`ops-yaml-grid`、`ops-yaml-card` 等关键容器补充 `min-width: 0` / `max-width: 100%` 约束，让长内容只在预期容器内换行或滚动，不再触发整页横向滚动条。
+- Files created/modified:
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 17: 配置卡片头部换行收缩
+- **Status:** complete
+- Actions taken:
+  - 进一步定位到横向滚动条由配置字段卡片头部触发：左侧标题说明与右侧来源 badge / 重启 badge / 恢复按钮在 section 双列布局下共同撑宽页面。
+  - 为 `ui-card`、`config-section-*`、`config-field-*` 一整条容器链补充 `min-width: 0`，并让字段头部与 section 头部支持内部换行，确保右侧状态块只在卡片内折行，不再把整页撑出横向滚动条。
+- Files created/modified:
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 18: Tooltip 隐藏态溢出修复
+- **Status:** complete
+- Actions taken:
+  - 继续定位发现配置卡片里的说明 Tooltip 在未显示时仍以绝对定位节点存在，浏览器会把它计入页面可滚动宽度，导致整页仍出现横向滚动条。
+  - 将 Tooltip 隐藏态改为默认 `display: none`，只在 hover / focus 时显示；同时将配置项说明 Tooltip 改为 `start` 对齐，减少显示态越过卡片边界的概率。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/ops/ConfigFieldRow.tsx`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 19: 配置 section 网格自动回落
+- **Status:** complete
+- Actions taken:
+  - 结合用户反馈，进一步把运维配置 section 网格从固定双列改为按可读宽度自动回落的布局，避免某一张 section 卡片在宽度不足时继续横向挤压整页。
+  - `config-section-grid` 现在要求单张卡片至少保留更宽的阅读宽度；主内容区不足以同时容纳两张卡片时会自动退回单列。
+- Files created/modified:
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 20: Switch 隐藏输入宽度收口
+- **Status:** complete
+- Actions taken:
+  - 根据用户排查结果，确认横向滚动条的直接来源是 `Switch` 组件中的隐藏 checkbox：`ui-switch-input` 仅做了透明处理，但没有收成真正不占布局宽度的视觉隐藏态。
+  - 为 `ui-switch` 增加相对定位与固定轨道尺寸，并把 `ui-switch-input` 改成标准的无障碍隐藏写法（1px + clip / clip-path），确保隐藏输入不会再参与页面宽度计算。
+- Files created/modified:
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
+### Phase 21: 隧道流量摘要卡片自适应换列
+- **Status:** complete
+- Actions taken:
+  - 定位到 DevTools 打开后的卡片挤压来自隧道流量页摘要区域仍在硬撑固定 6 列的紧凑 KPI 网格。
+  - 为 traffic 页面单独引入 `traffic-kpi-grid`，改用 `auto-fit + minmax(210px, 1fr)` 的自适应列数，让摘要卡片按可用宽度自动换列，不再在中间宽度下挤成一团。
+- Files created/modified:
+  - `cloud-bridge/web/src/admin/components/pages/TrafficPage.tsx`（modified）
+  - `cloud-bridge/web/src/index.css`（modified）
+  - `docs/progress.md`（updated）
+
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
@@ -140,6 +280,12 @@
 | 安全收口回归测试 | `cd cloud-bridge && go test ./runtime/bridge/adminapi ./runtime/bridge/app -count=1` | 通过 | 通过 | ✓ |
 | BMA-16 导出链路集成测试 | `cd cloud-bridge && go test ./runtime/bridge/app -run TestAdminDiagnoseExportDownloadLifecycleOnSingleServer -count=1` | 通过 | 通过 | ✓ |
 | BMA-16 Cookie+CSRF 集成测试 | `cd cloud-bridge && go test ./runtime/bridge/app -run TestBootstrapCookieAuthWriteRequiresCSRFOnSingleServer -count=1` | 通过 | 通过 | ✓ |
+| Admin 配置 YAML patch 回归 | `cd cloud-bridge && go test -timeout 60s ./runtime/bridge/adminapi -run TestConfigUpdateAcceptsYAMLBody -count=1` | 通过 | 通过 | ✓ |
+| 用户 override 恢复继承与预览回归 | `cd cloud-bridge && go test -timeout 60s ./runtime/bridge/app -run TestAdminRuntimeConfigStoreUpdateNullPatchRemovesUserOverrideAndExposesEditablePatch -count=1` | 通过 | 通过 | ✓ |
+| 分层配置加载与用户 override 回归 | `cd cloud-bridge && go test -timeout 60s ./runtime/bridge/adminapi ./runtime/bridge/app/... ./cmd/cloud-bridge/...` | 通过 | 通过 | ✓ |
+| cloud-bridge 全量编译校验 | `cd cloud-bridge && go build ./...` | 通过 | 通过 | ✓ |
+| 运维配置页类型检查 | `cd cloud-bridge/web && ./node_modules/.bin/tsc --noEmit -p tsconfig.json` | 通过 | 通过 | ✓ |
+| 运维配置页构建校验 | `cd cloud-bridge/web && npm run build` | 通过 | 通过 | ✓ |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |

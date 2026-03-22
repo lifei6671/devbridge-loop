@@ -70,8 +70,10 @@ type Config struct {
 	DefaultScope  pb.Scope            `yaml:"default_scope"`
 	// FallbackPolicies 定义按 namespace 生效的 scope 降级链。
 	FallbackPolicies []pb.ScopeFallbackPolicy `yaml:"fallback_policies"`
-	// RuntimeConfigFilePath 记录当前配置来源文件路径（仅运行时使用，不参与 YAML 编解码）。
+	// RuntimeConfigFilePath 记录用户目录配置文件路径（仅运行时使用，不参与 YAML 编解码）。
 	RuntimeConfigFilePath string `yaml:"-"`
+	// RuntimeBaseConfigFilePath 记录系统/显式基础配置文件路径（仅运行时使用，不参与 YAML 编解码）。
+	RuntimeBaseConfigFilePath string `yaml:"-"`
 }
 
 type IngressConfig struct {

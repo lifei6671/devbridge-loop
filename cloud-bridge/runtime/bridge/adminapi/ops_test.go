@@ -139,6 +139,79 @@ func TestConfigUpdateReturnsConflict(testingObject *testing.T) {
 	}
 }
 
+// TestConfigUpdateAcceptsYAMLBody 验证配置更新接口支持 YAML 请求体，并把嵌套 patch 展平成稳定 key。
+func TestConfigUpdateAcceptsYAMLBody(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	var callbackCalled bool
+	var receivedRequest ConfigUpdateRequest
+	var receivedActor string
+
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			UpdateConfig: func(now time.Time, request ConfigUpdateRequest, actor string) (ConfigUpdateResult, error) {
+				callbackCalled = true
+				receivedRequest = request
+				receivedActor = actor
+				return ConfigUpdateResult{
+					ConfigVersion: 2,
+					Snapshot: map[string]any{
+						"config_version": 2,
+					},
+					ApplyMode:       "staged_requires_restart",
+					RequiresRestart: true,
+				}, nil
+			},
+		},
+		BearerTokens: []BearerToken{
+			{Name: "admin-user", Token: "admin-token", Role: RoleAdmin},
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/config",
+		strings.NewReader(`if_match_version: 1
+patch:
+  observability:
+    log_level: debug
+  admin:
+    enabled: true
+`),
+	)
+	request.Header.Set("Authorization", "Bearer admin-token")
+	request.Header.Set("Content-Type", "application/yaml")
+	mux.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if callbackCalled {
+	} else {
+		testingObject.Fatalf("expected update callback called")
+	}
+	if receivedRequest.IfMatchVersion != 1 {
+		testingObject.Fatalf("unexpected if_match_version: got=%d want=1", receivedRequest.IfMatchVersion)
+	}
+	if receivedRequest.Patch["observability.log_level"] == "debug" {
+	} else {
+		testingObject.Fatalf("unexpected flattened observability.log_level: got=%v", receivedRequest.Patch["observability.log_level"])
+	}
+	if receivedRequest.Patch["admin.enabled"] == true {
+	} else {
+		testingObject.Fatalf("unexpected flattened admin.enabled: got=%v", receivedRequest.Patch["admin.enabled"])
+	}
+	if receivedActor != "admin-user" {
+		testingObject.Fatalf("unexpected actor: got=%s want=admin-user", receivedActor)
+	}
+}
+
 // TestDiagnoseExportDownloadMasksSensitiveFields 验证导出链路会脱敏敏感字段。
 func TestDiagnoseExportDownloadMasksSensitiveFields(testingObject *testing.T) {
 	testingObject.Parallel()
