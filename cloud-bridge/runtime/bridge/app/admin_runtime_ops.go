@@ -68,14 +68,7 @@ func buildAdminConfigSnapshot(
 	baseConfigLayer map[string]any,
 	userConfigLayer map[string]any,
 ) map[string]any {
-	authTokens := make([]map[string]any, 0, len(configCopy.Admin.AuthTokens))
-	for _, tokenConfig := range configCopy.Admin.AuthTokens {
-		authTokens = append(authTokens, map[string]any{
-			"name":  strings.TrimSpace(tokenConfig.Name),
-			"role":  strings.TrimSpace(tokenConfig.Role),
-			"token": maskAdminToken(tokenConfig.Token),
-		})
-	}
+	authProviders := buildAdminAuthProviderSnapshot(configCopy.Admin.AuthProviders)
 	fieldSources, err := buildRuntimeConfigFieldSources(baseConfigLayer, userConfigLayer)
 	if err != nil {
 		fieldSources = map[string]any{}
@@ -109,9 +102,8 @@ func buildAdminConfigSnapshot(
 			"allow_shared_listener": configCopy.Admin.AllowSharedListener,
 			"base_path":             normalizeAdminUIBasePath(configCopy.Admin.BasePath),
 			"ui_enabled":            configCopy.Admin.UIEnabled,
-			"auth_mode":             configCopy.Admin.AuthMode,
-			"auth_tokens":           authTokens,
-			"cookie_token_name":     strings.TrimSpace(configCopy.Admin.CookieTokenName),
+			"auth_providers":        authProviders,
+			"session_cookie_name":   strings.TrimSpace(configCopy.Admin.SessionCookieName),
 			"csrf_cookie_name":      strings.TrimSpace(configCopy.Admin.CSRFCookieName),
 			"csrf_header_name":      strings.TrimSpace(configCopy.Admin.CSRFHeaderName),
 			"allowed_origins":       append([]string(nil), configCopy.Admin.AllowedOrigins...),

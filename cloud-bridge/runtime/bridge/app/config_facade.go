@@ -11,8 +11,17 @@ type IngressConfig = appconfig.IngressConfig
 // AdminConfig 对外保持管理面配置类型别名。
 type AdminConfig = appconfig.AdminConfig
 
-// AdminAuthTokenConfig 对外保持管理面静态 Token 配置类型别名。
-type AdminAuthTokenConfig = appconfig.AdminAuthTokenConfig
+// AdminLegacyAuthTokenConfig 对外保持旧版静态 token 配置类型别名，供升级兼容迁移使用。
+type AdminLegacyAuthTokenConfig = appconfig.AdminLegacyAuthTokenConfig
+
+// AdminAuthProviderConfig 对外保持管理面认证 provider 配置类型别名。
+type AdminAuthProviderConfig = appconfig.AdminAuthProviderConfig
+
+// AdminPasswordProviderConfig 对外保持本地用户名密码 provider 配置类型别名。
+type AdminPasswordProviderConfig = appconfig.AdminPasswordProviderConfig
+
+// AdminPasswordAccountConfig 对外保持本地登录账号配置类型别名。
+type AdminPasswordAccountConfig = appconfig.AdminPasswordAccountConfig
 
 // ObservabilityConfig 对外保持观测配置类型别名。
 type ObservabilityConfig = appconfig.ObservabilityConfig

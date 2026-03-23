@@ -33,15 +33,15 @@ func TestOperatorCanDrainSession(testingObject *testing.T) {
 				}, nil
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "operator-user", Token: "operator-token", Role: RoleOperator},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "operator-user", password: "operator-pass", role: RoleOperator}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "operator-user", "operator-pass")
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
@@ -49,8 +49,8 @@ func TestOperatorCanDrainSession(testingObject *testing.T) {
 		"/api/admin/ops/session/session-1/drain",
 		strings.NewReader(`{"reason":"manual_drain"}`),
 	)
-	request.Header.Set("Authorization", "Bearer operator-token")
 	request.Header.Set("Content-Type", "application/json")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusOK {
@@ -81,15 +81,15 @@ func TestViewerCannotDrainSession(testingObject *testing.T) {
 				return DrainResult{}, nil
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
@@ -97,8 +97,8 @@ func TestViewerCannotDrainSession(testingObject *testing.T) {
 		"/api/admin/ops/session/session-1/drain",
 		strings.NewReader(`{"reason":"manual_drain"}`),
 	)
-	request.Header.Set("Authorization", "Bearer viewer-token")
 	request.Header.Set("Content-Type", "application/json")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusForbidden)
@@ -115,15 +115,15 @@ func TestConfigUpdateReturnsConflict(testingObject *testing.T) {
 				return ConfigUpdateResult{}, fmt.Errorf("%w: stale version", ErrAdminVersionConflict)
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "admin-user", Token: "admin-token", Role: RoleAdmin},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "admin-user", password: "admin-pass", role: RoleAdmin}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "admin-user", "admin-pass")
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
@@ -131,8 +131,8 @@ func TestConfigUpdateReturnsConflict(testingObject *testing.T) {
 		"/api/admin/config",
 		strings.NewReader(`{"if_match_version":1,"patch":{"observability.log_level":"debug"}}`),
 	)
-	request.Header.Set("Authorization", "Bearer admin-token")
 	request.Header.Set("Content-Type", "application/json")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusConflict {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusConflict, recorder.Body.String())
@@ -163,15 +163,15 @@ func TestConfigUpdateAcceptsYAMLBody(testingObject *testing.T) {
 				}, nil
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "admin-user", Token: "admin-token", Role: RoleAdmin},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "admin-user", password: "admin-pass", role: RoleAdmin}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "admin-user", "admin-pass")
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
@@ -185,8 +185,8 @@ patch:
     enabled: true
 `),
 	)
-	request.Header.Set("Authorization", "Bearer admin-token")
 	request.Header.Set("Content-Type", "application/yaml")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusOK {
@@ -221,10 +221,17 @@ func TestDiagnoseExportDownloadMasksSensitiveFields(testingObject *testing.T) {
 			BuildConfigSnapshot: func() map[string]any {
 				return map[string]any{
 					"admin": map[string]any{
-						"auth_tokens": []map[string]any{
+						"auth_providers": []map[string]any{
 							{
-								"name":  "admin",
-								"token": "plain-secret-token",
+								"name": "local-password",
+								"password": map[string]any{
+									"accounts": []map[string]any{
+										{
+											"username": "admin",
+											"password": "plain-secret-token",
+										},
+									},
+								},
 							},
 						},
 					},
@@ -232,19 +239,19 @@ func TestDiagnoseExportDownloadMasksSensitiveFields(testingObject *testing.T) {
 				}
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "admin-user", Token: "admin-token", Role: RoleAdmin},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "admin-user", password: "admin-pass", role: RoleAdmin}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "admin-user", "admin-pass")
 
 	exportRecorder := httptest.NewRecorder()
 	exportRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/diagnose/export", nil)
-	exportRequest.Header.Set("Authorization", "Bearer admin-token")
+	applyTestSession(exportRequest, session)
 	mux.ServeHTTP(exportRecorder, exportRequest)
 	if exportRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", exportRecorder.Code, http.StatusOK, exportRecorder.Body.String())
@@ -263,7 +270,7 @@ func TestDiagnoseExportDownloadMasksSensitiveFields(testingObject *testing.T) {
 
 	downloadRecorder := httptest.NewRecorder()
 	downloadRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	downloadRequest.Header.Set("Authorization", "Bearer admin-token")
+	applyTestSession(downloadRequest, session)
 	mux.ServeHTTP(downloadRecorder, downloadRequest)
 	if downloadRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected download status: got=%d want=%d body=%s", downloadRecorder.Code, http.StatusOK, downloadRecorder.Body.String())
@@ -291,26 +298,25 @@ func TestCookieAuthWriteRequiresValidCSRF(testingObject *testing.T) {
 				}, nil
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "operator-user", Token: "cookie-operator-token", Role: RoleOperator},
-		},
-		AuthMode:        "cookie",
-		CookieTokenName: "bridge_admin_token",
-		CSRFCookieName:  "bridge_admin_csrf",
-		CSRFHeaderName:  "X-CSRF-Token",
-		AllowedOrigins:  []string{"http://127.0.0.1:39081"},
+		AuthProviders:     newAuthProvidersForTest(testAuthAccount{username: "operator-user", password: "operator-pass", role: RoleOperator}),
+		SessionCookieName: "bridge_admin_session",
+		CSRFCookieName:    "bridge_admin_csrf",
+		CSRFHeaderName:    "X-CSRF-Token",
+		AllowedOrigins:    []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "operator-user", "operator-pass")
 
 	invalidRecorder := httptest.NewRecorder()
 	invalidRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/config/reload", nil)
-	invalidRequest.AddCookie(&http.Cookie{Name: "bridge_admin_token", Value: "cookie-operator-token"})
-	invalidRequest.AddCookie(&http.Cookie{Name: "bridge_admin_csrf", Value: "csrf-token-1"})
-	invalidRequest.Header.Set("Origin", "http://127.0.0.1:39081")
+	for _, cookie := range session.cookies {
+		invalidRequest.AddCookie(cookie)
+	}
+	invalidRequest.Header.Set("Origin", testAllowedOrigin)
 	// 缺失 CSRF Header，应被拒绝。
 	mux.ServeHTTP(invalidRecorder, invalidRequest)
 	if invalidRecorder.Code != http.StatusForbidden {
@@ -322,10 +328,7 @@ func TestCookieAuthWriteRequiresValidCSRF(testingObject *testing.T) {
 
 	validRecorder := httptest.NewRecorder()
 	validRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/config/reload", nil)
-	validRequest.AddCookie(&http.Cookie{Name: "bridge_admin_token", Value: "cookie-operator-token"})
-	validRequest.AddCookie(&http.Cookie{Name: "bridge_admin_csrf", Value: "csrf-token-2"})
-	validRequest.Header.Set("Origin", "http://127.0.0.1:39081")
-	validRequest.Header.Set("X-CSRF-Token", "csrf-token-2")
+	applyTestSession(validRequest, session)
 	mux.ServeHTTP(validRecorder, validRequest)
 	if validRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status for valid csrf request: got=%d want=%d body=%s", validRecorder.Code, http.StatusOK, validRecorder.Body.String())
@@ -340,20 +343,23 @@ func TestDiagnoseExportDownloadEnforcesIssuerAndOneTimeUse(testingObject *testin
 	testingObject.Parallel()
 
 	server, err := NewServer(ServerOptions{
-		BearerTokens: []BearerToken{
-			{Name: "admin-a", Token: "admin-a-token", Role: RoleAdmin},
-			{Name: "admin-b", Token: "admin-b-token", Role: RoleAdmin},
-		},
+		AuthProviders: newAuthProvidersForTest(
+			testAuthAccount{username: "admin-a", password: "admin-a-pass", role: RoleAdmin},
+			testAuthAccount{username: "admin-b", password: "admin-b-pass", role: RoleAdmin},
+		),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
 	}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	sessionA := loginAsTestUser(testingObject, mux, "admin-a", "admin-a-pass")
+	sessionB := loginAsTestUser(testingObject, mux, "admin-b", "admin-b-pass")
 
 	exportRecorder := httptest.NewRecorder()
 	exportRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/diagnose/export", nil)
-	exportRequest.Header.Set("Authorization", "Bearer admin-a-token")
+	applyTestSession(exportRequest, sessionA)
 	mux.ServeHTTP(exportRecorder, exportRequest)
 	if exportRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected export status: got=%d want=%d body=%s", exportRecorder.Code, http.StatusOK, exportRecorder.Body.String())
@@ -367,7 +373,7 @@ func TestDiagnoseExportDownloadEnforcesIssuerAndOneTimeUse(testingObject *testin
 
 	forbiddenRecorder := httptest.NewRecorder()
 	forbiddenRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	forbiddenRequest.Header.Set("Authorization", "Bearer admin-b-token")
+	applyTestSession(forbiddenRequest, sessionB)
 	mux.ServeHTTP(forbiddenRecorder, forbiddenRequest)
 	if forbiddenRecorder.Code != http.StatusForbidden {
 		testingObject.Fatalf("unexpected download status for wrong actor: got=%d want=%d body=%s", forbiddenRecorder.Code, http.StatusForbidden, forbiddenRecorder.Body.String())
@@ -375,7 +381,7 @@ func TestDiagnoseExportDownloadEnforcesIssuerAndOneTimeUse(testingObject *testin
 
 	successRecorder := httptest.NewRecorder()
 	successRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	successRequest.Header.Set("Authorization", "Bearer admin-a-token")
+	applyTestSession(successRequest, sessionA)
 	mux.ServeHTTP(successRecorder, successRequest)
 	if successRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected download status for issuer: got=%d want=%d body=%s", successRecorder.Code, http.StatusOK, successRecorder.Body.String())
@@ -386,7 +392,7 @@ func TestDiagnoseExportDownloadEnforcesIssuerAndOneTimeUse(testingObject *testin
 
 	replayRecorder := httptest.NewRecorder()
 	replayRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	replayRequest.Header.Set("Authorization", "Bearer admin-a-token")
+	applyTestSession(replayRequest, sessionA)
 	mux.ServeHTTP(replayRecorder, replayRequest)
 	if replayRecorder.Code != http.StatusNotFound {
 		testingObject.Fatalf("unexpected replay status: got=%d want=%d body=%s", replayRecorder.Code, http.StatusNotFound, replayRecorder.Body.String())

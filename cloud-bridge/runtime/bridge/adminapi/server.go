@@ -26,18 +26,10 @@ const (
 	defaultAuditLogLimit = 512
 	// maxTimeWindow 定义 logs/metrics 查询窗口上限（24 小时）。
 	maxTimeWindow = 24 * time.Hour
-	// defaultAdminAuthMode 定义默认鉴权模式（Bearer）。
-	defaultAdminAuthMode = "bearer"
-	// defaultCookieTokenName 定义 cookie 鉴权模式 token cookie 默认名称。
-	defaultCookieTokenName = "devbridge_admin_token"
 	// defaultCSRFCookieName 定义 cookie 鉴权模式 csrf cookie 默认名称。
 	defaultCSRFCookieName = "devbridge_admin_csrf"
 	// defaultCSRFHeaderName 定义 cookie 鉴权模式 csrf header 默认名称。
 	defaultCSRFHeaderName = "X-CSRF-Token"
-	// adminAuthModeBearer 表示 Header Bearer 鉴权模式。
-	adminAuthModeBearer = "bearer"
-	// adminAuthModeCookie 表示 Cookie 鉴权模式。
-	adminAuthModeCookie = "cookie"
 )
 
 // Role 定义管理后台权限角色。
@@ -51,13 +43,6 @@ const (
 	// RoleAdmin 配置管理 + 运维角色。
 	RoleAdmin Role = "admin"
 )
-
-// BearerToken 定义静态 Bearer Token 与角色映射。
-type BearerToken struct {
-	Name  string
-	Token string
-	Role  Role
-}
 
 // TunnelPoolReportSnapshot 定义 Agent tunnel 池上报的只读快照模型。
 type TunnelPoolReportSnapshot struct {
@@ -137,13 +122,11 @@ type Dependencies struct {
 // ServerOptions 定义管理后台 API 服务构造参数。
 type ServerOptions struct {
 	Dependencies  Dependencies
-	BearerTokens  []BearerToken
+	AuthProviders []AuthProviderConfig
 	MaxPageLimit  int
 	AuditLogLimit int
-	// AuthMode 定义管理 API 鉴权模式，支持 bearer/cookie。
-	AuthMode string
-	// CookieTokenName 定义 cookie 鉴权模式 token cookie 名。
-	CookieTokenName string
+	// SessionCookieName 定义会话 cookie 名。
+	SessionCookieName string
 	// CSRFCookieName 定义 cookie 鉴权模式 CSRF cookie 名。
 	CSRFCookieName string
 	// CSRFHeaderName 定义 cookie 鉴权模式 CSRF 请求头名。
@@ -170,48 +153,36 @@ type AuditRecord struct {
 }
 
 type principal struct {
-	name string
-	role Role
+	name        string
+	displayName string
+	provider    string
+	role        Role
 }
 
 type contextKey string
 
 const principalContextKey contextKey = "adminapi.principal"
 
-type authOptions struct {
-	allowAccessTokenQuery bool
-}
-
 // Server 定义 Bridge 管理后台只读 API 服务。
 type Server struct {
-	dependencies    Dependencies
-	tokenLookup     map[string]principal
-	maxPageLimit    int
-	auditLogs       *auditLogStore
-	exportStore     *diagnoseExportStore
-	authMode        string
-	cookieTokenName string
-	csrfCookieName  string
-	csrfHeaderName  string
-	allowedOrigins  map[string]struct{}
+	dependencies        Dependencies
+	authProviders       map[string]authProvider
+	providerDescriptors []authProviderDescriptor
+	sessionStore        *authSessionStore
+	maxPageLimit        int
+	auditLogs           *auditLogStore
+	exportStore         *diagnoseExportStore
+	sessionCookieName   string
+	csrfCookieName      string
+	csrfHeaderName      string
+	allowedOrigins      map[string]struct{}
 }
 
 // NewServer 创建管理后台 API 服务实例。
 func NewServer(options ServerOptions) (*Server, error) {
-	tokenLookup := make(map[string]principal, len(options.BearerTokens))
-	for _, tokenConfig := range options.BearerTokens {
-		normalizedToken := strings.TrimSpace(tokenConfig.Token)
-		if normalizedToken == "" {
-			return nil, fmt.Errorf("new admin api server: empty bearer token")
-		}
-		normalizedRole, ok := normalizeRole(string(tokenConfig.Role))
-		if !ok {
-			return nil, fmt.Errorf("new admin api server: unsupported role=%s", tokenConfig.Role)
-		}
-		tokenLookup[normalizedToken] = principal{
-			name: strings.TrimSpace(tokenConfig.Name),
-			role: normalizedRole,
-		}
+	authProviders, providerDescriptors, err := buildAuthProviders(options.AuthProviders)
+	if err != nil {
+		return nil, fmt.Errorf("new admin api server: %w", err)
 	}
 	maxPageLimit := options.MaxPageLimit
 	if maxPageLimit <= 0 {
@@ -221,16 +192,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if auditLogLimit <= 0 {
 		auditLogLimit = defaultAuditLogLimit
 	}
-	authMode := strings.ToLower(strings.TrimSpace(options.AuthMode))
-	if authMode == "" {
-		authMode = defaultAdminAuthMode
-	}
-	if authMode != adminAuthModeBearer && authMode != adminAuthModeCookie {
-		return nil, fmt.Errorf("new admin api server: unsupported auth mode=%s", options.AuthMode)
-	}
-	cookieTokenName := strings.TrimSpace(options.CookieTokenName)
-	if cookieTokenName == "" {
-		cookieTokenName = defaultCookieTokenName
+	sessionCookieName := strings.TrimSpace(options.SessionCookieName)
+	if sessionCookieName == "" {
+		sessionCookieName = defaultAdminSessionCookieName
 	}
 	csrfCookieName := strings.TrimSpace(options.CSRFCookieName)
 	if csrfCookieName == "" {
@@ -241,20 +205,21 @@ func NewServer(options ServerOptions) (*Server, error) {
 		csrfHeaderName = defaultCSRFHeaderName
 	}
 	allowedOrigins := normalizeAllowedOrigins(options.AllowedOrigins)
-	if authMode == adminAuthModeCookie && len(allowedOrigins) == 0 {
-		return nil, fmt.Errorf("new admin api server: empty allowed origins in cookie auth mode")
+	if len(allowedOrigins) == 0 {
+		return nil, fmt.Errorf("new admin api server: empty allowed origins")
 	}
 	server := &Server{
-		dependencies:    options.Dependencies,
-		tokenLookup:     tokenLookup,
-		maxPageLimit:    maxPageLimit,
-		auditLogs:       newAuditLogStore(auditLogLimit),
-		exportStore:     newDiagnoseExportStore(defaultDiagnoseExportLimit, defaultDiagnoseExportTTL),
-		authMode:        authMode,
-		cookieTokenName: cookieTokenName,
-		csrfCookieName:  csrfCookieName,
-		csrfHeaderName:  csrfHeaderName,
-		allowedOrigins:  allowedOrigins,
+		dependencies:        options.Dependencies,
+		authProviders:       authProviders,
+		providerDescriptors: providerDescriptors,
+		sessionStore:        newAuthSessionStore(0),
+		maxPageLimit:        maxPageLimit,
+		auditLogs:           newAuditLogStore(auditLogLimit),
+		exportStore:         newDiagnoseExportStore(defaultDiagnoseExportLimit, defaultDiagnoseExportTTL),
+		sessionCookieName:   sessionCookieName,
+		csrfCookieName:      csrfCookieName,
+		csrfHeaderName:      csrfHeaderName,
+		allowedOrigins:      allowedOrigins,
 	}
 	return server, nil
 }
@@ -264,6 +229,10 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	if server == nil || mux == nil {
 		return
 	}
+	mux.HandleFunc("/api/admin/auth/providers", server.handleAuthProviders)
+	mux.HandleFunc("/api/admin/auth/session", server.handleAuthSession)
+	mux.HandleFunc("/api/admin/auth/login", server.handleAuthLogin)
+	mux.HandleFunc("/api/admin/auth/logout", server.handleAuthLogout)
 	mux.Handle("/api/admin/bridge/overview", server.wrapHandler(RoleViewer, "bridge", "overview", server.handleBridgeOverview))
 	mux.Handle("/api/admin/routes", server.wrapHandler(RoleViewer, "routes", "list", server.handleRoutesList))
 	mux.Handle("/api/admin/services", server.wrapHandler(RoleViewer, "services", "list", server.handleServicesList))
@@ -278,16 +247,7 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/admin/logs/search", server.wrapHandler(RoleViewer, "logs", "search", server.handleLogsSearch))
 	mux.Handle("/api/admin/metrics/query", server.wrapHandler(RoleViewer, "metrics", "query", server.handleMetricsQuery))
 	mux.Handle("/api/admin/diagnose/summary", server.wrapHandler(RoleViewer, "diagnose", "summary", server.handleDiagnoseSummary))
-	mux.Handle(
-		"/api/admin/events/stream",
-		server.wrapHandlerWithOptions(
-			RoleViewer,
-			"events",
-			"stream",
-			server.handleEventsStream,
-			authOptions{allowAccessTokenQuery: true},
-		),
-	)
+	mux.Handle("/api/admin/events/stream", server.wrapHandler(RoleViewer, "events", "stream", server.handleEventsStream))
 	mux.Handle("/api/admin/ops/config/reload", server.wrapHandler(RoleOperator, "ops", "config_reload", server.handleOpsConfigReload))
 	mux.Handle("/api/admin/ops/session/", server.wrapHandler(RoleOperator, "ops", "session_drain", server.handleOpsSessionDrain))
 	mux.Handle("/api/admin/ops/connector/", server.wrapHandler(RoleOperator, "ops", "connector_drain", server.handleOpsConnectorDrain))
@@ -308,25 +268,12 @@ func (server *Server) wrapHandler(
 	action string,
 	handlerFunc http.HandlerFunc,
 ) http.Handler {
-	return server.wrapHandlerWithOptions(requiredRole, scope, action, handlerFunc, authOptions{})
-}
-
-func (server *Server) wrapHandlerWithOptions(
-	requiredRole Role,
-	scope string,
-	action string,
-	handlerFunc http.HandlerFunc,
-	options authOptions,
-) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		startAt := server.now()
-		actor, authErr := server.authenticateRequestWithOptions(request, options)
+		actor, authErr := server.authenticateRequest(request)
 		if authErr != nil {
 			writeError(writer, http.StatusUnauthorized, "UNAUTHORIZED", authErr.Error())
-			server.auditLogs.append(AuditRecord{
-				TSMS:      uint64(startAt.UnixMilli()),
-				Actor:     "",
-				Role:      "",
+			server.appendAuditRecord(startAt, AuditRecord{
 				Method:    request.Method,
 				Path:      request.URL.Path,
 				Scope:     scope,
@@ -340,8 +287,7 @@ func (server *Server) wrapHandlerWithOptions(
 		}
 		if !roleCanAccess(actor.role, requiredRole) {
 			writeError(writer, http.StatusForbidden, "FORBIDDEN", "permission denied for role")
-			server.auditLogs.append(AuditRecord{
-				TSMS:      uint64(startAt.UnixMilli()),
+			server.appendAuditRecord(startAt, AuditRecord{
 				Actor:     actor.name,
 				Role:      string(actor.role),
 				Method:    request.Method,
@@ -357,8 +303,7 @@ func (server *Server) wrapHandlerWithOptions(
 		}
 		if securityErr := server.enforceWriteRequestSecurity(request); securityErr != nil {
 			writeError(writer, http.StatusForbidden, "FORBIDDEN", securityErr.Error())
-			server.auditLogs.append(AuditRecord{
-				TSMS:      uint64(startAt.UnixMilli()),
+			server.appendAuditRecord(startAt, AuditRecord{
 				Actor:     actor.name,
 				Role:      string(actor.role),
 				Method:    request.Method,
@@ -384,8 +329,7 @@ func (server *Server) wrapHandlerWithOptions(
 		if statusCode >= http.StatusBadRequest {
 			result = "failed"
 		}
-		server.auditLogs.append(AuditRecord{
-			TSMS:         uint64(startAt.UnixMilli()),
+		server.appendAuditRecord(startAt, AuditRecord{
 			Actor:        actor.name,
 			Role:         string(actor.role),
 			Method:       request.Method,
@@ -402,48 +346,21 @@ func (server *Server) wrapHandlerWithOptions(
 }
 
 func (server *Server) authenticateRequest(request *http.Request) (principal, error) {
-	return server.authenticateRequestWithOptions(request, authOptions{})
-}
-
-func (server *Server) authenticateRequestWithOptions(
-	request *http.Request,
-	options authOptions,
-) (principal, error) {
 	if server == nil {
 		return principal{}, fmt.Errorf("admin api server unavailable")
 	}
 	if request == nil {
 		return principal{}, fmt.Errorf("missing request")
 	}
-	rawToken := extractBearerTokenFromHeader(request.Header.Get("Authorization"))
-	if rawToken == "" && server.authMode == adminAuthModeCookie {
-		rawToken = extractTokenFromCookie(request, server.cookieTokenName)
-	}
-	if rawToken == "" && options.allowAccessTokenQuery && request != nil && request.URL != nil {
-		rawToken = strings.TrimSpace(request.URL.Query().Get("access_token"))
-	}
-	if rawToken == "" {
-		return principal{}, fmt.Errorf("missing auth token")
-	}
-	if len(server.tokenLookup) == 0 {
-		return principal{}, fmt.Errorf("admin api auth token is not configured")
-	}
-	authPrincipal, exists := server.tokenLookup[rawToken]
+	session, exists := server.resolveSession(request)
 	if !exists {
-		return principal{}, fmt.Errorf("invalid auth token")
+		return principal{}, fmt.Errorf("missing or expired session")
 	}
+	authPrincipal := session.principal
 	if strings.TrimSpace(authPrincipal.name) == "" {
-		authPrincipal.name = "token_user"
+		authPrincipal.name = "admin_user"
 	}
 	return authPrincipal, nil
-}
-
-func extractBearerTokenFromHeader(rawAuthorization string) string {
-	authorization := strings.TrimSpace(rawAuthorization)
-	if !strings.HasPrefix(strings.ToLower(authorization), "bearer ") {
-		return ""
-	}
-	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(authorization, "Bearer "), "bearer "))
 }
 
 // extractTokenFromCookie 从指定 cookie 读取鉴权 token（仅 cookie 鉴权模式使用）。
@@ -516,13 +433,16 @@ func isMutationMethod(method string) bool {
 	}
 }
 
-// enforceWriteRequestSecurity 在 cookie 鉴权模式下对写请求启用 CSRF + 来源校验。
+// enforceWriteRequestSecurity 对写请求启用会话 + CSRF + 来源校验。
 func (server *Server) enforceWriteRequestSecurity(request *http.Request) error {
-	if server == nil || !isMutationMethod(request.Method) || server.authMode != adminAuthModeCookie {
+	if server == nil || !isMutationMethod(request.Method) {
 		return nil
 	}
 	if request == nil {
 		return fmt.Errorf("invalid request")
+	}
+	if strings.HasPrefix(request.URL.Path, "/api/admin/auth/login") {
+		return server.enforcePublicOriginSecurity(request)
 	}
 	rawOrigin := strings.TrimSpace(request.Header.Get("Origin"))
 	if rawOrigin == "" {
@@ -549,6 +469,28 @@ func (server *Server) enforceWriteRequestSecurity(request *http.Request) error {
 	return nil
 }
 
+// enforcePublicOriginSecurity 对登录等公开写接口仅执行来源校验。
+func (server *Server) enforcePublicOriginSecurity(request *http.Request) error {
+	if server == nil {
+		return nil
+	}
+	if request == nil {
+		return fmt.Errorf("invalid request")
+	}
+	rawOrigin := strings.TrimSpace(request.Header.Get("Origin"))
+	if rawOrigin == "" {
+		rawOrigin = originFromReferer(request.Header.Get("Referer"))
+	}
+	normalizedOrigin, ok := normalizeOrigin(rawOrigin)
+	if !ok {
+		return fmt.Errorf("origin check failed: missing or invalid origin")
+	}
+	if _, allowed := server.allowedOrigins[normalizedOrigin]; !allowed {
+		return fmt.Errorf("origin check failed: origin is not allowed")
+	}
+	return nil
+}
+
 func normalizeRole(role string) (Role, bool) {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case string(RoleViewer):
@@ -569,6 +511,17 @@ func roleCanAccess(currentRole Role, requiredRole Role) bool {
 		RoleAdmin:    3,
 	}
 	return priorityByRole[currentRole] >= priorityByRole[requiredRole]
+}
+
+func (server *Server) appendAuditRecord(startAt time.Time, record AuditRecord) {
+	if server == nil || server.auditLogs == nil {
+		return
+	}
+	if startAt.IsZero() {
+		startAt = server.now()
+	}
+	record.TSMS = uint64(startAt.UnixMilli())
+	server.auditLogs.append(record)
 }
 
 func (server *Server) handleBridgeOverview(writer http.ResponseWriter, request *http.Request) {

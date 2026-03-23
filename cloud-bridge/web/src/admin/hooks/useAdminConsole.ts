@@ -107,12 +107,17 @@ export function useAdminConsole() {
     openDetailDrawer,
     state,
   });
+  const { refreshAuthSession } = actions;
 
   useAdminConsoleRealtime({
     applySSESnapshot: actions.applySSESnapshot,
     refreshPageData: actions.refreshPageData,
     state,
   });
+
+  useEffect(() => {
+    void refreshAuthSession();
+  }, [refreshAuthSession]);
 
   useEffect(() => {
     syncAdminPageToURL(activePage, "replace");
@@ -189,6 +194,9 @@ export function useAdminConsole() {
     activeMetricKey: state.activeMetricKey,
     activePage: state.activePage,
     agentPoolSummary: state.agentPoolSummary,
+    authError: state.authError,
+    authProviders: state.authProviders,
+    authStatus: state.authStatus,
     clearTrafficOwnershipLookup: actions.clearTrafficOwnershipLookup,
     closeDetailDrawer,
     configSnapshot: state.configSnapshot,
@@ -209,9 +217,13 @@ export function useAdminConsole() {
     exportDownloadURL: state.exportDownloadURL,
     handleDetailRowKeyDown: actions.handleDetailRowKeyDown,
     isActiveDetailRow: actions.isActiveDetailRow,
+    isAuthenticating: state.isAuthenticating,
     isLoading: state.isLoading,
     isTrafficOwnershipLoading: state.isTrafficOwnershipLoading,
     lastSyncMS: state.lastSyncMS,
+    login: actions.login,
+    loginPassword: state.loginPassword,
+    loginUsername: state.loginUsername,
     logActionBars,
     logItems: state.logItems,
     logResultBars,
@@ -234,19 +246,26 @@ export function useAdminConsole() {
     prefillOpsFromDetail: actions.prefillOpsFromDetail,
     quickDrainFromDetail: actions.quickDrainFromDetail,
     realtimeSummary,
+    refreshAuthSession: actions.refreshAuthSession,
     refreshPageData: actions.refreshPageData,
     routeItems: state.routeItems,
     serviceItems: state.serviceItems,
+    session: state.session,
     sessionItems: state.sessionItems,
+    selectedProvider: state.selectedProvider,
     submitConfigPatch: actions.submitConfigPatch,
     submitConfigPatchDocument: actions.submitConfigPatchDocument,
     sessionStateFilter: state.sessionStateFilter,
     setActiveMetricKey: state.setActiveMetricKey,
+    setAuthError: state.setAuthError,
     setDrainConnectorID: state.setDrainConnectorID,
     setDrainReason: state.setDrainReason,
     setDrainSessionID: state.setDrainSessionID,
+    setLoginPassword: state.setLoginPassword,
+    setLoginUsername: state.setLoginUsername,
     setPatchKey: state.setPatchKey,
     setPatchValue: state.setPatchValue,
+    setSelectedProvider: state.setSelectedProvider,
     setSessionStateFilter: state.setSessionStateFilter,
     setTimeRangeMinutes: state.setTimeRangeMinutes,
     setTrafficLookupID: state.setTrafficLookupID,
@@ -258,6 +277,7 @@ export function useAdminConsole() {
     trafficOwnership: state.trafficOwnership,
     trafficOwnershipError: state.trafficOwnershipError,
     trafficSummary: state.trafficSummary,
+    logout: actions.logout,
     tunnelConnectorFilter: state.tunnelConnectorFilter,
     tunnelItems: state.tunnelItems,
     tunnelRingSegments,

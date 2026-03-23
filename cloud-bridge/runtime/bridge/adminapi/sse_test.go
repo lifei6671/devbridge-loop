@@ -35,9 +35,8 @@ func newSSETestServer(testingObject *testing.T) *Server {
 			ListTunnels:    func() []registry.TunnelRuntime { return nil },
 			TunnelSnapshot: func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -59,21 +58,23 @@ func TestSSETopicsQuerySupportsAll(testingObject *testing.T) {
 	}
 }
 
-// TestEventsStreamAllowsAccessTokenQuery 验证 SSE 路由支持 access_token query 鉴权。
-func TestEventsStreamAllowsAccessTokenQuery(testingObject *testing.T) {
+// TestEventsStreamUsesSessionCookie 验证 SSE 路由可复用浏览器登录会话。
+func TestEventsStreamUsesSessionCookie(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	server := newSSETestServer(testingObject)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 
 	requestContext, cancelRequest := context.WithCancel(context.Background())
 	defer cancelRequest()
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/api/admin/events/stream?topics=dashboard&interval_ms=1000&access_token=viewer-token",
+		"/api/admin/events/stream?topics=dashboard&interval_ms=1000",
 		nil,
 	).WithContext(requestContext)
+	applyTestSession(request, session)
 	recorder := httptest.NewRecorder()
 	serveDoneChannel := make(chan struct{})
 	go func() {
@@ -105,8 +106,8 @@ func TestEventsStreamAllowsAccessTokenQuery(testingObject *testing.T) {
 	}
 }
 
-// TestOverviewRejectsAccessTokenQuery 验证非 SSE 路由不会接受 access_token query 作为鉴权。
-func TestOverviewRejectsAccessTokenQuery(testingObject *testing.T) {
+// TestOverviewRejectsMissingSession 验证未登录时读接口会拒绝访问。
+func TestOverviewRejectsMissingSession(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	server := newSSETestServer(testingObject)
@@ -114,7 +115,7 @@ func TestOverviewRejectsAccessTokenQuery(testingObject *testing.T) {
 	server.RegisterRoutes(mux)
 
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview?access_token=viewer-token", nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusUnauthorized {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusUnauthorized)
@@ -210,9 +211,8 @@ func TestBuildTrafficSnapshotHonorsConnectorFilter(testingObject *testing.T) {
 				}
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)

@@ -4,7 +4,7 @@
 #
 # 说明：
 # 1) 本文件是“功能完整 + 安全默认值”示例，便于本地联调与部署参考。
-# 2) 生产环境请替换 token，不要使用示例中的默认值。
+# 2) 生产环境请替换管理账号密码，不要使用示例中的默认值。
 # 3) 所有地址均为 Go 标准监听地址格式（如 ":39081"）。
 
 ingress:
@@ -33,40 +33,41 @@ admin:
   base_path: "/admin"
   # 是否启用管理 UI（API 仍受 enabled 控制）。
   ui_enabled: true
-  # 管理面鉴权模式：
-  # - bearer：通过 Authorization: Bearer <token>
-  # - cookie：通过 Cookie 读 token（写接口会强制 CSRF 校验）
-  auth_mode: "bearer"
-  # cookie 模式读取 token 的 cookie 名。
-  # auth_mode=bearer 时该字段可保留默认值，不影响行为。
-  cookie_token_name: "devbridge_admin_token"
-  # cookie 模式 CSRF 双提交中的 cookie 名。
+  # 管理面浏览器会话 cookie 名。
+  session_cookie_name: "devbridge_admin_session"
+  # 管理面写接口 CSRF 双提交中的 cookie 名。
   csrf_cookie_name: "devbridge_admin_csrf"
-  # cookie 模式 CSRF 双提交中的请求头名。
+  # 管理面写接口 CSRF 双提交中的请求头名。
   csrf_header_name: "X-CSRF-Token"
-  # cookie 模式允许的来源 Origin 列表（写接口会校验 Origin/Referer）。
+  # 登录与写接口允许的来源 Origin 列表（服务端会校验 Origin/Referer）。
   # 示例：本地管理面地址。
   allowed_origins:
     - "http://127.0.0.1:39081"
     - "http://localhost:39081"
-  # 静态 token 列表（bearer/cookie 两种模式都会使用此映射）。
-  # role 可选：viewer / operator / admin
-  # - viewer：只读
-  # - operator：只读 + 运维写接口（drain/reload 等）
-  # - admin：最高权限（含配置更新与导出）
-  auth_tokens:
-    # 只读角色 token（可用于看板和查询页）。
-    - name: "viewer"
-      token: "devbridge-viewer-token"
-      role: "viewer"
-    # 运维角色 token（可执行受控运维命令）。
-    - name: "operator"
-      token: "devbridge-operator-token"
-      role: "operator"
-    # 管理角色 token（可执行高权限管理操作）。
-    - name: "admin"
-      token: "devbridge-admin-token"
-      role: "admin"
+  # 管理面认证 provider 列表。
+  # 当前首版仅实现本地用户名密码（type=password），后续预留 LDAP / OAuth 扩展位。
+  auth_providers:
+    - name: "local-password"
+      type: "password"
+      label: "本地账号"
+      enabled: true
+      password:
+        accounts:
+          # 只读账号：用于看板和查询页。
+          - username: "viewer"
+            password: "devbridge-viewer-pass"
+            display_name: "Viewer"
+            role: "viewer"
+          # 运维账号：可执行受控运维命令。
+          - username: "operator"
+            password: "devbridge-operator-pass"
+            display_name: "Operator"
+            role: "operator"
+          # 管理账号：可执行配置更新与导出。
+          - username: "admin"
+            password: "devbridge-admin-pass"
+            display_name: "Admin"
+            role: "admin"
 
 observability:
   # 指标暴露监听地址（metrics endpoint）。

@@ -139,7 +139,7 @@ control_plane:
 		[]byte(`admin:
   base_path: "/user-console"
   ui_enabled: true
-  auth_mode: bearer
+  session_cookie_name: "user-session"
 `),
 	)
 
@@ -197,9 +197,9 @@ control_plane:
 	} else {
 		testingObject.Fatalf("expected editable user patch to expose admin.ui_enabled, got=%v", readYAMLPath(editableUserPatch, "admin.ui_enabled"))
 	}
-	if readYAMLPath(editableUserPatch, "admin.auth_mode") == nil {
+	if readYAMLPath(editableUserPatch, "admin.session_cookie_name") == nil {
 	} else {
-		testingObject.Fatalf("expected editable user patch to filter unsupported field, got=%v", readYAMLPath(editableUserPatch, "admin.auth_mode"))
+		testingObject.Fatalf("expected editable user patch to filter unsupported field, got=%v", readYAMLPath(editableUserPatch, "admin.session_cookie_name"))
 	}
 
 	updateResult, err := store.update(
@@ -267,9 +267,9 @@ control_plane:
 	} else {
 		testingObject.Fatalf("expected editable user patch to preserve admin.ui_enabled, got=%v", readYAMLPath(editableUserPatchAfter, "admin.ui_enabled"))
 	}
-	if readYAMLPath(editableUserPatchAfter, "admin.auth_mode") == nil {
+	if readYAMLPath(editableUserPatchAfter, "admin.session_cookie_name") == nil {
 	} else {
-		testingObject.Fatalf("expected editable user patch to keep filtering unsupported field, got=%v", readYAMLPath(editableUserPatchAfter, "admin.auth_mode"))
+		testingObject.Fatalf("expected editable user patch to keep filtering unsupported field, got=%v", readYAMLPath(editableUserPatchAfter, "admin.session_cookie_name"))
 	}
 
 	persistedUserConfig := loadYAMLRecord(testingObject, userConfigFilePath)
@@ -281,9 +281,9 @@ control_plane:
 	} else {
 		testingObject.Fatalf("expected persisted user config to preserve admin.ui_enabled, got=%v", readYAMLPath(persistedUserConfig, "admin.ui_enabled"))
 	}
-	if readYAMLPath(persistedUserConfig, "admin.auth_mode") == "bearer" {
+	if readYAMLPath(persistedUserConfig, "admin.session_cookie_name") == "user-session" {
 	} else {
-		testingObject.Fatalf("expected persisted user config to preserve unsupported admin.auth_mode, got=%v", readYAMLPath(persistedUserConfig, "admin.auth_mode"))
+		testingObject.Fatalf("expected persisted user config to preserve unsupported admin.session_cookie_name, got=%v", readYAMLPath(persistedUserConfig, "admin.session_cookie_name"))
 	}
 }
 

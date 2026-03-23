@@ -96,25 +96,183 @@ type AdminConfig struct {
 	BasePath string `yaml:"base_path"`
 	// UIEnabled 控制管理 UI 路由是否启用（仍受 Enabled 总开关约束）。
 	UIEnabled bool `yaml:"ui_enabled"`
-	// AuthMode 定义管理 API 鉴权模式，支持 bearer/cookie。
-	AuthMode string `yaml:"auth_mode"`
-	// AuthTokens 定义静态 Bearer Token 与角色映射。
-	AuthTokens []AdminAuthTokenConfig `yaml:"auth_tokens"`
-	// CookieTokenName 定义 cookie 鉴权模式读取 token 的 cookie 名。
-	CookieTokenName string `yaml:"cookie_token_name"`
-	// CSRFCookieName 定义 cookie 鉴权模式 CSRF 双提交 cookie 名。
+	// LegacyAuthMode 保留旧版 bearer/cookie 配置入口，供升级兼容迁移使用。
+	LegacyAuthMode string `yaml:"auth_mode,omitempty"`
+	// LegacyAuthTokens 保留旧版静态 token 列表，供升级兼容迁移使用。
+	LegacyAuthTokens []AdminLegacyAuthTokenConfig `yaml:"auth_tokens,omitempty"`
+	// LegacyCookieTokenName 保留旧版 cookie token 名，供升级兼容迁移使用。
+	LegacyCookieTokenName string `yaml:"cookie_token_name,omitempty"`
+	// AuthProviders 定义管理面登录方式；当前首版实现 password，后续可扩展 LDAP/OAuth。
+	AuthProviders []AdminAuthProviderConfig `yaml:"auth_providers"`
+	// SessionCookieName 定义管理登录态会话 cookie 名。
+	SessionCookieName string `yaml:"session_cookie_name"`
+	// CSRFCookieName 定义管理面写接口 CSRF 双提交 cookie 名。
 	CSRFCookieName string `yaml:"csrf_cookie_name"`
-	// CSRFHeaderName 定义 cookie 鉴权模式 CSRF Header 名。
+	// CSRFHeaderName 定义管理面写接口 CSRF Header 名。
 	CSRFHeaderName string `yaml:"csrf_header_name"`
-	// AllowedOrigins 定义 cookie 鉴权模式允许的管理端来源 Origin 列表。
+	// AllowedOrigins 定义登录与写接口允许的管理端来源 Origin 列表。
 	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
-// AdminAuthTokenConfig 定义管理后台静态 Token 配置。
-type AdminAuthTokenConfig struct {
+// AdminLegacyAuthTokenConfig 定义旧版管理后台静态 Token 配置。
+type AdminLegacyAuthTokenConfig struct {
 	Name  string `yaml:"name"`
 	Token string `yaml:"token"`
 	Role  string `yaml:"role"`
+}
+
+// AdminAuthProviderConfig 定义管理面认证 provider 配置。
+type AdminAuthProviderConfig struct {
+	Name     string                      `yaml:"name"`
+	Type     string                      `yaml:"type"`
+	Label    string                      `yaml:"label"`
+	Enabled  bool                        `yaml:"enabled"`
+	Password AdminPasswordProviderConfig `yaml:"password"`
+}
+
+// NormalizeCompatibility 把旧配置字段折算到当前结构，避免升级时直接失效。
+func (c *Config) NormalizeCompatibility() {
+	if c == nil {
+		return
+	}
+	c.Admin.normalizeCompatibility()
+}
+
+func (c *AdminConfig) normalizeCompatibility() {
+	if c == nil {
+		return
+	}
+	if c.shouldUseLegacySessionCookieName() {
+		c.SessionCookieName = strings.TrimSpace(c.LegacyCookieTokenName)
+	}
+	if c.shouldUseLegacyAuthTokens() {
+		c.AuthProviders = []AdminAuthProviderConfig{
+			{
+				Name:    "legacy-token-compat",
+				Type:    "password",
+				Label:   "旧版 Token 兼容登录",
+				Enabled: true,
+				Password: AdminPasswordProviderConfig{
+					Accounts: buildLegacyPasswordAccounts(c.LegacyAuthTokens),
+				},
+			},
+		}
+	}
+	c.LegacyAuthMode = ""
+	c.LegacyAuthTokens = nil
+	c.LegacyCookieTokenName = ""
+}
+
+func (c *AdminConfig) shouldUseLegacySessionCookieName() bool {
+	if c == nil || strings.TrimSpace(c.LegacyCookieTokenName) == "" {
+		return false
+	}
+	normalizedSessionCookieName := strings.TrimSpace(c.SessionCookieName)
+	if normalizedSessionCookieName == "" {
+		return true
+	}
+	return normalizedSessionCookieName == DefaultConfig().Admin.SessionCookieName
+}
+
+func (c *AdminConfig) shouldUseLegacyAuthTokens() bool {
+	if c == nil || len(c.LegacyAuthTokens) == 0 {
+		return false
+	}
+	if len(c.AuthProviders) == 0 {
+		return true
+	}
+	return adminAuthProvidersEqual(c.AuthProviders, DefaultConfig().Admin.AuthProviders)
+}
+
+func adminAuthProvidersEqual(left []AdminAuthProviderConfig, right []AdminAuthProviderConfig) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		leftProvider := left[index]
+		rightProvider := right[index]
+		if strings.TrimSpace(leftProvider.Name) != strings.TrimSpace(rightProvider.Name) {
+			return false
+		}
+		if strings.TrimSpace(leftProvider.Type) != strings.TrimSpace(rightProvider.Type) {
+			return false
+		}
+		if strings.TrimSpace(leftProvider.Label) != strings.TrimSpace(rightProvider.Label) {
+			return false
+		}
+		if leftProvider.Enabled != rightProvider.Enabled {
+			return false
+		}
+		if !adminPasswordAccountsEqual(leftProvider.Password.Accounts, rightProvider.Password.Accounts) {
+			return false
+		}
+	}
+	return true
+}
+
+func adminPasswordAccountsEqual(left []AdminPasswordAccountConfig, right []AdminPasswordAccountConfig) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		leftAccount := left[index]
+		rightAccount := right[index]
+		if strings.TrimSpace(leftAccount.Username) != strings.TrimSpace(rightAccount.Username) {
+			return false
+		}
+		if strings.TrimSpace(leftAccount.Password) != strings.TrimSpace(rightAccount.Password) {
+			return false
+		}
+		if strings.TrimSpace(leftAccount.DisplayName) != strings.TrimSpace(rightAccount.DisplayName) {
+			return false
+		}
+		if strings.TrimSpace(leftAccount.Role) != strings.TrimSpace(rightAccount.Role) {
+			return false
+		}
+	}
+	return true
+}
+
+func buildLegacyPasswordAccounts(tokens []AdminLegacyAuthTokenConfig) []AdminPasswordAccountConfig {
+	accounts := make([]AdminPasswordAccountConfig, 0, len(tokens))
+	seenUsernames := make(map[string]int, len(tokens))
+	for index, tokenConfig := range tokens {
+		username := strings.TrimSpace(tokenConfig.Name)
+		if username == "" {
+			username = strings.ToLower(strings.TrimSpace(tokenConfig.Role))
+		}
+		if username == "" {
+			username = fmt.Sprintf("legacy-user-%d", index+1)
+		}
+		seenUsernames[username]++
+		if seenUsernames[username] > 1 {
+			username = fmt.Sprintf("%s-%d", username, seenUsernames[username])
+		}
+		displayName := strings.TrimSpace(tokenConfig.Name)
+		if displayName == "" {
+			displayName = username
+		}
+		accounts = append(accounts, AdminPasswordAccountConfig{
+			Username:    username,
+			Password:    strings.TrimSpace(tokenConfig.Token),
+			DisplayName: displayName,
+			Role:        strings.TrimSpace(tokenConfig.Role),
+		})
+	}
+	return accounts
+}
+
+// AdminPasswordProviderConfig 定义本地用户名密码登录 provider 配置。
+type AdminPasswordProviderConfig struct {
+	Accounts []AdminPasswordAccountConfig `yaml:"accounts"`
+}
+
+// AdminPasswordAccountConfig 定义一个本地登录账号。
+type AdminPasswordAccountConfig struct {
+	Username    string `yaml:"username"`
+	Password    string `yaml:"password"`
+	DisplayName string `yaml:"display_name"`
+	Role        string `yaml:"role"`
 }
 
 type ObservabilityConfig struct {
@@ -163,27 +321,39 @@ func DefaultConfig() Config {
 			AllowSharedListener: false,
 			BasePath:            "/admin",
 			UIEnabled:           true,
-			AuthMode:            "bearer",
-			AuthTokens: []AdminAuthTokenConfig{
+			AuthProviders: []AdminAuthProviderConfig{
 				{
-					Name:  "viewer",
-					Token: "devbridge-viewer-token",
-					Role:  "viewer",
-				},
-				{
-					Name:  "operator",
-					Token: "devbridge-operator-token",
-					Role:  "operator",
-				},
-				{
-					Name:  "admin",
-					Token: "devbridge-admin-token",
-					Role:  "admin",
+					Name:    "local-password",
+					Type:    "password",
+					Label:   "本地账号",
+					Enabled: true,
+					Password: AdminPasswordProviderConfig{
+						Accounts: []AdminPasswordAccountConfig{
+							{
+								Username:    "viewer",
+								Password:    "devbridge-viewer-pass",
+								DisplayName: "Viewer",
+								Role:        "viewer",
+							},
+							{
+								Username:    "operator",
+								Password:    "devbridge-operator-pass",
+								DisplayName: "Operator",
+								Role:        "operator",
+							},
+							{
+								Username:    "admin",
+								Password:    "devbridge-admin-pass",
+								DisplayName: "Admin",
+								Role:        "admin",
+							},
+						},
+					},
 				},
 			},
-			CookieTokenName: "devbridge_admin_token",
-			CSRFCookieName:  "devbridge_admin_csrf",
-			CSRFHeaderName:  "X-CSRF-Token",
+			SessionCookieName: "devbridge_admin_session",
+			CSRFCookieName:    "devbridge_admin_csrf",
+			CSRFHeaderName:    "X-CSRF-Token",
 			AllowedOrigins: []string{
 				"http://127.0.0.1:39081",
 				"http://localhost:39081",
@@ -228,48 +398,72 @@ func (c Config) Validate() error {
 		return fmt.Errorf("validate config: empty admin listen addr when admin is enabled")
 	}
 	if c.Admin.Enabled {
-		adminAuthMode := strings.ToLower(strings.TrimSpace(c.Admin.AuthMode))
-		if adminAuthMode == "" {
-			return fmt.Errorf("validate config: empty admin auth mode when admin is enabled")
+		if len(c.Admin.AuthProviders) == 0 {
+			return fmt.Errorf("validate config: empty admin auth providers when admin is enabled")
 		}
-		if adminAuthMode != "bearer" && adminAuthMode != "cookie" {
-			return fmt.Errorf("validate config: unsupported admin auth mode=%s", c.Admin.AuthMode)
-		}
-		if len(c.Admin.AuthTokens) == 0 {
-			return fmt.Errorf("validate config: empty admin auth tokens when admin is enabled")
-		}
-		tokenSet := make(map[string]struct{}, len(c.Admin.AuthTokens))
-		for _, tokenConfig := range c.Admin.AuthTokens {
-			normalizedToken := strings.TrimSpace(tokenConfig.Token)
-			if normalizedToken == "" {
-				return fmt.Errorf("validate config: empty admin auth token value")
+		providerNameSet := make(map[string]struct{}, len(c.Admin.AuthProviders))
+		enabledProviderCount := 0
+		for _, providerConfig := range c.Admin.AuthProviders {
+			normalizedProviderName := strings.TrimSpace(providerConfig.Name)
+			if normalizedProviderName == "" {
+				return fmt.Errorf("validate config: empty admin auth provider name")
 			}
-			if _, exists := tokenSet[normalizedToken]; exists {
-				return fmt.Errorf("validate config: duplicated admin auth token")
+			if _, exists := providerNameSet[normalizedProviderName]; exists {
+				return fmt.Errorf("validate config: duplicated admin auth provider name=%s", normalizedProviderName)
 			}
-			tokenSet[normalizedToken] = struct{}{}
-			normalizedRole := strings.ToLower(strings.TrimSpace(tokenConfig.Role))
-			if normalizedRole != "viewer" && normalizedRole != "operator" && normalizedRole != "admin" {
-				return fmt.Errorf("validate config: unsupported admin auth role=%s", tokenConfig.Role)
+			providerNameSet[normalizedProviderName] = struct{}{}
+			if !providerConfig.Enabled {
+				continue
 			}
-		}
-		if adminAuthMode == "cookie" {
-			if strings.TrimSpace(c.Admin.CookieTokenName) == "" {
-				return fmt.Errorf("validate config: empty admin cookie token name when auth mode is cookie")
-			}
-			if strings.TrimSpace(c.Admin.CSRFCookieName) == "" {
-				return fmt.Errorf("validate config: empty admin csrf cookie name when auth mode is cookie")
-			}
-			if strings.TrimSpace(c.Admin.CSRFHeaderName) == "" {
-				return fmt.Errorf("validate config: empty admin csrf header name when auth mode is cookie")
-			}
-			if len(c.Admin.AllowedOrigins) == 0 {
-				return fmt.Errorf("validate config: empty admin allowed origins when auth mode is cookie")
-			}
-			for _, rawOrigin := range c.Admin.AllowedOrigins {
-				if _, ok := normalizeOrigin(rawOrigin); !ok {
-					return fmt.Errorf("validate config: invalid admin allowed origin=%s", rawOrigin)
+			enabledProviderCount++
+			normalizedProviderType := strings.ToLower(strings.TrimSpace(providerConfig.Type))
+			switch normalizedProviderType {
+			case "password":
+				if len(providerConfig.Password.Accounts) == 0 {
+					return fmt.Errorf("validate config: empty password accounts for provider=%s", normalizedProviderName)
 				}
+				accountNameSet := make(map[string]struct{}, len(providerConfig.Password.Accounts))
+				for _, accountConfig := range providerConfig.Password.Accounts {
+					normalizedUsername := strings.TrimSpace(accountConfig.Username)
+					if normalizedUsername == "" {
+						return fmt.Errorf("validate config: empty admin username for provider=%s", normalizedProviderName)
+					}
+					if _, exists := accountNameSet[normalizedUsername]; exists {
+						return fmt.Errorf("validate config: duplicated admin username=%s for provider=%s", normalizedUsername, normalizedProviderName)
+					}
+					accountNameSet[normalizedUsername] = struct{}{}
+					if strings.TrimSpace(accountConfig.Password) == "" {
+						return fmt.Errorf("validate config: empty admin password for username=%s", normalizedUsername)
+					}
+					normalizedRole := strings.ToLower(strings.TrimSpace(accountConfig.Role))
+					if normalizedRole != "viewer" && normalizedRole != "operator" && normalizedRole != "admin" {
+						return fmt.Errorf("validate config: unsupported admin auth role=%s", accountConfig.Role)
+					}
+				}
+			case "ldap", "oauth":
+				return fmt.Errorf("validate config: admin auth provider type=%s is not implemented yet", normalizedProviderType)
+			default:
+				return fmt.Errorf("validate config: unsupported admin auth provider type=%s", providerConfig.Type)
+			}
+		}
+		if enabledProviderCount == 0 {
+			return fmt.Errorf("validate config: no enabled admin auth provider")
+		}
+		if strings.TrimSpace(c.Admin.SessionCookieName) == "" {
+			return fmt.Errorf("validate config: empty admin session cookie name")
+		}
+		if strings.TrimSpace(c.Admin.CSRFCookieName) == "" {
+			return fmt.Errorf("validate config: empty admin csrf cookie name")
+		}
+		if strings.TrimSpace(c.Admin.CSRFHeaderName) == "" {
+			return fmt.Errorf("validate config: empty admin csrf header name")
+		}
+		if len(c.Admin.AllowedOrigins) == 0 {
+			return fmt.Errorf("validate config: empty admin allowed origins")
+		}
+		for _, rawOrigin := range c.Admin.AllowedOrigins {
+			if _, ok := normalizeOrigin(rawOrigin); !ok {
+				return fmt.Errorf("validate config: invalid admin allowed origin=%s", rawOrigin)
 			}
 		}
 		if err := c.validateAdminNetworkIsolation(); err != nil {

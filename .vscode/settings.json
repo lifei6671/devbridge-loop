@@ -35,5 +35,6 @@
     },
     "search.exclude": {
         "**/vendor/**": true
-    }
+    },
+    "makefile.configureOnOpen": false
 }

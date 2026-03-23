@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { toast } from "sonner";
 
-import type { AdminPageKey, ApiRecord, RefreshPageOptions } from "../model";
+import type { AdminPageKey, AdminSessionRecord, ApiRecord, RefreshPageOptions } from "../model";
 import {
   asRecord,
   asRecordArray,
@@ -17,70 +17,239 @@ export type RefreshPageDataFn = (
   options?: RefreshPageOptions
 ) => Promise<void>;
 
+const defaultCSRFHeaderName = "X-CSRF-Token";
+
+function resolveCSRFHeaderName(session: AdminSessionRecord | null): string {
+  if (session === null) {
+    return defaultCSRFHeaderName;
+  }
+  const normalizedHeaderName = session.csrf_header_name.trim();
+  if (normalizedHeaderName !== "") {
+    return normalizedHeaderName;
+  }
+  return defaultCSRFHeaderName;
+}
+
+function isCSRFMismatchResponse(response: Response, payload: ApiRecord): boolean {
+  if (response.status !== 403) {
+    return false;
+  }
+  const errorRecord = asRecord(payload.error);
+  const errorText = readText(errorRecord, "message").toLowerCase();
+  return errorText.includes("csrf");
+}
+
 export function useAdminDataActions(state: AdminConsoleState) {
   const {
+    authStatus,
     sessionStateFilter,
+    setAuthError,
+    setAuthProviders,
+    setAuthStatus,
     setAgentPoolSummary,
     setConfigSnapshot,
     setConnectorItems,
     setDiagnoseSummary,
+    setIsAuthenticating,
     setIsLoading,
     setLastSyncMS,
+    setLoginPassword,
     setLogItems,
     setMetricPoints,
     setOverview,
     setRouteItems,
+    setSession,
     setServiceItems,
     setSessionItems,
     setTrafficSummary,
     setTunnelItems,
     setTunnelSummary,
+    session,
     timeRangeMinutes,
-    token,
     tunnelConnectorFilter,
     tunnelStateFilter,
   } = state;
 
+  const applySessionResponse = useCallback(
+    (payload: ApiRecord) => {
+      const authenticated = payload.authenticated === true;
+      setAuthProviders(asRecordArray(payload.providers).map((providerRecord) => ({
+        name: readText(providerRecord, "name"),
+        type: readText(providerRecord, "type"),
+        label: readText(providerRecord, "label"),
+        login_flow: readText(providerRecord, "login_flow"),
+      })));
+      if (!authenticated) {
+        setSession(null);
+        setAuthStatus("anonymous");
+        return null;
+      }
+      const sessionRecord = asRecord(payload.session);
+      const resolvedSession: AdminSessionRecord = {
+        username: readText(sessionRecord, "username"),
+        display_name: readText(sessionRecord, "display_name"),
+        role: readText(sessionRecord, "role"),
+        provider: readText(sessionRecord, "provider"),
+        csrf_token: readText(sessionRecord, "csrf_token"),
+        csrf_header_name: readText(payload, "csrf_header_name", defaultCSRFHeaderName),
+        expires_at_ms: Number(sessionRecord.expires_at_ms ?? 0),
+      };
+      setSession(resolvedSession);
+      setAuthStatus("authenticated");
+      setAuthError("");
+      return resolvedSession;
+    },
+    [setAuthError, setAuthProviders, setAuthStatus, setSession]
+  );
+
+  const refreshAuthSession = useCallback(async () => {
+    try {
+      const response = await fetch("/api/admin/auth/session", {
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+      const payload = asRecord(await response.json());
+      return applySessionResponse(payload);
+    } catch (error) {
+      setAuthStatus("anonymous");
+      setSession(null);
+      setAuthError(normalizeOperationError(error));
+      return null;
+    }
+  }, [applySessionResponse, setAuthError, setAuthStatus, setSession]);
+
   const requestAdmin = useCallback<AdminRequestFn>(
     async (path, init) => {
-      const normalizedToken = token.trim();
-      if (normalizedToken === "") {
-        throw new Error("请先填写 Bearer Token");
+      if (authStatus !== "authenticated" || session === null) {
+        throw new Error("请先登录管理后台");
       }
-      const headers = new Headers(init?.headers);
-      headers.set("Accept", "application/json");
-      headers.set("Authorization", `Bearer ${normalizedToken}`);
-      // 非 FormData 请求统一按 JSON 发送，减少接口层分支判断。
-      if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
-        headers.set("Content-Type", "application/json");
-      }
-      const response = await fetch(path, {
-        ...init,
-        headers,
-      });
-      const rawText = await response.text();
-      let parsedPayload: unknown = {};
-      if (rawText.trim() !== "") {
-        try {
-          parsedPayload = JSON.parse(rawText);
-        } catch {
-          parsedPayload = { raw_text: rawText };
+      const performRequest = async (
+        activeSession: AdminSessionRecord,
+        allowSessionRefresh: boolean
+      ): Promise<ApiRecord> => {
+        const headers = new Headers(init?.headers);
+        headers.set("Accept", "application/json");
+        if (init?.method !== undefined) {
+          const normalizedMethod = init.method.toUpperCase();
+          if (
+            (normalizedMethod === "POST" ||
+              normalizedMethod === "PUT" ||
+              normalizedMethod === "PATCH" ||
+              normalizedMethod === "DELETE") &&
+            activeSession.csrf_token.trim() !== ""
+          ) {
+            headers.set(resolveCSRFHeaderName(activeSession), activeSession.csrf_token);
+          }
         }
-      }
-      const responseRecord = asRecord(parsedPayload);
-      if (!response.ok) {
-        const errorRecord = asRecord(responseRecord.error);
-        const errorCode = readText(errorRecord, "code", "REQUEST_FAILED");
-        const errorText = readText(errorRecord, "message", `HTTP ${response.status}`);
-        throw new Error(`${errorCode}: ${errorText}`);
-      }
-      return responseRecord;
+        // 非 FormData 请求统一按 JSON 发送，减少接口层分支判断。
+        if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
+          headers.set("Content-Type", "application/json");
+        }
+        const response = await fetch(path, {
+          ...init,
+          credentials: "same-origin",
+          headers,
+        });
+        const rawText = await response.text();
+        let parsedPayload: unknown = {};
+        if (rawText.trim() !== "") {
+          try {
+            parsedPayload = JSON.parse(rawText);
+          } catch {
+            parsedPayload = { raw_text: rawText };
+          }
+        }
+        const responseRecord = asRecord(parsedPayload);
+        if (response.status === 401) {
+          setAuthStatus("anonymous");
+          setSession(null);
+          setAuthError("登录状态已失效，请重新登录。");
+        }
+        if (!response.ok && allowSessionRefresh && isCSRFMismatchResponse(response, responseRecord)) {
+          const refreshedSession = await refreshAuthSession();
+          if (refreshedSession !== null) {
+            return performRequest(refreshedSession, false);
+          }
+        }
+        if (!response.ok) {
+          const errorRecord = asRecord(responseRecord.error);
+          const errorCode = readText(errorRecord, "code", "REQUEST_FAILED");
+          const errorText = readText(errorRecord, "message", `HTTP ${response.status}`);
+          throw new Error(`${errorCode}: ${errorText}`);
+        }
+        return responseRecord;
+      };
+      return performRequest(session, true);
     },
-    [token]
+    [authStatus, refreshAuthSession, session, setAuthError, setAuthStatus, setSession]
   );
+
+  const login = useCallback(
+    async (provider: string, username: string, password: string) => {
+      setIsAuthenticating(true);
+      setAuthError("");
+      try {
+        const response = await fetch("/api/admin/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            provider,
+            username,
+            password,
+          }),
+        });
+        const payload = asRecord(await response.json());
+        if (!response.ok) {
+          const errorRecord = asRecord(payload.error);
+          throw new Error(readText(errorRecord, "message", "登录失败"));
+        }
+        applySessionResponse(payload);
+        setLoginPassword("");
+      } catch (error) {
+        const errorText = normalizeOperationError(error);
+        setAuthError(errorText);
+        setAuthStatus("anonymous");
+        setSession(null);
+        toast.error(errorText);
+      } finally {
+        setIsAuthenticating(false);
+      }
+    },
+    [
+      applySessionResponse,
+      setAuthError,
+      setAuthStatus,
+      setIsAuthenticating,
+      setLoginPassword,
+      setSession,
+    ]
+  );
+
+  const logout = useCallback(async () => {
+    try {
+      if (authStatus === "authenticated" && session !== null) {
+        await requestAdmin("/api/admin/auth/logout", {
+          method: "POST",
+        });
+      }
+    } finally {
+      setAuthStatus("anonymous");
+      setSession(null);
+      setAuthError("");
+    }
+  }, [authStatus, requestAdmin, session, setAuthError, setAuthStatus, setSession]);
 
   const refreshPageData = useCallback<RefreshPageDataFn>(
     async (page, options) => {
+      if (authStatus !== "authenticated") {
+        return;
+      }
       setIsLoading(true);
       try {
         if (page === "dashboard") {
@@ -206,6 +375,7 @@ export function useAdminDataActions(state: AdminConsoleState) {
       }
     },
     [
+      authStatus,
       requestAdmin,
       sessionStateFilter,
       setAgentPoolSummary,
@@ -290,8 +460,11 @@ export function useAdminDataActions(state: AdminConsoleState) {
 
   return {
     applySSESnapshot,
+    login,
     refreshPageData,
+    refreshAuthSession,
     requestAdmin,
+    logout,
   };
 }
 

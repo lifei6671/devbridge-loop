@@ -42,6 +42,7 @@ func ParseConfigYAML(rawConfigData []byte) (Config, error) {
 	if err := yamlDecoder.Decode(&defaultConfig); err != nil {
 		return Config{}, fmt.Errorf("parse yaml config: %w", err)
 	}
+	defaultConfig.NormalizeCompatibility()
 	// 解析后统一走一遍结构化校验，保证运行时语义一致。
 	if err := defaultConfig.Validate(); err != nil {
 		return Config{}, err
@@ -85,6 +86,7 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	}
 	configToPersist := config
 	configToPersist.RuntimeConfigFilePath = ""
+	configToPersist.NormalizeCompatibility()
 	if err := configToPersist.Validate(); err != nil {
 		return fmt.Errorf("save config to yaml: invalid config: %w", err)
 	}

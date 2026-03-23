@@ -70,6 +70,25 @@ export type RealtimeMode = "off" | "sse" | "polling";
 
 export type SSEConnectionState = "idle" | "connecting" | "live" | "error";
 
+export type AuthStatus = "loading" | "authenticated" | "anonymous";
+
+export type AdminAuthProvider = {
+  name: string;
+  type: string;
+  label: string;
+  login_flow: string;
+};
+
+export type AdminSessionRecord = {
+  username: string;
+  display_name: string;
+  role: string;
+  provider: string;
+  csrf_token: string;
+  csrf_header_name: string;
+  expires_at_ms: number;
+};
+
 export type SSEEnvelope = {
   version?: string;
   type?: string;

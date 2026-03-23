@@ -315,6 +315,28 @@ label > span,
   max-width: min(520px, 100%);
 }
 
+.topbar-account-chip {
+  display: grid;
+  gap: 2px;
+  min-height: 34px;
+  padding: 7px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-2) 78%, #fff 22%);
+}
+
+.topbar-account-chip span {
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.topbar-account-chip small {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
 .shell-status-trigger {
   display: inline-flex;
   padding: 0;
@@ -473,6 +495,92 @@ textarea:focus {
 .dashboard-stack {
   display: grid;
   gap: 16px;
+}
+
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-backdrop {
+  position: absolute;
+  inset: 0;
+  backdrop-filter: blur(16px);
+  background:
+    radial-gradient(circle at top, rgb(255 255 255 / 0.32) 0%, transparent 36%),
+    linear-gradient(180deg, rgb(17 28 61 / 0.3) 0%, rgb(17 28 61 / 0.42) 100%);
+}
+
+.auth-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(520px, 100%);
+  padding: 28px;
+  display: grid;
+  gap: 18px;
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at top right, rgb(214 226 255 / 0.72) 0%, transparent 30%),
+    linear-gradient(180deg, rgb(255 255 255 / 0.98) 0%, rgb(247 250 255 / 0.96) 100%);
+}
+
+.auth-dialog-head {
+  display: grid;
+  gap: 10px;
+}
+
+.auth-kicker {
+  margin: 0;
+  color: var(--accent-strong);
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.auth-dialog-head h2 {
+  margin: 0;
+  font-size: clamp(1.5rem, 2.5vw, 2rem);
+  line-height: 1.06;
+}
+
+.auth-sub {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.auth-field-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-field {
+  display: grid;
+  gap: 8px;
+}
+
+.auth-error {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid #ffd3da;
+  background: var(--danger-soft);
+  color: #c83555;
+  font-size: 0.9rem;
+}
+
+.auth-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.auth-submit-btn {
+  min-width: 120px;
 }
 
 .traffic-content-stack {

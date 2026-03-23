@@ -16,10 +16,10 @@
 
 鉴权方式：
 
-1. `Authorization: Bearer <token>`（推荐）
-2. `access_token` query（仅 SSE 场景使用，用于浏览器 `EventSource` 无法自定义 Header 的限制）
+1. 浏览器已登录管理界面，并携带同源 Session Cookie
+2. SSE 与普通 Admin API 复用同一会话，不额外要求 `access_token` query
 
-> 注意：`access_token` query 仅对该 SSE 路由生效，其他 API 仍要求 Bearer Header。
+> 注意：当前推荐部署方式是同源 Admin UI + API。若未来拆分独立域名或引入 OAuth 跳转，需在认证层扩展跨域会话策略，再评估 SSE 接入方式。
 
 ## 3. 查询参数
 
@@ -165,7 +165,7 @@
 ## 9. 示例
 
 ```text
-GET /api/admin/events/stream?topics=traffic&interval_ms=5000&tunnel_state=active&connector_id=agent-local&access_token=devbridge-viewer-token
+GET /api/admin/events/stream?topics=traffic&interval_ms=5000&tunnel_state=active&connector_id=agent-local
 ```
 
 ## 10. 本地联调步骤（Smoke Test）
@@ -177,10 +177,17 @@ cd cloud-bridge
 go run ./cmd/cloud-bridge -config ./config.example.yaml
 ```
 
-2. 终端验证 SSE 首帧事件（推荐 `curl -N`）：
+2. 先通过登录接口建立会话，再验证 SSE 首帧事件：
 
 ```bash
-curl -N "http://127.0.0.1:39081/api/admin/events/stream?topics=dashboard&interval_ms=1000&access_token=devbridge-viewer-token"
+curl -i -X POST "http://127.0.0.1:39081/api/admin/auth/login" \
+  -H 'Origin: http://127.0.0.1:39081' \
+  -H 'Content-Type: application/json' \
+  --data '{"provider":"local-password","username":"viewer","password":"devbridge-viewer-pass"}' \
+  -c /tmp/devbridge-admin.cookie
+
+curl -N "http://127.0.0.1:39081/api/admin/events/stream?topics=dashboard&interval_ms=1000" \
+  -b /tmp/devbridge-admin.cookie
 ```
 
 期望输出包含：
@@ -192,6 +199,6 @@ curl -N "http://127.0.0.1:39081/api/admin/events/stream?topics=dashboard&interva
 3. 前端页面验证：
 
 - 打开 Admin UI。
-- 应用可读 token（`viewer`）。
+- 浏览器弹出登录框，使用 `viewer` 账号登录。
 - 顶部自动刷新状态应显示 `实时流已连接（SSE）`。
 - 若服务端不可达或握手失败，应自动切换到轮询提示。

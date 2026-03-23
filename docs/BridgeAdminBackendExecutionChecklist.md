@@ -24,9 +24,9 @@
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/`、`cloud-bridge/runtime/bridge/adminview/`
   - 验收：后台输出不直接暴露 registry 内部结构。
 
-- [x] `BMA-3` 鉴权与角色模型：Bearer + `viewer/operator/admin`
+- [x] `BMA-3` 鉴权与角色模型：本地账号密码登录 + 浏览器会话 + `viewer/operator/admin`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/server.go`
-  - 验收：无 token 拒绝；viewer 可读；越权请求拒绝。
+  - 验收：未登录拒绝；viewer 可读；越权请求拒绝；写接口必须带 CSRF。
 
 - [x] `BMA-4` 只读资源域：`bridge/routes/connectors/sessions/tunnels/traffic/config/logs/metrics/diagnose`
   - 代码入口：`cloud-bridge/runtime/bridge/adminapi/server.go`
@@ -88,7 +88,7 @@
 
 - [x] `BMA-16` 内嵌部署联调
   - 验收：Bridge 单二进制可访问 Admin UI 并执行完整读写流程。
-  - 完成记录：`bootstrap` 集成测试已覆盖单实例 admin server 下 UI 路由、读接口、SSE、写接口（reload/config update/session drain/diagnose export-download）与 cookie+csrf 写入约束链路。
+  - 完成记录：`bootstrap` 集成测试已覆盖单实例 admin server 下 UI 路由、浏览器登录、读接口、SSE、写接口（reload/config update/session drain/diagnose export-download）与 session+csrf 写入约束链路。
 
 ---
 

@@ -77,7 +77,7 @@
 - Actions taken:
   - 新增 SSE 协议文档，明确事件模型、查询参数、payload 契约与重连降级语义。
   - 后端新增 `GET /api/admin/events/stream`，实现 `bridge.ready / bridge.snapshot / bridge.heartbeat` 推送。
-  - 鉴权增强：仅 SSE 路由支持 `access_token` query，其他 API 仍保持 Bearer Header。
+  - 鉴权增强：SSE 与普通 Admin API 统一复用浏览器登录会话，不再依赖 `access_token` query 或静态 Bearer Token。
   - 前端接入 `EventSource`，实现 SSE 优先 + 轮询兜底；顶部状态文案可区分连接中/已连接/回退轮询。
   - 新增 SSE 单测与 bootstrap 级联调测试，覆盖协议解析、路由鉴权、单实例 server SSE 输出能力。
   - 完成真实运行态 smoke test：`go run` 启动 bridge 后，`curl -N` 成功接收 `bridge.ready` 与连续 `bridge.snapshot`。
@@ -93,12 +93,15 @@
 ### Phase 8: 安全收口实现（BMA-12/BMA-13/BMA-14）
 - **Status:** complete
 - Actions taken:
-  - 新增 `cookie` 鉴权模式参数（`cookie_token_name/csrf_cookie_name/csrf_header_name/allowed_origins`），并在写请求路径统一启用 `Origin/Referer + CSRF 双提交` 校验。
+  - 将管理面鉴权从静态 token 重构为 `auth_providers + session_cookie_name + csrf_cookie_name + csrf_header_name + allowed_origins`，首版落地本地账号密码登录。
+  - 补充兼容迁移：历史 `auth_tokens/auth_mode/cookie_token_name` 配置在加载阶段自动折算到新认证结构，避免升级后直接启动失败。
+  - 管理台前端改为从 `auth/session` / `auth/login` 响应读取 `csrf_header_name`，并在会话漂移导致的 CSRF 403 后自动刷新一次会话再重试写请求。
   - 增加 `admin.allow_shared_listener` 与默认隔离校验，禁止管理面与控制面/业务面/指标面监听地址冲突（可显式放开）。
   - 导出下载链路增强为“发起人绑定 + 一次性下载链接 + no-store 响应头”，并补齐对应用例。
-  - 补充 `adminapi/app` 单测覆盖 cookie+csrf、防重放下载、网络隔离配置校验。
+  - 补充 `adminapi/app` 单测覆盖浏览器登录、session+csrf、防重放下载、网络隔离配置校验。
 - Files created/modified:
   - `cloud-bridge/runtime/bridge/adminapi/server.go`（modified）
+  - `cloud-bridge/runtime/bridge/adminapi/auth.go`（created）
   - `cloud-bridge/runtime/bridge/adminapi/export_store.go`（modified）
   - `cloud-bridge/runtime/bridge/adminapi/ops.go`（modified）
   - `cloud-bridge/runtime/bridge/adminapi/ops_test.go`（modified）

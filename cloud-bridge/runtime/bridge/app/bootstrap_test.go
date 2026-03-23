@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -15,6 +16,55 @@ import (
 	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
+
+const bootstrapTestAllowedOrigin = "http://127.0.0.1:39081"
+
+type bootstrapAuthSession struct {
+	cookies   []*http.Cookie
+	csrfToken string
+}
+
+func loginBootstrapUser(testingObject *testing.T, handler http.Handler, username string, password string) bootstrapAuthSession {
+	testingObject.Helper()
+	payload, err := json.Marshal(map[string]string{
+		"provider": "local-password",
+		"username": username,
+		"password": password,
+	})
+	if err != nil {
+		testingObject.Fatalf("marshal login payload failed: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/auth/login", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", bootstrapTestAllowedOrigin)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("login failed: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Session struct {
+			CSRFToken string `json:"csrf_token"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		testingObject.Fatalf("decode login response failed: %v body=%s", err, recorder.Body.String())
+	}
+	return bootstrapAuthSession{
+		cookies:   recorder.Result().Cookies(),
+		csrfToken: response.Session.CSRFToken,
+	}
+}
+
+func applyBootstrapSession(request *http.Request, session bootstrapAuthSession) {
+	for _, cookie := range session.cookies {
+		request.AddCookie(cookie)
+	}
+	if request != nil && request.Method != http.MethodGet && session.csrfToken != "" {
+		request.Header.Set("Origin", bootstrapTestAllowedOrigin)
+		request.Header.Set("X-CSRF-Token", session.csrfToken)
+	}
+}
 
 // TestDefaultConfigAdminEnabledByDefault 验证默认配置下管理面总开关默认开启。
 func TestDefaultConfigAdminEnabledByDefault(testingObject *testing.T) {
@@ -95,34 +145,32 @@ func TestConfigValidateRejectsEquivalentSharedAdminListenerByDefault(testingObje
 	}
 }
 
-// TestConfigValidateRejectsCookieAuthWithoutAllowedOrigins
-// 验证 cookie 鉴权模式必须显式配置允许来源，避免写接口暴露于 CSRF 风险。
-func TestConfigValidateRejectsCookieAuthWithoutAllowedOrigins(testingObject *testing.T) {
+// TestConfigValidateRejectsMissingAllowedOrigins
+// 验证浏览器登录会话模式必须显式配置允许来源，避免登录与写接口暴露于 CSRF 风险。
+func TestConfigValidateRejectsMissingAllowedOrigins(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	config := DefaultConfig()
 	config.Admin.Enabled = true
-	config.Admin.AuthMode = "cookie"
 	config.Admin.AllowedOrigins = nil
 	if err := config.Validate(); err == nil {
-		testingObject.Fatalf("validate config should fail when cookie auth mode has no allowed origins")
+		testingObject.Fatalf("validate config should fail when no allowed origins are configured")
 	}
 }
 
-// TestConfigValidateAllowsCookieAuthWithCSRFConfig
-// 验证 cookie 鉴权模式在 CSRF 相关字段齐备时可通过配置校验。
-func TestConfigValidateAllowsCookieAuthWithCSRFConfig(testingObject *testing.T) {
+// TestConfigValidateAllowsBrowserSessionAuthConfig
+// 验证浏览器登录会话模式在会话与 CSRF 相关字段齐备时可通过配置校验。
+func TestConfigValidateAllowsBrowserSessionAuthConfig(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	config := DefaultConfig()
 	config.Admin.Enabled = true
-	config.Admin.AuthMode = "cookie"
-	config.Admin.CookieTokenName = "bridge_admin_token"
+	config.Admin.SessionCookieName = "bridge_admin_session"
 	config.Admin.CSRFCookieName = "bridge_admin_csrf"
 	config.Admin.CSRFHeaderName = "X-CSRF-Token"
-	config.Admin.AllowedOrigins = []string{"http://127.0.0.1:39081"}
+	config.Admin.AllowedOrigins = []string{bootstrapTestAllowedOrigin}
 	if err := config.Validate(); err != nil {
-		testingObject.Fatalf("validate config should pass for cookie auth mode with csrf config: %v", err)
+		testingObject.Fatalf("validate config should pass for browser session auth config: %v", err)
 	}
 }
 
@@ -242,31 +290,40 @@ func TestBootstrapInitializesAdminServerWhenEnabled(testingObject *testing.T) {
 	}
 }
 
-// TestConfigValidateRejectsEmptyAdminAuthTokensWhenEnabled
-// 验证 admin 开启时必须配置 Bearer Token，避免无鉴权暴露管理接口。
-func TestConfigValidateRejectsEmptyAdminAuthTokensWhenEnabled(testingObject *testing.T) {
+// TestConfigValidateRejectsEmptyAdminAuthProvidersWhenEnabled
+// 验证 admin 开启时必须配置至少一个登录 provider，避免无鉴权暴露管理接口。
+func TestConfigValidateRejectsEmptyAdminAuthProvidersWhenEnabled(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	config := DefaultConfig()
 	config.Admin.Enabled = true
-	config.Admin.AuthTokens = nil
+	config.Admin.AuthProviders = nil
 	if err := config.Validate(); err == nil {
-		testingObject.Fatalf("validate config should fail when admin enabled and auth tokens empty")
+		testingObject.Fatalf("validate config should fail when admin enabled and auth providers empty")
 	}
 }
 
 // TestConfigValidateRejectsInvalidAdminAuthRole
-// 验证 admin token 角色非法时会被配置校验拦截。
+// 验证 admin 账号角色非法时会被配置校验拦截。
 func TestConfigValidateRejectsInvalidAdminAuthRole(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	config := DefaultConfig()
 	config.Admin.Enabled = true
-	config.Admin.AuthTokens = []AdminAuthTokenConfig{
+	config.Admin.AuthProviders = []AdminAuthProviderConfig{
 		{
-			Name:  "invalid",
-			Token: "invalid-token",
-			Role:  "super_admin",
+			Name:    "local-password",
+			Type:    "password",
+			Enabled: true,
+			Password: AdminPasswordProviderConfig{
+				Accounts: []AdminPasswordAccountConfig{
+					{
+						Username: "invalid",
+						Password: "invalid-pass",
+						Role:     "super_admin",
+					},
+				},
+			},
 		},
 	}
 	if err := config.Validate(); err == nil {
@@ -275,7 +332,7 @@ func TestConfigValidateRejectsInvalidAdminAuthRole(testingObject *testing.T) {
 }
 
 // TestBootstrapRegistersAdminAPIRoutesWhenEnabled
-// 验证管理面开启后会注册 /api/admin/* 路由，并强制 Bearer 鉴权。
+// 验证管理面开启后会注册 /api/admin/* 路由，并强制浏览器会话鉴权。
 func TestBootstrapRegistersAdminAPIRoutesWhenEnabled(testingObject *testing.T) {
 	testingObject.Parallel()
 
@@ -298,9 +355,10 @@ func TestBootstrapRegistersAdminAPIRoutesWhenEnabled(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected unauthorized status: got=%d want=%d", unauthorizedRecorder.Code, http.StatusUnauthorized)
 	}
 
+	viewerSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "viewer", "devbridge-viewer-pass")
 	authorizedRecorder := httptest.NewRecorder()
 	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
-	authorizedRequest.Header.Set("Authorization", "Bearer devbridge-viewer-token")
+	applyBootstrapSession(authorizedRequest, viewerSession)
 	runtime.adminServer.Handler.ServeHTTP(authorizedRecorder, authorizedRequest)
 	if authorizedRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected authorized status: got=%d want=%d body=%s", authorizedRecorder.Code, http.StatusOK, authorizedRecorder.Body.String())
@@ -337,18 +395,20 @@ func TestBootstrapServesAdminUIAndAPIOnSingleServer(testingObject *testing.T) {
 	}
 
 	// 再验证同一 server 上 API 读接口可访问。
+	viewerSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "viewer", "devbridge-viewer-pass")
 	overviewRecorder := httptest.NewRecorder()
 	overviewRequest := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
-	overviewRequest.Header.Set("Authorization", "Bearer devbridge-viewer-token")
+	applyBootstrapSession(overviewRequest, viewerSession)
 	runtime.adminServer.Handler.ServeHTTP(overviewRecorder, overviewRequest)
 	if overviewRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected overview status: got=%d want=%d body=%s", overviewRecorder.Code, http.StatusOK, overviewRecorder.Body.String())
 	}
 
 	// 最后验证受控写接口可执行，覆盖“单二进制读写链路”关键验收点。
+	operatorSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "operator", "devbridge-operator-pass")
 	reloadRecorder := httptest.NewRecorder()
 	reloadRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/config/reload", nil)
-	reloadRequest.Header.Set("Authorization", "Bearer devbridge-operator-token")
+	applyBootstrapSession(reloadRequest, operatorSession)
 	runtime.adminServer.Handler.ServeHTTP(reloadRecorder, reloadRequest)
 	if reloadRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected reload status: got=%d want=%d body=%s", reloadRecorder.Code, http.StatusOK, reloadRecorder.Body.String())
@@ -385,13 +445,15 @@ func TestBootstrapServesAdminSSEOnSingleServer(testingObject *testing.T) {
 		testingObject.Fatalf("expected admin server initialized")
 	}
 
+	viewerSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "viewer", "devbridge-viewer-pass")
 	// SSE 是长连接，需要用可取消上下文结束请求，避免测试阻塞。
 	requestContext, cancelRequest := context.WithCancel(context.Background())
 	request := httptest.NewRequest(
 		http.MethodGet,
-		"/api/admin/events/stream?topics=dashboard&interval_ms=1000&access_token=devbridge-viewer-token",
+		"/api/admin/events/stream?topics=dashboard&interval_ms=1000",
 		nil,
 	).WithContext(requestContext)
+	applyBootstrapSession(request, viewerSession)
 	recorder := httptest.NewRecorder()
 	serveDoneChannel := make(chan struct{})
 	go func() {
@@ -477,14 +539,15 @@ func TestAdminSessionDrainEndpointAppliesLifecycleEffects(testingObject *testing
 		testingObject.Fatalf("upsert tunnel failed: %v", err)
 	}
 
+	operatorSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "operator", "devbridge-operator-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/admin/ops/session/session-1/drain",
 		strings.NewReader(`{"reason":"manual_drain"}`),
 	)
-	request.Header.Set("Authorization", "Bearer devbridge-operator-token")
 	request.Header.Set("Content-Type", "application/json")
+	applyBootstrapSession(request, operatorSession)
 	runtime.adminServer.Handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -538,14 +601,15 @@ func TestAdminConfigUpdateEnforcesIfMatchVersion(testingObject *testing.T) {
 		testingObject.Fatalf("expected admin server initialized")
 	}
 
+	adminSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "admin", "devbridge-admin-pass")
 	updateRecorder := httptest.NewRecorder()
 	updateRequest := httptest.NewRequest(
 		http.MethodPut,
 		"/api/admin/config",
 		strings.NewReader(`{"if_match_version":1,"patch":{"observability.log_level":"debug"}}`),
 	)
-	updateRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
 	updateRequest.Header.Set("Content-Type", "application/json")
+	applyBootstrapSession(updateRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(updateRecorder, updateRequest)
 	if updateRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected update status: got=%d want=%d body=%s", updateRecorder.Code, http.StatusOK, updateRecorder.Body.String())
@@ -569,8 +633,8 @@ func TestAdminConfigUpdateEnforcesIfMatchVersion(testingObject *testing.T) {
 		"/api/admin/config",
 		strings.NewReader(`{"if_match_version":1,"patch":{"observability.log_level":"warn"}}`),
 	)
-	conflictRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
 	conflictRequest.Header.Set("Content-Type", "application/json")
+	applyBootstrapSession(conflictRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(conflictRecorder, conflictRequest)
 	if conflictRecorder.Code != http.StatusConflict {
 		testingObject.Fatalf("unexpected conflict status: got=%d want=%d body=%s", conflictRecorder.Code, http.StatusConflict, conflictRecorder.Body.String())
@@ -597,14 +661,15 @@ func TestAdminConfigUpdatePersistsToRuntimeConfigFile(testingObject *testing.T) 
 		testingObject.Fatalf("expected admin server initialized")
 	}
 
+	adminSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "admin", "devbridge-admin-pass")
 	updateRecorder := httptest.NewRecorder()
 	updateRequest := httptest.NewRequest(
 		http.MethodPut,
 		"/api/admin/config",
 		strings.NewReader(`{"if_match_version":1,"patch":{"ingress.http_addr":":18080","ingress.base_domain":"svc.dev.internal","control_plane.heartbeat_timeout_ms":45000}}`),
 	)
-	updateRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
 	updateRequest.Header.Set("Content-Type", "application/json")
+	applyBootstrapSession(updateRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(updateRecorder, updateRequest)
 	if updateRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected update status: got=%d want=%d body=%s", updateRecorder.Code, http.StatusOK, updateRecorder.Body.String())
@@ -646,9 +711,10 @@ func TestAdminDiagnoseExportDownloadLifecycleOnSingleServer(testingObject *testi
 		testingObject.Fatalf("expected admin server initialized")
 	}
 
+	adminSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "admin", "devbridge-admin-pass")
 	exportRecorder := httptest.NewRecorder()
 	exportRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/diagnose/export", nil)
-	exportRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
+	applyBootstrapSession(exportRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(exportRecorder, exportRequest)
 	if exportRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected export status: got=%d want=%d body=%s", exportRecorder.Code, http.StatusOK, exportRecorder.Body.String())
@@ -666,7 +732,7 @@ func TestAdminDiagnoseExportDownloadLifecycleOnSingleServer(testingObject *testi
 
 	downloadRecorder := httptest.NewRecorder()
 	downloadRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	downloadRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
+	applyBootstrapSession(downloadRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(downloadRecorder, downloadRequest)
 	if downloadRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected download status: got=%d want=%d body=%s", downloadRecorder.Code, http.StatusOK, downloadRecorder.Body.String())
@@ -674,26 +740,25 @@ func TestAdminDiagnoseExportDownloadLifecycleOnSingleServer(testingObject *testi
 
 	replayRecorder := httptest.NewRecorder()
 	replayRequest := httptest.NewRequest(http.MethodGet, exportResponse.DownloadURL, nil)
-	replayRequest.Header.Set("Authorization", "Bearer devbridge-admin-token")
+	applyBootstrapSession(replayRequest, adminSession)
 	runtime.adminServer.Handler.ServeHTTP(replayRecorder, replayRequest)
 	if replayRecorder.Code != http.StatusNotFound {
 		testingObject.Fatalf("unexpected replay status: got=%d want=%d body=%s", replayRecorder.Code, http.StatusNotFound, replayRecorder.Body.String())
 	}
 }
 
-// TestBootstrapCookieAuthWriteRequiresCSRFOnSingleServer
-// 验证 cookie 鉴权模式在单实例 server 下生效，且写请求强制 CSRF 与 Origin 校验。
-func TestBootstrapCookieAuthWriteRequiresCSRFOnSingleServer(testingObject *testing.T) {
+// TestBootstrapSessionWriteRequiresCSRFOnSingleServer
+// 验证浏览器会话模式在单实例 server 下生效，且写请求强制 CSRF 与 Origin 校验。
+func TestBootstrapSessionWriteRequiresCSRFOnSingleServer(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	config := DefaultConfig()
 	config.Admin.Enabled = true
 	config.Admin.UIEnabled = false
-	config.Admin.AuthMode = "cookie"
-	config.Admin.CookieTokenName = "bridge_admin_token"
+	config.Admin.SessionCookieName = "bridge_admin_session"
 	config.Admin.CSRFCookieName = "bridge_admin_csrf"
 	config.Admin.CSRFHeaderName = "X-CSRF-Token"
-	config.Admin.AllowedOrigins = []string{"http://127.0.0.1:39081"}
+	config.Admin.AllowedOrigins = []string{bootstrapTestAllowedOrigin}
 
 	runtime, err := Bootstrap(context.Background(), config)
 	if err != nil {
@@ -703,30 +768,24 @@ func TestBootstrapCookieAuthWriteRequiresCSRFOnSingleServer(testingObject *testi
 		testingObject.Fatalf("expected admin server initialized")
 	}
 
+	viewerSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "viewer", "devbridge-viewer-pass")
+	operatorSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "operator", "devbridge-operator-pass")
 	// 读接口仅依赖鉴权，不要求 CSRF。
 	overviewRecorder := httptest.NewRecorder()
 	overviewRequest := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
-	overviewRequest.AddCookie(&http.Cookie{
-		Name:  config.Admin.CookieTokenName,
-		Value: "devbridge-viewer-token",
-	})
+	applyBootstrapSession(overviewRequest, viewerSession)
 	runtime.adminServer.Handler.ServeHTTP(overviewRecorder, overviewRequest)
 	if overviewRecorder.Code != http.StatusOK {
-		testingObject.Fatalf("unexpected overview status in cookie auth mode: got=%d want=%d body=%s", overviewRecorder.Code, http.StatusOK, overviewRecorder.Body.String())
+		testingObject.Fatalf("unexpected overview status in session auth mode: got=%d want=%d body=%s", overviewRecorder.Code, http.StatusOK, overviewRecorder.Body.String())
 	}
 
 	// 写接口缺失 CSRF Header 时应拒绝。
 	forbiddenRecorder := httptest.NewRecorder()
 	forbiddenRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/config/reload", nil)
-	forbiddenRequest.AddCookie(&http.Cookie{
-		Name:  config.Admin.CookieTokenName,
-		Value: "devbridge-operator-token",
-	})
-	forbiddenRequest.AddCookie(&http.Cookie{
-		Name:  config.Admin.CSRFCookieName,
-		Value: "csrf-token",
-	})
-	forbiddenRequest.Header.Set("Origin", "http://127.0.0.1:39081")
+	for _, cookie := range operatorSession.cookies {
+		forbiddenRequest.AddCookie(cookie)
+	}
+	forbiddenRequest.Header.Set("Origin", bootstrapTestAllowedOrigin)
 	runtime.adminServer.Handler.ServeHTTP(forbiddenRecorder, forbiddenRequest)
 	if forbiddenRecorder.Code != http.StatusForbidden {
 		testingObject.Fatalf("unexpected forbidden status without csrf header: got=%d want=%d body=%s", forbiddenRecorder.Code, http.StatusForbidden, forbiddenRecorder.Body.String())
@@ -735,16 +794,7 @@ func TestBootstrapCookieAuthWriteRequiresCSRFOnSingleServer(testingObject *testi
 	// 带齐 CSRF Header + Cookie + 允许来源后，写接口应通过。
 	successRecorder := httptest.NewRecorder()
 	successRequest := httptest.NewRequest(http.MethodPost, "/api/admin/ops/config/reload", nil)
-	successRequest.AddCookie(&http.Cookie{
-		Name:  config.Admin.CookieTokenName,
-		Value: "devbridge-operator-token",
-	})
-	successRequest.AddCookie(&http.Cookie{
-		Name:  config.Admin.CSRFCookieName,
-		Value: "csrf-token-2",
-	})
-	successRequest.Header.Set("Origin", "http://127.0.0.1:39081")
-	successRequest.Header.Set(config.Admin.CSRFHeaderName, "csrf-token-2")
+	applyBootstrapSession(successRequest, operatorSession)
 	runtime.adminServer.Handler.ServeHTTP(successRecorder, successRequest)
 	if successRecorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected success status with csrf headers: got=%d want=%d body=%s", successRecorder.Code, http.StatusOK, successRecorder.Body.String())

@@ -20,17 +20,21 @@ admin:
   enabled: true
   ui_enabled: true
   listen_addr: ":49081"
-  auth_mode: bearer
-  auth_tokens:
-    - name: viewer
-      token: viewer-token
-      role: viewer
-    - name: operator
-      token: operator-token
-      role: operator
-    - name: admin
-      token: admin-token
-      role: admin
+  auth_providers:
+    - name: local-password
+      type: password
+      enabled: true
+      password:
+        accounts:
+          - username: viewer
+            password: viewer-pass
+            role: viewer
+          - username: operator
+            password: operator-pass
+            role: operator
+          - username: admin
+            password: admin-pass
+            role: admin
 control_plane:
   listen_addr: ":49080"
   grpc_h2_listen_addr: ":49082"
@@ -90,8 +94,15 @@ fallback_policies:
 	if config.Ingress.BaseDomain != "dev.example.internal" {
 		testingObject.Fatalf("unexpected ingress base_domain: got=%s want=%s", config.Ingress.BaseDomain, "dev.example.internal")
 	}
-	if len(config.Admin.AuthTokens) != 3 {
-		testingObject.Fatalf("unexpected admin token count: got=%d want=%d", len(config.Admin.AuthTokens), 3)
+	if len(config.Admin.AuthProviders) != 1 {
+		testingObject.Fatalf("unexpected admin auth provider count: got=%d want=%d", len(config.Admin.AuthProviders), 1)
+	}
+	if len(config.Admin.AuthProviders[0].Password.Accounts) != 3 {
+		testingObject.Fatalf(
+			"unexpected admin account count: got=%d want=%d",
+			len(config.Admin.AuthProviders[0].Password.Accounts),
+			3,
+		)
 	}
 	if config.DefaultScope.Namespace != "default" || config.DefaultScope.Environment != "shared" {
 		testingObject.Fatalf("unexpected default scope: %+v", config.DefaultScope)
@@ -101,6 +112,73 @@ fallback_policies:
 	}
 	if config.FallbackPolicies[0].Namespace != "dev" || !config.FallbackPolicies[0].External.Enabled {
 		testingObject.Fatalf("unexpected fallback policy: %+v", config.FallbackPolicies[0])
+	}
+}
+
+// TestParseConfigYAMLMigratesLegacyAdminAuthFields 验证旧版 admin 鉴权字段会自动迁移到新结构。
+func TestParseConfigYAMLMigratesLegacyAdminAuthFields(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	configYAML := `
+admin:
+  enabled: true
+  listen_addr: ":49081"
+  auth_mode: cookie
+  cookie_token_name: bridge_admin_token
+  auth_tokens:
+    - name: viewer
+      token: viewer-token
+      role: viewer
+    - name: admin
+      token: admin-token
+      role: admin
+control_plane:
+  listen_addr: ":49080"
+  grpc_h2_listen_addr: ":49082"
+`
+	config, err := ParseConfigYAML([]byte(configYAML))
+	if err != nil {
+		testingObject.Fatalf("parse legacy config yaml failed: %v", err)
+	}
+	if config.Admin.SessionCookieName != "bridge_admin_token" {
+		testingObject.Fatalf(
+			"unexpected migrated session cookie name: got=%s want=%s",
+			config.Admin.SessionCookieName,
+			"bridge_admin_token",
+		)
+	}
+	if len(config.Admin.AuthProviders) != 1 {
+		testingObject.Fatalf("unexpected migrated auth provider count: got=%d want=1", len(config.Admin.AuthProviders))
+	}
+	if config.Admin.AuthProviders[0].Name != "legacy-token-compat" {
+		testingObject.Fatalf(
+			"unexpected migrated provider name: got=%s want=%s",
+			config.Admin.AuthProviders[0].Name,
+			"legacy-token-compat",
+		)
+	}
+	if len(config.Admin.AuthProviders[0].Password.Accounts) != 2 {
+		testingObject.Fatalf(
+			"unexpected migrated account count: got=%d want=2",
+			len(config.Admin.AuthProviders[0].Password.Accounts),
+		)
+	}
+	if config.Admin.AuthProviders[0].Password.Accounts[0].Username != "viewer" {
+		testingObject.Fatalf(
+			"unexpected migrated viewer username: got=%s want=%s",
+			config.Admin.AuthProviders[0].Password.Accounts[0].Username,
+			"viewer",
+		)
+	}
+	if config.Admin.AuthProviders[0].Password.Accounts[0].Password != "viewer-token" {
+		testingObject.Fatalf(
+			"unexpected migrated viewer password: got=%s want=%s",
+			config.Admin.AuthProviders[0].Password.Accounts[0].Password,
+			"viewer-token",
+		)
+	}
+	if config.Admin.LegacyAuthMode != "" || len(config.Admin.LegacyAuthTokens) != 0 || config.Admin.LegacyCookieTokenName != "" {
+		testingObject.Fatalf("expected legacy admin auth fields cleared after migration: %+v", config.Admin)
 	}
 }
 

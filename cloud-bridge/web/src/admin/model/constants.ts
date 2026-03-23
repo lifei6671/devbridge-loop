@@ -1,6 +1,5 @@
 import type { AdminPageKey } from "./types";
 
-export const authStorageKey = "bridge.admin.token";
 export const autoRefreshEnabledStorageKey = "bridge.admin.auto_refresh.enabled";
 export const autoRefreshIntervalStorageKey = "bridge.admin.auto_refresh.interval_ms";
 export const autoRefreshIntervalOptions = [3000, 5000, 10000, 30000];

@@ -23,6 +23,7 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
   const { applySSESnapshot, refreshPageData, state } = params;
   const {
     activePage,
+    authStatus,
     autoRefreshEnabled,
     autoRefreshIntervalMS,
     isAutoRefreshInFlightRef,
@@ -36,20 +37,19 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
     sseEventSourceRef,
     sseReconnectTrigger,
     timeRangeMinutes,
-    token,
     tunnelConnectorFilter,
     tunnelStateFilter,
   } = state;
 
   useEffect(() => {
-    if (token.trim() === "") {
+    if (authStatus !== "authenticated") {
       return;
     }
     void refreshPageData(activePage);
-  }, [activePage, refreshPageData, token]);
+  }, [activePage, authStatus, refreshPageData]);
 
   useEffect(() => {
-    if (!autoRefreshEnabled || token.trim() === "" || realtimeMode !== "polling") {
+    if (!autoRefreshEnabled || authStatus !== "authenticated" || realtimeMode !== "polling") {
       return;
     }
     const reconnectIntervalMS = Math.max(autoRefreshIntervalMS * 3, minSSEReconnectIntervalMS);
@@ -59,7 +59,7 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
     return () => {
       window.clearInterval(timerID);
     };
-  }, [autoRefreshEnabled, autoRefreshIntervalMS, realtimeMode, setSSEReconnectTrigger, token]);
+  }, [authStatus, autoRefreshEnabled, autoRefreshIntervalMS, realtimeMode, setSSEReconnectTrigger]);
 
   useEffect(() => {
     if (sseEventSourceRef.current !== null) {
@@ -72,8 +72,7 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
       setIsAutoRefreshing(false);
       return;
     }
-    const normalizedToken = token.trim();
-    if (normalizedToken === "") {
+    if (authStatus !== "authenticated") {
       setRealtimeMode("off");
       setSSEConnectionState("idle");
       setIsAutoRefreshing(false);
@@ -87,7 +86,6 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
 
     const activeTopic = pickSSETopicByPage(activePage);
     const streamQuery: Record<string, string | number | undefined> = {
-      access_token: normalizedToken,
       topics: activeTopic,
       interval_ms: autoRefreshIntervalMS,
     };
@@ -180,6 +178,7 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
   }, [
     activePage,
     applySSESnapshot,
+    authStatus,
     autoRefreshEnabled,
     autoRefreshIntervalMS,
     sessionStateFilter,
@@ -190,13 +189,12 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
     sseEventSourceRef,
     sseReconnectTrigger,
     timeRangeMinutes,
-    token,
     tunnelConnectorFilter,
     tunnelStateFilter,
   ]);
 
   useEffect(() => {
-    if (!autoRefreshEnabled || token.trim() === "" || realtimeMode !== "polling") {
+    if (!autoRefreshEnabled || authStatus !== "authenticated" || realtimeMode !== "polling") {
       setIsAutoRefreshing(false);
       return;
     }
@@ -219,12 +217,12 @@ export function useAdminConsoleRealtime(params: UseAdminConsoleRealtimeParams) {
     };
   }, [
     activePage,
+    authStatus,
     autoRefreshEnabled,
     autoRefreshIntervalMS,
     isAutoRefreshInFlightRef,
     realtimeMode,
     refreshPageData,
     setIsAutoRefreshing,
-    token,
   ]);
 }

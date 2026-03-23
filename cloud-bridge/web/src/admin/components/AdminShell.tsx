@@ -12,6 +12,7 @@ export function AdminShell(props: AdminShellProps) {
   const {
     activeMeta,
     activePage,
+    authStatus,
     closeDetailDrawer,
     currentDetailItems,
     currentDetailRecord,
@@ -19,12 +20,14 @@ export function AdminShell(props: AdminShellProps) {
     detailSelection,
     isLoading,
     lastSyncMS,
+    logout,
     moveDetailSelection,
     navigateToPage,
     prefillOpsFromDetail,
     quickDrainFromDetail,
     realtimeSummary,
     refreshPageData,
+    session,
   } = props.vm;
 
   return (
@@ -93,6 +96,12 @@ export function AdminShell(props: AdminShellProps) {
 
               <div className="topbar-actions">
                 <div className="topbar-status-strip">
+                  {session !== null ? (
+                    <div className="topbar-account-chip">
+                      <span>{session.display_name || session.username}</span>
+                      <small>{session.role}</small>
+                    </div>
+                  ) : null}
                   <Tooltip
                     align="end"
                     content={realtimeSummary.detail}
@@ -113,9 +122,15 @@ export function AdminShell(props: AdminShellProps) {
                   type="button"
                   className="solid-btn topbar-refresh-btn"
                   onClick={() => void refreshPageData(activePage)}
+                  disabled={authStatus !== "authenticated"}
                 >
                   {isLoading ? "加载中..." : "刷新"}
                 </button>
+                {session !== null ? (
+                  <button type="button" className="ghost-btn" onClick={() => void logout()}>
+                    退出登录
+                  </button>
+                ) : null}
               </div>
             </div>
           </header>

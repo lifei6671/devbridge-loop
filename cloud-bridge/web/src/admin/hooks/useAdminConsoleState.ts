@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from "react";
 
 import type {
   AdminPageKey,
+  AdminAuthProvider,
+  AdminSessionRecord,
+  AuthStatus,
   ApiRecord,
   DetailSelection,
   RealtimeMode,
   SSEConnectionState,
 } from "../model";
 import {
-  authStorageKey,
   defaultAdminPage,
   defaultAutoRefreshIntervalMS,
   resolveAdminPageFromLocation,
@@ -21,7 +23,14 @@ export function useAdminConsoleState() {
     }
     return resolveAdminPageFromLocation(window.location);
   });
-  const [token, setToken] = useState("");
+  const [authStatus, setAuthStatus] = useState<AuthStatus>("loading");
+  const [authProviders, setAuthProviders] = useState<AdminAuthProvider[]>([]);
+  const [session, setSession] = useState<AdminSessionRecord | null>(null);
+  const [authError, setAuthError] = useState("");
+  const [selectedProvider, setSelectedProvider] = useState("");
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [lastSyncMS, setLastSyncMS] = useState(0);
   const [detailSelection, setDetailSelection] = useState<DetailSelection | null>(null);
@@ -66,21 +75,22 @@ export function useAdminConsoleState() {
   const sseEventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    const persistedToken = window.localStorage.getItem(authStorageKey) ?? "devbridge-viewer-token";
-    setToken(persistedToken);
-  }, []);
-
-  useEffect(() => {
-    if (token.trim() === "") {
+    if (selectedProvider.trim() !== "") {
       return;
     }
-    window.localStorage.setItem(authStorageKey, token);
-  }, [token]);
+    if (authProviders.length === 0) {
+      return;
+    }
+    setSelectedProvider(authProviders[0]?.name ?? "");
+  }, [authProviders, selectedProvider]);
 
   return {
     activeMetricKey,
     activePage,
     agentPoolSummary,
+    authError,
+    authProviders,
+    authStatus,
     autoRefreshEnabled,
     autoRefreshIntervalMS,
     configSnapshot,
@@ -91,11 +101,14 @@ export function useAdminConsoleState() {
     drainReason,
     drainSessionID,
     exportDownloadURL,
+    isAuthenticating,
     isAutoRefreshInFlightRef,
     isAutoRefreshing,
     isLoading,
     isTrafficOwnershipLoading,
     lastSyncMS,
+    loginPassword,
+    loginUsername,
     logItems,
     metricPoints,
     overview,
@@ -104,11 +117,16 @@ export function useAdminConsoleState() {
     realtimeMode,
     routeItems,
     serviceItems,
+    session,
     sessionItems,
     sessionStateFilter,
+    selectedProvider,
     setActiveMetricKey,
     setActivePage,
     setAgentPoolSummary,
+    setAuthError,
+    setAuthProviders,
+    setAuthStatus,
     setConfigSnapshot,
     setConnectorItems,
     setDetailSelection,
@@ -117,10 +135,13 @@ export function useAdminConsoleState() {
     setDrainReason,
     setDrainSessionID,
     setExportDownloadURL,
+    setIsAuthenticating,
     setIsAutoRefreshing,
     setIsLoading,
     setIsTrafficOwnershipLoading,
     setLastSyncMS,
+    setLoginPassword,
+    setLoginUsername,
     setLogItems,
     setMetricPoints,
     setOverview,
@@ -129,10 +150,12 @@ export function useAdminConsoleState() {
     setRealtimeMode,
     setRouteItems,
     setServiceItems,
+    setSession,
     setSessionItems,
     setSessionStateFilter,
     setSSEConnectionState,
     setSSEReconnectTrigger,
+    setSelectedProvider,
     setTimeRangeMinutes,
     setTrafficLookupID,
     setTrafficOwnership,
@@ -146,7 +169,6 @@ export function useAdminConsoleState() {
     sseEventSourceRef,
     sseReconnectTrigger,
     timeRangeMinutes,
-    token,
     trafficLookupID,
     trafficOwnership,
     trafficOwnershipError,

@@ -12,8 +12,8 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-// TestOverviewRequiresBearerToken 验证未携带 Bearer Token 时会被拒绝。
-func TestOverviewRequiresBearerToken(testingObject *testing.T) {
+// TestOverviewRequiresSession 验证未建立登录会话时会被拒绝。
+func TestOverviewRequiresSession(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	server, err := NewServer(ServerOptions{
@@ -26,9 +26,8 @@ func TestOverviewRequiresBearerToken(testingObject *testing.T) {
 			TunnelSnapshot:       func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
 			BuildConfigSnapshot:  func() map[string]any { return map[string]any{} },
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -44,8 +43,61 @@ func TestOverviewRequiresBearerToken(testingObject *testing.T) {
 	}
 }
 
-// TestViewerTokenCanReadOverview 验证 viewer 角色可以访问只读总览接口。
-func TestViewerTokenCanReadOverview(testingObject *testing.T) {
+// TestAuthSessionEchoesConfiguredCSRFHeaderName 验证会话接口会回传服务端实际使用的 CSRF Header 名。
+func TestAuthSessionEchoesConfiguredCSRFHeaderName(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	server, err := NewServer(ServerOptions{
+		Dependencies:      Dependencies{},
+		AuthProviders:     newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		CSRFHeaderName:    "X-Bridge-CSRF",
+		AllowedOrigins:    []string{testAllowedOrigin},
+		SessionCookieName: "bridge_admin_session",
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	sessionRecorder := httptest.NewRecorder()
+	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/admin/auth/session", nil)
+	mux.ServeHTTP(sessionRecorder, sessionRequest)
+	if sessionRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected anonymous session status: got=%d want=%d", sessionRecorder.Code, http.StatusOK)
+	}
+	var anonymousPayload map[string]any
+	if err := json.Unmarshal(sessionRecorder.Body.Bytes(), &anonymousPayload); err != nil {
+		testingObject.Fatalf("decode anonymous session payload failed: %v body=%s", err, sessionRecorder.Body.String())
+	}
+	if anonymousPayload["csrf_header_name"] != "X-Bridge-CSRF" {
+		testingObject.Fatalf("unexpected anonymous csrf header name: %+v", anonymousPayload)
+	}
+
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
+	authenticatedRecorder := httptest.NewRecorder()
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/api/admin/auth/session", nil)
+	applyTestSession(authenticatedRequest, session)
+	mux.ServeHTTP(authenticatedRecorder, authenticatedRequest)
+	if authenticatedRecorder.Code != http.StatusOK {
+		testingObject.Fatalf(
+			"unexpected authenticated session status: got=%d want=%d body=%s",
+			authenticatedRecorder.Code,
+			http.StatusOK,
+			authenticatedRecorder.Body.String(),
+		)
+	}
+	var authenticatedPayload map[string]any
+	if err := json.Unmarshal(authenticatedRecorder.Body.Bytes(), &authenticatedPayload); err != nil {
+		testingObject.Fatalf("decode authenticated session payload failed: %v body=%s", err, authenticatedRecorder.Body.String())
+	}
+	if authenticatedPayload["csrf_header_name"] != "X-Bridge-CSRF" {
+		testingObject.Fatalf("unexpected authenticated csrf header name: %+v", authenticatedPayload)
+	}
+}
+
+// TestViewerSessionCanReadOverview 验证 viewer 角色可以访问只读总览接口。
+func TestViewerSessionCanReadOverview(testingObject *testing.T) {
 	testingObject.Parallel()
 
 	now := time.Unix(1700000000, 0).UTC()
@@ -80,9 +132,8 @@ func TestViewerTokenCanReadOverview(testingObject *testing.T) {
 				}
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -90,9 +141,10 @@ func TestViewerTokenCanReadOverview(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -118,9 +170,8 @@ func TestLogsSearchRequiresTimeWindow(testingObject *testing.T) {
 			ListTunnels:          func() []registry.TunnelRuntime { return nil },
 			TunnelSnapshot:       func() registry.TunnelSnapshot { return registry.TunnelSnapshot{} },
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -128,9 +179,10 @@ func TestLogsSearchRequiresTimeWindow(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/logs/search", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusBadRequest)
@@ -198,9 +250,8 @@ func TestTunnelSummarySupportsConnectorFilter(testingObject *testing.T) {
 				}
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -208,9 +259,10 @@ func TestTunnelSummarySupportsConnectorFilter(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/tunnels/summary?connector_id=agent-a", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -342,9 +394,8 @@ func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
 				}
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -352,9 +403,10 @@ func TestServicesListIncludesConnectorAssociation(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/services", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -408,9 +460,8 @@ func TestTrafficOwnershipLookupByTrafficID(testingObject *testing.T) {
 				}, true
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -418,9 +469,10 @@ func TestTrafficOwnershipLookupByTrafficID(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership?traffic_id=traffic-ownership-1", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		testingObject.Fatalf("unexpected status: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
@@ -459,9 +511,8 @@ func TestTrafficOwnershipLookupRequiresTrafficID(testingObject *testing.T) {
 				return TrafficOwnershipRecord{}, false
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -469,9 +520,10 @@ func TestTrafficOwnershipLookupRequiresTrafficID(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusBadRequest)
@@ -489,9 +541,8 @@ func TestTrafficOwnershipLookupNotFound(testingObject *testing.T) {
 				return TrafficOwnershipRecord{}, false
 			},
 		},
-		BearerTokens: []BearerToken{
-			{Name: "viewer-user", Token: "viewer-token", Role: RoleViewer},
-		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
 	})
 	if err != nil {
 		testingObject.Fatalf("new admin api server failed: %v", err)
@@ -499,9 +550,10 @@ func TestTrafficOwnershipLookupNotFound(testingObject *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/admin/traffic/ownership?traffic_id=traffic-missing", nil)
-	request.Header.Set("Authorization", "Bearer viewer-token")
+	applyTestSession(request, session)
 	mux.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNotFound {
 		testingObject.Fatalf("unexpected status: got=%d want=%d", recorder.Code, http.StatusNotFound)

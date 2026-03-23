@@ -835,11 +835,20 @@ web/bridge-admin/
 
 ## 11.2 登录与认证
 
-可选最简方案：
+本期落地方案：
 
-* 本地账号密码
-* Session Cookie / Token
+* 本地账号密码登录（`password` provider）
+* 浏览器 Session Cookie 会话
+* `viewer/operator/admin` 三角色
 * 仅管理入口开启认证
+
+扩展要求：
+
+* 认证层必须抽象为 provider 接口，而不是把“用户名密码校验”写死在路由里
+* provider 描述需显式包含 `name/type/label/login_flow`
+* 首版仅启用 `password`，但配置结构需为后续 LDAP / OAuth 预留扩展位
+* 升级兼容要求：若历史配置仍使用 `auth_tokens/auth_mode/cookie_token_name`，加载阶段必须先迁移到新结构，再进入校验与启动流程
+* `GET /api/admin/auth/session` / `POST /api/admin/auth/login` 返回体需回传当前生效的 `csrf_header_name`，前端不得写死 Header 名
 
 若是内网使用，也不能完全省略认证层。
 
@@ -853,7 +862,7 @@ web/bridge-admin/
 
 不得仅依赖“已登录态”放行写操作。
 
-若仅使用 Bearer Token 方案，可不启用 CSRF Token，但必须禁止 Cookie 回退鉴权。
+本期浏览器管理面默认走同源 Cookie 会话，SSE 与普通 API 复用同一登录态，不再依赖 `access_token` query 或静态 Bearer Token 配置。
 
 ---
 

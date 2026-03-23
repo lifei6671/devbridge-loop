@@ -16,7 +16,8 @@ export function useAdminConsoleActions(params: UseAdminConsoleActionsParams) {
   const { navigateToPage, openDetailDrawer, state } = params;
   const { detailSelection } = state;
 
-  const { applySSESnapshot, refreshPageData, requestAdmin } = useAdminDataActions(state);
+  const { applySSESnapshot, login, logout, refreshAuthSession, refreshPageData, requestAdmin } =
+    useAdminDataActions(state);
   const opsActions = useAdminOpsActions({
     navigateToPage,
     refreshPageData,
@@ -56,7 +57,9 @@ export function useAdminConsoleActions(params: UseAdminConsoleActionsParams) {
     clearTrafficOwnershipLookup: trafficActions.clearTrafficOwnershipLookup,
     handleDetailRowKeyDown,
     isActiveDetailRow,
+    login,
     lookupTrafficOwnership: trafficActions.lookupTrafficOwnership,
+    logout,
     performConfigPatch: opsActions.performConfigPatch,
     performDrainConnector: opsActions.performDrainConnector,
     performDrainSession: opsActions.performDrainSession,
@@ -64,6 +67,7 @@ export function useAdminConsoleActions(params: UseAdminConsoleActionsParams) {
     performReload: opsActions.performReload,
     prefillOpsFromDetail: opsActions.prefillOpsFromDetail,
     quickDrainFromDetail: opsActions.quickDrainFromDetail,
+    refreshAuthSession,
     refreshPageData,
     submitConfigPatch: opsActions.submitConfigPatch,
     submitConfigPatchDocument: opsActions.submitConfigPatchDocument,

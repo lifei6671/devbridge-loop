@@ -118,6 +118,7 @@ func ApplyRuntimeConfigEnvOverrides(runtimeConfig Config) (Config, error) {
 	if _, err := applyRuntimeConfigEnvOverridesInPlace(&resolvedConfig); err != nil {
 		return Config{}, err
 	}
+	resolvedConfig.NormalizeCompatibility()
 	if err := resolvedConfig.Validate(); err != nil {
 		return Config{}, err
 	}

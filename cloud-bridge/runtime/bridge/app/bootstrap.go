@@ -30,6 +30,7 @@ type Runtime struct {
 
 // Bootstrap prepares the runtime graph. It is intentionally minimal in the skeleton.
 func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
+	cfg.NormalizeCompatibility()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -184,12 +185,11 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 					return adminConfigStore.update(now, request, actor)
 				},
 			},
-			BearerTokens:    buildAdminBearerTokens(cfg.Admin.AuthTokens),
-			AuthMode:        cfg.Admin.AuthMode,
-			CookieTokenName: cfg.Admin.CookieTokenName,
-			CSRFCookieName:  cfg.Admin.CSRFCookieName,
-			CSRFHeaderName:  cfg.Admin.CSRFHeaderName,
-			AllowedOrigins:  append([]string(nil), cfg.Admin.AllowedOrigins...),
+			AuthProviders:     buildAdminAuthProviders(cfg.Admin.AuthProviders),
+			SessionCookieName: cfg.Admin.SessionCookieName,
+			CSRFCookieName:    cfg.Admin.CSRFCookieName,
+			CSRFHeaderName:    cfg.Admin.CSRFHeaderName,
+			AllowedOrigins:    append([]string(nil), cfg.Admin.AllowedOrigins...),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("initialize admin api server: %w", err)
@@ -300,24 +300,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 }
 
-// buildAdminBearerTokens 把 app 配置中的 token 映射转换为 adminapi 可消费结构。
-func buildAdminBearerTokens(tokens []AdminAuthTokenConfig) []adminapi.BearerToken {
-	result := make([]adminapi.BearerToken, 0, len(tokens))
-	for _, tokenConfig := range tokens {
-		normalizedRole, ok := normalizeAdminRoleForAPI(tokenConfig.Role)
-		if !ok {
-			// Validate 已保证角色合法，这里仍做兜底防御。
-			continue
-		}
-		result = append(result, adminapi.BearerToken{
-			Name:  strings.TrimSpace(tokenConfig.Name),
-			Token: strings.TrimSpace(tokenConfig.Token),
-			Role:  normalizedRole,
-		})
-	}
-	return result
-}
-
 // normalizeAdminRoleForAPI 把字符串角色映射为 adminapi.Role。
 func normalizeAdminRoleForAPI(role string) (adminapi.Role, bool) {
 	switch strings.ToLower(strings.TrimSpace(role)) {
@@ -332,16 +314,75 @@ func normalizeAdminRoleForAPI(role string) (adminapi.Role, bool) {
 	}
 }
 
-// maskAdminToken 对配置快照中的 token 进行脱敏，避免管理接口泄露密钥材料。
-func maskAdminToken(rawToken string) string {
-	normalizedToken := strings.TrimSpace(rawToken)
-	if normalizedToken == "" {
+// buildAdminAuthProviders 把 app 配置中的 provider 描述转换为 adminapi 可消费结构。
+func buildAdminAuthProviders(providers []AdminAuthProviderConfig) []adminapi.AuthProviderConfig {
+	result := make([]adminapi.AuthProviderConfig, 0, len(providers))
+	for _, providerConfig := range providers {
+		provider := adminapi.AuthProviderConfig{
+			Name:    strings.TrimSpace(providerConfig.Name),
+			Type:    strings.TrimSpace(providerConfig.Type),
+			Label:   strings.TrimSpace(providerConfig.Label),
+			Enabled: providerConfig.Enabled,
+		}
+		if strings.EqualFold(strings.TrimSpace(providerConfig.Type), "password") {
+			provider.Password.Accounts = make([]adminapi.PasswordAccountConfig, 0, len(providerConfig.Password.Accounts))
+			for _, accountConfig := range providerConfig.Password.Accounts {
+				normalizedRole, ok := normalizeAdminRoleForAPI(accountConfig.Role)
+				if !ok {
+					continue
+				}
+				provider.Password.Accounts = append(provider.Password.Accounts, adminapi.PasswordAccountConfig{
+					Username:    strings.TrimSpace(accountConfig.Username),
+					Password:    strings.TrimSpace(accountConfig.Password),
+					DisplayName: strings.TrimSpace(accountConfig.DisplayName),
+					Role:        normalizedRole,
+				})
+			}
+		}
+		result = append(result, provider)
+	}
+	return result
+}
+
+// buildAdminAuthProviderSnapshot 生成管理面配置快照中可安全展示的 provider 结构。
+func buildAdminAuthProviderSnapshot(providers []AdminAuthProviderConfig) []map[string]any {
+	result := make([]map[string]any, 0, len(providers))
+	for _, providerConfig := range providers {
+		providerSnapshot := map[string]any{
+			"name":    strings.TrimSpace(providerConfig.Name),
+			"type":    strings.TrimSpace(providerConfig.Type),
+			"label":   strings.TrimSpace(providerConfig.Label),
+			"enabled": providerConfig.Enabled,
+		}
+		if strings.EqualFold(strings.TrimSpace(providerConfig.Type), "password") {
+			accountSnapshots := make([]map[string]any, 0, len(providerConfig.Password.Accounts))
+			for _, accountConfig := range providerConfig.Password.Accounts {
+				accountSnapshots = append(accountSnapshots, map[string]any{
+					"username":     strings.TrimSpace(accountConfig.Username),
+					"display_name": strings.TrimSpace(accountConfig.DisplayName),
+					"role":         strings.TrimSpace(accountConfig.Role),
+					"password":     maskAdminSecret(accountConfig.Password),
+				})
+			}
+			providerSnapshot["password"] = map[string]any{
+				"accounts": accountSnapshots,
+			}
+		}
+		result = append(result, providerSnapshot)
+	}
+	return result
+}
+
+// maskAdminSecret 对配置快照中的敏感凭据做脱敏，避免管理接口泄露密钥材料。
+func maskAdminSecret(rawSecret string) string {
+	normalizedSecret := strings.TrimSpace(rawSecret)
+	if normalizedSecret == "" {
 		return ""
 	}
-	if len(normalizedToken) <= 4 {
+	if len(normalizedSecret) <= 4 {
 		return "****"
 	}
-	return "****" + normalizedToken[len(normalizedToken)-4:]
+	return "****" + normalizedSecret[len(normalizedSecret)-4:]
 }
 
 // Shutdown 执行管理端口优雅关闭。
