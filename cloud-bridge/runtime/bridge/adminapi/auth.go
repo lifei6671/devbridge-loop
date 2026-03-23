@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -266,9 +265,6 @@ func buildAuthProviders(configs []AuthProviderConfig) (map[string]authProvider, 
 	if len(providers) == 0 {
 		return nil, nil, fmt.Errorf("build auth providers: empty enabled providers")
 	}
-	sort.Slice(descriptors, func(indexA int, indexB int) bool {
-		return descriptors[indexA].Name < descriptors[indexB].Name
-	})
 	return providers, descriptors, nil
 }
 
@@ -292,18 +288,31 @@ func (server *Server) authenticateLoginRequest(request *http.Request) (principal
 		return principal{}, fmt.Errorf("invalid login payload")
 	}
 	providerName := strings.TrimSpace(loginRequest.Provider)
-	if providerName == "" && len(server.providerDescriptors) == 1 {
-		providerName = server.providerDescriptors[0].Name
-		loginRequest.Provider = providerName
+	if providerName != "" {
+		provider, exists := server.authProviders[providerName]
+		if !exists {
+			return principal{}, fmt.Errorf("unsupported auth provider")
+		}
+		return provider.Authenticate(request.Context(), loginRequest)
 	}
-	if providerName == "" {
-		return principal{}, fmt.Errorf("missing auth provider")
+
+	var lastErr error
+	for _, descriptor := range server.providerDescriptors {
+		provider, exists := server.authProviders[descriptor.Name]
+		if !exists {
+			continue
+		}
+		loginRequest.Provider = descriptor.Name
+		actor, err := provider.Authenticate(request.Context(), loginRequest)
+		if err == nil {
+			return actor, nil
+		}
+		lastErr = err
 	}
-	provider, exists := server.authProviders[providerName]
-	if !exists {
-		return principal{}, fmt.Errorf("unsupported auth provider")
+	if lastErr != nil {
+		return principal{}, lastErr
 	}
-	return provider.Authenticate(request.Context(), loginRequest)
+	return principal{}, fmt.Errorf("missing auth provider")
 }
 
 func (server *Server) handleAuthProviders(writer http.ResponseWriter, request *http.Request) {

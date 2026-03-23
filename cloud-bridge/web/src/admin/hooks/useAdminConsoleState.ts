@@ -27,7 +27,6 @@ export function useAdminConsoleState() {
   const [authProviders, setAuthProviders] = useState<AdminAuthProvider[]>([]);
   const [session, setSession] = useState<AdminSessionRecord | null>(null);
   const [authError, setAuthError] = useState("");
-  const [selectedProvider, setSelectedProvider] = useState("");
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [isAuthenticating, setIsAuthenticating] = useState(false);
@@ -74,16 +73,6 @@ export function useAdminConsoleState() {
   const isAutoRefreshInFlightRef = useRef(false);
   const sseEventSourceRef = useRef<EventSource | null>(null);
 
-  useEffect(() => {
-    if (selectedProvider.trim() !== "") {
-      return;
-    }
-    if (authProviders.length === 0) {
-      return;
-    }
-    setSelectedProvider(authProviders[0]?.name ?? "");
-  }, [authProviders, selectedProvider]);
-
   return {
     activeMetricKey,
     activePage,
@@ -120,7 +109,6 @@ export function useAdminConsoleState() {
     session,
     sessionItems,
     sessionStateFilter,
-    selectedProvider,
     setActiveMetricKey,
     setActivePage,
     setAgentPoolSummary,
@@ -155,7 +143,6 @@ export function useAdminConsoleState() {
     setSessionStateFilter,
     setSSEConnectionState,
     setSSEReconnectTrigger,
-    setSelectedProvider,
     setTimeRangeMinutes,
     setTrafficLookupID,
     setTrafficOwnership,

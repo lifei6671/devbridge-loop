@@ -9,16 +9,13 @@ type AdminAuthDialogProps = {
 export function AdminAuthDialog(props: AdminAuthDialogProps) {
   const {
     authError,
-    authProviders,
     authStatus,
     isAuthenticating,
     login,
     loginPassword,
     loginUsername,
-    selectedProvider,
     setLoginPassword,
     setLoginUsername,
-    setSelectedProvider,
   } = props.vm;
 
   if (authStatus === "authenticated") {
@@ -27,7 +24,7 @@ export function AdminAuthDialog(props: AdminAuthDialogProps) {
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void login(selectedProvider, loginUsername, loginPassword);
+    void login(loginUsername, loginPassword);
   };
 
   return (
@@ -43,21 +40,6 @@ export function AdminAuthDialog(props: AdminAuthDialogProps) {
         </div>
 
         <div className="auth-field-grid">
-          <label className="auth-field">
-            <span>登录方式</span>
-            <select
-              value={selectedProvider}
-              onChange={(event) => setSelectedProvider(event.target.value)}
-              disabled={isAuthenticating || authProviders.length <= 1}
-            >
-              {authProviders.map((provider) => (
-                <option key={provider.name} value={provider.name}>
-                  {provider.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
           <label className="auth-field">
             <span>用户名</span>
             <input

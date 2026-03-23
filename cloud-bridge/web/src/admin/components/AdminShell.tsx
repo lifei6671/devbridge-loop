@@ -113,21 +113,26 @@ export function AdminShell(props: AdminShellProps) {
                       aria-label={`${realtimeSummary.label} 说明`}
                     >
                       <span className={`shell-status-pill tone-${realtimeSummary.tone}`}>
-                        {realtimeSummary.label}
+                        <span className="shell-status-indicator" aria-hidden="true" />
+                        <span className="shell-status-label">{realtimeSummary.label}</span>
                       </span>
                     </button>
                   </Tooltip>
                 </div>
                 <button
                   type="button"
-                  className="solid-btn topbar-refresh-btn"
+                  className="solid-btn topbar-action-btn topbar-refresh-btn"
                   onClick={() => void refreshPageData(activePage)}
                   disabled={authStatus !== "authenticated"}
                 >
                   {isLoading ? "加载中..." : "刷新"}
                 </button>
                 {session !== null ? (
-                  <button type="button" className="ghost-btn" onClick={() => void logout()}>
+                  <button
+                    type="button"
+                    className="ghost-btn topbar-action-btn topbar-logout-btn"
+                    onClick={() => void logout()}
+                  >
                     退出登录
                   </button>
                 ) : null}

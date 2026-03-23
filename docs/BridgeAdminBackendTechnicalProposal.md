@@ -846,6 +846,7 @@ web/bridge-admin/
 
 * 认证层必须抽象为 provider 接口，而不是把“用户名密码校验”写死在路由里
 * provider 描述需显式包含 `name/type/label/login_flow`
+* 浏览器登录表单不允许用户预先选择 provider；当 `POST /api/admin/auth/login` 未显式携带 `provider` 时，服务端必须按配置文件中已启用 provider 的声明顺序依次校验，首个命中即生效
 * 首版仅启用 `password`，但配置结构需为后续 LDAP / OAuth 预留扩展位
 * 升级兼容要求：若历史配置仍使用 `auth_tokens/auth_mode/cookie_token_name`，加载阶段必须先迁移到新结构，再进入校验与启动流程
 * `GET /api/admin/auth/session` / `POST /api/admin/auth/login` 返回体需回传当前生效的 `csrf_header_name`，前端不得写死 Header 名

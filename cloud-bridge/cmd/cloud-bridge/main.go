@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load bridge config failed: %v", err)
 	}
+	logRuntimeConfigPaths(cfg)
 	runtime, err := app.Bootstrap(ctx, cfg)
 	if err != nil {
 		log.Fatalf("bridge bootstrap failed: %v", err)
@@ -54,6 +55,38 @@ func loadRuntimeConfigFromFlags() (app.Config, error) {
 	return app.LoadRuntimeConfig(strings.TrimSpace(*configFilePathFlag))
 }
 
+func logRuntimeConfigPaths(runtimeConfig app.Config) {
+	baseConfigPath, userConfigPath := resolveLoadedRuntimeConfigPaths(runtimeConfig)
+	log.Printf(
+		"bridge config sources base_config_path=%s user_config_path=%s",
+		formatLoadedRuntimeConfigPathForLog(baseConfigPath),
+		formatLoadedRuntimeConfigPathForLog(userConfigPath),
+	)
+}
+
+func resolveLoadedRuntimeConfigPaths(runtimeConfig app.Config) (string, string) {
+	return existingConfigFilePath(runtimeConfig.RuntimeBaseConfigFilePath), existingConfigFilePath(runtimeConfig.RuntimeConfigFilePath)
+}
+
+func existingConfigFilePath(rawConfigFilePath string) string {
+	normalizedConfigFilePath := strings.TrimSpace(rawConfigFilePath)
+	if normalizedConfigFilePath == "" {
+		return ""
+	}
+	fileInfo, err := os.Stat(normalizedConfigFilePath)
+	if err != nil || fileInfo.IsDir() {
+		return ""
+	}
+	return normalizedConfigFilePath
+}
+
+func formatLoadedRuntimeConfigPathForLog(configFilePath string) string {
+	if strings.TrimSpace(configFilePath) == "" {
+		return "<none>"
+	}
+	return configFilePath
+}
+
 // applyRuntimeConfigEnvOverrides 将环境变量覆盖到运行配置，并再次执行结构化校验。
 func applyRuntimeConfigEnvOverrides(runtimeConfig app.Config) (app.Config, error) {
 	return app.ApplyRuntimeConfigEnvOverrides(runtimeConfig)
@@ -62,38 +95,6 @@ func applyRuntimeConfigEnvOverrides(runtimeConfig app.Config) (app.Config, error
 // applyControlPlaneTLSEnvOverrides 处理 control_plane TLS 相关环境变量覆盖（环境变量优先）。
 func applyControlPlaneTLSEnvOverrides(runtimeConfig *app.Config) error {
 	return app.ApplyControlPlaneTLSEnvOverrides(runtimeConfig)
-}
-
-// stringEnvOrDefault 读取字符串环境变量，空值时回退到默认值。
-func stringEnvOrDefault(key string, defaultValue string) string {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue
-	}
-	return normalizedValue
-}
-
-// commaSeparatedEnvList 读取逗号分隔环境变量；返回值中的布尔表示该变量是否显式存在。
-func commaSeparatedEnvList(key string) ([]string, bool) {
-	rawValue, exists := os.LookupEnv(key)
-	if !exists {
-		return nil, false
-	}
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return nil, true
-	}
-	rawParts := strings.Split(normalizedValue, ",")
-	normalizedParts := make([]string, 0, len(rawParts))
-	for _, rawPart := range rawParts {
-		normalizedPart := strings.TrimSpace(rawPart)
-		if normalizedPart == "" {
-			continue
-		}
-		normalizedParts = append(normalizedParts, normalizedPart)
-	}
-	return normalizedParts, true
 }
 
 // durationEnvOrDefault 读取 duration 环境变量，空值时回退默认值。

@@ -299,8 +299,10 @@ label > span,
 }
 
 .topbar-actions {
+  --topbar-control-height: 52px;
+  --topbar-control-width: 132px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: flex-end;
   gap: 12px;
   flex-wrap: wrap;
@@ -308,37 +310,53 @@ label > span,
 
 .topbar-status-strip {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 12px;
   flex-wrap: wrap;
   max-width: min(520px, 100%);
 }
 
+.topbar-status-strip > * {
+  flex: 0 0 auto;
+}
+
 .topbar-account-chip {
-  display: grid;
-  gap: 2px;
-  min-height: 34px;
-  padding: 7px 12px;
-  border-radius: 16px;
-  border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface-2) 78%, #fff 22%);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: var(--topbar-control-width);
+  height: var(--topbar-control-height);
+  padding: 8px 16px;
+  text-align: center;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--line) 84%);
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.96) 0%, rgb(244 247 255 / 0.92) 100%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.9),
+    0 10px 22px rgb(124 143 197 / 0.1);
 }
 
 .topbar-account-chip span {
-  font-size: 0.86rem;
+  font-size: 0.98rem;
   font-weight: 700;
+  line-height: 1;
 }
 
 .topbar-account-chip small {
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
+  line-height: 1;
 }
 
 .shell-status-trigger {
   display: inline-flex;
+  min-width: var(--topbar-control-width);
   padding: 0;
   border: 0;
   background: transparent;
@@ -346,36 +364,54 @@ label > span,
 }
 
 .shell-status-pill {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
-  min-height: 34px;
-  padding: 0 14px;
-  border-radius: 999px;
-  font-size: 0.82rem;
+  justify-content: center;
+  gap: 10px;
+  min-width: var(--topbar-control-width);
+  height: var(--topbar-control-height);
+  padding: 0 16px;
+  border-radius: 20px;
+  font-size: 0.88rem;
   font-weight: 700;
   border: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.3);
+}
+
+.shell-status-indicator {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 18%, transparent 82%);
+  flex: 0 0 auto;
+}
+
+.shell-status-label {
+  white-space: nowrap;
 }
 
 .shell-status-pill.tone-ok {
-  background: var(--ok-soft);
+  background: linear-gradient(180deg, #edf9f2 0%, #e2f6ea 100%);
   color: #10835a;
-  border-color: #cfeedd;
+  border-color: #c9ecd8;
 }
 
 .shell-status-pill.tone-warn {
-  background: var(--warn-soft);
+  background: linear-gradient(180deg, #fff8ea 0%, #fff0ce 100%);
   color: #b1700b;
   border-color: #f3d8a3;
 }
 
 .shell-status-pill.tone-danger {
-  background: var(--danger-soft);
+  background: linear-gradient(180deg, #fff2f4 0%, #ffe3e9 100%);
   color: #cc3152;
   border-color: #ffd0d8;
 }
 
 .shell-status-pill.tone-normal {
-  background: #f1f4fa;
+  background: linear-gradient(180deg, #f7f9fd 0%, #edf2fb 100%);
   color: #7280a5;
 }
 
@@ -383,8 +419,36 @@ label > span,
   max-width: min(320px, calc(100vw - 32px));
 }
 
-.topbar-refresh-btn {
-  min-width: 88px;
+.topbar-actions .topbar-action-btn {
+  box-sizing: border-box;
+  min-width: var(--topbar-control-width);
+  height: var(--topbar-control-height);
+  padding: 0 18px;
+  border-radius: 20px;
+  font-size: 0.9rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.topbar-actions .topbar-refresh-btn,
+.topbar-actions .topbar-logout-btn {
+  min-width: var(--topbar-control-width);
+}
+
+.topbar-actions .topbar-logout-btn {
+  border-color: color-mix(in srgb, var(--accent) 14%, var(--line) 86%);
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.95) 0%, rgb(247 249 255 / 0.92) 100%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.9),
+    0 10px 22px rgb(124 143 197 / 0.08);
+}
+
+.topbar-actions .topbar-logout-btn:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line) 72%);
+  background: linear-gradient(180deg, #f7f9ff 0%, #eef3ff 100%);
 }
 
 .inline-actions,

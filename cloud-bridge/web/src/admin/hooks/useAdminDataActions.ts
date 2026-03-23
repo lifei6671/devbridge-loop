@@ -187,7 +187,7 @@ export function useAdminDataActions(state: AdminConsoleState) {
   );
 
   const login = useCallback(
-    async (provider: string, username: string, password: string) => {
+    async (username: string, password: string) => {
       setIsAuthenticating(true);
       setAuthError("");
       try {
@@ -199,7 +199,6 @@ export function useAdminDataActions(state: AdminConsoleState) {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            provider,
             username,
             password,
           }),
