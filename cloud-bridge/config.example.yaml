@@ -81,6 +81,9 @@ control_plane:
   # 控制面 gRPC H2 监听地址。
   # 约束：必须与 listen_addr 不同，避免端口冲突。
   grpc_h2_listen_addr: ":39082"
+  # 控制面 QUIC 监听地址。
+  # 约束：必须同时不同于 listen_addr 与 grpc_h2_listen_addr。
+  quic_listen_addr: ":39083"
   # Session 心跳超时阈值。
   # 到达该时长未收到心跳会触发会话收敛（例如转为 STALE/CLOSED）。
   heartbeat_timeout: "30s"

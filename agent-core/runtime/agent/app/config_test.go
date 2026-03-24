@@ -41,14 +41,24 @@ func TestValidateRejectsUnknownBridgeTransport(testingObject *testing.T) {
 	}
 }
 
-// TestValidateRejectsUnwiredBridgeTransport 验证已定义但尚未接线的 transport 会被拒绝。
-func TestValidateRejectsUnwiredBridgeTransport(testingObject *testing.T) {
+// TestValidateAcceptsQUICBridgeTransport 验证已接线的 quic_native transport 可通过校验。
+func TestValidateAcceptsQUICBridgeTransport(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.BridgeTransport = transport.BindingTypeQUICNative.String()
+	if err := config.Validate(); err != nil {
+		testingObject.Fatalf("expected quic_native bridge_transport to pass validation, got %v", err)
+	}
+}
+
+// TestValidateRejectsStillUnwiredBridgeTransport 验证仍未接线的 transport 会被拒绝。
+func TestValidateRejectsStillUnwiredBridgeTransport(testingObject *testing.T) {
 	testingObject.Parallel()
 	testCases := []string{
-		transport.BindingTypeQUICNative.String(),
 		transport.BindingTypeH3Stream.String(),
 	}
 	for _, bridgeTransport := range testCases {
+		bridgeTransport := bridgeTransport
 		config := DefaultConfig()
 		config.BridgeTransport = bridgeTransport
 		if err := config.Validate(); err == nil {

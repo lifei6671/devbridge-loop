@@ -3,12 +3,14 @@ module github.com/lifei6671/devbridge-loop/ltfp
 go 1.26.0
 
 require (
+	github.com/quic-go/quic-go v0.59.0
 	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.11
 )
 
 require (
+	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect

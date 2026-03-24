@@ -126,7 +126,8 @@ func (c Config) Validate() error {
 	}
 	switch strings.TrimSpace(c.BridgeTransport) {
 	case transport.BindingTypeTCPFramed.String(),
-		transport.BindingTypeGRPCH2.String():
+		transport.BindingTypeGRPCH2.String(),
+		transport.BindingTypeQUICNative.String():
 		// 当前 agent runtime 仅支持 tcp_framed / grpc_h2。
 	default:
 		return fmt.Errorf("validate config: unsupported bridge_transport=%s", c.BridgeTransport)

@@ -283,6 +283,7 @@ type ObservabilityConfig struct {
 type ControlPlaneConfig struct {
 	ListenAddr               string        `yaml:"listen_addr"`
 	GRPCH2ListenAddr         string        `yaml:"grpc_h2_listen_addr"`
+	QUICListenAddr           string        `yaml:"quic_listen_addr"`
 	HeartbeatTimeout         time.Duration `yaml:"heartbeat_timeout"`
 	TLSMode                  string        `yaml:"tls_mode"`
 	TLSCertSource            string        `yaml:"tls_cert_source"`
@@ -366,6 +367,7 @@ func DefaultConfig() Config {
 		ControlPlane: ControlPlaneConfig{
 			ListenAddr:               ":39080",
 			GRPCH2ListenAddr:         ":39082",
+			QUICListenAddr:           ":39083",
 			HeartbeatTimeout:         30 * time.Second,
 			TLSMode:                  string(controlPlaneTLSModePlaintext),
 			TLSCertSource:            string(controlPlaneTLSCertSourceExternal),
@@ -476,8 +478,17 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == "" {
 		return fmt.Errorf("validate config: empty grpc_h2 control plane listen addr")
 	}
+	if strings.TrimSpace(c.ControlPlane.QUICListenAddr) == "" {
+		return fmt.Errorf("validate config: empty quic control plane listen addr")
+	}
 	if strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) == strings.TrimSpace(c.ControlPlane.ListenAddr) {
 		return fmt.Errorf("validate config: grpc_h2 listen addr must be different from tcp listen addr")
+	}
+	if strings.TrimSpace(c.ControlPlane.QUICListenAddr) == strings.TrimSpace(c.ControlPlane.ListenAddr) {
+		return fmt.Errorf("validate config: quic listen addr must be different from tcp listen addr")
+	}
+	if strings.TrimSpace(c.ControlPlane.QUICListenAddr) == strings.TrimSpace(c.ControlPlane.GRPCH2ListenAddr) {
+		return fmt.Errorf("validate config: quic listen addr must be different from grpc_h2 listen addr")
 	}
 	normalizedTLSMode, err := normalizeControlPlaneTLSMode(c.ControlPlane.TLSMode)
 	if err != nil {
@@ -590,6 +601,7 @@ func (c Config) validateAdminNetworkIsolation() error {
 		{name: "observability.metrics_addr", addr: c.Observability.MetricsAddr},
 		{name: "control_plane.listen_addr", addr: c.ControlPlane.ListenAddr},
 		{name: "control_plane.grpc_h2_listen_addr", addr: c.ControlPlane.GRPCH2ListenAddr},
+		{name: "control_plane.quic_listen_addr", addr: c.ControlPlane.QUICListenAddr},
 	}
 	for _, candidate := range addressesToCompare {
 		if normalizeListenAddr(candidate.addr) != normalizedAdminAddr {
