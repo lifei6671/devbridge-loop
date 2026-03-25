@@ -26,22 +26,23 @@
 | --- | --- | --- |
 | `grpc_h2` | `transport/grpcbinding` | control/tunnel 读写、deadline/cancel、reset/close、keepalive、消息上限与 transport option |
 | `tcp_framed` | `transport/tcpbinding` | 控制帧分块重组、优先级写队列、tunnel 生命周期、`SetDeadline*`/`Reset`/`CloseWrite` 语义 |
+| `quic_native` | `transport/quicbinding` | QUIC listener/dial、首条 stream 作为 control channel、tunnel producer/acceptor、deadline/reset/close、TLS 约束与 tunnel identity |
 
 说明：
 
-- `make test-binding` 运行两种 binding 的完整测试包。
+- `make test-binding` 运行三种 binding 的完整测试包。
 
 ## Parity、集成与压测
 
 | 类型 | 当前入口 | 说明 |
 | --- | --- | --- |
-| parity smoke | `make test-parity` | 运行 `codec` parity 与两种 binding 的同层语义回归 |
+| parity smoke | `make test-parity` | 运行 `codec` parity 与三种 binding 的同层语义回归 |
 | integration | `make test-integration` | `examples/interop` 握手、full-sync、publish/unpublish、health 等链路 |
-| pressure smoke | `make test-pressure` | 基准场景烟测：小包/大包、空闲维持、突发 refill（`-benchtime=1x`） |
+| pressure smoke | `make test-pressure` | 基准场景烟测：三种 binding 的小包/大包、空闲维持、突发 refill，以及 QUIC 的 stream limit saturation（`-benchtime=1x`） |
 
 说明：
 
-- parity 当前为 smoke 级别，双端接入后会继续补充真实端到端流量场景对齐用例。
+- parity 当前为 smoke 级别，现已覆盖 `grpc_h2 / tcp_framed / quic_native` 共享的 `open/ack/data/close` 与 `open/ack/data/reset` 语义；双端接入后会继续补充真实端到端流量场景对齐用例。
 
 ## 发布门槛
 
@@ -77,6 +78,7 @@
 | `AB-PT-002` | pressure smoke | refill 节流 | `agent-core/runtime/agent/tunnel/producer_test.go:TestTokenBucketConsumeOrDelayRespectsRateLimit` | PASS |
 | `AB-PT-003` | pressure smoke | 慢读回压 | `agent-core/runtime/agent/traffic/relay_test.go:TestStreamRelayBackpressureTimeout` | PASS |
 | `AB-PT-004` | pressure smoke | 大包 relay | `agent-core/runtime/agent/traffic/relay_test.go:TestStreamRelayLargePayloadFragmentation` | PASS |
+| `AB-PT-005` | pressure smoke | QUIC stream limit saturation | `ltfp/transport/quicbinding/integration_test.go:TestTunnelProducerRespectsMaxIncomingStreams`、`ltfp/transport/quicbinding/benchmark_test.go:BenchmarkQUICStreamLimitSaturation` | PASS |
 
 验证命令（本次执行）：
 

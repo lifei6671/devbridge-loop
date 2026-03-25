@@ -46,8 +46,21 @@ func TestValidateAcceptsQUICBridgeTransport(testingObject *testing.T) {
 	testingObject.Parallel()
 	config := DefaultConfig()
 	config.BridgeTransport = transport.BindingTypeQUICNative.String()
+	config.BridgeTLS.Enabled = true
+	config.BridgeTLS.RootCAFile = "testdata/root-ca.pem"
 	if err := config.Validate(); err != nil {
 		testingObject.Fatalf("expected quic_native bridge_transport to pass validation, got %v", err)
+	}
+}
+
+// TestValidateRejectsQUICBridgeTransportWithoutTLS 验证 quic_native 必须显式启用 Bridge TLS。
+func TestValidateRejectsQUICBridgeTransportWithoutTLS(testingObject *testing.T) {
+	testingObject.Parallel()
+	config := DefaultConfig()
+	config.BridgeTransport = transport.BindingTypeQUICNative.String()
+	config.BridgeTLS.Enabled = false
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for quic_native without bridge tls")
 	}
 }
 

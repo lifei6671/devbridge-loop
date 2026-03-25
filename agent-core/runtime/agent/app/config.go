@@ -112,6 +112,7 @@ func DefaultConfig() Config {
 
 // Validate ensures required config fields are present.
 func (c Config) Validate() error {
+	normalizedBridgeTransport := strings.TrimSpace(c.BridgeTransport)
 	if strings.TrimSpace(c.AgentID) == "" {
 		// agent_id 为空会导致会话归属不明确。
 		return fmt.Errorf("validate config: empty agent_id")
@@ -124,13 +125,17 @@ func (c Config) Validate() error {
 		// TLS 模式下必须显式提供 Root CA，避免无意识退回系统默认证书池。
 		return fmt.Errorf("validate config: empty bridge_tls.root_ca_file when tls is enabled")
 	}
-	switch strings.TrimSpace(c.BridgeTransport) {
+	switch normalizedBridgeTransport {
 	case transport.BindingTypeTCPFramed.String(),
 		transport.BindingTypeGRPCH2.String(),
 		transport.BindingTypeQUICNative.String():
-		// 当前 agent runtime 仅支持 tcp_framed / grpc_h2。
+		// 当前 agent runtime 仅支持 tcp_framed / grpc_h2 / quic_native。
 	default:
 		return fmt.Errorf("validate config: unsupported bridge_transport=%s", c.BridgeTransport)
+	}
+	if normalizedBridgeTransport == transport.BindingTypeQUICNative.String() && !c.BridgeTLS.Enabled {
+		// quic_native 强依赖 TLS，避免落回不受支持的明文 QUIC 模式。
+		return fmt.Errorf("validate config: bridge_transport=quic_native requires bridge_tls.enabled=true")
 	}
 	normalizedAuthMethod := strings.ToLower(strings.TrimSpace(c.Session.AuthMethod))
 	if normalizedAuthMethod == "" {

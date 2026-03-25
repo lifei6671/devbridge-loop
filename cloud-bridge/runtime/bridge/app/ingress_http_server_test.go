@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/connectorproxy"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
@@ -350,6 +351,259 @@ func TestIngressHTTPHandlerConnectorProxyRelaysHTTPResponse(testingObject *testi
 	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
 	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
 		testingObject.Fatalf("expected one recycled idle tunnel after connector proxy, total=%d idle=%d", snapshot.TotalCount, snapshot.IdleCount)
+	}
+}
+
+// TestIngressHTTPHandlerConnectorQUICDataPath 验证 QUIC tunnel 下 HTTP ingress 可完成真实 data relay 并保留 binding。
+func TestIngressHTTPHandlerConnectorQUICDataPath(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-http-quic-connector-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.quic-data.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
+			},
+		},
+	})
+
+	testTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-quic-connector-1")
+	testTunnel.bindingType = transport.BindingTypeQUICNative
+	go func() {
+		for {
+			writes := testTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: writes[0].OpenReq.TrafficID,
+				Success:   true,
+			}})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				Data: []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\nhello-quic"),
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				CloseAck: &pb.TrafficCloseAck{
+					TrafficID: writes[0].OpenReq.TrafficID,
+					Accepted:  true,
+				},
+			})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{
+				RecycleAck: &pb.TunnelRecycleAck{
+					TunnelID:   "tunnel-http-quic-connector-1",
+					RecycleSeq: 1,
+					Accepted:   true,
+				},
+			})
+			return
+		}
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
+	request.Host = "api.quic-data.local"
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
+	request.Header.Set("X-Request-Id", "trace-quic-data-1")
+	recorder := httptest.NewRecorder()
+	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected status code: got=%d want=%d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if recorder.Body.String() != "hello-quic" {
+		testingObject.Fatalf("unexpected response body: got=%s want=%s", recorder.Body.String(), "hello-quic")
+	}
+	if recorder.Header().Get("X-DevBridge-Route-Id") != "route-http-quic-connector-1" {
+		testingObject.Fatalf("unexpected route header: %s", recorder.Header().Get("X-DevBridge-Route-Id"))
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) < 4 {
+		testingObject.Fatalf("expected at least open+data+close+recycle writes, got=%d", len(writes))
+	}
+	if writes[0].OpenReq == nil {
+		testingObject.Fatalf("expected first write to be open request")
+	}
+	var tunneledHTTPRequest bytes.Buffer
+	hasClose := false
+	hasRecycle := false
+	for _, payload := range writes {
+		if len(payload.Data) > 0 {
+			_, _ = tunneledHTTPRequest.Write(payload.Data)
+		}
+		if payload.Close != nil {
+			hasClose = true
+		}
+		if payload.Recycle != nil {
+			hasRecycle = true
+		}
+	}
+	if !strings.Contains(tunneledHTTPRequest.String(), "GET /v1/orders HTTP/1.1") {
+		testingObject.Fatalf("unexpected tunneled request line: %s", tunneledHTTPRequest.String())
+	}
+	if !hasClose {
+		testingObject.Fatalf("expected close payload written during quic connector flow")
+	}
+	if !hasRecycle {
+		testingObject.Fatalf("expected recycle payload written during quic connector flow")
+	}
+	if testTunnel.closeCount != 0 {
+		testingObject.Fatalf("expected quic tunnel kept for reuse, close_count=%d", testTunnel.closeCount)
+	}
+
+	tunnelRuntime, exists := runtime.dataPlane.tunnelRegistry.Get("tunnel-http-quic-connector-1")
+	if !exists {
+		testingObject.Fatalf("expected quic tunnel kept in registry after recycle")
+	}
+	if tunnelRuntime.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected tunnel binding: got=%s want=%s",
+			tunnelRuntime.Binding,
+			transport.BindingTypeQUICNative.String(),
+		)
+	}
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 1 || snapshot.IdleCount != 1 {
+		testingObject.Fatalf("expected one recycled idle quic tunnel after connector proxy, total=%d idle=%d", snapshot.TotalCount, snapshot.IdleCount)
+	}
+}
+
+// TestIngressHTTPHandlerConnectorQUICResetReturnsStructuredFailure 验证 QUIC relay 收到 reset 时返回结构化失败并清理 tunnel。
+func TestIngressHTTPHandlerConnectorQUICResetReturnsStructuredFailure(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	cfg := DefaultConfig()
+	enableExternalFallbackPolicyForTest(&cfg, "dev")
+	runtime := newRuntimeWithConfigAndDataPlaneDependenciesForTest(testingObject, cfg, runtimeDataPlaneDependencies{})
+	runtime.ingressHTTPServer = newIngressHTTPServer(runtime, ":0")
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-http-quic-reset-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.quic-reset.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
+			},
+		},
+	})
+
+	testTunnel := newRuntimeDataPlaneTestTunnel("tunnel-http-quic-reset-1")
+	testTunnel.bindingType = transport.BindingTypeQUICNative
+	go func() {
+		for {
+			writes := testTunnel.Writes()
+			if len(writes) == 0 || writes[0].OpenReq == nil {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			trafficID := strings.TrimSpace(writes[0].OpenReq.TrafficID)
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+				TrafficID: trafficID,
+				Success:   true,
+			}})
+			testTunnel.EnqueueReadPayload(pb.StreamPayload{Reset: &pb.TrafficReset{
+				TrafficID:    trafficID,
+				ErrorCode:    "UPSTREAM_RESET",
+				ErrorMessage: "connector relay aborted",
+			}})
+			return
+		}
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", testTunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/v1/orders", nil)
+	request.Host = "api.quic-reset.local"
+	request.Header.Set("X-Bridge-Namespace", "dev")
+	request.Header.Set("X-Bridge-Environment", "demo")
+	request.Header.Set("X-Request-Id", "trace-quic-reset-1")
+	recorder := httptest.NewRecorder()
+	runtime.ingressHTTPServer.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		testingObject.Fatalf("unexpected status code: got=%d want=%d body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var response struct {
+		TrafficID string `json:"traffic_id"`
+		TraceID   string `json:"trace_id"`
+		Error     struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		testingObject.Fatalf("decode response failed: %v", err)
+	}
+	if response.Error.Code != connectorproxy.FailureCodeRelayFailed {
+		testingObject.Fatalf(
+			"unexpected error code: got=%s want=%s body=%s",
+			response.Error.Code,
+			connectorproxy.FailureCodeRelayFailed,
+			recorder.Body.String(),
+		)
+	}
+	if !strings.Contains(response.Error.Message, "relay reset") || !strings.Contains(response.Error.Message, "UPSTREAM_RESET") {
+		testingObject.Fatalf("unexpected reset message: %s", response.Error.Message)
+	}
+	if response.TraceID != "trace-quic-reset-1" {
+		testingObject.Fatalf("unexpected trace id: got=%s want=%s", response.TraceID, "trace-quic-reset-1")
+	}
+	if strings.TrimSpace(response.TrafficID) == "" {
+		testingObject.Fatalf("expected non-empty traffic id")
+	}
+	if testTunnel.closeCount != 1 {
+		testingObject.Fatalf("expected quic reset tunnel closed once, got=%d", testTunnel.closeCount)
+	}
+
+	writes := testTunnel.Writes()
+	if len(writes) == 0 || writes[0].OpenReq == nil {
+		testingObject.Fatalf("expected open request written before reset")
+	}
+	for _, payload := range writes {
+		if payload.Recycle != nil {
+			testingObject.Fatalf("expected no recycle write after quic reset")
+		}
+	}
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 0 {
+		testingObject.Fatalf("expected quic reset tunnel removed from registry, total=%d", snapshot.TotalCount)
 	}
 }
 

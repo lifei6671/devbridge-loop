@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,8 +17,19 @@ import (
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 )
+
+type runtimeBridgeQUICAcceptConnResult struct {
+	conn *quicbinding.Conn
+	err  error
+}
+
+type runtimeBridgeQUICAcceptTunnelResult struct {
+	tunnel transport.Tunnel
+	err    error
+}
 
 type testPrioritizedControlChannel struct {
 	lastFrame transport.PrioritizedControlFrame
@@ -306,6 +318,48 @@ func TestNextTunnelIDUsesSessionScopedPrefix(testingObject *testing.T) {
 func (tunnel *runtimeBridgeTestTunnel) Close() error {
 	_ = tunnel
 	return nil
+}
+
+func readBusinessControlEnvelopeForRuntimeBridgeTest(
+	testingObject *testing.T,
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+) pb.ControlEnvelope {
+	testingObject.Helper()
+	frame, err := controlChannel.ReadControlFrame(ctx)
+	if err != nil {
+		testingObject.Fatalf("read control frame failed: %v", err)
+	}
+	envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frame)
+	if err != nil {
+		testingObject.Fatalf("decode business control envelope failed: %v", err)
+	}
+	return envelope
+}
+
+func writeBusinessControlEnvelopeForRuntimeBridgeTest(
+	testingObject *testing.T,
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+	envelope pb.ControlEnvelope,
+) {
+	testingObject.Helper()
+	frame, err := transport.EncodeBusinessControlEnvelopeFrame(envelope)
+	if err != nil {
+		testingObject.Fatalf("encode business control envelope failed: %v", err)
+	}
+	if err := controlChannel.WriteControlFrame(ctx, frame); err != nil {
+		testingObject.Fatalf("write control frame failed: %v", err)
+	}
+}
+
+func mustMarshalJSONForRuntimeBridgeTest(testingObject *testing.T, value any) []byte {
+	testingObject.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		testingObject.Fatalf("marshal json failed: %v", err)
+	}
+	return encoded
 }
 
 // testHasDiagnoseCode 判断 diagnose.logs 返回体中是否包含指定事件码。
@@ -755,6 +809,251 @@ func TestInitTransportSupportsGRPCH2(testingObject *testing.T) {
 	}
 	if runtime.grpcTransport == nil {
 		testingObject.Fatalf("expected grpc transport initialized")
+	}
+}
+
+// TestInitTransportSupportsQUICNative 验证 quic_native 已接入 runtime 初始化路径。
+func TestInitTransportSupportsQUICNative(testingObject *testing.T) {
+	testingObject.Parallel()
+	runtime := &Runtime{
+		cfg: Config{
+			BridgeTransport: transport.BindingTypeQUICNative.String(),
+		},
+	}
+	if err := runtime.initTransport(); err != nil {
+		testingObject.Fatalf("init quic_native transport failed: %v", err)
+	}
+	if runtime.quicTransport == nil {
+		testingObject.Fatalf("expected quic transport initialized")
+	}
+}
+
+// TestConnectBridgeControlQUICRefreshesTunnelProducer 验证 QUIC 控制面握手后会刷新 tunnel producer 并可打开 tunnel。
+func TestConnectBridgeControlQUICRefreshesTunnelProducer(testingObject *testing.T) {
+	fixture := newBridgeQUICTLSFixtureForTest(testingObject)
+	serverTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	listener, err := serverTransport.ListenAddr("127.0.0.1:0", fixture.serverTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("listen quic transport failed: %v", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+
+	serverConnResult := make(chan runtimeBridgeQUICAcceptConnResult, 1)
+	go func() {
+		acceptConnContext, cancelAcceptConn := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelAcceptConn()
+		serverConn, acceptErr := listener.Accept(acceptConnContext)
+		serverConnResult <- runtimeBridgeQUICAcceptConnResult{conn: serverConn, err: acceptErr}
+	}()
+
+	runtime := &Runtime{
+		cfg: Config{
+			AgentID:         "agent-local",
+			BridgeAddr:      listener.Addr().String(),
+			BridgeTransport: transport.BindingTypeQUICNative.String(),
+			BridgeTLS: BridgeTLSConfig{
+				Enabled:    true,
+				RootCAFile: fixture.rootCAFile,
+				ServerName: fixture.serverName,
+			},
+			Session: SessionConfig{
+				AuthTimeout:      2 * time.Second,
+				AuthMethod:       "token",
+				AuthToken:        "dbt_agent-local.agent-dev-secret",
+				ClientCapVersion: "agent-core/v1",
+			},
+			ControlChannel: ControlChannelConfig{
+				DialTimeout: 2 * time.Second,
+			},
+		},
+	}
+	if err := runtime.initTransport(); err != nil {
+		testingObject.Fatalf("init quic transport failed: %v", err)
+	}
+	defer runtime.closeCurrentControlChannel()
+
+	if err := runtime.connectBridgeControl(context.Background()); err != nil {
+		testingObject.Fatalf("connect bridge control over quic failed: %v", err)
+	}
+
+	acceptedConn := <-serverConnResult
+	if acceptedConn.err != nil {
+		testingObject.Fatalf("accept quic transport failed: %v", acceptedConn.err)
+	}
+	serverConn := acceptedConn.conn
+	defer func() {
+		_ = serverConn.Close(nil)
+	}()
+
+	handshakeErrChan := make(chan error, 1)
+	go func() {
+		handshakeErrChan <- func() error {
+			handshakeContext, cancelHandshake := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelHandshake()
+			serverControlChannel, err := serverConn.AcceptControlChannel(handshakeContext)
+			if err != nil {
+				return fmt.Errorf("accept quic control channel failed: %w", err)
+			}
+
+			helloEnvelope := readBusinessControlEnvelopeForRuntimeBridgeTest(testingObject, handshakeContext, serverControlChannel)
+			if helloEnvelope.MessageType != pb.ControlMessageConnectorHello {
+				return fmt.Errorf("unexpected first handshake message: %s", helloEnvelope.MessageType)
+			}
+			var helloPayload pb.ConnectorHello
+			if err := json.Unmarshal(helloEnvelope.Payload, &helloPayload); err != nil {
+				return fmt.Errorf("decode connector hello failed: %w", err)
+			}
+			if len(helloPayload.SupportedBindings) != 1 || helloPayload.SupportedBindings[0] != transport.BindingTypeQUICNative.String() {
+				return fmt.Errorf("unexpected supported bindings: %+v", helloPayload.SupportedBindings)
+			}
+			writeBusinessControlEnvelopeForRuntimeBridgeTest(testingObject, handshakeContext, serverControlChannel, pb.ControlEnvelope{
+				VersionMajor: 2,
+				VersionMinor: 1,
+				MessageType:  pb.ControlMessageConnectorWelcome,
+				ConnectorID:  helloEnvelope.ConnectorID,
+				Payload: mustMarshalJSONForRuntimeBridgeTest(testingObject, pb.ConnectorWelcome{
+					AssignedSessionEpoch: 7,
+					HeartbeatIntervalSec: 5,
+					SelectedBinding:      transport.BindingTypeQUICNative.String(),
+				}),
+			})
+
+			authEnvelope := readBusinessControlEnvelopeForRuntimeBridgeTest(testingObject, handshakeContext, serverControlChannel)
+			if authEnvelope.MessageType != pb.ControlMessageConnectorAuth {
+				return fmt.Errorf("unexpected second handshake message: %s", authEnvelope.MessageType)
+			}
+			writeBusinessControlEnvelopeForRuntimeBridgeTest(testingObject, handshakeContext, serverControlChannel, pb.ControlEnvelope{
+				VersionMajor: 2,
+				VersionMinor: 1,
+				MessageType:  pb.ControlMessageConnectorAuthAck,
+				ConnectorID:  authEnvelope.ConnectorID,
+				SessionID:    "session-quic-7",
+				SessionEpoch: 7,
+				Payload: mustMarshalJSONForRuntimeBridgeTest(testingObject, pb.ConnectorAuthAck{
+					Success:      true,
+					SessionID:    "session-quic-7",
+					SessionEpoch: 7,
+				}),
+			})
+			return nil
+		}()
+	}()
+
+	if err := runtime.performControlHandshake(context.Background()); err != nil {
+		testingObject.Fatalf("perform quic control handshake failed: %v", err)
+	}
+	if err := <-handshakeErrChan; err != nil {
+		testingObject.Fatalf("serve quic handshake failed: %v", err)
+	}
+
+	runtime.bridgeMu.RLock()
+	quicProducer := runtime.quicTunnelProducer
+	bridgeSessionID := runtime.bridgeSession
+	bridgeSessionEpoch := runtime.bridgeEpoch
+	runtime.bridgeMu.RUnlock()
+	if quicProducer == nil {
+		testingObject.Fatalf("expected quic tunnel producer initialized after handshake")
+	}
+	if bridgeSessionID != "session-quic-7" || bridgeSessionEpoch != 7 {
+		testingObject.Fatalf("unexpected authoritative session: id=%s epoch=%d", bridgeSessionID, bridgeSessionEpoch)
+	}
+	sessionPayload := runtime.sessionSnapshotPayload()
+	if sessionPayload["bridge_transport"] != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf("unexpected session bridge_transport: %+v", sessionPayload["bridge_transport"])
+	}
+	sessionQUIC, ok := sessionPayload["quic"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected session quic payload map, got=%T", sessionPayload["quic"])
+	}
+	if sessionQUIC["enabled"] != true {
+		testingObject.Fatalf("expected session quic enabled=true, got=%+v", sessionQUIC["enabled"])
+	}
+	if sessionQUIC["connected"] != true {
+		testingObject.Fatalf("expected session quic connected=true, got=%+v", sessionQUIC["connected"])
+	}
+	if sessionQUIC["tunnel_producer_ready"] != true {
+		testingObject.Fatalf("expected session quic tunnel_producer_ready=true, got=%+v", sessionQUIC["tunnel_producer_ready"])
+	}
+	localAddr, _ := sessionQUIC["local_addr"].(string)
+	if strings.TrimSpace(localAddr) == "" {
+		testingObject.Fatalf("expected session quic local_addr to be set")
+	}
+	remoteAddr, _ := sessionQUIC["remote_addr"].(string)
+	if strings.TrimSpace(remoteAddr) == "" {
+		testingObject.Fatalf("expected session quic remote_addr to be set")
+	}
+	streamOpenTimeoutMS, ok := sessionQUIC["stream_open_timeout_ms"].(uint64)
+	if !ok || streamOpenTimeoutMS == 0 {
+		testingObject.Fatalf("expected session quic stream_open_timeout_ms > 0, got=%+v", sessionQUIC["stream_open_timeout_ms"])
+	}
+
+	agentPayload := runtime.agentSnapshotPayload()
+	agentQUIC, ok := agentPayload["quic"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected agent quic payload map, got=%T", agentPayload["quic"])
+	}
+	if agentQUIC["connected"] != true {
+		testingObject.Fatalf("expected agent quic connected=true, got=%+v", agentQUIC["connected"])
+	}
+
+	runtime.setBridgeSessionReady(true)
+	acceptor, err := quicbinding.NewTunnelAcceptor(serverConn, quicbinding.TunnelAcceptorConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic tunnel acceptor failed: %v", err)
+	}
+	defer acceptor.Close(nil)
+
+	serverTunnelResult := make(chan runtimeBridgeQUICAcceptTunnelResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		acceptedTunnel, acceptErr := acceptor.AcceptTunnel(ctx)
+		serverTunnelResult <- runtimeBridgeQUICAcceptTunnelResult{tunnel: acceptedTunnel, err: acceptErr}
+	}()
+
+	runtimeTunnel, err := (&bridgeTunnelOpener{runtime: runtime}).Open(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic runtime tunnel failed: %v", err)
+	}
+	defer func() {
+		_ = runtimeTunnel.Close()
+	}()
+
+	acceptedTunnel := <-serverTunnelResult
+	if acceptedTunnel.err != nil {
+		testingObject.Fatalf("accept quic tunnel failed: %v", acceptedTunnel.err)
+	}
+	defer func() {
+		_ = acceptedTunnel.tunnel.Close()
+	}()
+	if acceptedTunnel.tunnel.Meta().SessionID != "session-quic-7" || acceptedTunnel.tunnel.Meta().SessionEpoch != 7 {
+		testingObject.Fatalf("unexpected quic tunnel meta: %+v", acceptedTunnel.tunnel.Meta())
+	}
+	if !strings.HasPrefix(acceptedTunnel.tunnel.ID(), "tun-quic-7-") {
+		testingObject.Fatalf("unexpected quic tunnel id: %s", acceptedTunnel.tunnel.ID())
+	}
+
+	diagnosePayload := runtime.diagnoseSnapshotPayload()
+	if diagnosePayload["bridge_transport"] != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf("unexpected diagnose bridge_transport: %+v", diagnosePayload["bridge_transport"])
+	}
+	diagnoseQUIC, ok := diagnosePayload["quic"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected diagnose quic payload map, got=%T", diagnosePayload["quic"])
+	}
+	if diagnoseQUIC["enabled"] != true {
+		testingObject.Fatalf("expected diagnose quic enabled=true, got=%+v", diagnoseQUIC["enabled"])
+	}
+	if diagnoseQUIC["connected"] != true {
+		testingObject.Fatalf("expected diagnose quic connected=true, got=%+v", diagnoseQUIC["connected"])
+	}
+	if diagnoseQUIC["tunnel_producer_ready"] != true {
+		testingObject.Fatalf("expected diagnose quic tunnel_producer_ready=true, got=%+v", diagnoseQUIC["tunnel_producer_ready"])
 	}
 }
 

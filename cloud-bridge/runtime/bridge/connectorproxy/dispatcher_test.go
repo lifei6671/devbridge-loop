@@ -13,6 +13,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 type connectorProxyTestRefillRequester struct {
@@ -49,6 +50,7 @@ type connectorProxyReadResult struct {
 
 type connectorProxyTestTunnel struct {
 	tunnelID string
+	binding  transport.BindingType
 
 	readQueue  chan connectorProxyReadResult
 	writeMutex sync.Mutex
@@ -79,6 +81,13 @@ func newConnectorProxyTestTunnel(tunnelID string) *connectorProxyTestTunnel {
 
 func (tunnel *connectorProxyTestTunnel) ID() string {
 	return tunnel.tunnelID
+}
+
+func (tunnel *connectorProxyTestTunnel) BindingType() transport.BindingType {
+	if tunnel == nil || tunnel.binding == "" {
+		return transport.BindingTypeTCPFramed
+	}
+	return tunnel.binding
 }
 
 func (tunnel *connectorProxyTestTunnel) ReadPayload(ctx context.Context) (pb.StreamPayload, error) {
@@ -769,6 +778,121 @@ func TestDispatcherDispatchSuccessLifecycle(testingObject *testing.T) {
 	}
 	if writes[1].Recycle == nil || writes[1].Recycle.TunnelID != "tunnel-1" || writes[1].Recycle.RecycleSeq != 1 || writes[1].Recycle.IsFinal {
 		testingObject.Fatalf("expected second write is non-final recycle request")
+	}
+}
+
+// TestDispatcherDispatchRejectsConcurrentReuseOfSameQUICTunnel 验证 active 中的 quic tunnel 不会被第二条 traffic 并发复用。
+func TestDispatcherDispatchRejectsConcurrentReuseOfSameQUICTunnel(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnel := newConnectorProxyTestTunnel("tunnel-quic-concurrent")
+	tunnel.binding = transport.BindingTypeQUICNative
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		OpenAck: &pb.TrafficOpenAck{
+			TrafficID: "traffic-quic-1",
+			Success:   true,
+		},
+	})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{
+		RecycleAck: &pb.TunnelRecycleAck{
+			TunnelID:   "tunnel-quic-concurrent",
+			RecycleSeq: 1,
+			Accepted:   true,
+		},
+	})
+	if _, err := tunnelRegistry.UpsertIdle(time.Now().UTC(), "connector-quic", "session-quic", tunnel); err != nil {
+		testingObject.Fatalf("upsert quic idle tunnel failed: %v", err)
+	}
+
+	acquirer, err := NewTunnelAcquirer(TunnelAcquirerOptions{
+		Registry:       tunnelRegistry,
+		EnableNoIdleWT: false,
+	})
+	if err != nil {
+		testingObject.Fatalf("new tunnel acquirer failed: %v", err)
+	}
+	relayStarted := make(chan struct{})
+	relayRelease := make(chan struct{})
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		TunnelAcquirer: acquirer,
+		OpenHandshake:  NewOpenHandshake(OpenHandshakeOptions{OpenTimeout: time.Second}),
+		Relay: RelayFunc(func(ctx context.Context, tunnel registry.RuntimeTunnel, trafficID string) error {
+			_ = ctx
+			_ = tunnel
+			_ = trafficID
+			close(relayStarted)
+			<-relayRelease
+			return nil
+		}),
+		TunnelRegistry: tunnelRegistry,
+	})
+	if err != nil {
+		testingObject.Fatalf("new dispatcher failed: %v", err)
+	}
+
+	resultChannel := make(chan DispatchResult, 1)
+	errorChannel := make(chan error, 1)
+	go func() {
+		result, dispatchErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
+			ConnectorID: "connector-quic",
+			TrafficOpen: pb.TrafficOpen{
+				TrafficID:        "traffic-quic-1",
+				LogicalServiceID: "svc-1",
+				InstanceID:       "inst-1",
+			},
+		})
+		resultChannel <- result
+		errorChannel <- dispatchErr
+	}()
+
+	select {
+	case <-relayStarted:
+	case <-time.After(time.Second):
+		testingObject.Fatalf("expected first quic dispatch entered relay")
+	}
+
+	runtimeDuringRelay, exists := tunnelRegistry.Get("tunnel-quic-concurrent")
+	if !exists {
+		testingObject.Fatalf("expected quic tunnel tracked during relay")
+	}
+	if runtimeDuringRelay.State != registry.TunnelStateActive {
+		testingObject.Fatalf("expected active quic tunnel during relay, got=%s", runtimeDuringRelay.State)
+	}
+	if runtimeDuringRelay.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected quic tunnel binding during relay: got=%s want=%s",
+			runtimeDuringRelay.Binding,
+			transport.BindingTypeQUICNative,
+		)
+	}
+
+	secondResult, secondErr := dispatcher.Dispatch(context.Background(), DispatchRequest{
+		ConnectorID: "connector-quic",
+		TrafficOpen: pb.TrafficOpen{
+			TrafficID:        "traffic-quic-2",
+			LogicalServiceID: "svc-1",
+			InstanceID:       "inst-2",
+		},
+	})
+	if !errors.Is(secondErr, ErrNoIdleTunnel) {
+		testingObject.Fatalf("expected second quic dispatch to fail with ErrNoIdleTunnel, got=%v", secondErr)
+	}
+	if secondResult.ErrorCode != FailureCodeNoIdleTunnel {
+		testingObject.Fatalf(
+			"unexpected second quic dispatch error code: got=%s want=%s",
+			secondResult.ErrorCode,
+			FailureCodeNoIdleTunnel,
+		)
+	}
+
+	close(relayRelease)
+	if dispatchErr := <-errorChannel; dispatchErr != nil {
+		testingObject.Fatalf("first quic dispatch failed: %v", dispatchErr)
+	}
+	firstResult := <-resultChannel
+	if firstResult.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected first quic dispatch status: %d", firstResult.HTTPStatus)
 	}
 }
 

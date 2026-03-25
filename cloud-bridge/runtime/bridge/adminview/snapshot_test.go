@@ -144,12 +144,14 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 			"control_plane": map[string]any{
 				"listen_addr":         ":39080",
 				"grpc_h2_listen_addr": ":39082",
+				"quic_listen_addr":    ":39083",
+				"tls_mode":            "required",
 			},
 		},
 	)
 
-	if len(overview.Listeners) != 5 {
-		testingObject.Fatalf("unexpected listener size: got=%d want=5", len(overview.Listeners))
+	if len(overview.Listeners) != 6 {
+		testingObject.Fatalf("unexpected listener size: got=%d want=6", len(overview.Listeners))
 	}
 	if overview.Listeners[0].ListenerID != "ingress_http" || overview.Listeners[0].Port != "38080" {
 		testingObject.Fatalf("unexpected ingress http listener: %+v", overview.Listeners[0])
@@ -157,8 +159,49 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 	if overview.Listeners[1].ListenerID != "ingress_grpc" || overview.Listeners[1].Port != "38081" {
 		testingObject.Fatalf("unexpected ingress grpc listener: %+v", overview.Listeners[1])
 	}
-	if overview.Listeners[4].ListenerID != "admin_ui_api" || overview.Listeners[4].Port != "39081" {
+	if overview.Listeners[4].ListenerID != "control_plane_quic" || overview.Listeners[4].Port != "39083" {
+		testingObject.Fatalf("unexpected quic listener: %+v", overview.Listeners[4])
+	}
+	if overview.Listeners[5].ListenerID != "admin_ui_api" || overview.Listeners[5].Port != "39081" {
 		testingObject.Fatalf("unexpected admin listener: %+v", overview.Listeners[4])
+	}
+}
+
+func TestBuildSessionAndTunnelItemsIncludeBinding(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessions := BuildSessionItems([]registry.SessionRuntime{
+		{
+			SessionID:   "session-quic-1",
+			ConnectorID: "agent-quic",
+			Epoch:       7,
+			Binding:     "quic_native",
+			State:       registry.SessionActive,
+			UpdatedAt:   time.Unix(1_900_250_000, 0).UTC(),
+		},
+	})
+	if len(sessions) != 1 {
+		testingObject.Fatalf("unexpected session item count: got=%d want=1", len(sessions))
+	}
+	if sessions[0].Binding != "quic_native" {
+		testingObject.Fatalf("unexpected session binding: %+v", sessions[0])
+	}
+
+	tunnels := BuildTunnelItems([]registry.TunnelRuntime{
+		{
+			TunnelID:    "tun-quic-1",
+			ConnectorID: "agent-quic",
+			SessionID:   "session-quic-1",
+			Binding:     "quic_native",
+			State:       registry.TunnelStateIdle,
+			UpdatedAt:   time.Unix(1_900_250_010, 0).UTC(),
+		},
+	})
+	if len(tunnels) != 1 {
+		testingObject.Fatalf("unexpected tunnel item count: got=%d want=1", len(tunnels))
+	}
+	if tunnels[0].Binding != "quic_native" {
+		testingObject.Fatalf("unexpected tunnel binding: %+v", tunnels[0])
 	}
 }
 

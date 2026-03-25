@@ -2,10 +2,16 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"strings"
 	"sync"
@@ -13,6 +19,7 @@ import (
 	"time"
 
 	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
+	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/obs"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
@@ -21,6 +28,7 @@ import (
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -182,6 +190,346 @@ func decodeConnectorAuthAckFromEnvelope(testingObject *testing.T, envelope *pb.C
 	return authAckPayload
 }
 
+func encodeBusinessControlFrameForTest(
+	testingObject *testing.T,
+	envelope pb.ControlEnvelope,
+) transport.ControlFrame {
+	testingObject.Helper()
+	frame, err := transport.EncodeBusinessControlEnvelopeFrame(envelope)
+	if err != nil {
+		testingObject.Fatalf("encode business control frame failed: %v", err)
+	}
+	return frame
+}
+
+func readBusinessControlEnvelopeForTest(
+	testingObject *testing.T,
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+) pb.ControlEnvelope {
+	testingObject.Helper()
+	frame, err := controlChannel.ReadControlFrame(ctx)
+	if err != nil {
+		testingObject.Fatalf("read control frame failed: %v", err)
+	}
+	envelope, err := transport.DecodeBusinessControlEnvelopeFrame(frame)
+	if err != nil {
+		testingObject.Fatalf("decode business control envelope failed: %v", err)
+	}
+	return envelope
+}
+
+func newQUICControlPlaneTLSConfigsForTest(testingObject *testing.T) (*tls.Config, *tls.Config) {
+	testingObject.Helper()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		testingObject.Fatalf("generate ed25519 key failed: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "127.0.0.1",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		testingObject.Fatalf("create self-signed certificate failed: %v", err)
+	}
+	certificate, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		testingObject.Fatalf("parse certificate failed: %v", err)
+	}
+	serverCertificate := tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  privateKey,
+		Leaf:        certificate,
+	}
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		MinVersion:   tls.VersionTLS13,
+	}
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(certificate)
+	clientTLSConfig := &tls.Config{
+		RootCAs:    rootCAs,
+		ServerName: "127.0.0.1",
+		MinVersion: tls.VersionTLS13,
+	}
+	return serverTLSConfig, clientTLSConfig
+}
+
+type stubQUICConfigManager struct {
+	serverTLSConfig *tls.Config
+}
+
+func (manager *stubQUICConfigManager) Refresh(context.Context) error {
+	return nil
+}
+
+func (manager *stubQUICConfigManager) CurrentServerTLSConfig() *tls.Config {
+	if manager == nil || manager.serverTLSConfig == nil {
+		return nil
+	}
+	return manager.serverTLSConfig.Clone()
+}
+
+func (manager *stubQUICConfigManager) CurrentServerCertNotAfter() time.Time {
+	if manager == nil || manager.serverTLSConfig == nil || len(manager.serverTLSConfig.Certificates) == 0 {
+		return time.Time{}
+	}
+	return manager.serverTLSConfig.Certificates[0].Leaf.NotAfter
+}
+
+func (manager *stubQUICConfigManager) NextReloadInterval() time.Duration {
+	return time.Hour
+}
+
+func waitForQUICListenerForTest(
+	testingObject *testing.T,
+	server *controlPlaneServer,
+) *quicbinding.Listener {
+	testingObject.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		server.mu.Lock()
+		listener := server.quicListener
+		server.mu.Unlock()
+		if listener != nil {
+			return listener
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	testingObject.Fatalf("timed out waiting for quic listener")
+	return nil
+}
+
+type authenticatedQUICControlPlaneFixture struct {
+	server                *controlPlaneServer
+	controlChannel        transport.ControlChannel
+	clientConn            *quicbinding.Conn
+	authAckPayload        pb.ConnectorAuthAck
+	sessionRegistry       *registry.SessionRegistry
+	serviceRegistry       *registry.ServiceRegistry
+	tunnelRegistry        *registry.TunnelRegistry
+	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	cancel                context.CancelFunc
+	serverErrChannel      chan error
+}
+
+func newAuthenticatedQUICControlPlaneFixtureForTest(
+	testingObject *testing.T,
+) *authenticatedQUICControlPlaneFixture {
+	testingObject.Helper()
+
+	serverTLSConfig, clientTLSConfig := newQUICControlPlaneTLSConfigsForTest(testingObject)
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	sessionRegistry := registry.NewSessionRegistry()
+	serviceRegistry := registry.NewServiceRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	tunnelPoolReportStore := bridgecontrol.NewTunnelPoolReportStore()
+	server := &controlPlaneServer{
+		quicListenAddr: ":0",
+		tlsMode:        apptls.ModeRequired,
+		tlsConfigManager: &stubQUICConfigManager{
+			serverTLSConfig: serverTLSConfig,
+		},
+		quicTransport: quicTransport,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry:       sessionRegistry,
+			serviceRegistry:       serviceRegistry,
+			tunnelRegistry:        tunnelRegistry,
+			tunnelPoolReportStore: tunnelPoolReportStore,
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverErrChannel := make(chan error, 1)
+	go func() {
+		serverErrChannel <- server.runQUIC(ctx)
+	}()
+
+	listener := waitForQUICListenerForTest(testingObject, server)
+	clientConn, err := quicTransport.Dial(context.Background(), listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		cancel()
+		testingObject.Fatalf("dial quic control plane failed: %v", err)
+	}
+	controlChannel, err := clientConn.OpenControlChannel(context.Background())
+	if err != nil {
+		cancel()
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("open quic control channel failed: %v", err)
+	}
+
+	helloPayload := pb.ConnectorHello{
+		ConnectorID: "agent-local",
+		NodeName:    "node-quic",
+		Version:     "agent-core",
+		SupportedBindings: []string{
+			transport.BindingTypeTCPFramed.String(),
+			transport.BindingTypeQUICNative.String(),
+		},
+	}
+	encodedHelloPayload, err := json.Marshal(helloPayload)
+	if err != nil {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("marshal connector hello payload failed: %v", err)
+	}
+	helloFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  "agent-local",
+		Payload:      encodedHelloPayload,
+	})
+	if err := controlChannel.WriteControlFrame(context.Background(), helloFrame); err != nil {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("write connector hello frame failed: %v", err)
+	}
+	welcomeEnvelope := readBusinessControlEnvelopeForTest(testingObject, context.Background(), controlChannel)
+	if welcomeEnvelope.MessageType != pb.ControlMessageConnectorWelcome {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("unexpected welcome message type: got=%s", welcomeEnvelope.MessageType)
+	}
+
+	authPayload := pb.ConnectorAuth{
+		AuthMethod:       "token",
+		Token:            "dbt_agent-local.agent-dev-secret",
+		ClientCapVersion: "agent-core/v1",
+	}
+	encodedAuthPayload, err := json.Marshal(authPayload)
+	if err != nil {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("marshal connector auth payload failed: %v", err)
+	}
+	authFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  "agent-local",
+		Payload:      encodedAuthPayload,
+	})
+	if err := controlChannel.WriteControlFrame(context.Background(), authFrame); err != nil {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("write connector auth frame failed: %v", err)
+	}
+	authAckEnvelope := readBusinessControlEnvelopeForTest(testingObject, context.Background(), controlChannel)
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(authAckEnvelope.Payload, &authAckPayload); err != nil {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("unmarshal connector auth ack failed: %v", err)
+	}
+	if !authAckPayload.Success {
+		cancel()
+		_ = controlChannel.Close(context.Background())
+		_ = clientConn.Close(nil)
+		testingObject.Fatalf("expected quic auth success, got code=%s", authAckPayload.ErrorCode)
+	}
+
+	return &authenticatedQUICControlPlaneFixture{
+		server:                server,
+		controlChannel:        controlChannel,
+		clientConn:            clientConn,
+		authAckPayload:        authAckPayload,
+		sessionRegistry:       sessionRegistry,
+		serviceRegistry:       serviceRegistry,
+		tunnelRegistry:        tunnelRegistry,
+		tunnelPoolReportStore: tunnelPoolReportStore,
+		cancel:                cancel,
+		serverErrChannel:      serverErrChannel,
+	}
+}
+
+func (fixture *authenticatedQUICControlPlaneFixture) Close(testingObject *testing.T) {
+	testingObject.Helper()
+	if fixture == nil {
+		return
+	}
+	if fixture.controlChannel != nil {
+		_ = fixture.controlChannel.Close(context.Background())
+	}
+	if fixture.clientConn != nil {
+		_ = fixture.clientConn.Close(nil)
+	}
+	if fixture.cancel != nil {
+		fixture.cancel()
+	}
+	if fixture.serverErrChannel == nil {
+		return
+	}
+	select {
+	case serverErr := <-fixture.serverErrChannel:
+		if serverErr != nil && !errors.Is(serverErr, context.Canceled) {
+			testingObject.Fatalf("run quic control plane returned error: %v", serverErr)
+		}
+	case <-time.After(2 * time.Second):
+		testingObject.Fatalf("timed out waiting for quic control plane shutdown")
+	}
+}
+
+func (fixture *authenticatedQUICControlPlaneFixture) OpenTunnelAndWaitRegistered(
+	testingObject *testing.T,
+) (transport.Tunnel, registry.TunnelRuntime) {
+	testingObject.Helper()
+	if fixture == nil || fixture.clientConn == nil {
+		testingObject.Fatalf("quic fixture is not initialized")
+	}
+	beforeTunnelIDs := make(map[string]struct{})
+	for _, runtime := range fixture.tunnelRegistry.List() {
+		beforeTunnelIDs[runtime.TunnelID] = struct{}{}
+	}
+	tunnelProducer, err := quicbinding.NewTunnelProducer(fixture.clientConn, quicbinding.TunnelIdentityConfig{
+		SessionID:    fixture.authAckPayload.SessionID,
+		SessionEpoch: fixture.authAckPayload.SessionEpoch,
+	})
+	if err != nil {
+		testingObject.Fatalf("new quic tunnel producer failed: %v", err)
+	}
+	clientTunnel, err := tunnelProducer.OpenTunnel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic tunnel failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, runtime := range fixture.tunnelRegistry.List() {
+			if _, exists := beforeTunnelIDs[runtime.TunnelID]; exists {
+				continue
+			}
+			if runtime.SessionID != fixture.authAckPayload.SessionID {
+				continue
+			}
+			return clientTunnel, runtime
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = clientTunnel.Close()
+	testingObject.Fatalf("expected quic tunnel registered")
+	return nil, registry.TunnelRuntime{}
+}
+
 func buildPublishServiceForTest(
 	instanceID string,
 	serviceName string,
@@ -299,6 +647,660 @@ func TestServeControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 		}
 	case <-time.After(time.Second):
 		testingObject.Fatalf("serve control channel did not stop in time")
+	}
+}
+
+func TestSelectWelcomeBindingPrefersPreferredBinding(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	selectedBinding := selectWelcomeBinding(
+		[]string{
+			transport.BindingTypeTCPFramed.String(),
+			transport.BindingTypeQUICNative.String(),
+		},
+		transport.BindingTypeQUICNative,
+	)
+	if selectedBinding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"expected preferred selected binding %s, got %s",
+			transport.BindingTypeQUICNative,
+			selectedBinding,
+		)
+	}
+}
+
+func TestRunQUICAcceptsControlChannelAndRegistersTunnel(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	serverTLSConfig, clientTLSConfig := newQUICControlPlaneTLSConfigsForTest(testingObject)
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	server := &controlPlaneServer{
+		quicListenAddr: ":0",
+		tlsMode:        apptls.ModeRequired,
+		tlsConfigManager: &stubQUICConfigManager{
+			serverTLSConfig: serverTLSConfig,
+		},
+		quicTransport: quicTransport,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErrChannel := make(chan error, 1)
+	go func() {
+		serverErrChannel <- server.runQUIC(ctx)
+	}()
+
+	listener := waitForQUICListenerForTest(testingObject, server)
+	clientConn, err := quicTransport.Dial(context.Background(), listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("dial quic control plane failed: %v", err)
+	}
+	defer func() {
+		_ = clientConn.Close(nil)
+	}()
+
+	controlChannel, err := clientConn.OpenControlChannel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic control channel failed: %v", err)
+	}
+	defer func() {
+		_ = controlChannel.Close(context.Background())
+	}()
+
+	helloPayload := pb.ConnectorHello{
+		ConnectorID: "agent-local",
+		NodeName:    "node-quic",
+		Version:     "agent-core",
+		SupportedBindings: []string{
+			transport.BindingTypeTCPFramed.String(),
+			transport.BindingTypeQUICNative.String(),
+		},
+	}
+	encodedHelloPayload, err := json.Marshal(helloPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector hello payload failed: %v", err)
+	}
+	helloFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorHello,
+		ConnectorID:  "agent-local",
+		Payload:      encodedHelloPayload,
+	})
+	if err := controlChannel.WriteControlFrame(context.Background(), helloFrame); err != nil {
+		testingObject.Fatalf("write connector hello frame failed: %v", err)
+	}
+	welcomeEnvelope := readBusinessControlEnvelopeForTest(testingObject, context.Background(), controlChannel)
+	if welcomeEnvelope.MessageType != pb.ControlMessageConnectorWelcome {
+		testingObject.Fatalf("unexpected welcome message type: got=%s", welcomeEnvelope.MessageType)
+	}
+	var welcomePayload pb.ConnectorWelcome
+	if err := json.Unmarshal(welcomeEnvelope.Payload, &welcomePayload); err != nil {
+		testingObject.Fatalf("unmarshal connector welcome failed: %v", err)
+	}
+	if welcomePayload.SelectedBinding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected selected binding: got=%s want=%s",
+			welcomePayload.SelectedBinding,
+			transport.BindingTypeQUICNative,
+		)
+	}
+
+	authPayload := pb.ConnectorAuth{
+		AuthMethod:       "token",
+		Token:            "dbt_agent-local.agent-dev-secret",
+		ClientCapVersion: "agent-core/v1",
+	}
+	encodedAuthPayload, err := json.Marshal(authPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal connector auth payload failed: %v", err)
+	}
+	authFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageConnectorAuth,
+		ConnectorID:  "agent-local",
+		Payload:      encodedAuthPayload,
+	})
+	if err := controlChannel.WriteControlFrame(context.Background(), authFrame); err != nil {
+		testingObject.Fatalf("write connector auth frame failed: %v", err)
+	}
+	authAckEnvelope := readBusinessControlEnvelopeForTest(testingObject, context.Background(), controlChannel)
+	var authAckPayload pb.ConnectorAuthAck
+	if err := json.Unmarshal(authAckEnvelope.Payload, &authAckPayload); err != nil {
+		testingObject.Fatalf("unmarshal connector auth ack failed: %v", err)
+	}
+	if !authAckPayload.Success {
+		testingObject.Fatalf("expected quic auth success, got code=%s", authAckPayload.ErrorCode)
+	}
+	sessionSnapshot, exists := sessionRegistry.GetBySession(authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected quic session registered")
+	}
+	if sessionSnapshot.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected quic session binding: got=%s want=%s",
+			sessionSnapshot.Binding,
+			transport.BindingTypeQUICNative,
+		)
+	}
+	oldHeartbeat := sessionSnapshot.LastHeartbeat
+	if err := controlChannel.WriteControlFrame(context.Background(), transport.ControlFrame{
+		Type: transport.ControlFrameTypeHeartbeatPing,
+	}); err != nil {
+		testingObject.Fatalf("write quic heartbeat ping failed: %v", err)
+	}
+	heartbeatReply, err := controlChannel.ReadControlFrame(context.Background())
+	if err != nil {
+		testingObject.Fatalf("read quic heartbeat pong failed: %v", err)
+	}
+	if heartbeatReply.Type != transport.ControlFrameTypeHeartbeatPong {
+		testingObject.Fatalf(
+			"unexpected quic heartbeat reply type: got=%d want=%d",
+			heartbeatReply.Type,
+			transport.ControlFrameTypeHeartbeatPong,
+		)
+	}
+	heartbeatDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(heartbeatDeadline) {
+		updatedSessionSnapshot, exists := sessionRegistry.GetBySession(authAckPayload.SessionID)
+		if !exists {
+			testingObject.Fatalf("expected quic session still registered")
+		}
+		if updatedSessionSnapshot.LastHeartbeat.After(oldHeartbeat) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	updatedSessionSnapshot, exists := sessionRegistry.GetBySession(authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected quic session still registered after heartbeat")
+	}
+	if !updatedSessionSnapshot.LastHeartbeat.After(oldHeartbeat) {
+		testingObject.Fatalf(
+			"expected quic heartbeat refreshed: old=%v new=%v",
+			oldHeartbeat,
+			updatedSessionSnapshot.LastHeartbeat,
+		)
+	}
+
+	tunnelProducer, err := quicbinding.NewTunnelProducer(clientConn, quicbinding.TunnelIdentityConfig{
+		SessionID:    authAckPayload.SessionID,
+		SessionEpoch: authAckPayload.SessionEpoch,
+	})
+	if err != nil {
+		testingObject.Fatalf("new quic tunnel producer failed: %v", err)
+	}
+	clientTunnel, err := tunnelProducer.OpenTunnel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic tunnel failed: %v", err)
+	}
+	defer func() {
+		_ = clientTunnel.Close()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		tunnelList := tunnelRegistry.List()
+		if len(tunnelList) == 1 {
+			registeredTunnel := tunnelList[0]
+			if registeredTunnel.ConnectorID != "agent-local" || registeredTunnel.SessionID != authAckPayload.SessionID {
+				testingObject.Fatalf(
+					"unexpected quic tunnel owner: connector=%s session=%s",
+					registeredTunnel.ConnectorID,
+					registeredTunnel.SessionID,
+				)
+			}
+			if registeredTunnel.Binding != transport.BindingTypeQUICNative.String() {
+				testingObject.Fatalf(
+					"unexpected quic tunnel binding: got=%s want=%s",
+					registeredTunnel.Binding,
+					transport.BindingTypeQUICNative,
+				)
+			}
+			cancel()
+			runErr := <-serverErrChannel
+			if runErr != nil {
+				testingObject.Fatalf("run quic control plane returned error: %v", runErr)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	runErr := <-serverErrChannel
+	if runErr != nil {
+		testingObject.Fatalf("run quic control plane returned error: %v", runErr)
+	}
+	testingObject.Fatalf("expected quic tunnel registered")
+}
+
+func TestRunQUICDoesNotRegisterTunnelBeforeAuth(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	serverTLSConfig, clientTLSConfig := newQUICControlPlaneTLSConfigsForTest(testingObject)
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-quic-existing",
+		ConnectorID:   "agent-existing",
+		Epoch:         7,
+		Binding:       transport.BindingTypeQUICNative.String(),
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		quicListenAddr:                  ":0",
+		tlsMode:                         apptls.ModeRequired,
+		quicControlChannelAcceptTimeout: 200 * time.Millisecond,
+		tlsConfigManager: &stubQUICConfigManager{
+			serverTLSConfig: serverTLSConfig,
+		},
+		quicTransport: quicTransport,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErrChannel := make(chan error, 1)
+	go func() {
+		serverErrChannel <- server.runQUIC(ctx)
+	}()
+
+	listener := waitForQUICListenerForTest(testingObject, server)
+	clientConn, err := quicTransport.Dial(context.Background(), listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("dial quic control plane failed: %v", err)
+	}
+	defer func() {
+		_ = clientConn.Close(nil)
+	}()
+
+	controlChannel, err := clientConn.OpenControlChannel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic control channel failed: %v", err)
+	}
+	defer func() {
+		_ = controlChannel.Close(context.Background())
+	}()
+
+	tunnelProducer, err := quicbinding.NewTunnelProducer(clientConn, quicbinding.TunnelIdentityConfig{
+		SessionID:      "session-quic-existing",
+		SessionEpoch:   7,
+		TunnelIDPrefix: "unauth-quic",
+	})
+	if err != nil {
+		testingObject.Fatalf("new quic tunnel producer failed: %v", err)
+	}
+	clientTunnel, err := tunnelProducer.OpenTunnel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic tunnel before auth failed: %v", err)
+	}
+	defer func() {
+		_ = clientTunnel.Close()
+	}()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(tunnelRegistry.List()) > 0 {
+			testingObject.Fatalf("expected no quic tunnel to register before auth, got %+v", tunnelRegistry.List())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case runErr := <-serverErrChannel:
+		if runErr != nil {
+			testingObject.Fatalf("run quic control plane returned error: %v", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		testingObject.Fatalf("timed out waiting for quic control plane shutdown")
+	}
+}
+
+func TestServeQUICInboundConnectionTimesOutWithoutControlChannel(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	serverTLSConfig, clientTLSConfig := newQUICControlPlaneTLSConfigsForTest(testingObject)
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	listener, err := quicTransport.ListenAddr("127.0.0.1:0", serverTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("listen quic transport failed: %v", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+
+	acceptedConnChannel := make(chan *quicbinding.Conn, 1)
+	acceptErrChannel := make(chan error, 1)
+	go func() {
+		serverConn, acceptErr := listener.Accept(context.Background())
+		if acceptErr != nil {
+			acceptErrChannel <- acceptErr
+			return
+		}
+		acceptedConnChannel <- serverConn
+	}()
+
+	clientConn, err := quicTransport.Dial(context.Background(), listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("dial quic control plane failed: %v", err)
+	}
+	defer func() {
+		_ = clientConn.Close(nil)
+	}()
+
+	select {
+	case acceptErr := <-acceptErrChannel:
+		testingObject.Fatalf("accept quic connection failed: %v", acceptErr)
+	case serverConn := <-acceptedConnChannel:
+		defer func() {
+			_ = serverConn.Close(nil)
+		}()
+		server := &controlPlaneServer{
+			quicControlChannelAcceptTimeout: 80 * time.Millisecond,
+			dispatcher:                      newControlMessageDispatcher(controlMessageDispatcherOptions{}),
+		}
+		serveErrChannel := make(chan error, 1)
+		go func() {
+			serveErrChannel <- server.serveQUICInboundConnection(context.Background(), serverConn)
+		}()
+
+		select {
+		case serveErr := <-serveErrChannel:
+			if serveErr == nil {
+				testingObject.Fatalf("expected quic inbound serve to time out without control channel")
+			}
+		case <-time.After(300 * time.Millisecond):
+			testingObject.Fatalf("expected quic inbound serve to stop after control channel timeout")
+		}
+	}
+}
+
+func TestRunQUICHandlesTunnelPoolReportAndRecyclesIdleTunnel(testingObject *testing.T) {
+	fixture := newAuthenticatedQUICControlPlaneFixtureForTest(testingObject)
+	defer fixture.Close(testingObject)
+
+	clientTunnel, registeredTunnel := fixture.OpenTunnelAndWaitRegistered(testingObject)
+	defer func() {
+		_ = clientTunnel.Close()
+	}()
+	if registeredTunnel.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected registered quic tunnel binding: got=%s want=%s",
+			registeredTunnel.Binding,
+			transport.BindingTypeQUICNative,
+		)
+	}
+
+	reportPayload := pb.TunnelPoolReport{
+		SessionID:       fixture.authAckPayload.SessionID,
+		SessionEpoch:    fixture.authAckPayload.SessionEpoch,
+		IdleCount:       0,
+		InUseCount:      1,
+		TargetIdleCount: 2,
+		Trigger:         "periodic",
+		TimestampUnix:   time.Now().UTC().Unix(),
+	}
+	encodedReportPayload, err := json.Marshal(reportPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal quic tunnel report payload failed: %v", err)
+	}
+	reportFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor: 2,
+		VersionMinor: 1,
+		MessageType:  pb.ControlMessageTunnelPoolReport,
+		SessionID:    fixture.authAckPayload.SessionID,
+		SessionEpoch: fixture.authAckPayload.SessionEpoch,
+		ConnectorID:  "agent-local",
+		RequestID:    "req-quic-refill",
+		Payload:      encodedReportPayload,
+	})
+	if err := fixture.controlChannel.WriteControlFrame(context.Background(), reportFrame); err != nil {
+		testingObject.Fatalf("write quic tunnel pool report failed: %v", err)
+	}
+	readContext, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRead()
+	replyEnvelope := readBusinessControlEnvelopeForTest(testingObject, readContext, fixture.controlChannel)
+	if replyEnvelope.MessageType != pb.ControlMessageTunnelRefillRequest {
+		testingObject.Fatalf(
+			"unexpected quic refill reply type: got=%s want=%s",
+			replyEnvelope.MessageType,
+			pb.ControlMessageTunnelRefillRequest,
+		)
+	}
+	var refillRequest pb.TunnelRefillRequest
+	if err := json.Unmarshal(replyEnvelope.Payload, &refillRequest); err != nil {
+		testingObject.Fatalf("unmarshal quic refill request failed: %v", err)
+	}
+	if refillRequest.RequestedIdleDelta <= 0 {
+		testingObject.Fatalf("unexpected quic refill delta: %d", refillRequest.RequestedIdleDelta)
+	}
+	if refillRequest.Metadata["bridge_idle_recycled_count"] != "1" {
+		testingObject.Fatalf("unexpected bridge recycled metadata: %+v", refillRequest.Metadata)
+	}
+	if refillRequest.Metadata["bridge_idle_count"] != "0" || refillRequest.Metadata["bridge_in_use_count"] != "0" {
+		testingObject.Fatalf("unexpected bridge pool metadata after recycle: %+v", refillRequest.Metadata)
+	}
+	reportItems := fixture.tunnelPoolReportStore.List()
+	if len(reportItems) != 1 || reportItems[0].SessionID != fixture.authAckPayload.SessionID {
+		testingObject.Fatalf("unexpected tunnel pool report snapshot: %+v", reportItems)
+	}
+	recycleDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(recycleDeadline) {
+		if _, exists := fixture.tunnelRegistry.Get(registeredTunnel.TunnelID); !exists {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	testingObject.Fatalf("expected quic idle tunnel recycled after periodic report")
+}
+
+func TestRunQUICHeartbeatSurvivesHeavyDataStreams(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	fixture := newAuthenticatedQUICControlPlaneFixtureForTest(testingObject)
+	defer fixture.Close(testingObject)
+
+	const tunnelCount = 1
+	clientTunnels := make([]transport.Tunnel, 0, tunnelCount)
+	writeStarted := make(chan struct{}, tunnelCount)
+	writeDone := make(chan error, tunnelCount)
+	payload := make([]byte, 256*1024)
+
+	for index := 0; index < tunnelCount; index++ {
+		clientTunnel, _ := fixture.OpenTunnelAndWaitRegistered(testingObject)
+		clientTunnels = append(clientTunnels, clientTunnel)
+	}
+
+	for _, clientTunnel := range clientTunnels {
+		if err := clientTunnel.SetWriteDeadline(time.Now().Add(400 * time.Millisecond)); err != nil {
+			testingObject.Fatalf("set quic tunnel write deadline failed: %v", err)
+		}
+		go func(tunnel transport.Tunnel) {
+			writeStarted <- struct{}{}
+			for {
+				if _, err := tunnel.Write(payload); err != nil {
+					writeDone <- err
+					return
+				}
+			}
+		}(clientTunnel)
+	}
+	defer func() {
+		for _, clientTunnel := range clientTunnels {
+			_ = clientTunnel.Close()
+		}
+		for index := 0; index < len(clientTunnels); index++ {
+			select {
+			case <-writeDone:
+			case <-time.After(2 * time.Second):
+				testingObject.Fatalf("timed out waiting for quic data writer shutdown")
+			}
+		}
+	}()
+
+	for index := 0; index < tunnelCount; index++ {
+		select {
+		case <-writeStarted:
+		case <-time.After(time.Second):
+			testingObject.Fatalf("expected quic data writer started")
+		}
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pingStartedAt := time.Now()
+	if err := fixture.controlChannel.WriteControlFrame(context.Background(), transport.ControlFrame{
+		Type: transport.ControlFrameTypeHeartbeatPing,
+	}); err != nil {
+		testingObject.Fatalf("write quic heartbeat ping under data load failed: %v", err)
+	}
+	readContext, cancelRead := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancelRead()
+	heartbeatReply, err := fixture.controlChannel.ReadControlFrame(readContext)
+	if err != nil {
+		testingObject.Fatalf("read quic heartbeat pong under data load failed: %v", err)
+	}
+	if heartbeatReply.Type != transport.ControlFrameTypeHeartbeatPong {
+		testingObject.Fatalf(
+			"unexpected quic heartbeat reply under data load: got=%d want=%d",
+			heartbeatReply.Type,
+			transport.ControlFrameTypeHeartbeatPong,
+		)
+	}
+	if elapsed := time.Since(pingStartedAt); elapsed > 250*time.Millisecond {
+		testingObject.Fatalf("expected quic heartbeat pong before deadline under data load, elapsed=%s", elapsed)
+	}
+}
+
+func TestRunQUICSweepSessionLifecyclePurgesServiceAndTunnel(testingObject *testing.T) {
+	fixture := newAuthenticatedQUICControlPlaneFixtureForTest(testingObject)
+	defer fixture.Close(testingObject)
+
+	publishPayload := buildPublishServiceForTest(
+		"inst-quic-stale",
+		"quic-order-service",
+		"http",
+		[]pb.ServiceEndpoint{
+			{Protocol: "http", Host: "127.0.0.1", Port: 18080},
+		},
+	)
+	encodedPublishPayload, err := json.Marshal(publishPayload)
+	if err != nil {
+		testingObject.Fatalf("marshal quic publish payload failed: %v", err)
+	}
+	publishFrame := encodeBusinessControlFrameForTest(testingObject, pb.ControlEnvelope{
+		VersionMajor:    2,
+		VersionMinor:    1,
+		MessageType:     pb.ControlMessagePublishService,
+		SessionID:       fixture.authAckPayload.SessionID,
+		SessionEpoch:    fixture.authAckPayload.SessionEpoch,
+		ConnectorID:     "agent-local",
+		RequestID:       "req-quic-stale",
+		EventID:         "evt-quic-stale",
+		ResourceType:    "service",
+		ResourceID:      "inst-quic-stale",
+		ResourceVersion: 1,
+		Payload:         encodedPublishPayload,
+	})
+	if err := fixture.controlChannel.WriteControlFrame(context.Background(), publishFrame); err != nil {
+		testingObject.Fatalf("write quic publish frame failed: %v", err)
+	}
+	publishAckEnvelope := readBusinessControlEnvelopeForTest(testingObject, context.Background(), fixture.controlChannel)
+	if publishAckEnvelope.MessageType != pb.ControlMessagePublishServiceAck {
+		testingObject.Fatalf(
+			"unexpected quic publish ack type: got=%s want=%s",
+			publishAckEnvelope.MessageType,
+			pb.ControlMessagePublishServiceAck,
+		)
+	}
+	var publishAck pb.PublishServiceAck
+	if err := json.Unmarshal(publishAckEnvelope.Payload, &publishAck); err != nil {
+		testingObject.Fatalf("unmarshal quic publish ack payload failed: %v", err)
+	}
+	if !publishAck.Accepted {
+		testingObject.Fatalf("expected quic publish accepted, got error=%s", publishAck.ErrorCode)
+	}
+
+	clientTunnel, registeredTunnel := fixture.OpenTunnelAndWaitRegistered(testingObject)
+	defer func() {
+		_ = clientTunnel.Close()
+	}()
+	instanceSnapshot, exists := fixture.serviceRegistry.GetInstanceByID("inst-quic-stale")
+	if !exists {
+		testingObject.Fatalf("expected published quic service instance exists")
+	}
+	logicalServiceID := instanceSnapshot.LogicalService.LogicalServiceID
+	sessionSnapshot, exists := fixture.sessionRegistry.GetBySession(fixture.authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected quic session exists before lifecycle sweep")
+	}
+
+	staleAt := sessionSnapshot.LastHeartbeat.Add(2 * time.Minute)
+	fixture.server.dispatcher.sweepSessionLifecycle(staleAt, 30*time.Second, 30*time.Second)
+
+	staleSession, exists := fixture.sessionRegistry.GetBySession(fixture.authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected quic session exists after stale sweep")
+	}
+	if staleSession.State != registry.SessionStale {
+		testingObject.Fatalf("unexpected quic session state after stale sweep: got=%s want=%s", staleSession.State, registry.SessionStale)
+	}
+	logicalServiceSnapshot, exists := fixture.serviceRegistry.GetLogicalServiceByID(logicalServiceID)
+	if !exists {
+		testingObject.Fatalf("expected quic logical service snapshot exists")
+	}
+	if logicalServiceSnapshot.Status != pb.ServiceStatusInactive {
+		testingObject.Fatalf(
+			"unexpected quic logical service status after stale sweep: got=%s want=%s",
+			logicalServiceSnapshot.Status,
+			pb.ServiceStatusInactive,
+		)
+	}
+	instanceSnapshot, exists = fixture.serviceRegistry.GetInstanceByID("inst-quic-stale")
+	if !exists {
+		testingObject.Fatalf("expected quic instance snapshot exists after stale sweep")
+	}
+	if instanceSnapshot.Instance.InstanceStatus != pb.ServiceStatusStale {
+		testingObject.Fatalf(
+			"unexpected quic instance status after stale sweep: got=%s want=%s",
+			instanceSnapshot.Instance.InstanceStatus,
+			pb.ServiceStatusStale,
+		)
+	}
+	if _, exists := fixture.tunnelRegistry.Get(registeredTunnel.TunnelID); exists {
+		testingObject.Fatalf("expected quic tunnel purged after stale sweep")
+	}
+
+	fixture.server.dispatcher.sweepSessionLifecycle(staleAt.Add(2*time.Minute), 30*time.Second, 30*time.Second)
+	closedSession, exists := fixture.sessionRegistry.GetBySession(fixture.authAckPayload.SessionID)
+	if !exists {
+		testingObject.Fatalf("expected quic session exists after close sweep")
+	}
+	if closedSession.State != registry.SessionClosed {
+		testingObject.Fatalf("unexpected quic session state after close sweep: got=%s want=%s", closedSession.State, registry.SessionClosed)
 	}
 }
 
@@ -633,6 +1635,7 @@ func TestServeControlChannelMarksSessionClosedOnPeerClose(testingObject *testing
 			serverControl,
 			dispatcher,
 			"10.20.30.40:39080",
+			transport.BindingTypeTCPFramed,
 		)
 	}()
 

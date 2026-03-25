@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 type tunnelRegistryTestTunnel struct {
-	tunnelID string
-	closed   bool
+	tunnelID    string
+	bindingType transport.BindingType
+	closed      bool
 }
 
 func (tunnel *tunnelRegistryTestTunnel) ID() string {
@@ -32,6 +34,13 @@ func (tunnel *tunnelRegistryTestTunnel) WritePayload(ctx context.Context, payloa
 func (tunnel *tunnelRegistryTestTunnel) Close() error {
 	tunnel.closed = true
 	return nil
+}
+
+func (tunnel *tunnelRegistryTestTunnel) BindingType() transport.BindingType {
+	if tunnel == nil || tunnel.bindingType == "" {
+		return transport.BindingTypeTCPFramed
+	}
+	return tunnel.bindingType
 }
 
 // TestTunnelRegistryStateFlow 验证 tunnel 状态流转 idle -> reserved -> active -> closed -> remove。
@@ -64,6 +73,28 @@ func TestTunnelRegistryStateFlow(testingObject *testing.T) {
 	}
 	if _, exists := registry.Get("tunnel-1"); exists {
 		testingObject.Fatalf("expected tunnel removed from registry")
+	}
+}
+
+func TestTunnelRegistryCapturesBindingType(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	registry := NewTunnelRegistry()
+	now := time.Now().UTC()
+	_, err := registry.UpsertIdle(now, "connector-1", "session-1", &tunnelRegistryTestTunnel{
+		tunnelID:    "tunnel-quic-1",
+		bindingType: transport.BindingTypeQUICNative,
+	})
+	if err != nil {
+		testingObject.Fatalf("upsert quic tunnel failed: %v", err)
+	}
+
+	runtime, exists := registry.Get("tunnel-quic-1")
+	if !exists {
+		testingObject.Fatalf("expected quic tunnel runtime exists")
+	}
+	if runtime.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf("unexpected tunnel binding: got=%s want=%s", runtime.Binding, transport.BindingTypeQUICNative)
 	}
 }
 

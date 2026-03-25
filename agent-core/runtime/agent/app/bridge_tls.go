@@ -77,6 +77,20 @@ func buildBridgeGRPCTransportCredentials(bridgeTLSConfig BridgeTLSConfig, bridge
 	return credentials.NewTLS(tlsConfig), nil
 }
 
+// buildBridgeQUICClientTLSConfig 构造 quic_native 拨号使用的 TLS 配置。
+func buildBridgeQUICClientTLSConfig(bridgeTLSConfig BridgeTLSConfig, bridgeAddr string) (*tls.Config, error) {
+	tlsConfig, err := buildBridgeClientTLSConfig(bridgeTLSConfig, bridgeAddr)
+	if err != nil {
+		return nil, err
+	}
+	if tlsConfig == nil {
+		return nil, fmt.Errorf("build bridge quic tls config: bridge tls is disabled")
+	}
+	// QUIC 需要由 quicbinding 注入自身 ALPN，不能沿用 gRPC 的 h2。
+	tlsConfig.NextProtos = nil
+	return tlsConfig, nil
+}
+
 // dialBridgeTCPConn 按当前配置拨号 Bridge TCP 连接，并在需要时完成 TLS 握手。
 func dialBridgeTCPConn(
 	ctx context.Context,

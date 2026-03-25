@@ -179,7 +179,7 @@ QUIC 首版默认要求 TLS 1.3 加密。
   - 连续打开多条 bidirectional stream
   - Bridge 侧成功 accept 并双向读写
 - [ ] 明确首版不做 0-RTT / datagram / session resume
-- [ ] 明确 QUIC 配置项与现有 `tls_mode` 的兼容策略
+- [x] 明确 QUIC 配置项与现有 `tls_mode` 的兼容策略
 
 ### 验收标准
 
@@ -224,13 +224,13 @@ QUIC 首版默认要求 TLS 1.3 加密。
 ### 清单
 
 - [x] 在 `cloud-bridge` 配置中新增 QUIC 监听配置
-- [ ] 新增 QUIC listener 初始化和关闭逻辑
-- [ ] 新增 QUIC accept loop
+- [x] 新增 QUIC listener 初始化和关闭逻辑
+- [x] 新增 QUIC accept loop
 - [ ] 为每条 QUIC 连接建立 Bridge 侧 transport session
-- [ ] 固定 control stream 建立流程
-- [ ] 接收 Agent 打开的 tunnel stream 并写入 idle pool
-- [ ] 在握手阶段支持 `selected_binding=quic_native`
-- [ ] 保持现有 auth / heartbeat / publish / pool report 逻辑不变
+- [x] 固定 control stream 建立流程
+- [x] 接收 Agent 打开的 tunnel stream 并写入 idle pool
+- [x] 在握手阶段支持 `selected_binding=quic_native`
+- [x] 保持现有 auth / heartbeat / publish / pool report 逻辑不变
 - [ ] 为 QUIC 连接和 stream 增加结构化日志
 
 ### 验收标准
@@ -247,13 +247,13 @@ QUIC 首版默认要求 TLS 1.3 加密。
 ### 清单
 
 - [x] 放开 Agent `bridge_transport` 校验，支持 `quic_native`
-- [ ] 新增 QUIC dialer 与 TLS 配置加载
-- [ ] Agent session opener 支持 QUIC
-- [ ] 使用 control stream 完成握手与认证
-- [ ] tunnel maintainer 改为通过 QUIC bidirectional stream 建 tunnel
-- [ ] refill controller 在 QUIC 下复用现有节流与并发限制
-- [ ] 保证 Agent 上报的 `SupportedBindings` 可包含 `quic_native`
-- [ ] 补齐 runtime 单测
+- [x] 新增 QUIC dialer 与 TLS 配置加载
+- [x] Agent session opener 支持 QUIC
+- [x] 使用 control stream 完成握手与认证
+- [x] tunnel maintainer 改为通过 QUIC bidirectional stream 建 tunnel
+- [x] refill controller 在 QUIC 下复用现有节流与并发限制
+- [x] 保证 Agent 上报的 `SupportedBindings` 可包含 `quic_native`
+- [x] 补齐 runtime 单测
 
 ### 验收标准
 
@@ -268,13 +268,13 @@ QUIC 首版默认要求 TLS 1.3 加密。
 
 ### 清单
 
-- [ ] 对齐 `TrafficOpen / OpenAck / Data / Close / Reset`
-- [ ] 对齐 deadline / cancel / reset 语义
-- [ ] 对齐 tunnel recycle 语义
-- [ ] 校验单 tunnel 单并发 traffic 约束
-- [ ] 校验 stream reset 后 tunnel 状态是否正确收敛到 `broken/closed`
-- [ ] 校验 idle tunnel 静默断开清理逻辑
-- [ ] 校验 control stream 与大流量数据流并存时 heartbeat 不被饿死
+- [x] 对齐 `TrafficOpen / OpenAck / Data / Close / Reset`
+- [x] 对齐 deadline / cancel / reset 语义
+- [x] 对齐 tunnel recycle 语义
+- [x] 校验单 tunnel 单并发 traffic 约束
+- [x] 校验 stream reset 后 tunnel 状态是否正确收敛到 `broken/closed`
+- [x] 校验 idle tunnel 静默断开清理逻辑
+- [x] 校验 control stream 与大流量数据流并存时 heartbeat 不被饿死
 
 ### 验收标准
 
@@ -290,22 +290,23 @@ QUIC 首版默认要求 TLS 1.3 加密。
 ### 清单
 
 - [x] `ltfp/transport/quicbinding/*_test.go` 单测
-- [ ] `ltfp` parity 测试新增 QUIC
+- [x] `ltfp` parity 测试新增 QUIC
 - [ ] 集成测试覆盖：
   - 握手
   - 认证
   - 心跳
   - pool refill
-  - open/ack/data/close/reset
-  - late ack
+  - open/ack/close/recycle（app 层 HTTP ingress + connector path 已补齐 QUIC 变体）
+  - late ack（app 层 open timeout drain 已补齐 QUIC 变体）
+  - data / reset（HTTP ingress + connector path 已补齐 QUIC 变体；更广的跨协议/end-to-end 场景仍待补齐）
   - recycle
   - session stale
 - [ ] 压测覆盖：
-  - 突发开 stream
-  - stream limit 打满
-  - 弱网丢包
-  - 空闲超时
-  - 慢读回压
+  - [ ] 突发开 stream
+  - [x] stream limit 打满
+  - [ ] 弱网丢包
+  - [x] 空闲超时
+  - [ ] 慢读回压
 - [ ] 增加 QUIC 维度指标
 - [ ] 管理台展示 `binding=quic_native`
 - [ ] 更新测试矩阵文档
@@ -345,30 +346,30 @@ QUIC 首版默认要求 TLS 1.3 加密。
 - [x] 实现 stream 到 tunnel 的状态映射
 - [ ] 实现 QUIC control write/read queue
 - [x] 实现 keepalive / idle timeout 配置归一化
-- [ ] 对齐 `BindingInfo.KeepalivePolicy`
+- [x] 对齐 `BindingInfo.KeepalivePolicy`
 - [ ] 更新 `Makefile`：
-  - `test-binding`
-  - `test-parity`
-  - `test-pressure`
-- [ ] 更新 `ltfp/docs/TestMatrix.md`
+  - [x] `test-binding`
+  - [x] `test-parity`
+  - [x] `test-pressure`
+- [x] 更新 `ltfp/docs/TestMatrix.md`
 
 ## 7.2 `agent-core` 任务
 
-- [ ] 扩展配置校验枚举
-- [ ] 增加 QUIC 地址 / TLS / ServerName / timeout 配置
-- [ ] QUIC session opener 接入
-- [ ] QUIC tunnel producer 接入
-- [ ] runtime diagnostics 增加 QUIC 字段
-- [ ] 补齐 QUIC 场景单测与集测
+- [x] 扩展配置校验枚举
+- [x] 复用既有 `bridge_addr / bridge_tls / dial_timeout` 完成 QUIC 配置接线
+- [x] QUIC session opener 接入
+- [x] QUIC tunnel producer 接入
+- [x] runtime diagnostics 增加 QUIC 字段
+- [x] 补齐 QUIC 场景单测与集测
 
 ## 7.3 `cloud-bridge` 任务
 
-- [ ] 增加 QUIC 监听配置
-- [ ] 初始化 QUIC listener
-- [ ] 接入 QUIC 连接 accept loop
-- [ ] 控制面握手支持 `selected_binding=quic_native`
-- [ ] 接入 QUIC tunnel stream acceptor
-- [ ] registry / observability 与 QUIC 对齐
+- [x] 增加 QUIC 监听配置
+- [x] 初始化 QUIC listener
+- [x] 接入 QUIC 连接 accept loop
+- [x] 控制面握手支持 `selected_binding=quic_native`
+- [x] 接入 QUIC tunnel stream acceptor
+- [x] registry / observability 与 QUIC 对齐
 - [ ] 补齐 Bridge 侧集成测试
 
 ## 7.4 文档与运维任务
@@ -401,6 +402,22 @@ QUIC 首版默认要求 TLS 1.3 加密。
 
 - QUIC 分支单独定义监听与 TLS 必填项
 - 不让“伪明文 QUIC”进入实现
+- Bridge 当前实现仅在 `control_plane.tls_mode != plaintext` 且服务端 TLS 配置已就绪时启动 QUIC listener；默认明文控制面不会尝试拉起 QUIC 监听
+
+当前状态：
+
+- `cloud-bridge` 与 `agent-core` 已分别执行 `go mod tidy`，补齐了 `quic-go` 相关 transitive checksum
+- Agent 当前实现复用了现有 `bridge_addr / bridge_tls / control_channel.dial_timeout` 配置；`quic_native` 下额外约束为必须启用 `bridge_tls.enabled=true`
+- Agent 的 `agent.snapshot / session.snapshot / diagnose.snapshot` 已补齐 QUIC 维度，当前可观测到是否启用 QUIC、控制连接状态、tunnel producer 就绪态及本地/远端地址
+- Bridge 当前已把 QUIC binding 写入 session/tunnel registry，并通过 adminview/admin API 暴露 connector/session/tunnel 的 `binding=quic_native` 与 QUIC listener 概览；前端页面本身尚未单独做视觉展示适配
+- Bridge 当前要求每条 QUIC 连接必须先在控制流上完成 `Hello -> Auth -> AuthAck`，随后才会启动 tunnel stream accept loop；未认证连接即使提前打开 data stream，也不会进入 session/tunnel registry
+- Bridge 当前对“等待首个 QUIC control stream”显式施加超时，避免客户端只完成 QUIC/TLS 建连却长期不打开控制流，导致未认证连接长期占用 goroutine 与连接资源
+- Bridge 侧现有 QUIC 集成覆盖已包含握手、认证、transport heartbeat 刷新 session、`TunnelPoolReport -> TunnelRefillRequest`、idle tunnel recycle、session stale sweep、admin API 只读链路对 `binding=quic_native` / QUIC listener 的读取，以及 app 层 HTTP ingress + connector path 下的 `open/ack/close/recycle`、`open timeout + late ack drain`、`data/reset` QUIC 变体；更广的跨协议 end-to-end 语义与压测场景仍待补齐
+- Bridge connector path 现已补齐 QUIC 下的“单 tunnel 单并发 traffic”约束回归，验证 active 中的 quic tunnel 不会被第二条 traffic 并发复用；控制面也补了真实 QUIC control+tunnel 压载场景，验证单条大流量 data stream 持续写入时 heartbeat pong 仍能按时返回
+- `ltfp` 当前已把 QUIC 纳入 parity smoke：`grpc_h2 / tcp_framed / quic_native` 共用同一组 `open/ack/data/close` 与 `open/ack/data/reset` 场景断言；`make test-binding` 也已纳入 `transport/quicbinding`
+- `ltfp` 的 QUIC session / tunnel 现在都显式断言 `BindingInfo().KeepalivePolicy == DefaultKeepalivePolicyForBinding(quic_native)`，避免后续回归把保活策略默默漂移
+- `ltfp/transport/quicbinding/tunnel_test.go` 已补齐 tunnel 级 QUIC 语义回归，覆盖 `read deadline` 超时不破坏 tunnel、本地 reset、对端 stream reset 后状态收敛到 `broken`、idle peer close 后清理收敛到 `closed`，以及 `CloseWrite -> EOF`
+- `ltfp` 的 `make test-pressure` 现已纳入 QUIC benchmark smoke，覆盖 `TunnelSmallPayload / TunnelLargePayload / TunnelIdleDeadline / BurstRefill / StreamLimitSaturation`；同时 `transport/quicbinding` 已补齐 `TestTunnelProducerRespectsMaxIncomingStreams`，验证控制流 + 单条数据流占满 stream 配额时额外开流会按预期超时，释放后可恢复；运行时会出现一条 `quic-go` 的本地 UDP buffer 提示，但 benchmark 已正常通过
 
 ### 8.3 UDP 网络风险
 

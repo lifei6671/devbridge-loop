@@ -94,6 +94,13 @@ func TestNewSessionBuildsServerSession(testingObject *testing.T) {
 	if session.BindingInfo().Type != transport.BindingTypeQUICNative {
 		testingObject.Fatalf("expected quic_native binding type, got %s", session.BindingInfo().Type)
 	}
+	if session.BindingInfo().KeepalivePolicy != transport.DefaultKeepalivePolicyForBinding(transport.BindingTypeQUICNative) {
+		testingObject.Fatalf(
+			"unexpected quic session keepalive policy: got=%+v want=%+v",
+			session.BindingInfo().KeepalivePolicy,
+			transport.DefaultKeepalivePolicyForBinding(transport.BindingTypeQUICNative),
+		)
+	}
 	if err := session.Open(context.Background()); err != nil {
 		testingObject.Fatalf("open session failed: %v", err)
 	}

@@ -16,6 +16,7 @@ import (
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"google.golang.org/grpc"
 )
@@ -50,20 +51,23 @@ type Runtime struct {
 	tunnelIDSequence   uint64
 	bridgeCommandChan  chan bridgeCommand
 
-	controlChannel   transport.ControlChannel
-	tcpTransport     *tcpbinding.Transport
-	grpcTransport    *grpcbinding.Transport
-	grpcClient       transportgen.GRPCH2TransportServiceClient
-	grpcConn         *grpc.ClientConn
-	tunnelRegistry   *tunnel.Registry
-	tunnelManager    *tunnel.Manager
-	refillHandler    *control.RefillHandler
-	serviceCatalog   *service.Catalog
-	controlPublisher *control.Publisher
-	tunnelReporter   *control.TunnelReporter
-	healthReporter   *control.HealthReporter
-	trafficAcceptor  *traffic.Acceptor
-	trafficOpener    *traffic.Opener
+	controlChannel     transport.ControlChannel
+	tcpTransport       *tcpbinding.Transport
+	grpcTransport      *grpcbinding.Transport
+	quicTransport      *quicbinding.Transport
+	grpcClient         transportgen.GRPCH2TransportServiceClient
+	grpcConn           *grpc.ClientConn
+	quicConn           *quicbinding.Conn
+	quicTunnelProducer *quicbinding.TunnelProducer
+	tunnelRegistry     *tunnel.Registry
+	tunnelManager      *tunnel.Manager
+	refillHandler      *control.RefillHandler
+	serviceCatalog     *service.Catalog
+	controlPublisher   *control.Publisher
+	tunnelReporter     *control.TunnelReporter
+	healthReporter     *control.HealthReporter
+	trafficAcceptor    *traffic.Acceptor
+	trafficOpener      *traffic.Opener
 
 	trafficWakeupChannel chan struct{}
 	trafficWorkersMutex  sync.Mutex

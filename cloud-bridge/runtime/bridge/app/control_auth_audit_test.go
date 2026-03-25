@@ -103,6 +103,7 @@ func TestServeControlChannelAuthAuditLogMasksTokenID(testingObject *testing.T) {
 			serverControl,
 			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
 			"10.20.30.40:39080",
+			transport.BindingTypeTCPFramed,
 		)
 	}()
 
@@ -212,6 +213,7 @@ func TestServeControlChannelAuthAuditLogOmitsTokenIDBeforeWelcome(testingObject 
 			serverControl,
 			newControlMessageDispatcher(controlMessageDispatcherOptions{}),
 			"10.20.30.40:39080",
+			transport.BindingTypeTCPFramed,
 		)
 	}()
 

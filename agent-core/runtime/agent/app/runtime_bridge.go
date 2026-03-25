@@ -26,6 +26,7 @@ import (
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/validate"
 )
@@ -96,6 +97,16 @@ type runtimeSessionSnapshot struct {
 	unavailableReason string
 }
 
+type runtimeQUICSnapshot struct {
+	enabled             bool
+	connected           bool
+	tunnelProducerReady bool
+	localAddr           string
+	remoteAddr          string
+	streamOpenTimeoutMS uint64
+	maxIncomingStreams  uint64
+}
+
 type runtimeServiceAddInput struct {
 	InstanceID             string
 	Scope                  pb.Scope
@@ -129,17 +140,17 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 	if !active {
 		return nil, errors.New("bridge control channel is not active")
 	}
-	tunnelID := opener.runtime.nextTunnelID()
-	tunnelMeta := transport.TunnelMeta{
-		TunnelID:     tunnelID,
-		SessionID:    sessionID,
-		SessionEpoch: sessionEpoch,
-		CreatedAt:    time.Now().UTC(),
-	}
 	switch strings.TrimSpace(opener.runtime.cfg.BridgeTransport) {
 	case transport.BindingTypeTCPFramed.String():
 		if opener.runtime.tcpTransport == nil {
 			return nil, errors.New("tcp transport is not initialized")
+		}
+		tunnelID := opener.runtime.nextTunnelID()
+		tunnelMeta := transport.TunnelMeta{
+			TunnelID:     tunnelID,
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			CreatedAt:    time.Now().UTC(),
 		}
 		rawTunnel, err := opener.runtime.openBridgeTCPTunnel(ctx, tunnelMeta)
 		if err != nil {
@@ -165,6 +176,13 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		// 所有新建 tunnel 统一包一层 payload 适配器，供 traffic runtime 直接消费。
 		return newRuntimeTrafficTunnelAdapter(rawTunnel), nil
 	case transport.BindingTypeGRPCH2.String():
+		tunnelID := opener.runtime.nextTunnelID()
+		tunnelMeta := transport.TunnelMeta{
+			TunnelID:     tunnelID,
+			SessionID:    sessionID,
+			SessionEpoch: sessionEpoch,
+			CreatedAt:    time.Now().UTC(),
+		}
 		opener.runtime.bridgeMu.RLock()
 		grpcTransport := opener.runtime.grpcTransport
 		grpcClient := opener.runtime.grpcClient
@@ -196,6 +214,18 @@ func (opener *bridgeTunnelOpener) Open(ctx context.Context) (tunnel.RuntimeTunne
 		}
 		// grpc tunnel 同样走统一 payload 适配层，避免 runtime 侧分 binding 分支。
 		return newRuntimeTrafficTunnelAdapter(grpcTunnel), nil
+	case transport.BindingTypeQUICNative.String():
+		opener.runtime.bridgeMu.RLock()
+		quicProducer := opener.runtime.quicTunnelProducer
+		opener.runtime.bridgeMu.RUnlock()
+		if quicProducer == nil {
+			return nil, errors.New("quic tunnel producer is not initialized")
+		}
+		quicTunnel, err := quicProducer.OpenTunnel(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("open quic tunnel failed: %w", err)
+		}
+		return newRuntimeTrafficTunnelAdapter(quicTunnel), nil
 	default:
 		return nil, fmt.Errorf("unsupported bridge transport=%s", opener.runtime.cfg.BridgeTransport)
 	}
@@ -335,6 +365,33 @@ func normalizeTunnelIDScope(rawScope string) string {
 	return sanitizedScope
 }
 
+func buildQUICTunnelIDPrefix(sessionID string, agentID string) string {
+	scope := normalizeTunnelIDScope(strings.TrimSpace(sessionID))
+	if scope == "" {
+		scope = normalizeTunnelIDScope(strings.TrimSpace(agentID))
+	}
+	if scope == "" {
+		return "tun"
+	}
+	return fmt.Sprintf("tun-%s", scope)
+}
+
+func newQUICTunnelProducer(
+	quicConn *quicbinding.Conn,
+	sessionID string,
+	sessionEpoch uint64,
+	agentID string,
+) (*quicbinding.TunnelProducer, error) {
+	if quicConn == nil {
+		return nil, errors.New("quic control connection is nil")
+	}
+	return quicbinding.NewTunnelProducer(quicConn, quicbinding.TunnelIdentityConfig{
+		SessionID:      strings.TrimSpace(sessionID),
+		SessionEpoch:   sessionEpoch,
+		TunnelIDPrefix: buildQUICTunnelIDPrefix(sessionID, agentID),
+	})
+}
+
 func (r *Runtime) initTransport() error {
 	if r == nil {
 		return errors.New("runtime is nil")
@@ -350,6 +407,7 @@ func (r *Runtime) initTransport() error {
 		}
 		r.tcpTransport = tcpTransport
 		r.grpcTransport = nil
+		r.quicTransport = nil
 		return nil
 	case transport.BindingTypeGRPCH2.String():
 		grpcTransport, err := grpcbinding.NewTransportWithConfig(grpcbinding.TransportConfig{})
@@ -358,9 +416,18 @@ func (r *Runtime) initTransport() error {
 		}
 		r.grpcTransport = grpcTransport
 		r.tcpTransport = nil
+		r.quicTransport = nil
 		return nil
-	case transport.BindingTypeQUICNative.String(),
-		transport.BindingTypeH3Stream.String():
+	case transport.BindingTypeQUICNative.String():
+		quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+		if err != nil {
+			return fmt.Errorf("initialize quic transport: %w", err)
+		}
+		r.quicTransport = quicTransport
+		r.tcpTransport = nil
+		r.grpcTransport = nil
+		return nil
+	case transport.BindingTypeH3Stream.String():
 		return fmt.Errorf(
 			"bridge transport %s 暂未在 agent-core 中接入，请先使用 %s 或 %s",
 			r.cfg.BridgeTransport,
@@ -472,6 +539,15 @@ func (r *Runtime) clearGRPCClientConn() *grpc.ClientConn {
 	return clientConn
 }
 
+func (r *Runtime) clearQUICConn() *quicbinding.Conn {
+	r.bridgeMu.Lock()
+	defer r.bridgeMu.Unlock()
+	quicConn := r.quicConn
+	r.quicConn = nil
+	r.quicTunnelProducer = nil
+	return quicConn
+}
+
 func (r *Runtime) closeCurrentControlChannel() {
 	controlChannel := r.clearControlChannel()
 	if controlChannel != nil {
@@ -480,6 +556,10 @@ func (r *Runtime) closeCurrentControlChannel() {
 	clientConn := r.clearGRPCClientConn()
 	if clientConn != nil {
 		_ = clientConn.Close()
+	}
+	quicConn := r.clearQUICConn()
+	if quicConn != nil {
+		_ = quicConn.Close(nil)
 	}
 }
 
@@ -805,6 +885,48 @@ func (r *Runtime) sessionSnapshot() runtimeSessionSnapshot {
 	return snapshot
 }
 
+func (r *Runtime) quicSnapshot() runtimeQUICSnapshot {
+	if r == nil {
+		return runtimeQUICSnapshot{}
+	}
+	snapshot := runtimeQUICSnapshot{
+		enabled: strings.TrimSpace(r.cfg.BridgeTransport) == transport.BindingTypeQUICNative.String(),
+	}
+	r.bridgeMu.RLock()
+	quicConn := r.quicConn
+	snapshot.tunnelProducerReady = r.quicTunnelProducer != nil
+	r.bridgeMu.RUnlock()
+	if quicConn != nil {
+		snapshot.connected = true
+		if localAddr := quicConn.LocalAddr(); localAddr != nil {
+			snapshot.localAddr = strings.TrimSpace(localAddr.String())
+		}
+		if remoteAddr := quicConn.RemoteAddr(); remoteAddr != nil {
+			snapshot.remoteAddr = strings.TrimSpace(remoteAddr.String())
+		}
+	}
+	if r.quicTransport != nil {
+		transportConfig := r.quicTransport.Config()
+		snapshot.streamOpenTimeoutMS = durationToMillis(transportConfig.StreamOpenTimeout)
+		if transportConfig.MaxIncomingStreams > 0 {
+			snapshot.maxIncomingStreams = uint64(transportConfig.MaxIncomingStreams)
+		}
+	}
+	return snapshot
+}
+
+func quicSnapshotPayload(snapshot runtimeQUICSnapshot) map[string]any {
+	return map[string]any{
+		"enabled":                snapshot.enabled,
+		"connected":              snapshot.connected,
+		"tunnel_producer_ready":  snapshot.tunnelProducerReady,
+		"local_addr":             snapshot.localAddr,
+		"remote_addr":            snapshot.remoteAddr,
+		"stream_open_timeout_ms": snapshot.streamOpenTimeoutMS,
+		"max_incoming_streams":   snapshot.maxIncomingStreams,
+	}
+}
+
 func (r *Runtime) notifyTunnelManagerState(state string) {
 	if r == nil || r.tunnelManager == nil {
 		return
@@ -821,6 +943,8 @@ func (r *Runtime) connectBridgeControl(ctx context.Context) error {
 		return r.connectBridgeControlTCP(ctx)
 	case transport.BindingTypeGRPCH2.String():
 		return r.connectBridgeControlGRPC(ctx)
+	case transport.BindingTypeQUICNative.String():
+		return r.connectBridgeControlQUIC(ctx)
 	default:
 		return fmt.Errorf("unsupported bridge transport=%s", r.cfg.BridgeTransport)
 	}
@@ -903,6 +1027,45 @@ func (r *Runtime) connectBridgeControlGRPC(ctx context.Context) error {
 	r.controlChannel = controlChannel
 	r.grpcConn = clientConn
 	r.grpcClient = client
+	r.bridgeMu.Unlock()
+	r.setBridgeConnected(newRuntimeSessionID())
+	return nil
+}
+
+func (r *Runtime) connectBridgeControlQUIC(ctx context.Context) error {
+	if r == nil {
+		return errors.New("runtime is nil")
+	}
+	if r.quicTransport == nil {
+		return errors.New("quic transport is not initialized")
+	}
+	r.closeCurrentControlChannel()
+	r.setBridgeConnecting()
+
+	dialTimeout := r.cfg.ControlChannel.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
+	dialContext, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	defer cancelDial()
+	tlsConfig, err := buildBridgeQUICClientTLSConfig(r.cfg.BridgeTLS, r.cfg.BridgeAddr)
+	if err != nil {
+		return fmt.Errorf("build bridge quic tls config failed: %w", err)
+	}
+	quicConn, err := r.quicTransport.Dial(dialContext, r.cfg.BridgeAddr, tlsConfig)
+	if err != nil {
+		return fmt.Errorf("dial bridge quic connection failed: %w", err)
+	}
+	controlChannel, err := quicConn.OpenControlChannel(dialContext)
+	if err != nil {
+		_ = quicConn.Close(nil)
+		return fmt.Errorf("open bridge quic control channel failed: %w", err)
+	}
+
+	r.bridgeMu.Lock()
+	r.controlChannel = controlChannel
+	r.quicConn = quicConn
+	r.quicTunnelProducer = nil
 	r.bridgeMu.Unlock()
 	r.setBridgeConnected(newRuntimeSessionID())
 	return nil
@@ -1745,6 +1908,23 @@ func (r *Runtime) applyAuthoritativeSession(sessionID string, sessionEpoch uint6
 	}
 }
 
+func (r *Runtime) refreshQUICTunnelProducer(sessionID string, sessionEpoch uint64) error {
+	if r == nil {
+		return errors.New("runtime is nil")
+	}
+	r.bridgeMu.RLock()
+	quicConn := r.quicConn
+	r.bridgeMu.RUnlock()
+	quicProducer, err := newQUICTunnelProducer(quicConn, sessionID, sessionEpoch, r.cfg.AgentID)
+	if err != nil {
+		return err
+	}
+	r.bridgeMu.Lock()
+	r.quicTunnelProducer = quicProducer
+	r.bridgeMu.Unlock()
+	return nil
+}
+
 // waitHandshakeBusinessEnvelope 等待并解析握手阶段来自 Bridge 的业务控制消息。
 func (r *Runtime) waitHandshakeBusinessEnvelope(
 	ctx context.Context,
@@ -1860,6 +2040,11 @@ func (r *Runtime) performControlHandshake(ctx context.Context) error {
 		)
 	}
 	r.applyAuthoritativeSession(authAckPayload.SessionID, authAckPayload.SessionEpoch)
+	if strings.TrimSpace(r.cfg.BridgeTransport) == transport.BindingTypeQUICNative.String() {
+		if err := r.refreshQUICTunnelProducer(authAckPayload.SessionID, authAckPayload.SessionEpoch); err != nil {
+			return fmt.Errorf("refresh quic tunnel producer failed: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -2145,6 +2330,7 @@ func (r *Runtime) runBridgeControlLoop(ctx context.Context) error {
 // 组装 agent.snapshot 返回体。
 func (r *Runtime) agentSnapshotPayload() map[string]any {
 	sessionSnapshot := r.sessionSnapshot()
+	quicSnapshot := r.quicSnapshot()
 	tunnelPoolSnapshot := tunnel.Snapshot{}
 	if r.tunnelRegistry != nil {
 		tunnelPoolSnapshot = r.tunnelRegistry.Snapshot()
@@ -2160,6 +2346,7 @@ func (r *Runtime) agentSnapshotPayload() map[string]any {
 		"updated_at_ms":      sessionSnapshot.updatedAtMS,
 		"last_error":         sessionSnapshot.lastError,
 		"bridge_unavailable": sessionSnapshot.unavailableReason,
+		"quic":               quicSnapshotPayload(quicSnapshot),
 		"tunnel_pool": map[string]any{
 			"opening":  tunnelPoolSnapshot.OpeningCount,
 			"idle":     tunnelPoolSnapshot.IdleCount,
@@ -2176,7 +2363,9 @@ func (r *Runtime) agentSnapshotPayload() map[string]any {
 // 组装 session.snapshot 返回体。
 func (r *Runtime) sessionSnapshotPayload() map[string]any {
 	sessionSnapshot := r.sessionSnapshot()
+	quicSnapshot := r.quicSnapshot()
 	return map[string]any{
+		"bridge_transport":          r.cfg.BridgeTransport,
 		"state":                     sessionSnapshot.state,
 		"session_id":                sessionSnapshot.sessionID,
 		"session_epoch":             sessionSnapshot.sessionEpoch,
@@ -2189,6 +2378,7 @@ func (r *Runtime) sessionSnapshotPayload() map[string]any {
 		"updated_at_ms":             sessionSnapshot.updatedAtMS,
 		"last_error":                sessionSnapshot.lastError,
 		"unavailable_reason":        sessionSnapshot.unavailableReason,
+		"quic":                      quicSnapshotPayload(quicSnapshot),
 		"source":                    "agent.runtime",
 	}
 }
@@ -2806,9 +2996,11 @@ func (r *Runtime) diagnoseSnapshotPayload() map[string]any {
 		tunnelPoolSnapshot = r.tunnelRegistry.Snapshot()
 	}
 	sessionSnapshot := r.sessionSnapshot()
+	quicSnapshot := r.quicSnapshot()
 	events := r.snapshotDiagnoseEvents(runtimeDiagnoseDefaultLogLimit)
 	summary := summarizeDiagnoseEvents(events)
 	return map[string]any{
+		"bridge_transport":    r.cfg.BridgeTransport,
 		"state":               sessionSnapshot.state,
 		"last_error":          sessionSnapshot.lastError,
 		"retry_fail_streak":   sessionSnapshot.retryFailStreak,
@@ -2824,6 +3016,7 @@ func (r *Runtime) diagnoseSnapshotPayload() map[string]any {
 		"last_event_at_ms":    summary.LastEventAtMS,
 		"last_event_code":     summary.LastEventCode,
 		"last_event_message":  summary.LastEventMessage,
+		"quic":                quicSnapshotPayload(quicSnapshot),
 		"updated_at_ms":       runtimeNowMillis(),
 		"source":              "agent.runtime.diagnose",
 	}

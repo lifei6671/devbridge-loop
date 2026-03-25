@@ -26,6 +26,7 @@ const (
 type runtimeBridgeTunnelAdapter struct {
 	tunnel          transport.Tunnel
 	tunnelID        string
+	bindingType     transport.BindingType
 	jsonCodec       *codec.JSONCodec
 	maxPayloadBytes int
 	ioPollInterval  time.Duration
@@ -42,10 +43,15 @@ var _ registry.RuntimeTunnel = (*runtimeBridgeTunnelAdapter)(nil)
 var _ registry.RuntimeTunnelHealthProber = (*runtimeBridgeTunnelAdapter)(nil)
 
 // newRuntimeBridgeTunnelAdapter 创建 Bridge data-plane tunnel payload 适配器。
-func newRuntimeBridgeTunnelAdapter(rawTunnel transport.Tunnel, tunnelID string) *runtimeBridgeTunnelAdapter {
+func newRuntimeBridgeTunnelAdapter(
+	rawTunnel transport.Tunnel,
+	tunnelID string,
+	bindingType transport.BindingType,
+) *runtimeBridgeTunnelAdapter {
 	return &runtimeBridgeTunnelAdapter{
 		tunnel:           rawTunnel,
 		tunnelID:         strings.TrimSpace(tunnelID),
+		bindingType:      bindingType,
 		jsonCodec:        codec.NewJSONCodec(),
 		maxPayloadBytes:  defaultBridgeTunnelMaxPayloadBytes,
 		ioPollInterval:   defaultBridgeTunnelIOPollInterval,
@@ -69,7 +75,13 @@ func (adapter *runtimeBridgeTunnelAdapter) ID() string {
 
 // BindingType 返回底层 tunnel 的 binding 类型，供上层做协议特定策略分支。
 func (adapter *runtimeBridgeTunnelAdapter) BindingType() transport.BindingType {
-	if adapter == nil || adapter.tunnel == nil {
+	if adapter == nil {
+		return ""
+	}
+	if adapter.bindingType != "" {
+		return adapter.bindingType
+	}
+	if adapter.tunnel == nil {
 		return ""
 	}
 	return adapter.tunnel.BindingInfo().Type

@@ -23,6 +23,7 @@ type SessionRuntime struct {
 	SessionID     string
 	ConnectorID   string
 	Epoch         uint64
+	Binding       string
 	State         SessionState
 	LastHeartbeat time.Time
 	UpdatedAt     time.Time

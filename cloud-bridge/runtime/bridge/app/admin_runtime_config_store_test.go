@@ -287,6 +287,34 @@ control_plane:
 	}
 }
 
+func TestBuildAdminConfigSnapshotIncludesQUICListenAddr(testingObject *testing.T) {
+	config := DefaultConfig()
+	config.ControlPlane.ListenAddr = ":39080"
+	config.ControlPlane.GRPCH2ListenAddr = ":39082"
+	config.ControlPlane.QUICListenAddr = ":39083"
+
+	snapshot := buildAdminConfigSnapshot(
+		config,
+		1,
+		time.Unix(1_700_000_000, 0).UTC(),
+		"tester",
+		map[string]any{},
+		map[string]any{},
+	)
+
+	controlPlaneSnapshot, ok := snapshot["control_plane"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected control_plane snapshot object")
+	}
+	if controlPlaneSnapshot["quic_listen_addr"] != ":39083" {
+		testingObject.Fatalf(
+			"unexpected control_plane.quic_listen_addr: got=%v want=%s",
+			controlPlaneSnapshot["quic_listen_addr"],
+			":39083",
+		)
+	}
+}
+
 func loadYAMLRecord(testingObject *testing.T, filePath string) map[string]any {
 	testingObject.Helper()
 	rawContent, err := os.ReadFile(filePath)

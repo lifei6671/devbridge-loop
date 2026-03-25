@@ -3,9 +3,15 @@ package grpcbinding
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -13,6 +19,7 @@ import (
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/runtime"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -94,35 +101,51 @@ func (service *parityTunnelService) TunnelStream(
 	return scenarioErr
 }
 
-// TestBindingParityOpenEchoClose 验证同一组 open/ack/data/close 场景在两种 binding 下结果一致。
+// TestBindingParityOpenEchoClose 验证同一组 open/ack/data/close 场景在三种 binding 下结果一致。
 func TestBindingParityOpenEchoClose(testingObject *testing.T) {
 	testPayload := bytes.Repeat([]byte("payload-"), 32)
 	grpcResult := runGRPCH2ParityScenario(testingObject, parityScenarioClose, testPayload)
 	tcpResult := runTCPParityScenario(testingObject, parityScenarioClose, testPayload)
+	quicResult := runQUICParityScenario(testingObject, parityScenarioClose, testPayload)
 
 	// 对齐 openAck 语义，确保两种 binding 没有行为分叉。
 	if grpcResult.OpenAckCode != tcpResult.OpenAckCode || grpcResult.OpenAckMessage != tcpResult.OpenAckMessage {
 		testingObject.Fatalf("openAck mismatch: grpc=%+v tcp=%+v", grpcResult, tcpResult)
 	}
+	if grpcResult.OpenAckCode != quicResult.OpenAckCode || grpcResult.OpenAckMessage != quicResult.OpenAckMessage {
+		testingObject.Fatalf("openAck mismatch: grpc=%+v quic=%+v", grpcResult, quicResult)
+	}
 	// 对齐数据回环结果，确保 payload 与顺序一致。
 	if !bytes.Equal(grpcResult.EchoPayload, tcpResult.EchoPayload) {
 		testingObject.Fatalf("echo payload mismatch: grpc_len=%d tcp_len=%d", len(grpcResult.EchoPayload), len(tcpResult.EchoPayload))
 	}
+	if !bytes.Equal(grpcResult.EchoPayload, quicResult.EchoPayload) {
+		testingObject.Fatalf("echo payload mismatch: grpc_len=%d quic_len=%d", len(grpcResult.EchoPayload), len(quicResult.EchoPayload))
+	}
 	// close 收敛后两边都应得到 EOF。
-	if !grpcResult.ReachedEOF || !tcpResult.ReachedEOF {
-		testingObject.Fatalf("expected EOF for both bindings: grpc=%v tcp=%v", grpcResult.ReachedEOF, tcpResult.ReachedEOF)
+	if !grpcResult.ReachedEOF || !tcpResult.ReachedEOF || !quicResult.ReachedEOF {
+		testingObject.Fatalf(
+			"expected EOF for all bindings: grpc=%v tcp=%v quic=%v",
+			grpcResult.ReachedEOF,
+			tcpResult.ReachedEOF,
+			quicResult.ReachedEOF,
+		)
 	}
 }
 
-// TestBindingParityOpenDataReset 验证同一组 open/ack/data/reset 场景在两种 binding 下结果一致。
+// TestBindingParityOpenDataReset 验证同一组 open/ack/data/reset 场景在三种 binding 下结果一致。
 func TestBindingParityOpenDataReset(testingObject *testing.T) {
 	testPayload := bytes.Repeat([]byte("reset-case-"), 24)
 	grpcResult := runGRPCH2ParityScenario(testingObject, parityScenarioReset, testPayload)
 	tcpResult := runTCPParityScenario(testingObject, parityScenarioReset, testPayload)
+	quicResult := runQUICParityScenario(testingObject, parityScenarioReset, testPayload)
 
 	// reset 码与 message 应保持一致，避免 binding 特判。
 	if grpcResult.ResetCode != tcpResult.ResetCode || grpcResult.ResetMessage != tcpResult.ResetMessage {
 		testingObject.Fatalf("reset mismatch: grpc=%+v tcp=%+v", grpcResult, tcpResult)
+	}
+	if grpcResult.ResetCode != quicResult.ResetCode || grpcResult.ResetMessage != quicResult.ResetMessage {
+		testingObject.Fatalf("reset mismatch: grpc=%+v quic=%+v", grpcResult, quicResult)
 	}
 }
 
@@ -254,6 +277,153 @@ func runTCPParityScenario(
 		}
 	case <-time.After(parityTestTimeout):
 		testingObject.Fatalf("tcp parity server did not stop in time")
+	}
+	return result
+}
+
+// runQUICParityScenario 在真实 QUIC listener 上执行统一 parity 场景。
+func runQUICParityScenario(
+	testingObject *testing.T,
+	mode parityScenarioMode,
+	payload []byte,
+) parityScenarioResult {
+	testingObject.Helper()
+	testContext, cancelTest := context.WithTimeout(context.Background(), parityTestTimeout)
+	defer cancelTest()
+
+	transportBinding := quicbinding.NewTransport()
+	serverTLSConfig, clientTLSConfig := newParityQUICTLSConfigs(testingObject)
+	listener, err := transportBinding.ListenAddr("127.0.0.1:0", serverTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("listen quic parity server failed: %v", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+
+	serverConnResult := make(chan struct {
+		conn *quicbinding.Conn
+		err  error
+	}, 1)
+	go func() {
+		serverConn, acceptErr := listener.Accept(testContext)
+		serverConnResult <- struct {
+			conn *quicbinding.Conn
+			err  error
+		}{conn: serverConn, err: acceptErr}
+	}()
+
+	clientConn, err := transportBinding.Dial(testContext, listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("dial quic parity tunnel failed: %v", err)
+	}
+	defer func() {
+		_ = clientConn.Close(nil)
+	}()
+
+	serverAccepted := <-serverConnResult
+	if serverAccepted.err != nil {
+		testingObject.Fatalf("accept quic parity conn failed: %v", serverAccepted.err)
+	}
+	serverConn := serverAccepted.conn
+	defer func() {
+		_ = serverConn.Close(nil)
+	}()
+
+	serverControlResult := make(chan struct {
+		control transport.ControlChannel
+		err     error
+	}, 1)
+	go func() {
+		controlChannel, acceptErr := serverConn.AcceptControlChannel(testContext)
+		serverControlResult <- struct {
+			control transport.ControlChannel
+			err     error
+		}{control: controlChannel, err: acceptErr}
+	}()
+
+	clientControl, err := clientConn.OpenControlChannel(testContext)
+	if err != nil {
+		testingObject.Fatalf("open quic parity control channel failed: %v", err)
+	}
+	defer func() {
+		_ = clientControl.Close(context.Background())
+	}()
+	if err := clientControl.WriteControlFrame(testContext, transport.ControlFrame{
+		Type:    0x2001,
+		Payload: []byte("quic-parity-bootstrap"),
+	}); err != nil {
+		testingObject.Fatalf("write quic parity bootstrap control frame failed: %v", err)
+	}
+
+	serverControlAccepted := <-serverControlResult
+	if serverControlAccepted.err != nil {
+		testingObject.Fatalf("accept quic parity control channel failed: %v", serverControlAccepted.err)
+	}
+	serverControl := serverControlAccepted.control
+	defer func() {
+		_ = serverControl.Close(context.Background())
+	}()
+	if _, err := serverControl.ReadControlFrame(testContext); err != nil {
+		testingObject.Fatalf("read quic parity bootstrap control frame failed: %v", err)
+	}
+
+	producer, err := quicbinding.NewTunnelProducer(clientConn, quicbinding.TunnelIdentityConfig{
+		SessionID:      "quic-parity-session",
+		SessionEpoch:   1,
+		TunnelIDPrefix: "quic-parity",
+	})
+	if err != nil {
+		testingObject.Fatalf("new quic parity tunnel producer failed: %v", err)
+	}
+	acceptor, err := quicbinding.NewTunnelAcceptor(serverConn, quicbinding.TunnelAcceptorConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic parity tunnel acceptor failed: %v", err)
+	}
+	defer acceptor.Close(nil)
+
+	serverTunnelResult := make(chan struct {
+		tunnel transport.Tunnel
+		err    error
+	}, 1)
+	go func() {
+		serverTunnel, acceptErr := acceptor.AcceptTunnel(testContext)
+		serverTunnelResult <- struct {
+			tunnel transport.Tunnel
+			err    error
+		}{tunnel: serverTunnel, err: acceptErr}
+	}()
+
+	clientTunnel, err := producer.OpenTunnel(testContext)
+	if err != nil {
+		testingObject.Fatalf("open quic parity tunnel failed: %v", err)
+	}
+	defer func() {
+		_ = clientTunnel.Close()
+	}()
+
+	serverAcceptedTunnel := <-serverTunnelResult
+	if serverAcceptedTunnel.err != nil {
+		testingObject.Fatalf("accept quic parity tunnel failed: %v", serverAcceptedTunnel.err)
+	}
+	serverTunnel := serverAcceptedTunnel.tunnel
+	defer func() {
+		_ = serverTunnel.Close()
+	}()
+
+	serverErrorChannel := make(chan error, 1)
+	go func() {
+		serverErrorChannel <- runParityServerScenario(serverTunnel, mode, len(payload))
+	}()
+
+	result := runParityClientScenario(testingObject, clientTunnel, mode, payload)
+	select {
+	case serverErr := <-serverErrorChannel:
+		if serverErr != nil {
+			testingObject.Fatalf("quic parity server failed: %v", serverErr)
+		}
+	case <-time.After(parityTestTimeout):
+		testingObject.Fatalf("quic parity server did not stop in time")
 	}
 	return result
 }
@@ -426,4 +596,41 @@ func readFixedSizeFromStream(reader io.Reader, expectedSize int) ([]byte, error)
 		return nil, err
 	}
 	return payload, nil
+}
+
+func newParityQUICTLSConfigs(testingObject *testing.T) (*tls.Config, *tls.Config) {
+	testingObject.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		testingObject.Fatalf("generate quic parity ed25519 key failed: %v", err)
+	}
+	certificateTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IPAddresses: []net.IP{
+			net.ParseIP("127.0.0.1"),
+		},
+		DNSNames:              []string{"localhost"},
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, certificateTemplate, certificateTemplate, publicKey, privateKey)
+	if err != nil {
+		testingObject.Fatalf("create quic parity certificate failed: %v", err)
+	}
+	tlsCertificate := tls.Certificate{
+		Certificate: [][]byte{certificateDER},
+		PrivateKey:  privateKey,
+	}
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCertificate},
+	}
+	clientTLSConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "127.0.0.1",
+	}
+	return serverTLSConfig, clientTLSConfig
 }

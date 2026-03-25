@@ -27,6 +27,7 @@ import (
 	transportgen "github.com/lifei6671/devbridge-loop/ltfp/pb/gen/devbridge/loop/v2/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/grpcbinding"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport/quicbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/transport/tcpbinding"
 	"github.com/lifei6671/devbridge-loop/ltfp/validate"
 	"google.golang.org/grpc"
@@ -49,6 +50,8 @@ const (
 	incomingTunnelOwnerResolveWait = 5 * time.Second
 	// incomingTCPTunnelHandshakeTimeout 定义 TCP 入站读取首帧 tunnel 握手超时。
 	incomingTCPTunnelHandshakeTimeout = 2 * time.Second
+	// defaultQUICControlChannelAcceptTimeout 定义 QUIC 首个控制流的等待上限。
+	defaultQUICControlChannelAcceptTimeout = 2 * time.Second
 )
 
 // controlChannelLifecycleState 描述控制连接在 Bridge 侧的运行阶段。
@@ -125,6 +128,8 @@ type controlChannelSessionState struct {
 	sessionID    string
 	sessionEpoch uint64
 	connectorID  string
+	// preferredBinding 记录本条控制连接实际承载的 binding，用于返回权威 selected_binding。
+	preferredBinding transport.BindingType
 	// lifecycle 显式记录连接生命周期，收敛到 connecting->connected->control_ready->authenticated->draining/closed/failed。
 	lifecycle controlChannelLifecycleState
 	// sourceIP 保存连接建立时提取出的源地址，供认证审计直接复用。
@@ -135,6 +140,9 @@ type controlChannelSessionState struct {
 	helloAccepted bool
 	// unauthConnectionReserved 标记当前连接是否已占用未认证连接预算。
 	unauthConnectionReserved bool
+	// authenticatedChannel 在控制连接完成认证后关闭，供 QUIC data-plane 解锁。
+	authenticatedChannel chan struct{}
+	authenticatedOnce    sync.Once
 }
 
 // newControlChannelSessionState 创建控制连接上下文并预先归一化 source_ip。
@@ -142,8 +150,16 @@ func newControlChannelSessionState(peerAddr string) *controlChannelSessionState 
 	return &controlChannelSessionState{
 		lifecycle: controlChannelStateConnecting,
 		// 连接建立时就提取 source_ip，避免后续每次认证重复解析地址。
-		sourceIP: appauth.NormalizeSourceIP(peerAddr),
+		sourceIP:             appauth.NormalizeSourceIP(peerAddr),
+		authenticatedChannel: make(chan struct{}),
 	}
+}
+
+func (state *controlChannelSessionState) setPreferredBinding(bindingType transport.BindingType) {
+	if state == nil {
+		return
+	}
+	state.preferredBinding = bindingType
 }
 
 // setSession 更新控制连接会话上下文。
@@ -218,6 +234,11 @@ func (state *controlChannelSessionState) markAuthenticated() {
 	}
 	state.markControlReady()
 	_ = state.transitionLifecycle(controlChannelStateAuthenticated)
+	state.authenticatedOnce.Do(func() {
+		if state.authenticatedChannel != nil {
+			close(state.authenticatedChannel)
+		}
+	})
 }
 
 // markDraining 把连接状态推进到 draining。
@@ -260,6 +281,15 @@ func (state *controlChannelSessionState) isAuthenticated() bool {
 		return false
 	}
 	return state.lifecycle == controlChannelStateAuthenticated
+}
+
+func (state *controlChannelSessionState) authenticatedDone() <-chan struct{} {
+	if state == nil || state.authenticatedChannel == nil {
+		closedChannel := make(chan struct{})
+		close(closedChannel)
+		return closedChannel
+	}
+	return state.authenticatedChannel
 }
 
 // controlMessageDispatcherOptions 定义控制面分发器依赖。
@@ -526,7 +556,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 	}
 
 	welcomePayload := pb.ConnectorWelcome{
-		SelectedBinding:      selectWelcomeBinding(helloPayload.SupportedBindings),
+		SelectedBinding:      selectWelcomeBinding(helloPayload.SupportedBindings, sessionState.preferredBinding),
 		VersionMajor:         envelope.VersionMajor,
 		VersionMinor:         envelope.VersionMinor,
 		HeartbeatIntervalSec: connectorHeartbeatIntervalSec,
@@ -663,6 +693,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			Token:                authPayload.Token,
 		},
 		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			sessionRuntime.Binding = strings.TrimSpace(sessionState.preferredBinding.String())
 			dispatcher.commitAuthenticatedSession(now, sessionRuntime, envelope.ResourceVersion)
 			return nil
 		},
@@ -739,7 +770,15 @@ func (dispatcher *controlMessageDispatcher) allocateAssignedSessionEpoch(connect
 }
 
 // selectWelcomeBinding 从客户端支持列表中选择握手返回 binding。
-func selectWelcomeBinding(supportedBindings []string) string {
+func selectWelcomeBinding(supportedBindings []string, preferredBinding transport.BindingType) string {
+	if preferredBinding != "" {
+		normalizedPreferredBinding := strings.TrimSpace(preferredBinding.String())
+		for _, binding := range supportedBindings {
+			if strings.TrimSpace(binding) == normalizedPreferredBinding {
+				return normalizedPreferredBinding
+			}
+		}
+	}
 	if len(supportedBindings) == 0 {
 		return defaultWelcomeBinding
 	}
@@ -1064,6 +1103,7 @@ func (dispatcher *controlMessageDispatcher) applyAuthAckSession(envelope pb.Cont
 		sessionID,
 		sessionEpoch,
 		strings.TrimSpace(envelope.ConnectorID),
+		"",
 		envelope.ResourceVersion,
 	)
 }
@@ -1099,6 +1139,7 @@ func (dispatcher *controlMessageDispatcher) upsertSessionFromEnvelope(envelope p
 		sessionID,
 		envelope.SessionEpoch,
 		connectorID,
+		"",
 		envelope.ResourceVersion,
 	)
 }
@@ -1120,6 +1161,7 @@ func (dispatcher *controlMessageDispatcher) handleHeartbeat(envelope pb.ControlE
 		sessionID,
 		sessionEpoch,
 		strings.TrimSpace(envelope.ConnectorID),
+		"",
 		envelope.ResourceVersion,
 	)
 
@@ -1150,6 +1192,7 @@ func (dispatcher *controlMessageDispatcher) upsertActiveSession(
 	sessionID string,
 	sessionEpoch uint64,
 	connectorID string,
+	binding string,
 	resourceVersion uint64,
 ) {
 	if dispatcher == nil || dispatcher.sessionHandler == nil || dispatcher.sessionRegistry == nil {
@@ -1163,6 +1206,7 @@ func (dispatcher *controlMessageDispatcher) upsertActiveSession(
 		SessionID:     normalizedSessionID,
 		ConnectorID:   strings.TrimSpace(connectorID),
 		Epoch:         sessionEpoch,
+		Binding:       strings.TrimSpace(binding),
 		State:         registry.SessionActive,
 		LastHeartbeat: now,
 		UpdatedAt:     now,
@@ -1186,9 +1230,18 @@ func (dispatcher *controlMessageDispatcher) commitAuthenticatedSession(
 	if normalizedConnectorID == "" {
 		if existingSession, exists := dispatcher.sessionRegistry.GetBySession(sessionRuntime.SessionID); exists {
 			normalizedConnectorID = strings.TrimSpace(existingSession.ConnectorID)
+			if strings.TrimSpace(sessionRuntime.Binding) == "" {
+				sessionRuntime.Binding = strings.TrimSpace(existingSession.Binding)
+			}
+		}
+	}
+	if strings.TrimSpace(sessionRuntime.Binding) == "" {
+		if existingSession, exists := dispatcher.sessionRegistry.GetBySession(sessionRuntime.SessionID); exists {
+			sessionRuntime.Binding = strings.TrimSpace(existingSession.Binding)
 		}
 	}
 	sessionRuntime.ConnectorID = normalizedConnectorID
+	sessionRuntime.Binding = strings.TrimSpace(sessionRuntime.Binding)
 	sessionRuntime.State = registry.SessionActive
 	if sessionRuntime.LastHeartbeat.IsZero() {
 		sessionRuntime.LastHeartbeat = now
@@ -1584,22 +1637,26 @@ func parseRefillMetadataInt(metadata map[string]string, key string) int {
 }
 
 type controlPlaneServer struct {
-	tcpListenAddr    string
-	grpcListenAddr   string
-	heartbeatTTL     time.Duration
-	tlsMode          apptls.Mode
-	tlsCertSource    apptls.CertSource
-	tlsConfigManager apptls.ConfigManager
-	metrics          *obs.Metrics
+	tcpListenAddr                   string
+	grpcListenAddr                  string
+	quicListenAddr                  string
+	quicControlChannelAcceptTimeout time.Duration
+	heartbeatTTL                    time.Duration
+	tlsMode                         apptls.Mode
+	tlsCertSource                   apptls.CertSource
+	tlsConfigManager                apptls.ConfigManager
+	metrics                         *obs.Metrics
 
 	tcpTransport  *tcpbinding.Transport
 	grpcTransport *grpcbinding.Transport
+	quicTransport *quicbinding.Transport
 	dispatcher    *controlMessageDispatcher
 	grpcAcceptor  *grpcbinding.TunnelAcceptor
 
 	mu           sync.Mutex
 	tcpListener  net.Listener
 	grpcListener net.Listener
+	quicListener *quicbinding.Listener
 	grpcServer   *grpc.Server
 }
 
@@ -1627,6 +1684,10 @@ func newControlPlaneServer(
 	grpcTransport, err := grpcbinding.NewTransportWithConfig(grpcbinding.TransportConfig{})
 	if err != nil {
 		return nil, fmt.Errorf("new control plane grpc transport: %w", err)
+	}
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		return nil, fmt.Errorf("new control plane quic transport: %w", err)
 	}
 	normalizedTLSMode, err := apptls.NormalizeMode(config.TLSMode)
 	if err != nil {
@@ -1672,16 +1733,19 @@ func newControlPlaneServer(
 		metrics = obs.DefaultMetrics
 	}
 	return &controlPlaneServer{
-		tcpListenAddr:    strings.TrimSpace(config.ListenAddr),
-		grpcListenAddr:   strings.TrimSpace(config.GRPCH2ListenAddr),
-		heartbeatTTL:     config.HeartbeatTimeout,
-		tlsMode:          normalizedTLSMode,
-		tlsCertSource:    normalizedTLSCertSource,
-		tlsConfigManager: tlsConfigManager,
-		metrics:          metrics,
-		tcpTransport:     tcpTransport,
-		grpcTransport:    grpcTransport,
-		grpcAcceptor:     grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
+		tcpListenAddr:                   strings.TrimSpace(config.ListenAddr),
+		grpcListenAddr:                  strings.TrimSpace(config.GRPCH2ListenAddr),
+		quicListenAddr:                  strings.TrimSpace(config.QUICListenAddr),
+		quicControlChannelAcceptTimeout: defaultQUICControlChannelAcceptTimeout,
+		heartbeatTTL:                    config.HeartbeatTimeout,
+		tlsMode:                         normalizedTLSMode,
+		tlsCertSource:                   normalizedTLSCertSource,
+		tlsConfigManager:                tlsConfigManager,
+		metrics:                         metrics,
+		tcpTransport:                    tcpTransport,
+		grpcTransport:                   grpcTransport,
+		quicTransport:                   quicTransport,
+		grpcAcceptor:                    grpcbinding.NewTunnelAcceptor(grpcbinding.TunnelAcceptorConfig{}),
 		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
 			sessionRegistry:       dependencies.sessionRegistry,
 			serviceRegistry:       dependencies.serviceRegistry,
@@ -1718,6 +1782,9 @@ func (server *controlPlaneServer) run(ctx context.Context) error {
 		runners = append(runners, server.runGRPC)
 		runners = append(runners, server.runGRPCTunnelAcceptLoop)
 	}
+	if server.quicEnabled() {
+		runners = append(runners, server.runQUIC)
+	}
 	serverErrChan := make(chan error, len(runners))
 	var serverWaitGroup sync.WaitGroup
 	for _, run := range runners {
@@ -1739,6 +1806,23 @@ func (server *controlPlaneServer) run(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+func (server *controlPlaneServer) quicEnabled() bool {
+	if server == nil || server.quicTransport == nil || strings.TrimSpace(server.quicListenAddr) == "" {
+		return false
+	}
+	if server.tlsMode == apptls.ModePlaintext {
+		return false
+	}
+	return server.currentServerTLSConfig() != nil
+}
+
+func (server *controlPlaneServer) effectiveQUICControlChannelAcceptTimeout() time.Duration {
+	if server == nil || server.quicControlChannelAcceptTimeout <= 0 {
+		return defaultQUICControlChannelAcceptTimeout
+	}
+	return server.quicControlChannelAcceptTimeout
 }
 
 // runSessionLifecycleLoop 周期推进 session 超时收敛，并联动 service/tunnel 生命周期。
@@ -1908,6 +1992,48 @@ func (server *controlPlaneServer) runGRPC(ctx context.Context) error {
 	}
 }
 
+func (server *controlPlaneServer) runQUIC(ctx context.Context) error {
+	if server == nil {
+		return errors.New("control plane server is nil")
+	}
+	if !server.quicEnabled() {
+		return nil
+	}
+	listener, err := server.quicTransport.ListenAddr(server.quicListenAddr, server.currentServerTLSConfig())
+	if err != nil {
+		return fmt.Errorf("listen quic control plane: %w", err)
+	}
+	server.mu.Lock()
+	server.quicListener = listener
+	server.mu.Unlock()
+	defer func() {
+		_ = listener.Close()
+		server.mu.Lock()
+		if server.quicListener == listener {
+			server.quicListener = nil
+		}
+		server.mu.Unlock()
+	}()
+
+	var connectionWaitGroup sync.WaitGroup
+	defer connectionWaitGroup.Wait()
+
+	for {
+		quicConn, acceptErr := listener.Accept(ctx)
+		if acceptErr != nil {
+			if ctx.Err() != nil || errors.Is(acceptErr, context.Canceled) || errors.Is(acceptErr, transport.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accept quic inbound connection: %w", acceptErr)
+		}
+		connectionWaitGroup.Add(1)
+		go func(rawConn *quicbinding.Conn) {
+			defer connectionWaitGroup.Done()
+			_ = server.serveQUICInboundConnection(ctx, rawConn)
+		}(quicConn)
+	}
+}
+
 // runGRPCTunnelAcceptLoop 从 gRPC TunnelAcceptor 消费 tunnel 并登记到共享 registry。
 func (server *controlPlaneServer) runGRPCTunnelAcceptLoop(ctx context.Context) error {
 	if server == nil || server.grpcAcceptor == nil {
@@ -1926,6 +2052,31 @@ func (server *controlPlaneServer) runGRPCTunnelAcceptLoop(ctx context.Context) e
 		}
 		if registerErr := server.registerAcceptedTunnel(acceptedTunnel, transport.BindingTypeGRPCH2); registerErr != nil {
 			// 单条 tunnel 入库失败不应影响整个接入循环。
+			_ = acceptedTunnel.Close()
+			continue
+		}
+	}
+}
+
+func (server *controlPlaneServer) runQUICTunnelAcceptLoop(
+	ctx context.Context,
+	acceptor *quicbinding.TunnelAcceptor,
+) error {
+	if server == nil || acceptor == nil {
+		return nil
+	}
+	for {
+		acceptedTunnel, err := acceptor.AcceptTunnel(ctx)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, transport.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accept quic tunnel: %w", err)
+		}
+		if acceptedTunnel == nil {
+			continue
+		}
+		if registerErr := server.registerAcceptedTunnel(acceptedTunnel, transport.BindingTypeQUICNative); registerErr != nil {
 			_ = acceptedTunnel.Close()
 			continue
 		}
@@ -1952,6 +2103,12 @@ func (server *controlPlaneServer) shutdown() error {
 	}
 	if server.grpcAcceptor != nil {
 		server.grpcAcceptor.Close(transport.ErrClosed)
+	}
+	if server.quicListener != nil {
+		if err := server.quicListener.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		server.quicListener = nil
 	}
 	if server.grpcListener != nil {
 		if err := server.grpcListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
@@ -1996,6 +2153,7 @@ func serveGRPCControlChannelWithDispatcher(
 		effectiveDispatcher = newControlMessageDispatcher(controlMessageDispatcherOptions{})
 	}
 	sessionState := newControlChannelSessionState(grpcPeerAddrString(stream.Context()))
+	sessionState.setPreferredBinding(transport.BindingTypeGRPCH2)
 	sessionState.markConnected()
 	sessionState.markControlReady()
 	defer func() {
@@ -2129,6 +2287,7 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 			controlChannel,
 			server.dispatcher,
 			apptls.RemoteAddrString(rawConn),
+			transport.BindingTypeTCPFramed,
 		); serveErr != nil && !isControlChannelClosedError(serveErr) {
 			_ = controlChannel.Close(context.Background())
 			return fmt.Errorf("serve tcp inbound: serve control channel: %w", serveErr)
@@ -2144,6 +2303,82 @@ func (server *controlPlaneServer) serveTCPInboundConnection(ctx context.Context,
 	if registerErr := server.handleAcceptedTCPTunnel(classifiedConn); registerErr != nil {
 		_ = classifiedConn.Close()
 		return registerErr
+	}
+	return nil
+}
+
+func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context, rawConn *quicbinding.Conn) error {
+	if server == nil || rawConn == nil {
+		return errors.New("serve quic inbound: invalid argument")
+	}
+	peerAddr := ""
+	if rawConn.RemoteAddr() != nil {
+		peerAddr = strings.TrimSpace(rawConn.RemoteAddr().String())
+	}
+	connectionContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer func() {
+		_ = rawConn.Close(nil)
+	}()
+
+	acceptControlContext, cancelAcceptControl := context.WithTimeout(
+		connectionContext,
+		server.effectiveQUICControlChannelAcceptTimeout(),
+	)
+	controlChannel, err := rawConn.AcceptControlChannel(acceptControlContext)
+	cancelAcceptControl()
+	if err != nil {
+		return fmt.Errorf("serve quic inbound: accept control channel: %w", err)
+	}
+	sessionState := newControlChannelSessionState(peerAddr)
+	serveErrChannel := make(chan error, 1)
+	go func() {
+		serveErrChannel <- serveControlChannelWithDispatcherAndState(
+			connectionContext,
+			controlChannel,
+			server.dispatcher,
+			sessionState,
+			transport.BindingTypeQUICNative,
+		)
+	}()
+
+	select {
+	case <-sessionState.authenticatedDone():
+	case serveErr := <-serveErrChannel:
+		if serveErr != nil && !isControlChannelClosedError(serveErr) {
+			return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
+		}
+		return nil
+	case <-connectionContext.Done():
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("serve quic inbound: wait authenticated control channel: %w", connectionContext.Err())
+	}
+
+	tunnelAcceptor, err := quicbinding.NewTunnelAcceptor(rawConn, quicbinding.TunnelAcceptorConfig{})
+	if err != nil {
+		cancel()
+		serveErr := <-serveErrChannel
+		if serveErr != nil && !isControlChannelClosedError(serveErr) {
+			return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
+		}
+		return fmt.Errorf("serve quic inbound: new tunnel acceptor: %w", err)
+	}
+	defer tunnelAcceptor.Close(transport.ErrClosed)
+	acceptErrChannel := make(chan error, 1)
+	go func() {
+		acceptErrChannel <- server.runQUICTunnelAcceptLoop(connectionContext, tunnelAcceptor)
+	}()
+
+	serveErr := <-serveErrChannel
+	cancel()
+	acceptErr := <-acceptErrChannel
+	if serveErr != nil && !isControlChannelClosedError(serveErr) {
+		return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
+	}
+	if acceptErr != nil && !errors.Is(acceptErr, transport.ErrClosed) && !errors.Is(acceptErr, context.Canceled) {
+		return fmt.Errorf("serve quic inbound: accept tunnels: %w", acceptErr)
 	}
 	return nil
 }
@@ -2362,20 +2597,20 @@ func (server *controlPlaneServer) resolveAcceptedTunnelOwner(
 	bindingType transport.BindingType,
 	wait time.Duration,
 ) (string, string, uint64, bool) {
-	if bindingType != transport.BindingTypeGRPCH2 {
+	if bindingType != transport.BindingTypeGRPCH2 && bindingType != transport.BindingTypeQUICNative {
 		return server.resolveSingleActiveSessionOwner()
 	}
-	if connectorID, sessionID, sessionEpoch, ok := server.resolveGRPCTunnelOwnerBySessionMeta(rawTunnel, wait); ok {
+	if connectorID, sessionID, sessionEpoch, ok := server.resolveTunnelOwnerBySessionMeta(rawTunnel, wait); ok {
 		return connectorID, sessionID, sessionEpoch, true
 	}
 	// metadata 已提供但无法解析 owner 时直接失败，避免重复等待与错误回退归属。
-	if grpcTunnelHasSessionMeta(rawTunnel) {
+	if tunnelHasSessionMeta(rawTunnel) {
 		return "", "", 0, false
 	}
 	return server.waitSingleActiveSessionOwner(wait)
 }
 
-func grpcTunnelHasSessionMeta(rawTunnel transport.Tunnel) bool {
+func tunnelHasSessionMeta(rawTunnel transport.Tunnel) bool {
 	if rawTunnel == nil {
 		return false
 	}
@@ -2383,7 +2618,7 @@ func grpcTunnelHasSessionMeta(rawTunnel transport.Tunnel) bool {
 	return strings.TrimSpace(rawMeta.SessionID) != "" && rawMeta.SessionEpoch > 0
 }
 
-func (server *controlPlaneServer) resolveGRPCTunnelOwnerBySessionMeta(
+func (server *controlPlaneServer) resolveTunnelOwnerBySessionMeta(
 	rawTunnel transport.Tunnel,
 	wait time.Duration,
 ) (string, string, uint64, bool) {
@@ -2480,7 +2715,7 @@ func (server *controlPlaneServer) registerAcceptedTunnelWithOwner(
 		return nil
 	}
 	normalizedNow := time.Now().UTC()
-	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel, tunnelID)
+	adapter := newRuntimeBridgeTunnelAdapter(rawTunnel, tunnelID, bindingType)
 	if adapter == nil {
 		_ = rawTunnel.Close()
 		return errors.New("register accepted tunnel: build runtime adapter failed")
@@ -2808,7 +3043,7 @@ func serveControlChannelWithDispatcher(
 	controlChannel transport.ControlChannel,
 	dispatcher *controlMessageDispatcher,
 ) error {
-	return serveControlChannelWithDispatcherAndPeerAddr(ctx, controlChannel, dispatcher, "")
+	return serveControlChannelWithDispatcherAndPeerAddr(ctx, controlChannel, dispatcher, "", "")
 }
 
 // serveControlChannelWithDispatcherAndPeerAddr 处理控制流并把接入源地址注入认证审计上下文。
@@ -2817,6 +3052,23 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 	controlChannel transport.ControlChannel,
 	dispatcher *controlMessageDispatcher,
 	peerAddr string,
+	bindingType transport.BindingType,
+) (serveErr error) {
+	return serveControlChannelWithDispatcherAndState(
+		ctx,
+		controlChannel,
+		dispatcher,
+		newControlChannelSessionState(peerAddr),
+		bindingType,
+	)
+}
+
+func serveControlChannelWithDispatcherAndState(
+	ctx context.Context,
+	controlChannel transport.ControlChannel,
+	dispatcher *controlMessageDispatcher,
+	sessionState *controlChannelSessionState,
+	bindingType transport.BindingType,
 ) (serveErr error) {
 	effectiveDispatcher := dispatcher
 	if effectiveDispatcher == nil {
@@ -2826,11 +3078,16 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 	if controlChannel == nil {
 		return errors.New("control channel is nil")
 	}
-	sessionState := newControlChannelSessionState(peerAddr)
+	if sessionState == nil {
+		sessionState = newControlChannelSessionState("")
+	}
+	sessionState.setPreferredBinding(bindingType)
 	sessionState.markConnected()
 	sessionState.markControlReady()
 	defer func() {
 		effectiveDispatcher.releaseUnauthenticatedConnectionBudget(sessionState)
+		failureReason := controlChannelCloseReason(bindingType, "failed")
+		closedReason := controlChannelCloseReason(bindingType, "closed")
 		// 认证成功后，连接退出必须显式推进会话终态，避免遗留隧道资源。
 		if serveErr != nil &&
 			!errors.Is(serveErr, context.Canceled) &&
@@ -2838,13 +3095,13 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 			effectiveDispatcher.markSessionFailedFromState(
 				time.Now().UTC(),
 				sessionState,
-				"tcp_control_channel_failed",
+				failureReason,
 			)
 		} else {
 			effectiveDispatcher.closeSessionFromState(
 				time.Now().UTC(),
 				sessionState,
-				"tcp_control_channel_closed",
+				closedReason,
 			)
 		}
 		_ = controlChannel.Close(context.Background())
@@ -2852,7 +3109,7 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 	if !effectiveDispatcher.reserveUnauthenticatedConnectionBudget(sessionState) {
 		slog.Warn(
 			"reject control channel by unauthenticated connection budget",
-			"peer_addr", strings.TrimSpace(peerAddr),
+			"peer_addr", strings.TrimSpace(sessionState.sourceIP),
 		)
 		return nil
 	}
@@ -2890,6 +3147,17 @@ func serveControlChannelWithDispatcherAndPeerAddr(
 			return fmt.Errorf("write control reply frame: %w", replyErr)
 		}
 	}
+}
+
+func controlChannelCloseReason(bindingType transport.BindingType, suffix string) string {
+	normalizedSuffix := strings.TrimSpace(suffix)
+	if normalizedSuffix == "" {
+		normalizedSuffix = "closed"
+	}
+	if bindingType == "" {
+		return fmt.Sprintf("control_channel_%s", normalizedSuffix)
+	}
+	return fmt.Sprintf("%s_control_channel_%s", bindingType, normalizedSuffix)
 }
 
 func writeControlFrameWithPriority(

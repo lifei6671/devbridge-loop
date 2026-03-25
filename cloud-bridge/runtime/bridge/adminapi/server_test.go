@@ -302,6 +302,103 @@ func TestTunnelSummarySupportsConnectorFilter(testingObject *testing.T) {
 	}
 }
 
+// TestReadonlyListsExposeQUICBinding 验证只读管理面会返回 QUIC binding 与 QUIC listener 概览。
+func TestReadonlyListsExposeQUICBinding(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	now := time.Unix(1773492430, 0).UTC()
+	server, err := NewServer(ServerOptions{
+		Dependencies: Dependencies{
+			Now: func() time.Time { return now },
+			ListSessions: func() []registry.SessionRuntime {
+				return []registry.SessionRuntime{
+					{
+						SessionID:     "session-quic-1",
+						ConnectorID:   "agent-quic",
+						Epoch:         7,
+						Binding:       "quic_native",
+						State:         registry.SessionActive,
+						LastHeartbeat: now,
+						UpdatedAt:     now,
+					},
+				}
+			},
+			ListTunnels: func() []registry.TunnelRuntime {
+				return []registry.TunnelRuntime{
+					{
+						TunnelID:    "tun-quic-1",
+						ConnectorID: "agent-quic",
+						SessionID:   "session-quic-1",
+						Binding:     "quic_native",
+						State:       registry.TunnelStateIdle,
+						UpdatedAt:   now,
+					},
+				}
+			},
+			TunnelSnapshot: func() registry.TunnelSnapshot {
+				return registry.TunnelSnapshot{
+					IdleCount:  1,
+					TotalCount: 1,
+					UpdatedAt:  now,
+				}
+			},
+			BuildConfigSnapshot: func() map[string]any {
+				return map[string]any{
+					"config_version": uint64(1),
+					"control_plane": map[string]any{
+						"listen_addr":         ":39080",
+						"grpc_h2_listen_addr": ":39082",
+						"quic_listen_addr":    ":39083",
+						"tls_mode":            "required",
+					},
+				}
+			},
+		},
+		AuthProviders:  newAuthProvidersForTest(testAuthAccount{username: "viewer-user", password: "viewer-pass", role: RoleViewer}),
+		AllowedOrigins: []string{testAllowedOrigin},
+	})
+	if err != nil {
+		testingObject.Fatalf("new admin api server failed: %v", err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	session := loginAsTestUser(testingObject, mux, "viewer-user", "viewer-pass")
+
+	sessionsRecorder := httptest.NewRecorder()
+	sessionsRequest := httptest.NewRequest(http.MethodGet, "/api/admin/sessions", nil)
+	applyTestSession(sessionsRequest, session)
+	mux.ServeHTTP(sessionsRecorder, sessionsRequest)
+	if sessionsRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected sessions status: got=%d want=%d body=%s", sessionsRecorder.Code, http.StatusOK, sessionsRecorder.Body.String())
+	}
+	if !strings.Contains(sessionsRecorder.Body.String(), "\"binding\":\"quic_native\"") {
+		testingObject.Fatalf("expected sessions payload to include quic binding: %s", sessionsRecorder.Body.String())
+	}
+
+	tunnelsRecorder := httptest.NewRecorder()
+	tunnelsRequest := httptest.NewRequest(http.MethodGet, "/api/admin/tunnels", nil)
+	applyTestSession(tunnelsRequest, session)
+	mux.ServeHTTP(tunnelsRecorder, tunnelsRequest)
+	if tunnelsRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected tunnels status: got=%d want=%d body=%s", tunnelsRecorder.Code, http.StatusOK, tunnelsRecorder.Body.String())
+	}
+	if !strings.Contains(tunnelsRecorder.Body.String(), "\"binding\":\"quic_native\"") {
+		testingObject.Fatalf("expected tunnels payload to include quic binding: %s", tunnelsRecorder.Body.String())
+	}
+
+	overviewRecorder := httptest.NewRecorder()
+	overviewRequest := httptest.NewRequest(http.MethodGet, "/api/admin/bridge/overview", nil)
+	applyTestSession(overviewRequest, session)
+	mux.ServeHTTP(overviewRecorder, overviewRequest)
+	if overviewRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected overview status: got=%d want=%d body=%s", overviewRecorder.Code, http.StatusOK, overviewRecorder.Body.String())
+	}
+	if !strings.Contains(overviewRecorder.Body.String(), "\"listener_id\":\"control_plane_quic\"") {
+		testingObject.Fatalf("expected overview payload to include quic listener: %s", overviewRecorder.Body.String())
+	}
+}
+
 // TestBuildAgentTunnelPoolSummaryUsesLatestReportTimestamp
 // 验证 agent pool 汇总的 updated_at_ms 来源于 report 数据，而不是请求当前时间。
 func TestBuildAgentTunnelPoolSummaryUsesLatestReportTimestamp(testingObject *testing.T) {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,6 +71,84 @@ func TestBuildBridgeClientTLSConfigLoadsRootCA(testingObject *testing.T) {
 	}
 	if tlsConfig.RootCAs == nil {
 		testingObject.Fatalf("expected tls root ca pool initialized")
+	}
+}
+
+// TestBuildBridgeQUICClientTLSConfigClearsHTTP2ALPN 验证 QUIC TLS 配置不会携带 gRPC 的 h2 ALPN。
+func TestBuildBridgeQUICClientTLSConfigClearsHTTP2ALPN(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	fixture := newBridgeQUICTLSFixtureForTest(testingObject)
+	tlsConfig, err := buildBridgeQUICClientTLSConfig(BridgeTLSConfig{
+		Enabled:    true,
+		RootCAFile: fixture.rootCAFile,
+		ServerName: fixture.serverName,
+	}, "127.0.0.1:39080")
+	if err != nil {
+		testingObject.Fatalf("build bridge quic tls config failed: %v", err)
+	}
+	if tlsConfig == nil {
+		testingObject.Fatalf("expected non-nil quic tls config")
+	}
+	if len(tlsConfig.NextProtos) != 0 {
+		testingObject.Fatalf("expected quic tls config to leave ALPN empty, got=%v", tlsConfig.NextProtos)
+	}
+	if tlsConfig.ServerName != fixture.serverName {
+		testingObject.Fatalf("unexpected quic tls server name: got=%s want=%s", tlsConfig.ServerName, fixture.serverName)
+	}
+	if tlsConfig.RootCAs == nil {
+		testingObject.Fatalf("expected quic tls root ca pool initialized")
+	}
+}
+
+type bridgeQUICTLSFixture struct {
+	serverTLSConfig *tls.Config
+	rootCAFile      string
+	serverName      string
+}
+
+func newBridgeQUICTLSFixtureForTest(testingObject *testing.T) bridgeQUICTLSFixture {
+	testingObject.Helper()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		testingObject.Fatalf("generate ed25519 key failed: %v", err)
+	}
+	certificateTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "127.0.0.1",
+		},
+		NotBefore:             time.Now().UTC().Add(-time.Hour),
+		NotAfter:              time.Now().UTC().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, certificateTemplate, certificateTemplate, publicKey, privateKey)
+	if err != nil {
+		testingObject.Fatalf("create self-signed certificate failed: %v", err)
+	}
+	certificate, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		testingObject.Fatalf("parse certificate failed: %v", err)
+	}
+	rootCAFile := filepath.Join(testingObject.TempDir(), "root-ca.pem")
+	if err := os.WriteFile(rootCAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes}), 0o600); err != nil {
+		testingObject.Fatalf("write root ca file failed: %v", err)
+	}
+	return bridgeQUICTLSFixture{
+		serverTLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{{
+				Certificate: [][]byte{derBytes},
+				PrivateKey:  privateKey,
+				Leaf:        certificate,
+			}},
+			MinVersion: tls.VersionTLS13,
+		},
+		rootCAFile: rootCAFile,
+		serverName: "127.0.0.1",
 	}
 }
 

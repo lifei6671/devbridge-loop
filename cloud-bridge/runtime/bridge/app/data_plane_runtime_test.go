@@ -508,6 +508,117 @@ func TestDispatchHTTPIngressConnectorPath(testingObject *testing.T) {
 	}
 }
 
+// TestDispatchHTTPIngressQUICConnectorPath 验证 app 层 connector 主路径可保留 quic_native binding 语义。
+func TestDispatchHTTPIngressQUICConnectorPath(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime, err := Bootstrap(context.Background(), DefaultConfig())
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-quic-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.quic.local",
+			PathPrefix: "/v1",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
+			},
+		},
+		Metadata: map[string]string{
+			"ingress_mode": string(pb.IngressModeL7Shared),
+		},
+	})
+
+	tunnel := newRuntimeDataPlaneTestTunnel("tunnel-quic-1")
+	tunnel.bindingType = transport.BindingTypeQUICNative
+	tunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+		TrafficID: "traffic-quic-1",
+		Success:   true,
+	}})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{Close: &pb.TrafficClose{
+		TrafficID: "traffic-quic-1",
+	}})
+	tunnel.EnqueueReadPayload(pb.StreamPayload{RecycleAck: &pb.TunnelRecycleAck{
+		TunnelID:   "tunnel-quic-1",
+		RecycleSeq: 1,
+		Accepted:   true,
+	}})
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", tunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	result, err := runtime.DispatchHTTPIngress(context.Background(), ingress.HTTPGatewayRequest{
+		Host:        "api.quic.local",
+		Path:        "/v1/orders",
+		Namespace:   "dev",
+		Environment: "demo",
+	}, pb.TrafficOpen{
+		TrafficID:        "traffic-quic-1",
+		RouteID:          "route-quic-1",
+		LogicalServiceID: "ls-1",
+	})
+	if err != nil {
+		testingObject.Fatalf("dispatch quic http ingress failed: %v", err)
+	}
+	if result.Execute.HTTPStatus != 200 {
+		testingObject.Fatalf("unexpected execute http status: %d", result.Execute.HTTPStatus)
+	}
+	if result.Execute.ConnectorResult == nil || result.Execute.ConnectorResult.TunnelID != "tunnel-quic-1" {
+		testingObject.Fatalf("expected connector execute result tunnel=tunnel-quic-1")
+	}
+
+	writes := tunnel.Writes()
+	if len(writes) != 3 {
+		testingObject.Fatalf("expected open+close_ack+recycle writes, got=%d", len(writes))
+	}
+	if writes[0].OpenReq == nil || writes[0].OpenReq.TrafficID != "traffic-quic-1" {
+		testingObject.Fatalf("expected first payload to be open req with traffic-quic-1")
+	}
+	if writes[1].CloseAck == nil || writes[1].CloseAck.TrafficID != "traffic-quic-1" || !writes[1].CloseAck.Accepted {
+		testingObject.Fatalf("expected second payload to be close_ack accepted for traffic-quic-1")
+	}
+	if writes[2].Recycle == nil || writes[2].Recycle.TunnelID != "tunnel-quic-1" || writes[2].Recycle.RecycleSeq != 1 {
+		testingObject.Fatalf("expected third payload to be recycle seq=1 for tunnel-quic-1")
+	}
+	if tunnel.closeCount != 0 {
+		testingObject.Fatalf("expected quic tunnel kept alive for reuse, close_count=%d", tunnel.closeCount)
+	}
+
+	tunnelRuntime, exists := runtime.dataPlane.tunnelRegistry.Get("tunnel-quic-1")
+	if !exists {
+		testingObject.Fatalf("expected quic tunnel still present in registry")
+	}
+	if tunnelRuntime.Binding != transport.BindingTypeQUICNative.String() {
+		testingObject.Fatalf(
+			"unexpected tunnel binding after quic recycle: got=%s want=%s",
+			tunnelRuntime.Binding,
+			transport.BindingTypeQUICNative.String(),
+		)
+	}
+	if tunnelRuntime.State != registry.TunnelStateIdle || tunnelRuntime.ReuseCount != 1 || tunnelRuntime.RecycleSeq != 1 {
+		testingObject.Fatalf(
+			"expected recycled quic tunnel state idle/reuse=1/recycle_seq=1, got state=%s reuse=%d recycle_seq=%d",
+			tunnelRuntime.State,
+			tunnelRuntime.ReuseCount,
+			tunnelRuntime.RecycleSeq,
+		)
+	}
+}
+
 // TestDispatchHTTPIngressExternalServicePath 验证 external_service 走 direct path。
 func TestDispatchHTTPIngressExternalServicePath(testingObject *testing.T) {
 	testingObject.Parallel()
@@ -691,6 +802,108 @@ func TestDispatchHTTPIngressConnectorOpenAckTimeoutLifecycle(testingObject *test
 	})
 	if metrics.BridgeTrafficOpenTimeoutTotal() != 1 {
 		testingObject.Fatalf("expected open timeout metric increment once, got=%d", metrics.BridgeTrafficOpenTimeoutTotal())
+	}
+}
+
+// TestDispatchHTTPIngressQUICConnectorOpenAckTimeoutLifecycle 验证 QUIC connector path 复用 timeout/cancel/late-ack 语义。
+func TestDispatchHTTPIngressQUICConnectorOpenAckTimeoutLifecycle(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	metrics := obs.NewMetrics()
+	runtime := newRuntimeWithDataPlaneDependenciesForTest(testingObject, runtimeDataPlaneDependencies{
+		connectorOpenTimeout:         20 * time.Millisecond,
+		connectorLateAckDrainTimeout: 80 * time.Millisecond,
+		connectorMetrics:             metrics,
+	})
+	now := time.Now().UTC()
+	seedConnectorServiceAndSession(runtime, now)
+
+	runtime.dataPlane.routeRegistry.Upsert(now, pb.Route{
+		RouteID: "route-quic-timeout-1",
+		Scope: pb.Scope{
+			Namespace:   "dev",
+			Environment: "demo",
+		},
+		Match: pb.RouteMatch{
+			Protocol:   "http",
+			Host:       "api.quic-timeout.local",
+			PathPrefix: "/",
+		},
+		Target: pb.RouteTarget{
+			Type: pb.RouteTargetTypeConnectorService,
+			ConnectorService: &pb.ConnectorServiceTarget{
+				Selector: pb.ServiceSelector{
+					ServiceName: "order-service",
+				},
+			},
+		},
+		Metadata: map[string]string{
+			"ingress_mode": string(pb.IngressModeL7Shared),
+		},
+	})
+
+	tunnel := newRuntimeDataPlaneTestTunnel("tunnel-quic-timeout-1")
+	tunnel.bindingType = transport.BindingTypeQUICNative
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		tunnel.EnqueueReadPayload(pb.StreamPayload{OpenAck: &pb.TrafficOpenAck{
+			TrafficID: "traffic-quic-timeout-1",
+			Success:   true,
+		}})
+	}()
+	if _, err := runtime.RegisterIdleTunnel("connector-1", "session-1", tunnel); err != nil {
+		testingObject.Fatalf("register idle tunnel failed: %v", err)
+	}
+
+	result, err := runtime.DispatchHTTPIngress(context.Background(), ingress.HTTPGatewayRequest{
+		Host:        "api.quic-timeout.local",
+		Path:        "/v1/orders",
+		Namespace:   "dev",
+		Environment: "demo",
+	}, pb.TrafficOpen{
+		TrafficID:        "traffic-quic-timeout-1",
+		RouteID:          "route-quic-timeout-1",
+		LogicalServiceID: "ls-1",
+	})
+	if !errors.Is(err, connectorproxy.ErrOpenAckTimeout) {
+		testingObject.Fatalf("expected quic open_ack timeout error, got=%v", err)
+	}
+	if result.Execute.HTTPStatus != 504 {
+		testingObject.Fatalf("unexpected execute http status: %d", result.Execute.HTTPStatus)
+	}
+	if result.Execute.ErrorCode != connectorproxy.FailureCodeOpenAckTimeout {
+		testingObject.Fatalf("unexpected execute error code: %s", result.Execute.ErrorCode)
+	}
+
+	writes := tunnel.Writes()
+	if len(writes) < 2 {
+		testingObject.Fatalf("expected open+reset writes, got=%d", len(writes))
+	}
+	if writes[0].OpenReq == nil || writes[0].OpenReq.TrafficID != "traffic-quic-timeout-1" {
+		testingObject.Fatalf("expected first write open_req with traffic-quic-timeout-1")
+	}
+	if writes[1].Reset == nil {
+		testingObject.Fatalf("expected second write timeout reset payload")
+	}
+	if writes[1].Reset.ErrorCode != connectorproxy.OpenTimeoutResetCode {
+		testingObject.Fatalf("unexpected timeout reset code: %s", writes[1].Reset.ErrorCode)
+	}
+	if tunnel.closeCount != 1 {
+		testingObject.Fatalf("expected quic timeout tunnel closed once, got=%d", tunnel.closeCount)
+	}
+
+	snapshot := runtime.dataPlane.tunnelRegistry.Snapshot()
+	if snapshot.TotalCount != 0 {
+		testingObject.Fatalf("expected quic timeout tunnel removed from registry, total=%d", snapshot.TotalCount)
+	}
+	if _, exists := runtime.dataPlane.tunnelRegistry.Get("tunnel-quic-timeout-1"); exists {
+		testingObject.Fatalf("expected quic timeout tunnel purged from registry")
+	}
+	waitUntilMetric(testingObject, 300*time.Millisecond, func() bool {
+		return metrics.BridgeTrafficOpenAckLateTotal() == 1
+	})
+	if metrics.BridgeTrafficOpenTimeoutTotal() != 1 {
+		testingObject.Fatalf("expected quic open timeout metric increment once, got=%d", metrics.BridgeTrafficOpenTimeoutTotal())
 	}
 }
 

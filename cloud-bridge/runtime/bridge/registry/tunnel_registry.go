@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 // TunnelState 定义 Bridge 侧 tunnel 生命周期状态。
@@ -52,6 +53,7 @@ type TunnelRuntime struct {
 	TunnelID    string
 	ConnectorID string
 	SessionID   string
+	Binding     string
 	TrafficID   string
 	ReuseCount  int
 	RecycleSeq  uint64
@@ -120,6 +122,7 @@ func (registry *TunnelRegistry) UpsertIdle(now time.Time, connectorID string, se
 		TunnelID:    normalizedTunnelID,
 		ConnectorID: normalizedConnectorID,
 		SessionID:   strings.TrimSpace(sessionID),
+		Binding:     bindingTypeFromRuntimeTunnel(tunnel),
 		State:       TunnelStateIdle,
 		CreatedAt:   normalizedNow,
 		UpdatedAt:   normalizedNow,
@@ -128,6 +131,21 @@ func (registry *TunnelRegistry) UpsertIdle(now time.Time, connectorID string, se
 	registry.idleByConnector[normalizedConnectorID] = append(registry.idleByConnector[normalizedConnectorID], normalizedTunnelID)
 	registry.updatedAt = normalizedNow
 	return cloneTunnelRuntime(runtime), nil
+}
+
+type runtimeTunnelBindingAware interface {
+	BindingType() transport.BindingType
+}
+
+func bindingTypeFromRuntimeTunnel(tunnel RuntimeTunnel) string {
+	if tunnel == nil {
+		return ""
+	}
+	bindingAware, ok := tunnel.(runtimeTunnelBindingAware)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(bindingAware.BindingType().String())
 }
 
 // AcquireIdle 按 FIFO 获取 connector 对应的一条 idle tunnel，并切换为 reserved。
@@ -514,6 +532,7 @@ func cloneTunnelRuntime(runtime *TunnelRuntime) TunnelRuntime {
 		TunnelID:    runtime.TunnelID,
 		ConnectorID: runtime.ConnectorID,
 		SessionID:   runtime.SessionID,
+		Binding:     runtime.Binding,
 		TrafficID:   runtime.TrafficID,
 		ReuseCount:  runtime.ReuseCount,
 		RecycleSeq:  runtime.RecycleSeq,

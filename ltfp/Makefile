@@ -12,7 +12,7 @@ test-unit:
 	$(GO) test ./pb ./validate ./codec ./errors ./negotiation ./session ./consistency ./runtime ./transport -count=1
 
 test-binding:
-	$(GO) test ./transport/grpcbinding ./transport/tcpbinding -count=1
+	$(GO) test ./transport/grpcbinding ./transport/tcpbinding ./transport/quicbinding -count=1
 
 test-integration:
 	$(GO) test ./examples/interop -count=1
@@ -21,7 +21,7 @@ test-parity:
 	$(GO) test ./codec ./transport/grpcbinding ./transport/tcpbinding -count=1
 
 test-pressure:
-	$(GO) test ./transport/grpcbinding ./transport/tcpbinding -run '^$$' -bench 'Benchmark(GRPCH2|TCP)(TunnelSmallPayload|TunnelLargePayload|TunnelIdle(Deadline|Probe)|BurstRefill)' -benchtime=1x -count=1
+	$(GO) test ./transport/grpcbinding ./transport/tcpbinding ./transport/quicbinding -run '^$$' -bench 'Benchmark(GRPCH2|TCP|QUIC)(TunnelSmallPayload|TunnelLargePayload|TunnelIdle(Deadline|Probe)|BurstRefill|StreamLimitSaturation)' -benchtime=1x -count=1
 
 test-compat:
 	$(GO) test ./validate ./negotiation ./pb/gen/devbridge/loop/v2 -count=1

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"net"
 	"testing"
@@ -217,6 +218,16 @@ func TestTunnelProducerAndAcceptorRoundTrip(testingObject *testing.T) {
 	if serverTunnel.ID() == "" {
 		testingObject.Fatalf("expected non-empty tunnel id")
 	}
+	if serverTunnel.BindingInfo().Type != transport.BindingTypeQUICNative {
+		testingObject.Fatalf("expected quic tunnel binding type, got %s", serverTunnel.BindingInfo().Type)
+	}
+	if serverTunnel.BindingInfo().KeepalivePolicy != transport.DefaultKeepalivePolicyForBinding(transport.BindingTypeQUICNative) {
+		testingObject.Fatalf(
+			"unexpected quic tunnel keepalive policy: got=%+v want=%+v",
+			serverTunnel.BindingInfo().KeepalivePolicy,
+			transport.DefaultKeepalivePolicyForBinding(transport.BindingTypeQUICNative),
+		)
+	}
 
 	clientPayload := []byte("hello over quic tunnel")
 	if _, err := clientTunnel.Write(clientPayload); err != nil {
@@ -245,6 +256,43 @@ func TestTunnelProducerAndAcceptorRoundTrip(testingObject *testing.T) {
 	}
 }
 
+func TestTunnelProducerRespectsMaxIncomingStreams(testingObject *testing.T) {
+	rig := newBenchmarkQUICRigWithConfig(testingObject, TransportConfig{
+		MaxIncomingStreams: 2,
+		StreamOpenTimeout:  40 * time.Millisecond,
+	})
+	defer rig.Close()
+
+	firstClientTunnel, firstServerTunnel := rig.OpenTunnelPair(testingObject)
+	defer func() {
+		_ = firstClientTunnel.Close()
+		_ = firstServerTunnel.Close()
+	}()
+
+	openContext, cancelOpen := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	_, err := rig.producer.OpenTunnel(openContext)
+	cancelOpen()
+	if err == nil {
+		testingObject.Fatalf("expected quic open tunnel to timeout when stream limit is saturated")
+	}
+	if !errors.Is(err, transport.ErrTimeout) && !containsTimeout(err) {
+		testingObject.Fatalf("expected ErrTimeout when quic stream limit saturated, got %v", err)
+	}
+
+	if err := firstClientTunnel.Close(); err != nil {
+		testingObject.Fatalf("close first client quic tunnel failed: %v", err)
+	}
+	if err := firstServerTunnel.Close(); err != nil {
+		testingObject.Fatalf("close first server quic tunnel failed: %v", err)
+	}
+
+	recoveredClientTunnel, recoveredServerTunnel := rig.OpenTunnelPair(testingObject)
+	defer func() {
+		_ = recoveredClientTunnel.Close()
+		_ = recoveredServerTunnel.Close()
+	}()
+}
+
 type acceptConnResult struct {
 	conn *Conn
 	err  error
@@ -267,7 +315,7 @@ func testControlFrame() transport.ControlFrame {
 	}
 }
 
-func newTestTLSConfigs(testingObject *testing.T) (*tls.Config, *tls.Config) {
+func newTestTLSConfigs(testingObject testing.TB) (*tls.Config, *tls.Config) {
 	testingObject.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

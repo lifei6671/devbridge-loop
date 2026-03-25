@@ -57,6 +57,7 @@ type ConnectorItem struct {
 	SessionID      string  `json:"session_id"`
 	SessionEpoch   uint64  `json:"session_epoch"`
 	SessionState   string  `json:"session_state"`
+	Binding        string  `json:"binding"`
 	ServiceCount   int     `json:"service_count"`
 	ActiveServices int     `json:"active_service_count"`
 	HealthRate     float64 `json:"health_rate"`
@@ -68,6 +69,7 @@ type SessionItem struct {
 	SessionID       string `json:"session_id"`
 	ConnectorID     string `json:"connector_id"`
 	Epoch           uint64 `json:"epoch"`
+	Binding         string `json:"binding"`
 	State           string `json:"state"`
 	LastHeartbeatMS uint64 `json:"last_heartbeat_ms"`
 	UpdatedAtMS     uint64 `json:"updated_at_ms"`
@@ -105,6 +107,7 @@ type TunnelItem struct {
 	TunnelID    string `json:"tunnel_id"`
 	ConnectorID string `json:"connector_id"`
 	SessionID   string `json:"session_id"`
+	Binding     string `json:"binding"`
 	TrafficID   string `json:"traffic_id"`
 	State       string `json:"state"`
 	LastError   string `json:"last_error"`
@@ -247,6 +250,14 @@ func BuildBridgeListeners(configSnapshot map[string]any) []BridgeListenerItem {
 		readConfigString(controlPlaneConfig, "grpc_h2_listen_addr"),
 		"Agent 控制面 gRPC H2 通道，同时接收 gRPC tunnel。",
 	)
+	if strings.ToLower(readConfigString(controlPlaneConfig, "tls_mode")) != "plaintext" {
+		appendListener(
+			"control_plane_quic",
+			"Control Plane QUIC",
+			readConfigString(controlPlaneConfig, "quic_listen_addr"),
+			"Agent 控制面 QUIC 通道，同时接收 QUIC tunnel。",
+		)
+	}
 	if readConfigBool(adminConfig, "enabled") {
 		appendListener(
 			"admin_ui_api",
@@ -370,6 +381,7 @@ func BuildConnectorItems(sessions []registry.SessionRuntime, serviceInstances []
 			SessionID:      strings.TrimSpace(session.SessionID),
 			SessionEpoch:   session.Epoch,
 			SessionState:   strings.TrimSpace(string(session.State)),
+			Binding:        strings.TrimSpace(session.Binding),
 			ServiceCount:   serviceCountByConnector[connectorID],
 			ActiveServices: activeServiceCountByConnector[connectorID],
 			HealthRate:     0,
@@ -427,6 +439,7 @@ func BuildSessionItems(sessions []registry.SessionRuntime) []SessionItem {
 			SessionID:       strings.TrimSpace(session.SessionID),
 			ConnectorID:     strings.TrimSpace(session.ConnectorID),
 			Epoch:           session.Epoch,
+			Binding:         strings.TrimSpace(session.Binding),
 			State:           strings.TrimSpace(string(session.State)),
 			LastHeartbeatMS: lastHeartbeatMS,
 			UpdatedAtMS:     updatedAtMS,
@@ -595,6 +608,7 @@ func BuildTunnelItems(tunnels []registry.TunnelRuntime) []TunnelItem {
 			TunnelID:    strings.TrimSpace(tunnelRuntime.TunnelID),
 			ConnectorID: strings.TrimSpace(tunnelRuntime.ConnectorID),
 			SessionID:   strings.TrimSpace(tunnelRuntime.SessionID),
+			Binding:     strings.TrimSpace(tunnelRuntime.Binding),
 			TrafficID:   strings.TrimSpace(tunnelRuntime.TrafficID),
 			State:       strings.TrimSpace(string(tunnelRuntime.State)),
 			LastError:   strings.TrimSpace(tunnelRuntime.LastError),
