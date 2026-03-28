@@ -17,6 +17,9 @@ func TestDefaultConfigTunnelPoolValues(testingObject *testing.T) {
 			defaultConfig.BridgeTransport,
 		)
 	}
+	if defaultConfig.BridgeAddr != "127.0.0.1:39081" {
+		testingObject.Fatalf("unexpected default bridge_addr: %s", defaultConfig.BridgeAddr)
+	}
 	if defaultConfig.TunnelPool.MinIdle != 8 {
 		testingObject.Fatalf("unexpected default min_idle: %d", defaultConfig.TunnelPool.MinIdle)
 	}

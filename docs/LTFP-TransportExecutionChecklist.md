@@ -254,7 +254,7 @@
 
 ### T13. 二期预留项
 
-- [ ] 实现 `quic_native` binding
+- [x] 实现 `quic_native` binding
 - [ ] 实现 `h3_stream` binding
 - [ ] 评估 datagram 抽象与能力位
 - [ ] 评估 session resume

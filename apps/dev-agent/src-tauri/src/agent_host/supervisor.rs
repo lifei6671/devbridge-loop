@@ -1182,7 +1182,7 @@ fn run_mock_localrpc_server_loop(
     let runtime_agent_id =
         std::env::var("DEV_AGENT_CFG_AGENT_ID").unwrap_or_else(|_| "agent-local".to_string());
     let runtime_bridge_addr = std::env::var("DEV_AGENT_CFG_BRIDGE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:39080".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:39081".to_string());
     let runtime_ipc_transport = std::env::var("DEV_AGENT_IPC_TRANSPORT")
         .unwrap_or_else(|_| if cfg!(windows) { "named_pipe" } else { "uds" }.to_string());
     let runtime_ipc_endpoint = std::env::var("DEV_AGENT_IPC_ENDPOINT").unwrap_or_default();
@@ -1791,8 +1791,11 @@ mod tests {
             runtime_program: PathBuf::from(program),
             runtime_args,
             agent_id: "agent-local".to_string(),
-            bridge_addr: "127.0.0.1:39080".to_string(),
+            bridge_addr: "127.0.0.1:39081".to_string(),
             bridge_transport: "tcp_framed".to_string(),
+            bridge_tls_enabled: false,
+            bridge_tls_root_ca_file: String::new(),
+            bridge_tls_server_name: String::new(),
             tunnel_pool_min_idle: 8,
             tunnel_pool_max_idle: 32,
             tunnel_pool_max_inflight: 4,

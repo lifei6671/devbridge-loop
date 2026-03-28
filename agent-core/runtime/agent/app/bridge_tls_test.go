@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,6 +72,34 @@ func TestBuildBridgeClientTLSConfigLoadsRootCA(testingObject *testing.T) {
 	}
 	if tlsConfig.RootCAs == nil {
 		testingObject.Fatalf("expected tls root ca pool initialized")
+	}
+}
+
+func TestBuildBridgeClientTLSConfigRejectsInvalidRootCAFileWithPathHint(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	rootCAFile := filepath.Join(tempDir, "root-ca.key")
+	if err := os.WriteFile(
+		rootCAFile,
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("not-a-cert")}),
+		0o600,
+	); err != nil {
+		testingObject.Fatalf("write invalid root ca file failed: %v", err)
+	}
+
+	_, err := buildBridgeClientTLSConfig(BridgeTLSConfig{
+		Enabled:    true,
+		RootCAFile: rootCAFile,
+	}, "bridge.internal.example:39080")
+	if err == nil {
+		testingObject.Fatalf("expected invalid root ca file error")
+	}
+	if !strings.Contains(err.Error(), rootCAFile) {
+		testingObject.Fatalf("expected error contains root ca file path, got=%v", err)
+	}
+	if !strings.Contains(err.Error(), "root-ca.crt") {
+		testingObject.Fatalf("expected error contains managed_ca root cert hint, got=%v", err)
 	}
 }
 

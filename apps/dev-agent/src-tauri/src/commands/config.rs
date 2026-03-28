@@ -19,6 +19,9 @@ pub struct HostConfigUpdateInput {
     pub agent_id: String,
     pub bridge_addr: String,
     pub bridge_transport: String,
+    pub bridge_tls_enabled: bool,
+    pub bridge_tls_root_ca_file: String,
+    pub bridge_tls_server_name: String,
     pub tunnel_pool_min_idle: u32,
     pub tunnel_pool_max_idle: u32,
     pub tunnel_pool_max_inflight: u32,
@@ -139,6 +142,9 @@ pub fn host_config_update(
             agent_id,
             bridge_addr,
             bridge_transport,
+            bridge_tls_enabled: input.bridge_tls_enabled,
+            bridge_tls_root_ca_file: input.bridge_tls_root_ca_file.trim().to_string(),
+            bridge_tls_server_name: input.bridge_tls_server_name.trim().to_string(),
             tunnel_pool_min_idle: input.tunnel_pool_min_idle,
             tunnel_pool_max_idle: input.tunnel_pool_max_idle,
             tunnel_pool_max_inflight: input.tunnel_pool_max_inflight,
@@ -170,7 +176,7 @@ pub fn host_config_update(
                 format!(
                     "配置已更新 runtime_program={} agent_id={} bridge_addr={} \
 tunnel_pool(min_idle={},max_idle={},max_inflight={},ttl_ms={},open_rate={},open_burst={},reconcile_gap_ms={}) \
-bridge_transport={} ipc_transport={} ipc_endpoint={} ts={}",
+bridge_transport={} bridge_tls_enabled={} bridge_tls_root_ca_file={} bridge_tls_server_name={} ipc_transport={} ipc_endpoint={} ts={}",
                     input.runtime_program.trim(),
                     input.agent_id.trim(),
                     input.bridge_addr.trim(),
@@ -182,6 +188,9 @@ bridge_transport={} ipc_transport={} ipc_endpoint={} ts={}",
                     input.tunnel_pool_open_burst,
                     input.tunnel_pool_reconcile_gap_ms,
                     input.bridge_transport.trim(),
+                    input.bridge_tls_enabled,
+                    input.bridge_tls_root_ca_file.trim(),
+                    input.bridge_tls_server_name.trim(),
                     ipc_transport,
                     ipc_endpoint,
                     now_ms()

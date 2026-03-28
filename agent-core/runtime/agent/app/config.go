@@ -77,7 +77,7 @@ type ControlChannelConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		AgentID:         "agent-local",
-		BridgeAddr:      "127.0.0.1:39080",
+		BridgeAddr:      "127.0.0.1:39081",
 		BridgeTransport: transport.BindingTypeTCPFramed.String(),
 		BridgeTLS: BridgeTLSConfig{
 			Enabled: false,

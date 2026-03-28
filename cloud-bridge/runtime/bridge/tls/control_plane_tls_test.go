@@ -136,6 +136,36 @@ func TestLoadControlPlaneServerTLSConfigDisablesSessionResumption(testingObject 
 	}
 }
 
+// TestBuildControlPlaneQUICServerTLSConfigClearsHTTP2ALPN 验证 QUIC 专用 TLS 配置不会携带 gRPC 的 h2 ALPN。
+func TestBuildControlPlaneQUICServerTLSConfigClearsHTTP2ALPN(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	certFile, keyFile := writeControlPlaneTLSKeyPair(testingObject, tempDir)
+
+	baseConfig, err := loadControlPlaneServerTLSConfig(certFile, keyFile)
+	if err != nil {
+		testingObject.Fatalf("load control plane tls config failed: %v", err)
+	}
+	if baseConfig == nil {
+		testingObject.Fatalf("expected non-nil base tls config")
+	}
+	if len(baseConfig.NextProtos) == 0 || baseConfig.NextProtos[0] != "h2" {
+		testingObject.Fatalf("expected base tls config keep h2 alpn, got=%v", baseConfig.NextProtos)
+	}
+
+	quicConfig := buildControlPlaneQUICServerTLSConfig(baseConfig)
+	if quicConfig == nil {
+		testingObject.Fatalf("expected non-nil quic tls config")
+	}
+	if len(quicConfig.NextProtos) != 0 {
+		testingObject.Fatalf("expected quic tls config to clear alpn, got=%v", quicConfig.NextProtos)
+	}
+	if len(baseConfig.NextProtos) == 0 || baseConfig.NextProtos[0] != "h2" {
+		testingObject.Fatalf("expected base tls config remain unchanged, got=%v", baseConfig.NextProtos)
+	}
+}
+
 // TestManagedCAControlPlaneCertificateProviderLoadsTLSConfig 验证 managed_ca provider 可完成 Root CA 初始化与服务端签发。
 func TestManagedCAControlPlaneCertificateProviderLoadsTLSConfig(testingObject *testing.T) {
 	testingObject.Parallel()

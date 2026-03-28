@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -188,6 +189,80 @@ func (rig *benchmarkQUICRig) OpenTunnelPair(testingObject testing.TB) (transport
 		testingObject.Fatalf("accept quic benchmark tunnel failed: %v", serverAccepted.err)
 	}
 	return clientTunnel, serverAccepted.tunnel
+}
+
+func (rig *benchmarkQUICRig) OpenTunnelBurst(
+	testingObject testing.TB,
+	burstSize int,
+) ([]transport.Tunnel, []transport.Tunnel) {
+	testingObject.Helper()
+	if rig == nil || rig.producer == nil || rig.acceptor == nil {
+		testingObject.Fatalf("quic benchmark rig not initialized")
+	}
+	if burstSize <= 0 {
+		testingObject.Fatalf("invalid quic burst size: %d", burstSize)
+	}
+
+	tunnelContext, cancelTunnel := context.WithTimeout(context.Background(), benchmarkQUICTunnelTimeout)
+	defer cancelTunnel()
+	serverTunnelResults := make(chan acceptTunnelResult, burstSize)
+	go func() {
+		for index := 0; index < burstSize; index++ {
+			tunnel, acceptErr := rig.acceptor.AcceptTunnel(tunnelContext)
+			serverTunnelResults <- acceptTunnelResult{tunnel: tunnel, err: acceptErr}
+			if acceptErr != nil {
+				return
+			}
+		}
+	}()
+
+	clientTunnels := make([]transport.Tunnel, burstSize)
+	clientOpenErrors := make(chan error, burstSize)
+	var openWaitGroup sync.WaitGroup
+	for index := 0; index < burstSize; index++ {
+		openWaitGroup.Add(1)
+		go func(tunnelIndex int) {
+			defer openWaitGroup.Done()
+			tunnel, err := rig.producer.OpenTunnel(tunnelContext)
+			if err != nil {
+				clientOpenErrors <- fmt.Errorf("open quic burst tunnel %d: %w", tunnelIndex, err)
+				return
+			}
+			clientTunnels[tunnelIndex] = tunnel
+		}(index)
+	}
+	openWaitGroup.Wait()
+	close(clientOpenErrors)
+	for openErr := range clientOpenErrors {
+		if openErr != nil {
+			for _, tunnel := range clientTunnels {
+				if tunnel != nil {
+					_ = tunnel.Close()
+				}
+			}
+			testingObject.Fatalf("open quic burst tunnel failed: %v", openErr)
+		}
+	}
+
+	serverTunnels := make([]transport.Tunnel, 0, burstSize)
+	for index := 0; index < burstSize; index++ {
+		serverAccepted := <-serverTunnelResults
+		if serverAccepted.err != nil {
+			for _, tunnel := range clientTunnels {
+				if tunnel != nil {
+					_ = tunnel.Close()
+				}
+			}
+			for _, tunnel := range serverTunnels {
+				if tunnel != nil {
+					_ = tunnel.Close()
+				}
+			}
+			testingObject.Fatalf("accept quic burst tunnel failed: %v", serverAccepted.err)
+		}
+		serverTunnels = append(serverTunnels, serverAccepted.tunnel)
+	}
+	return clientTunnels, serverTunnels
 }
 
 type benchmarkQUICTunnelProducer struct {
@@ -519,6 +594,90 @@ func BenchmarkQUICStreamLimitSaturation(testingB *testing.B) {
 			_ = serverTunnel.Close()
 			rig.Close()
 			testingB.Fatalf("expected quic stream saturation timeout, got %v", err)
+		}
+
+		_ = clientTunnel.Close()
+		_ = serverTunnel.Close()
+		rig.Close()
+	}
+}
+
+// BenchmarkQUICBurstOpenStreams 基准：单连接上突发打开多条 tunnel stream。
+func BenchmarkQUICBurstOpenStreams(testingB *testing.B) {
+	const burstOpenCount = 32
+
+	testingB.ResetTimer()
+	for index := 0; index < testingB.N; index++ {
+		rig := newBenchmarkQUICRig(testingB)
+		clientTunnels, serverTunnels := rig.OpenTunnelBurst(testingB, burstOpenCount)
+		if len(clientTunnels) != burstOpenCount || len(serverTunnels) != burstOpenCount {
+			for _, tunnel := range clientTunnels {
+				if tunnel != nil {
+					_ = tunnel.Close()
+				}
+			}
+			for _, tunnel := range serverTunnels {
+				if tunnel != nil {
+					_ = tunnel.Close()
+				}
+			}
+			rig.Close()
+			testingB.Fatalf(
+				"unexpected quic burst tunnel counts: client=%d server=%d",
+				len(clientTunnels),
+				len(serverTunnels),
+			)
+		}
+		for _, tunnel := range clientTunnels {
+			if tunnel != nil {
+				_ = tunnel.Close()
+			}
+		}
+		for _, tunnel := range serverTunnels {
+			if tunnel != nil {
+				_ = tunnel.Close()
+			}
+		}
+		rig.Close()
+	}
+}
+
+// BenchmarkQUICTunnelSlowReadBackpressure 基准：对端不读时写侧能在 deadline 内报超时。
+func BenchmarkQUICTunnelSlowReadBackpressure(testingB *testing.B) {
+	payload := make([]byte, 1024*1024)
+
+	testingB.SetBytes(int64(len(payload)))
+	testingB.ResetTimer()
+	for index := 0; index < testingB.N; index++ {
+		rig := newBenchmarkQUICRig(testingB)
+		clientTunnel, serverTunnel := rig.OpenTunnelPair(testingB)
+
+		timedOut := false
+		for writeIndex := 0; writeIndex < 128; writeIndex++ {
+			if err := clientTunnel.SetWriteDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+				_ = clientTunnel.Close()
+				_ = serverTunnel.Close()
+				rig.Close()
+				testingB.Fatalf("set quic slow-read write deadline failed: %v", err)
+			}
+			_, err := clientTunnel.Write(payload)
+			if err == nil {
+				continue
+			}
+			if containsTimeout(err) {
+				timedOut = true
+				break
+			}
+			_ = clientTunnel.Close()
+			_ = serverTunnel.Close()
+			rig.Close()
+			testingB.Fatalf("unexpected quic slow-read write error: %v", err)
+		}
+		if !timedOut {
+			_ = clientTunnel.Close()
+			_ = serverTunnel.Close()
+			rig.Close()
+			testingB.Fatalf("expected quic slow-read backpressure timeout")
 		}
 
 		_ = clientTunnel.Close()

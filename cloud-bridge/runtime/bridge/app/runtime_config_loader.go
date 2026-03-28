@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +19,12 @@ import (
 const (
 	runtimeDefaultConfigFileName = "bridge.yaml"
 
-	runtimeConfigSourceDefault = "default"
-	runtimeConfigSourceSystem  = "system"
-	runtimeConfigSourceUser    = "user"
-	runtimeConfigSourceEnv     = "env"
+	runtimeConfigSourceDefault  = "default"
+	runtimeConfigSourceSystem   = "system"
+	runtimeConfigSourceUser     = "user"
+	runtimeConfigSourceLocal    = "local"
+	runtimeConfigSourceEnv      = "env"
+	runtimeConfigSourceExplicit = "explicit"
 
 	linuxRuntimeConfigDirName   = "devbridge"
 	windowsRuntimeConfigDirName = "DevBridge"
@@ -38,6 +42,7 @@ const (
 	envAdminBasePath                  = "DEV_BRIDGE_CFG_ADMIN_BASE_PATH"
 	envControlPlaneListenAddr         = "DEV_BRIDGE_CFG_CONTROL_PLANE_LISTEN_ADDR"
 	envControlPlaneGRPCH2ListenAddr   = "DEV_BRIDGE_CFG_CONTROL_PLANE_GRPC_H2_LISTEN_ADDR"
+	envControlPlaneQUICListenAddr     = "DEV_BRIDGE_CFG_CONTROL_PLANE_QUIC_LISTEN_ADDR"
 	envControlPlaneHeartbeatTimeout   = "DEV_BRIDGE_CFG_CONTROL_PLANE_HEARTBEAT_TIMEOUT"
 	envControlPlaneHeartbeatTimeoutMS = "DEV_BRIDGE_CFG_CONTROL_PLANE_HEARTBEAT_TIMEOUT_MS"
 	envObservabilityLogLevel          = "DEV_BRIDGE_CFG_OBSERVABILITY_LOG_LEVEL"
@@ -60,28 +65,57 @@ const (
 
 type envLookupFn func(key string) (string, bool)
 
-var runtimeConfigFieldYAMLPaths = map[string]string{
-	"default_scope.namespace":            "default_scope.namespace",
-	"default_scope.environment":          "default_scope.environment",
-	"ingress.http_addr":                  "ingress.http_addr",
-	"ingress.grpc_addr":                  "ingress.grpc_addr",
-	"ingress.https_addr":                 "ingress.https_addr",
-	"ingress.tls_sni_addr":               "ingress.tls_sni_addr",
-	"ingress.tcp_port_range":             "ingress.tcp_port_range",
-	"ingress.base_domain":                "ingress.base_domain",
-	"admin.enabled":                      "admin.enabled",
-	"admin.listen_addr":                  "admin.listen_addr",
-	"admin.allow_shared_listener":        "admin.allow_shared_listener",
-	"admin.base_path":                    "admin.base_path",
-	"admin.ui_enabled":                   "admin.ui_enabled",
-	"control_plane.listen_addr":          "control_plane.listen_addr",
-	"control_plane.grpc_h2_listen_addr":  "control_plane.grpc_h2_listen_addr",
-	"control_plane.heartbeat_timeout_ms": "control_plane.heartbeat_timeout",
-	"observability.log_level":            "observability.log_level",
-	"observability.metrics_addr":         "observability.metrics_addr",
+type runtimeConfigLayerMaps struct {
+	systemConfigFilePath   string
+	systemLayer            map[string]any
+	userConfigFilePath     string
+	userLayer              map[string]any
+	localConfigFilePath    string
+	localLayer             map[string]any
+	explicitConfigFilePath string
+	explicitLayer          map[string]any
 }
 
-// LoadRuntimeConfig 按“环境变量 > 用户目录 > 系统/显式基础配置 > 默认值”的顺序构建运行配置。
+type runtimeConfigEditableTarget struct {
+	source string
+	layer  map[string]any
+	path   string
+}
+
+var runtimeConfigFieldYAMLPaths = map[string]string{
+	"default_scope.namespace":                       "default_scope.namespace",
+	"default_scope.environment":                     "default_scope.environment",
+	"ingress.http_addr":                             "ingress.http_addr",
+	"ingress.grpc_addr":                             "ingress.grpc_addr",
+	"ingress.https_addr":                            "ingress.https_addr",
+	"ingress.tls_sni_addr":                          "ingress.tls_sni_addr",
+	"ingress.tcp_port_range":                        "ingress.tcp_port_range",
+	"ingress.base_domain":                           "ingress.base_domain",
+	"admin.enabled":                                 "admin.enabled",
+	"admin.listen_addr":                             "admin.listen_addr",
+	"admin.allow_shared_listener":                   "admin.allow_shared_listener",
+	"admin.base_path":                               "admin.base_path",
+	"admin.ui_enabled":                              "admin.ui_enabled",
+	"control_plane.listen_addr":                     "control_plane.listen_addr",
+	"control_plane.grpc_h2_listen_addr":             "control_plane.grpc_h2_listen_addr",
+	"control_plane.quic_listen_addr":                "control_plane.quic_listen_addr",
+	"control_plane.heartbeat_timeout_ms":            "control_plane.heartbeat_timeout",
+	"control_plane.tls_mode":                        "control_plane.tls_mode",
+	"control_plane.tls_cert_source":                 "control_plane.tls_cert_source",
+	"control_plane.tls_cert_file":                   "control_plane.tls_cert_file",
+	"control_plane.tls_key_file":                    "control_plane.tls_key_file",
+	"control_plane.tls_ca_cert_file":                "control_plane.tls_ca_cert_file",
+	"control_plane.tls_ca_key_file":                 "control_plane.tls_ca_key_file",
+	"control_plane.tls_server_common_name":          "control_plane.tls_server_common_name",
+	"control_plane.tls_server_san_dns":              "control_plane.tls_server_san_dns",
+	"control_plane.tls_server_san_ips":              "control_plane.tls_server_san_ips",
+	"control_plane.tls_server_cert_ttl_ms":          "control_plane.tls_server_cert_ttl",
+	"control_plane.tls_server_cert_renew_before_ms": "control_plane.tls_server_cert_renew_before",
+	"observability.log_level":                       "observability.log_level",
+	"observability.metrics_addr":                    "observability.metrics_addr",
+}
+
+// LoadRuntimeConfig 按“显式 -config > 环境变量 > 程序运行目录 > 用户目录 > 系统目录 > 默认值”的顺序构建运行配置。
 func LoadRuntimeConfig(explicitBaseConfigFilePath string) (Config, error) {
 	homeDir, _ := os.UserHomeDir()
 	userConfigFilePath, err := resolveRuntimeUserConfigFilePath(runtime.GOOS, os.LookupEnv, homeDir)
@@ -92,16 +126,19 @@ func LoadRuntimeConfig(explicitBaseConfigFilePath string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	baseConfigFilePath, err := resolveRuntimeBaseConfigFilePath(
-		explicitBaseConfigFilePath,
-		workingDirectory,
-		runtime.GOOS,
-		os.LookupEnv,
-	)
+	systemConfigFilePath, err := resolveRuntimeSystemConfigFilePath(runtime.GOOS, os.LookupEnv)
 	if err != nil {
 		return Config{}, err
 	}
-	baseLayer, err := maybeLoadRuntimeConfigLayerMap(baseConfigFilePath)
+	localConfigFilePath, err := resolveRuntimeLocalConfigFilePath(workingDirectory)
+	if err != nil {
+		return Config{}, err
+	}
+	explicitConfigFilePath, err := resolveRuntimeExplicitConfigFilePath(explicitBaseConfigFilePath)
+	if err != nil {
+		return Config{}, err
+	}
+	systemLayer, err := maybeLoadRuntimeConfigLayerMap(systemConfigFilePath)
 	if err != nil {
 		return Config{}, err
 	}
@@ -109,7 +146,24 @@ func LoadRuntimeConfig(explicitBaseConfigFilePath string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return buildRuntimeConfigFromLayers(baseConfigFilePath, baseLayer, userConfigFilePath, userLayer)
+	localLayer, err := maybeLoadRuntimeConfigLayerMap(localConfigFilePath)
+	if err != nil {
+		return Config{}, err
+	}
+	explicitLayer, err := maybeLoadRuntimeConfigLayerMap(explicitConfigFilePath)
+	if err != nil {
+		return Config{}, err
+	}
+	return buildRuntimeConfigFromLayerMaps(runtimeConfigLayerMaps{
+		systemConfigFilePath:   systemConfigFilePath,
+		systemLayer:            systemLayer,
+		userConfigFilePath:     userConfigFilePath,
+		userLayer:              userLayer,
+		localConfigFilePath:    localConfigFilePath,
+		localLayer:             localLayer,
+		explicitConfigFilePath: explicitConfigFilePath,
+		explicitLayer:          explicitLayer,
+	})
 }
 
 // ApplyRuntimeConfigEnvOverrides 将环境变量覆盖应用到配置副本，并执行 Validate。
@@ -163,36 +217,20 @@ func resolveRuntimeSystemConfigFilePath(goos string, lookupEnv envLookupFn) (str
 	return "/etc/devbridge/bridge.yaml", nil
 }
 
-func resolveRuntimeBaseConfigFilePath(
-	explicitBaseConfigFilePath string,
-	workingDirectory string,
-	goos string,
-	lookupEnv envLookupFn,
-) (string, error) {
+func resolveRuntimeExplicitConfigFilePath(explicitBaseConfigFilePath string) (string, error) {
 	normalizedExplicitBaseConfigFilePath := strings.TrimSpace(explicitBaseConfigFilePath)
 	if normalizedExplicitBaseConfigFilePath != "" {
 		return filepath.Abs(normalizedExplicitBaseConfigFilePath)
 	}
-	systemConfigFilePath, err := resolveRuntimeSystemConfigFilePath(goos, lookupEnv)
-	if err != nil {
-		return "", err
-	}
-	systemConfigExists, err := fileExists(systemConfigFilePath)
-	if err != nil {
-		return "", err
-	}
-	if systemConfigExists {
-		return systemConfigFilePath, nil
-	}
-	legacyLocalConfigFilePath := filepath.Join(strings.TrimSpace(workingDirectory), runtimeDefaultConfigFileName)
-	legacyLocalConfigExists, err := fileExists(legacyLocalConfigFilePath)
-	if err != nil {
-		return "", err
-	}
-	if legacyLocalConfigExists {
-		return legacyLocalConfigFilePath, nil
-	}
 	return "", nil
+}
+
+func resolveRuntimeLocalConfigFilePath(workingDirectory string) (string, error) {
+	normalizedWorkingDirectory := strings.TrimSpace(workingDirectory)
+	if normalizedWorkingDirectory == "" {
+		return "", nil
+	}
+	return filepath.Abs(filepath.Join(normalizedWorkingDirectory, runtimeDefaultConfigFileName))
 }
 
 func maybeLoadRuntimeConfigLayerMap(configFilePath string) (map[string]any, error) {
@@ -210,28 +248,46 @@ func maybeLoadRuntimeConfigLayerMap(configFilePath string) (map[string]any, erro
 	return map[string]any{}, nil
 }
 
-func buildRuntimeConfigFromLayers(
-	baseConfigFilePath string,
-	baseLayer map[string]any,
-	userConfigFilePath string,
-	userLayer map[string]any,
-) (Config, error) {
+func buildRuntimeConfigFromLayerMaps(layerMaps runtimeConfigLayerMaps) (Config, error) {
 	resolvedConfig := DefaultConfig()
-	if err := applyRuntimeConfigLayerMap(&resolvedConfig, baseLayer); err != nil {
+	if err := applyRuntimeConfigLayerMap(&resolvedConfig, layerMaps.systemLayer); err != nil {
 		return Config{}, err
 	}
-	if err := applyRuntimeConfigLayerMap(&resolvedConfig, userLayer); err != nil {
+	if err := applyRuntimeConfigLayerMap(&resolvedConfig, layerMaps.userLayer); err != nil {
 		return Config{}, err
 	}
-	resolvedConfig.RuntimeConfigFilePath = strings.TrimSpace(userConfigFilePath)
-	resolvedConfig.RuntimeBaseConfigFilePath = strings.TrimSpace(baseConfigFilePath)
-	resolvedConfigWithEnv, err := ApplyRuntimeConfigEnvOverrides(resolvedConfig)
-	if err != nil {
+	if err := applyRuntimeConfigLayerMap(&resolvedConfig, layerMaps.localLayer); err != nil {
 		return Config{}, err
 	}
-	resolvedConfigWithEnv.RuntimeConfigFilePath = strings.TrimSpace(userConfigFilePath)
-	resolvedConfigWithEnv.RuntimeBaseConfigFilePath = strings.TrimSpace(baseConfigFilePath)
-	return resolvedConfigWithEnv, nil
+	resolvedConfig.RuntimeConfigFilePath = strings.TrimSpace(layerMaps.userConfigFilePath)
+	resolvedConfig.RuntimeSystemConfigFilePath = strings.TrimSpace(layerMaps.systemConfigFilePath)
+	resolvedConfig.RuntimeLocalConfigFilePath = strings.TrimSpace(layerMaps.localConfigFilePath)
+	resolvedConfig.RuntimeExplicitConfigFilePath = strings.TrimSpace(layerMaps.explicitConfigFilePath)
+	resolvedConfig.RuntimeBaseConfigFilePath = runtimeBaseConfigFilePathForLayerMaps(layerMaps)
+	if _, err := applyRuntimeConfigEnvOverridesInPlace(&resolvedConfig); err != nil {
+		return Config{}, err
+	}
+	if err := applyRuntimeConfigLayerMap(&resolvedConfig, layerMaps.explicitLayer); err != nil {
+		return Config{}, err
+	}
+	resolvedConfig.NormalizeCompatibility()
+	if err := resolvedConfig.Validate(); err != nil {
+		return Config{}, err
+	}
+	return resolvedConfig, nil
+}
+
+func runtimeBaseConfigFilePathForLayerMaps(layerMaps runtimeConfigLayerMaps) string {
+	if strings.TrimSpace(layerMaps.explicitConfigFilePath) != "" {
+		return strings.TrimSpace(layerMaps.explicitConfigFilePath)
+	}
+	if len(layerMaps.localLayer) > 0 {
+		return strings.TrimSpace(layerMaps.localConfigFilePath)
+	}
+	if len(layerMaps.systemLayer) > 0 {
+		return strings.TrimSpace(layerMaps.systemConfigFilePath)
+	}
+	return ""
 }
 
 func loadRuntimeConfigLayerMapFromFile(configFilePath string) (map[string]any, error) {
@@ -334,28 +390,119 @@ func writeRuntimeConfigBytesToFile(encodedContent []byte, configFilePath string)
 	return nil
 }
 
-func buildRuntimeConfigFieldSources(baseLayer map[string]any, userLayer map[string]any) (map[string]any, error) {
+func buildRuntimeConfigFieldSources(layerMaps runtimeConfigLayerMaps) (map[string]any, error) {
 	envOverrideKeys, err := runtimeEnvOverrideKeys()
 	if err != nil {
 		return nil, err
 	}
 	fieldSources := make(map[string]any, len(runtimeConfigFieldYAMLPaths))
 	for fieldKey, yamlPath := range runtimeConfigFieldYAMLPaths {
+		if _, exists := readRuntimeConfigYAMLPath(layerMaps.explicitLayer, yamlPath); exists {
+			fieldSources[fieldKey] = runtimeConfigSourceExplicit
+			continue
+		}
 		if _, exists := envOverrideKeys[fieldKey]; exists {
 			fieldSources[fieldKey] = runtimeConfigSourceEnv
 			continue
 		}
-		if _, exists := readRuntimeConfigYAMLPath(userLayer, yamlPath); exists {
+		if _, exists := readRuntimeConfigYAMLPath(layerMaps.localLayer, yamlPath); exists {
+			fieldSources[fieldKey] = runtimeConfigSourceLocal
+			continue
+		}
+		if _, exists := readRuntimeConfigYAMLPath(layerMaps.userLayer, yamlPath); exists {
 			fieldSources[fieldKey] = runtimeConfigSourceUser
 			continue
 		}
-		if _, exists := readRuntimeConfigYAMLPath(baseLayer, yamlPath); exists {
+		if _, exists := readRuntimeConfigYAMLPath(layerMaps.systemLayer, yamlPath); exists {
 			fieldSources[fieldKey] = runtimeConfigSourceSystem
 			continue
 		}
 		fieldSources[fieldKey] = runtimeConfigSourceDefault
 	}
 	return fieldSources, nil
+}
+
+func resolveEditableRuntimeConfigTarget(
+	layerMaps runtimeConfigLayerMaps,
+) (runtimeConfigEditableTarget, error) {
+	explicitConfigEditable, err := isRuntimeConfigTargetEditable(layerMaps.explicitConfigFilePath, true)
+	if err != nil {
+		return runtimeConfigEditableTarget{}, fmt.Errorf("resolve editable runtime config target: stat explicit config failed: %w", err)
+	}
+	if explicitConfigEditable {
+		return runtimeConfigEditableTarget{
+			source: runtimeConfigSourceExplicit,
+			layer:  cloneRuntimeConfigLayerMap(layerMaps.explicitLayer),
+			path:   strings.TrimSpace(layerMaps.explicitConfigFilePath),
+		}, nil
+	}
+	localConfigEditable, err := isRuntimeConfigTargetEditable(layerMaps.localConfigFilePath, false)
+	if err != nil {
+		return runtimeConfigEditableTarget{}, fmt.Errorf("resolve editable runtime config target: stat local config failed: %w", err)
+	}
+	if localConfigEditable {
+		return runtimeConfigEditableTarget{
+			source: runtimeConfigSourceLocal,
+			layer:  cloneRuntimeConfigLayerMap(layerMaps.localLayer),
+			path:   strings.TrimSpace(layerMaps.localConfigFilePath),
+		}, nil
+	}
+	userConfigEditable, err := isRuntimeConfigTargetEditable(layerMaps.userConfigFilePath, true)
+	if err != nil {
+		return runtimeConfigEditableTarget{}, fmt.Errorf("resolve editable runtime config target: stat user config failed: %w", err)
+	}
+	if userConfigEditable {
+		return runtimeConfigEditableTarget{
+			source: runtimeConfigSourceUser,
+			layer:  cloneRuntimeConfigLayerMap(layerMaps.userLayer),
+			path:   strings.TrimSpace(layerMaps.userConfigFilePath),
+		}, nil
+	}
+	if strings.TrimSpace(layerMaps.userConfigFilePath) != "" {
+		return runtimeConfigEditableTarget{
+			source: runtimeConfigSourceUser,
+			layer:  cloneRuntimeConfigLayerMap(layerMaps.userLayer),
+			path:   strings.TrimSpace(layerMaps.userConfigFilePath),
+		}, nil
+	}
+	systemConfigEditable, err := isRuntimeConfigTargetEditable(layerMaps.systemConfigFilePath, false)
+	if err != nil {
+		return runtimeConfigEditableTarget{}, fmt.Errorf("resolve editable runtime config target: stat system config failed: %w", err)
+	}
+	if systemConfigEditable {
+		return runtimeConfigEditableTarget{
+			source: runtimeConfigSourceSystem,
+			layer:  cloneRuntimeConfigLayerMap(layerMaps.systemLayer),
+			path:   strings.TrimSpace(layerMaps.systemConfigFilePath),
+		}, nil
+	}
+	return runtimeConfigEditableTarget{
+		source: runtimeConfigSourceDefault,
+		layer:  map[string]any{},
+		path:   "",
+	}, nil
+}
+
+func isRuntimeConfigTargetEditable(configFilePath string, allowCreate bool) (bool, error) {
+	normalizedConfigFilePath := strings.TrimSpace(configFilePath)
+	if normalizedConfigFilePath == "" {
+		return false, nil
+	}
+	configFileExists, err := fileExists(normalizedConfigFilePath)
+	if err != nil {
+		return false, err
+	}
+	if !configFileExists {
+		return allowCreate, nil
+	}
+	configFileHandle, err := os.OpenFile(normalizedConfigFilePath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return false, nil
+	}
+	if closeErr := configFileHandle.Close(); closeErr != nil {
+		return false, closeErr
+	}
+	return true, nil
 }
 
 func buildEditableRuntimeConfigPatch(userLayer map[string]any) map[string]any {
@@ -379,24 +526,39 @@ func buildEditableRuntimeConfigPatch(userLayer map[string]any) map[string]any {
 }
 
 func buildEditableRuntimeConfigRestorePreview(
-	baseConfigFilePath string,
-	baseLayer map[string]any,
-	userLayer map[string]any,
+	layerMaps runtimeConfigLayerMaps,
 ) (map[string]any, error) {
-	restorePreview := map[string]any{}
-	if len(userLayer) == 0 {
-		return restorePreview, nil
-	}
-	fallbackConfig, err := buildRuntimeConfigFromLayers(baseConfigFilePath, baseLayer, "", map[string]any{})
+	editableTarget, err := resolveEditableRuntimeConfigTarget(layerMaps)
 	if err != nil {
 		return nil, err
 	}
-	fallbackSources, err := buildRuntimeConfigFieldSources(baseLayer, map[string]any{})
+	restorePreview := map[string]any{}
+	if len(editableTarget.layer) == 0 {
+		return restorePreview, nil
+	}
+	fallbackLayerMaps := layerMaps
+	switch editableTarget.source {
+	case runtimeConfigSourceExplicit:
+		fallbackLayerMaps.explicitLayer = map[string]any{}
+	case runtimeConfigSourceLocal:
+		fallbackLayerMaps.localLayer = map[string]any{}
+	case runtimeConfigSourceUser:
+		fallbackLayerMaps.userLayer = map[string]any{}
+	case runtimeConfigSourceSystem:
+		fallbackLayerMaps.systemLayer = map[string]any{}
+	default:
+		return restorePreview, nil
+	}
+	fallbackConfig, err := buildRuntimeConfigFromLayerMaps(fallbackLayerMaps)
+	if err != nil {
+		return nil, err
+	}
+	fallbackSources, err := buildRuntimeConfigFieldSources(fallbackLayerMaps)
 	if err != nil {
 		return nil, err
 	}
 	for fieldKey, yamlPath := range runtimeConfigFieldYAMLPaths {
-		if _, exists := readRuntimeConfigYAMLPath(userLayer, yamlPath); exists != true {
+		if _, exists := readRuntimeConfigYAMLPath(editableTarget.layer, yamlPath); exists != true {
 			continue
 		}
 		restorePreview[fieldKey] = map[string]any{
@@ -435,8 +597,32 @@ func readRuntimeConfigFieldSnapshotValue(runtimeConfig Config, fieldKey string) 
 		return runtimeConfig.ControlPlane.ListenAddr
 	case "control_plane.grpc_h2_listen_addr":
 		return runtimeConfig.ControlPlane.GRPCH2ListenAddr
+	case "control_plane.quic_listen_addr":
+		return runtimeConfig.ControlPlane.QUICListenAddr
 	case "control_plane.heartbeat_timeout_ms":
 		return uint64(runtimeConfig.ControlPlane.HeartbeatTimeout.Milliseconds())
+	case "control_plane.tls_mode":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSMode)
+	case "control_plane.tls_cert_source":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSCertSource)
+	case "control_plane.tls_cert_file":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSCertFile)
+	case "control_plane.tls_key_file":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSKeyFile)
+	case "control_plane.tls_ca_cert_file":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSCACertFile)
+	case "control_plane.tls_ca_key_file":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSCAKeyFile)
+	case "control_plane.tls_server_common_name":
+		return strings.TrimSpace(runtimeConfig.ControlPlane.TLSServerCommonName)
+	case "control_plane.tls_server_san_dns":
+		return append([]string(nil), runtimeConfig.ControlPlane.TLSServerSANDNS...)
+	case "control_plane.tls_server_san_ips":
+		return append([]string(nil), runtimeConfig.ControlPlane.TLSServerSANIPs...)
+	case "control_plane.tls_server_cert_ttl_ms":
+		return uint64(runtimeConfig.ControlPlane.TLSServerCertTTL.Milliseconds())
+	case "control_plane.tls_server_cert_renew_before_ms":
+		return uint64(runtimeConfig.ControlPlane.TLSServerCertRenewBefore.Milliseconds())
 	case "observability.log_level":
 		return runtimeConfig.Observability.LogLevel
 	case "observability.metrics_addr":
@@ -540,6 +726,10 @@ func applyEditableRuntimeConfigEnvOverrides(runtimeConfig *Config, appliedFieldK
 		runtimeConfig.ControlPlane.GRPCH2ListenAddr = value
 		appliedFieldKeys["control_plane.grpc_h2_listen_addr"] = struct{}{}
 	}
+	if value, ok := lookupNonEmptyEnv(os.LookupEnv, envControlPlaneQUICListenAddr); ok {
+		runtimeConfig.ControlPlane.QUICListenAddr = value
+		appliedFieldKeys["control_plane.quic_listen_addr"] = struct{}{}
+	}
 	if value, applied, err := lookupHeartbeatTimeoutEnv(os.LookupEnv); err != nil {
 		return err
 	} else if applied {
@@ -611,7 +801,7 @@ func applyControlPlaneTLSEnvOverridesWithTracking(runtimeConfig *Config, applied
 	}
 	if applied {
 		runtimeConfig.ControlPlane.TLSServerCertTTL = serverCertTTL
-		markRuntimeConfigFieldApplied(appliedFieldKeys, "control_plane.tls_server_cert_ttl")
+		markRuntimeConfigFieldApplied(appliedFieldKeys, "control_plane.tls_server_cert_ttl_ms")
 	}
 	serverCertRenewBefore, applied, err := lookupDurationEnv(os.LookupEnv, envControlPlaneTLSServerCertRenewBefore)
 	if err != nil {
@@ -619,17 +809,23 @@ func applyControlPlaneTLSEnvOverridesWithTracking(runtimeConfig *Config, applied
 	}
 	if applied {
 		runtimeConfig.ControlPlane.TLSServerCertRenewBefore = serverCertRenewBefore
-		markRuntimeConfigFieldApplied(appliedFieldKeys, "control_plane.tls_server_cert_renew_before")
+		markRuntimeConfigFieldApplied(appliedFieldKeys, "control_plane.tls_server_cert_renew_before_ms")
 	}
 	return nil
 }
 
-func applyRuntimeConfigPatch(configCandidate *Config, userLayer map[string]any, patchKey string, patchValue any) error {
+func applyRuntimeConfigPatch(
+	configCandidate *Config,
+	editableLayer map[string]any,
+	editableConfigFilePath string,
+	patchKey string,
+	patchValue any,
+) error {
 	if configCandidate == nil {
 		return errors.New("apply runtime config patch: nil config")
 	}
-	if userLayer == nil {
-		return errors.New("apply runtime config patch: nil user layer")
+	if editableLayer == nil {
+		return errors.New("apply runtime config patch: nil editable layer")
 	}
 	normalizedPatchKey := strings.TrimSpace(patchKey)
 	if patchValue == nil {
@@ -637,7 +833,7 @@ func applyRuntimeConfigPatch(configCandidate *Config, userLayer map[string]any, 
 		if exists != true {
 			return fmt.Errorf("unsupported patch key=%s", normalizedPatchKey)
 		}
-		deleteRuntimeConfigYAMLPath(userLayer, yamlPath)
+		deleteRuntimeConfigYAMLPath(editableLayer, yamlPath)
 		return nil
 	}
 	switch normalizedPatchKey {
@@ -647,70 +843,70 @@ func applyRuntimeConfigPatch(configCandidate *Config, userLayer map[string]any, 
 			return err
 		}
 		configCandidate.Ingress.HTTPAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "ingress.grpc_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Ingress.GRPCAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "ingress.https_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Ingress.HTTPSAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "ingress.tls_sni_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Ingress.TLSSNIAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "ingress.tcp_port_range":
 		portRange, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Ingress.TCPPortRange = portRange
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], portRange)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], portRange)
 	case "ingress.base_domain":
 		baseDomain, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Ingress.BaseDomain = baseDomain
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], baseDomain)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], baseDomain)
 	case "admin.enabled":
 		enabled, err := parsePatchBool(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Admin.Enabled = enabled
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], enabled)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], enabled)
 	case "admin.listen_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Admin.ListenAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "admin.allow_shared_listener":
 		allowSharedListener, err := parsePatchBool(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Admin.AllowSharedListener = allowSharedListener
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], allowSharedListener)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], allowSharedListener)
 	case "admin.ui_enabled":
 		enabled, err := parsePatchBool(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Admin.UIEnabled = enabled
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], enabled)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], enabled)
 	case "admin.base_path":
 		basePath, err := parsePatchString(patchValue)
 		if err != nil {
@@ -718,35 +914,121 @@ func applyRuntimeConfigPatch(configCandidate *Config, userLayer map[string]any, 
 		}
 		normalizedBasePath := normalizeAdminUIBasePath(basePath)
 		configCandidate.Admin.BasePath = normalizedBasePath
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], normalizedBasePath)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], normalizedBasePath)
 	case "control_plane.listen_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.ControlPlane.ListenAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "control_plane.grpc_h2_listen_addr":
 		listenAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.ControlPlane.GRPCH2ListenAddr = listenAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
+	case "control_plane.quic_listen_addr":
+		listenAddr, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.QUICListenAddr = listenAddr
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], listenAddr)
 	case "control_plane.heartbeat_timeout":
 		heartbeatTimeout, err := parsePatchDuration(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths["control_plane.heartbeat_timeout_ms"], heartbeatTimeout.String())
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths["control_plane.heartbeat_timeout_ms"], heartbeatTimeout.String())
 	case "control_plane.heartbeat_timeout_ms":
 		heartbeatTimeout, err := parsePatchDurationMillis(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.ControlPlane.HeartbeatTimeout = heartbeatTimeout
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], heartbeatTimeout.String())
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], heartbeatTimeout.String())
+	case "control_plane.tls_mode":
+		tlsMode, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSMode = tlsMode
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsMode)
+		applyManagedCAControlPlaneDefaults(configCandidate, editableLayer, editableConfigFilePath)
+	case "control_plane.tls_cert_source":
+		tlsCertSource, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSCertSource = tlsCertSource
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsCertSource)
+		applyManagedCAControlPlaneDefaults(configCandidate, editableLayer, editableConfigFilePath)
+	case "control_plane.tls_cert_file":
+		tlsCertFile, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSCertFile = tlsCertFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsCertFile)
+	case "control_plane.tls_key_file":
+		tlsKeyFile, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSKeyFile = tlsKeyFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsKeyFile)
+	case "control_plane.tls_ca_cert_file":
+		tlsCACertFile, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSCACertFile = tlsCACertFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsCACertFile)
+	case "control_plane.tls_ca_key_file":
+		tlsCAKeyFile, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSCAKeyFile = tlsCAKeyFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsCAKeyFile)
+	case "control_plane.tls_server_common_name":
+		tlsServerCommonName, err := parsePatchString(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSServerCommonName = tlsServerCommonName
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsServerCommonName)
+	case "control_plane.tls_server_san_dns":
+		tlsServerSANDNS, err := parsePatchStringList(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSServerSANDNS = append([]string(nil), tlsServerSANDNS...)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], append([]string(nil), tlsServerSANDNS...))
+	case "control_plane.tls_server_san_ips":
+		tlsServerSANIPs, err := parsePatchStringList(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSServerSANIPs = append([]string(nil), tlsServerSANIPs...)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], append([]string(nil), tlsServerSANIPs...))
+	case "control_plane.tls_server_cert_ttl_ms":
+		tlsServerCertTTL, err := parsePatchDurationMillis(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSServerCertTTL = tlsServerCertTTL
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsServerCertTTL.String())
+	case "control_plane.tls_server_cert_renew_before_ms":
+		tlsServerCertRenewBefore, err := parsePatchDurationMillis(patchValue)
+		if err != nil {
+			return err
+		}
+		configCandidate.ControlPlane.TLSServerCertRenewBefore = tlsServerCertRenewBefore
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], tlsServerCertRenewBefore.String())
 	case "observability.log_level":
 		logLevel, err := parsePatchString(patchValue)
 		if err != nil {
@@ -754,32 +1036,158 @@ func applyRuntimeConfigPatch(configCandidate *Config, userLayer map[string]any, 
 		}
 		normalizedLogLevel := strings.TrimSpace(logLevel)
 		configCandidate.Observability.LogLevel = normalizedLogLevel
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], normalizedLogLevel)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], normalizedLogLevel)
 	case "observability.metrics_addr":
 		metricsAddr, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.Observability.MetricsAddr = metricsAddr
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], metricsAddr)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], metricsAddr)
 	case "default_scope.namespace":
 		namespace, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.DefaultScope.Namespace = namespace
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], namespace)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], namespace)
 	case "default_scope.environment":
 		environment, err := parsePatchString(patchValue)
 		if err != nil {
 			return err
 		}
 		configCandidate.DefaultScope.Environment = environment
-		setRuntimeConfigYAMLPath(userLayer, runtimeConfigFieldYAMLPaths[patchKey], environment)
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths[patchKey], environment)
 	default:
 		return fmt.Errorf("unsupported patch key=%s", patchKey)
 	}
 	return nil
+}
+
+func applyManagedCAControlPlaneDefaults(
+	configCandidate *Config,
+	editableLayer map[string]any,
+	editableConfigFilePath string,
+) {
+	if configCandidate == nil || editableLayer == nil {
+		return
+	}
+	normalizedTLSMode := strings.ToLower(strings.TrimSpace(configCandidate.ControlPlane.TLSMode))
+	if normalizedTLSMode == "" || normalizedTLSMode == "plaintext" {
+		return
+	}
+	normalizedTLSCertSource := strings.ToLower(strings.TrimSpace(configCandidate.ControlPlane.TLSCertSource))
+	if normalizedTLSCertSource != "managed_ca" {
+		return
+	}
+	defaultCACertFile, defaultCAKeyFile := defaultManagedCAFilePaths(editableConfigFilePath)
+	if strings.TrimSpace(configCandidate.ControlPlane.TLSCACertFile) == "" && strings.TrimSpace(defaultCACertFile) != "" {
+		configCandidate.ControlPlane.TLSCACertFile = defaultCACertFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths["control_plane.tls_ca_cert_file"], defaultCACertFile)
+	}
+	if strings.TrimSpace(configCandidate.ControlPlane.TLSCAKeyFile) == "" && strings.TrimSpace(defaultCAKeyFile) != "" {
+		configCandidate.ControlPlane.TLSCAKeyFile = defaultCAKeyFile
+		setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths["control_plane.tls_ca_key_file"], defaultCAKeyFile)
+	}
+	normalizedSANDNS := normalizeNonEmptyStringSlice(configCandidate.ControlPlane.TLSServerSANDNS)
+	normalizedSANIPs := normalizeNonEmptyStringSlice(configCandidate.ControlPlane.TLSServerSANIPs)
+	if len(normalizedSANDNS) == 0 && len(normalizedSANIPs) == 0 {
+		defaultSANDNS, defaultSANIPs := defaultManagedCASANs(configCandidate)
+		if len(defaultSANDNS) > 0 {
+			configCandidate.ControlPlane.TLSServerSANDNS = append([]string(nil), defaultSANDNS...)
+			setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths["control_plane.tls_server_san_dns"], append([]string(nil), defaultSANDNS...))
+		}
+		if len(defaultSANIPs) > 0 {
+			configCandidate.ControlPlane.TLSServerSANIPs = append([]string(nil), defaultSANIPs...)
+			setRuntimeConfigYAMLPath(editableLayer, runtimeConfigFieldYAMLPaths["control_plane.tls_server_san_ips"], append([]string(nil), defaultSANIPs...))
+		}
+		if strings.TrimSpace(configCandidate.ControlPlane.TLSServerCommonName) == "" {
+			defaultServerCommonName := defaultManagedCAServerCommonName(defaultSANDNS, defaultSANIPs)
+			if defaultServerCommonName != "" {
+				configCandidate.ControlPlane.TLSServerCommonName = defaultServerCommonName
+				setRuntimeConfigYAMLPath(
+					editableLayer,
+					runtimeConfigFieldYAMLPaths["control_plane.tls_server_common_name"],
+					defaultServerCommonName,
+				)
+			}
+		}
+	}
+}
+
+func defaultManagedCAFilePaths(runtimeConfigFilePath string) (string, string) {
+	configDirectory := strings.TrimSpace(filepath.Dir(strings.TrimSpace(runtimeConfigFilePath)))
+	if configDirectory == "" || configDirectory == "." {
+		return "", ""
+	}
+	return filepath.Join(configDirectory, "root-ca.crt"), filepath.Join(configDirectory, "root-ca.key")
+}
+
+func defaultManagedCASANs(configCandidate *Config) ([]string, []string) {
+	if configCandidate == nil {
+		return []string{"localhost"}, []string{"127.0.0.1"}
+	}
+	sanDNSSet := map[string]struct{}{}
+	sanIPSet := map[string]struct{}{}
+	for _, listenAddr := range []string{
+		configCandidate.ControlPlane.ListenAddr,
+		configCandidate.ControlPlane.GRPCH2ListenAddr,
+		configCandidate.ControlPlane.QUICListenAddr,
+	} {
+		hostText := managedCAHostFromListenAddr(listenAddr)
+		if hostText == "" {
+			continue
+		}
+		if parsedIP := net.ParseIP(hostText); parsedIP != nil {
+			if parsedIP.IsUnspecified() {
+				continue
+			}
+			sanIPSet[parsedIP.String()] = struct{}{}
+			continue
+		}
+		sanDNSSet[hostText] = struct{}{}
+	}
+	if len(sanDNSSet) == 0 && len(sanIPSet) == 0 {
+		sanDNSSet["localhost"] = struct{}{}
+		sanIPSet["127.0.0.1"] = struct{}{}
+	}
+	sanDNSNames := make([]string, 0, len(sanDNSSet))
+	for sanDNSName := range sanDNSSet {
+		sanDNSNames = append(sanDNSNames, sanDNSName)
+	}
+	sanIPTexts := make([]string, 0, len(sanIPSet))
+	for sanIPText := range sanIPSet {
+		sanIPTexts = append(sanIPTexts, sanIPText)
+	}
+	sort.Strings(sanDNSNames)
+	sort.Strings(sanIPTexts)
+	return sanDNSNames, sanIPTexts
+}
+
+func managedCAHostFromListenAddr(listenAddr string) string {
+	normalizedListenAddr := strings.TrimSpace(listenAddr)
+	if normalizedListenAddr == "" {
+		return ""
+	}
+	hostText, _, err := net.SplitHostPort(normalizedListenAddr)
+	if err != nil {
+		return ""
+	}
+	hostText = strings.TrimSpace(hostText)
+	if hostText == "" {
+		return ""
+	}
+	return strings.Trim(hostText, "[]")
+}
+
+func defaultManagedCAServerCommonName(sanDNSNames []string, sanIPTexts []string) string {
+	if len(sanDNSNames) > 0 {
+		return strings.TrimSpace(sanDNSNames[0])
+	}
+	if len(sanIPTexts) > 0 {
+		return strings.TrimSpace(sanIPTexts[0])
+	}
+	return ""
 }
 
 func cloneRuntimeConfigLayerMap(source map[string]any) map[string]any {

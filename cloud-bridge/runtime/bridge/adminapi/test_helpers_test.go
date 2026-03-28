@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const testAllowedOrigin = "http://127.0.0.1:39081"
+const testAllowedOrigin = "http://127.0.0.1:39080"
 
 type testAuthAccount struct {
 	username string

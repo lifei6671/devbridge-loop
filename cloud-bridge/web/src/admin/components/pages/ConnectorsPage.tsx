@@ -125,6 +125,7 @@ export function ConnectorsPage(props: ConnectorsPageProps) {
               <tr>
                 <th>Session ID</th>
                 <th>Connector ID</th>
+                <th>Binding</th>
                 <th>Epoch</th>
                 <th>State</th>
                 <th>Last Heartbeat</th>
@@ -146,6 +147,7 @@ export function ConnectorsPage(props: ConnectorsPageProps) {
                 >
                   <td>{readText(item, "session_id")}</td>
                   <td>{readText(item, "connector_id")}</td>
+                  <td>{readText(item, "binding", "--")}</td>
                   <td>{readText(item, "epoch", "0")}</td>
                   <td>
                     <StatePill label={readText(item, "state", "UNKNOWN")} />
@@ -168,7 +170,7 @@ export function ConnectorsPage(props: ConnectorsPageProps) {
               ))}
               {sessionItems.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="empty-cell">
+                  <td colSpan={8} className="empty-cell">
                     当前没有 session 数据。
                   </td>
                 </tr>

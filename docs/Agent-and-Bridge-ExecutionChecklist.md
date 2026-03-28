@@ -186,7 +186,7 @@
 - [x] Agent 初始化支持外部传入 `tunnelPool` 参数覆盖默认值
 - [x] 未传字段回落默认值
 - [x] 首版不做运行时热更新（重启生效）
-- [x] `bridge_transport` 支持按 Agent 配置切换 `tcp_framed/grpc_h2`（控制通路与 tunnel 通路均走同一 binding）
+- [x] `bridge_transport` 支持按 Agent 配置切换 `tcp_framed/grpc_h2/quic_native`（控制通路与 tunnel 通路均走同一 binding）
 - [x] Bridge 控制面新增 `grpc_h2` 监听地址配置，与 `tcp_framed` 监听地址分离
 
 验收标准：

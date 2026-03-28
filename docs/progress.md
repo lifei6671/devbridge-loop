@@ -131,10 +131,10 @@
 ### Phase 10: 运维配置组件化与分层配置持久化
 - **Status:** complete
 - Actions taken:
-  - 新增运行时配置分层加载：`环境变量 > 用户目录 > 系统目录 > 默认值`，并按 Linux XDG / Windows Known Folders 解析配置路径。
-  - `adminRuntimeConfigStore` 改为只把用户 patch 写回用户目录 override 文件，`/api/admin/config/snapshot` 同步返回 `config_file_path`、`base_config_file_path`、`field_sources`、`editable_user_patch`、`field_restore_preview`。
-  - `PUT /api/admin/config` 支持用 `null` 删除用户目录 override 字段，恢复继承系统目录或默认值。
-  - 运维页重构为组件化常用配置表单：每项展示说明 tooltip icon、来源 badge、重启提示；字段有未保存改动时会直接展示“当前值 -> 保存后值”的差异预览，且环境变量来源会额外提示保存仅写入用户目录 override；来源为用户目录的字段支持“恢复继承值”，并直接展示恢复后会继承的来源和值；高级区新增 YAML patch 编辑器、用户 patch 回填和 YAML 快照预览。
+  - 新增运行时配置分层加载：`显式 -config > 环境变量 > 程序运行目录 bridge.yaml > 用户目录 > 系统目录 > 默认值`，并按 Linux XDG / Windows Known Folders 解析配置路径。
+  - `adminRuntimeConfigStore` 现在会把配置写回当前已加载且可编辑的最高优先级文件（显式 `-config`、程序运行目录、用户目录；若用户层尚不存在则优先创建用户目录 override，仅在用户配置路径不可用时才退回系统目录），`/api/admin/config/snapshot` 同步返回 `config_file_path`、`config_file_source`、`base_config_file_path`、`field_sources`、`editable_file_patch`、`field_restore_preview`。
+  - `PUT /api/admin/config` 支持用 `null` 删除当前写回目标文件中的字段，恢复继承更低优先级配置。
+  - 运维页组件化表单与 YAML patch 入口同步切换为“当前可编辑配置文件”语义：保存提示、环境变量提示、回填 patch、恢复继承和 Managed CA 默认路径都会跟随实际写回目标层变化；未显式填写 CA 路径时，默认 Root CA 证书与私钥会直接落在配置文件同目录。
 - Files created/modified:
   - `cloud-bridge/runtime/bridge/app/runtime_config_loader.go`（created）
   - `cloud-bridge/runtime/bridge/app/runtime_config_loader_test.go`（created）

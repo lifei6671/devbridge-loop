@@ -123,10 +123,10 @@ func TestViewerSessionCanReadOverview(testingObject *testing.T) {
 					},
 					"admin": map[string]any{
 						"enabled":     true,
-						"listen_addr": ":39081",
+						"listen_addr": ":39080",
 					},
 					"control_plane": map[string]any{
-						"listen_addr":         ":39080",
+						"listen_addr":         ":39081",
 						"grpc_h2_listen_addr": ":39082",
 					},
 				}

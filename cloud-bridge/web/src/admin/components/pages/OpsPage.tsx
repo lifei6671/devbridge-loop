@@ -9,12 +9,14 @@ import {
   buildConfigUpdateYAMLDocument,
   buildOpsConfigDraft,
   buildOpsConfigPatch,
+  deriveManagedCAIdentitySuggestion,
   formatConfigSnapshotAsYAML,
   formatOpsConfigSource,
   listOpsConfigFields,
   opsConfigSections,
-  readEditableUserPatch,
+  readEditableConfigFilePatch,
   readNumber,
+  readOpsConfigFileSource,
   readOpsConfigSource,
   readOpsConfigValue,
   readText,
@@ -92,8 +94,8 @@ export function OpsPage(props: OpsPageProps) {
   const dirtyPatch = buildOpsConfigPatch(configSnapshot, draftState.values);
   const dirtyPatchSignature = JSON.stringify(dirtyPatch);
   const dirtyCount = Object.keys(dirtyPatch).length;
-  const editableUserPatch = readEditableUserPatch(configSnapshot);
-  const editableUserPatchRootCount = Object.keys(editableUserPatch).length;
+  const editableConfigFilePatch = readEditableConfigFilePatch(configSnapshot);
+  const editableConfigFilePatchRootCount = Object.keys(editableConfigFilePatch).length;
   const yamlSnapshot = formatConfigSnapshotAsYAML(configSnapshot);
   const yamlExample = buildConfigUpdateYAMLDocument(configVersion, {
     "admin.base_path": "/console",
@@ -105,19 +107,37 @@ export function OpsPage(props: OpsPageProps) {
         ? false
         : true
       : false;
-  const userConfigFilePath = readText(
+  const configFilePath = readText(
     configSnapshot,
     "config_file_path",
-    "未解析到用户目录配置文件"
+    "未解析到可写配置文件"
   );
+  const configFileSource = readOpsConfigFileSource(configSnapshot);
+  const configFileSourceLabel = formatOpsConfigSource(configFileSource);
+  const managedCAHint = buildManagedCAHint({
+    controlPlaneListenAddr: String(draftState.values["control_plane.listen_addr"] ?? ""),
+    controlPlaneGRPCH2ListenAddr: String(draftState.values["control_plane.grpc_h2_listen_addr"] ?? ""),
+    controlPlaneQUICListenAddr: String(draftState.values["control_plane.quic_listen_addr"] ?? ""),
+    tlsMode: String(draftState.values["control_plane.tls_mode"] ?? ""),
+    tlsCertSource: String(draftState.values["control_plane.tls_cert_source"] ?? ""),
+    tlsCACertFile: String(draftState.values["control_plane.tls_ca_cert_file"] ?? ""),
+    tlsCAKeyFile: String(draftState.values["control_plane.tls_ca_key_file"] ?? ""),
+    tlsServerCommonName: String(draftState.values["control_plane.tls_server_common_name"] ?? ""),
+    tlsServerSANDNS: String(draftState.values["control_plane.tls_server_san_dns"] ?? ""),
+    tlsServerSANIPs: String(draftState.values["control_plane.tls_server_san_ips"] ?? ""),
+    configFilePath,
+    configFileSourceLabel,
+  });
   const baseConfigFilePath = readText(
     configSnapshot,
     "base_config_file_path",
-    "未检测到系统目录配置文件"
+    "未检测到基础配置文件"
   );
   const sourceSummary = {
     default: 0,
     env: 0,
+    explicit: 0,
+    local: 0,
     system: 0,
     user: 0,
   };
@@ -148,6 +168,14 @@ export function OpsPage(props: OpsPageProps) {
     const source = readOpsConfigSource(configSnapshot, field.key);
     if (source === "env") {
       sourceSummary.env += 1;
+      continue;
+    }
+    if (source === "explicit") {
+      sourceSummary.explicit += 1;
+      continue;
+    }
+    if (source === "local") {
+      sourceSummary.local += 1;
       continue;
     }
     if (source === "user") {
@@ -228,7 +256,7 @@ export function OpsPage(props: OpsPageProps) {
     setIsSavingConfig(true);
     try {
       const savedSnapshot = await submitConfigPatch(dirtyPatch, {
-        successMessage: `已写入用户目录配置文件，${dirtyCount} 项改动待重启生效。`,
+        successMessage: `已写入${configFileSourceLabel}配置文件，${dirtyCount} 项改动待重启生效。`,
       });
       if (savedSnapshot === null) {
         return;
@@ -248,7 +276,7 @@ export function OpsPage(props: OpsPageProps) {
           [fieldKey]: null,
         },
         {
-          successMessage: `已移除 ${fieldLabel} 的用户目录 override。`,
+          successMessage: `已移除 ${fieldLabel} 在${configFileSourceLabel}中的配置。`,
         }
       );
       if (savedSnapshot === null) {
@@ -281,14 +309,14 @@ export function OpsPage(props: OpsPageProps) {
     });
   };
 
-  const handleFillYAMLFromEditableUserPatch = () => {
-    if (editableUserPatchRootCount === 0) {
-      toast.info("用户目录配置文件当前没有可编辑 override。");
+  const handleFillYAMLFromEditableConfigFilePatch = () => {
+    if (editableConfigFilePatchRootCount === 0) {
+      toast.info(`${configFileSourceLabel}配置文件当前没有可编辑字段。`);
       return;
     }
     setYAMLEditor({
       baseVersion: configVersion,
-      document: buildConfigUpdateYAMLDocument(configVersion, editableUserPatch),
+      document: buildConfigUpdateYAMLDocument(configVersion, editableConfigFilePatch),
       touched: false,
     });
   };
@@ -307,7 +335,7 @@ export function OpsPage(props: OpsPageProps) {
     setIsSavingYAML(true);
     try {
       const savedSnapshot = await submitConfigPatchDocument(yamlEditor.document, {
-        successMessage: "已按 YAML patch 写入用户目录配置文件。",
+        successMessage: `已按 YAML patch 写入${configFileSourceLabel}配置文件。`,
       });
       if (savedSnapshot === null) {
         return;
@@ -324,13 +352,13 @@ export function OpsPage(props: OpsPageProps) {
           <div>
             <h3>常用运行配置</h3>
             <span className="panel-sub">
-              保存操作会把用户修改项写入用户目录配置文件，环境变量仍然拥有最高优先级。
+              保存操作会把修改写入当前可编辑配置文件，环境变量仍然会覆盖同字段的生效值。
             </span>
           </div>
           <div className="ops-config-head-badges">
             <Badge variant={dirtyCount > 0 ? "warning" : "outline"}>待保存 {dirtyCount}</Badge>
             <Badge variant="secondary">版本 {readText(configSnapshot, "config_version", "--")}</Badge>
-            <Badge variant="outline">环境变量 &gt; 用户目录 &gt; 系统目录 &gt; 默认值</Badge>
+            <Badge variant="outline">显式 -config &gt; 环境变量 &gt; 程序目录 &gt; 用户目录 &gt; 系统目录 &gt; 默认值</Badge>
             {hasRemoteSnapshotChange === true ? (
               <Badge variant="warning">后台快照已更新，当前草稿已保留</Badge>
             ) : null}
@@ -339,21 +367,23 @@ export function OpsPage(props: OpsPageProps) {
 
         <div className="ops-config-meta-grid">
           <article className="ops-config-meta-card">
-            <span className="ops-config-meta-label">用户配置文件</span>
-            <code className="ops-config-path">{userConfigFilePath}</code>
-            <p>保存时仅写入用户目录 override，不回写系统目录和环境变量。</p>
+            <span className="ops-config-meta-label">当前写回目标</span>
+            <code className="ops-config-path">{configFilePath}</code>
+            <p>当前会写回{configFileSourceLabel}；环境变量不会被回写，且仍保持更高优先级。</p>
           </article>
 
           <article className="ops-config-meta-card">
             <span className="ops-config-meta-label">基础配置层</span>
             <code className="ops-config-path">{baseConfigFilePath}</code>
-            <p>这里展示当前作为基础层参与合并的系统目录或显式配置文件路径。</p>
+            <p>这里展示当前最高优先级的基础配置文件路径，可能来自显式 `-config`、程序运行目录或系统目录。</p>
           </article>
 
           <article className="ops-config-meta-card">
             <span className="ops-config-meta-label">来源概览</span>
             <div className="ops-config-source-row">
+              <Badge variant="danger">{formatOpsConfigSource("explicit")} {sourceSummary.explicit}</Badge>
               <Badge variant="warning">{formatOpsConfigSource("env")} {sourceSummary.env}</Badge>
+              <Badge variant="secondary">{formatOpsConfigSource("local")} {sourceSummary.local}</Badge>
               <Badge variant="success">{formatOpsConfigSource("user")} {sourceSummary.user}</Badge>
               <Badge variant="secondary">{formatOpsConfigSource("system")} {sourceSummary.system}</Badge>
               <Badge variant="outline">{formatOpsConfigSource("default")} {sourceSummary.default}</Badge>
@@ -365,7 +395,7 @@ export function OpsPage(props: OpsPageProps) {
             <span className="ops-config-meta-label">表单操作</span>
             <div className="ops-config-actions">
               <Button onClick={() => void handleSaveDraft()} disabled={isSavingConfig === true || dirtyCount === 0}>
-                {isSavingConfig === true ? "写入中..." : "保存到用户目录"}
+                {isSavingConfig === true ? "写入中..." : `保存到${configFileSourceLabel}`}
               </Button>
               <Button
                 variant="outline"
@@ -379,6 +409,47 @@ export function OpsPage(props: OpsPageProps) {
           </article>
         </div>
 
+        {managedCAHint !== null ? (
+          <article className="ops-config-managed-ca-note">
+            <div className="ops-config-managed-ca-head">
+              <div>
+                <h4>Managed CA 自动补齐提示</h4>
+                <p>{managedCAHint.summary}</p>
+              </div>
+              <Badge variant={managedCAHint.tlsMode === "plaintext" ? "outline" : "warning"}>
+                {managedCAHint.tlsMode === "plaintext" ? "当前仅提示" : "保存时会补齐"}
+              </Badge>
+            </div>
+
+            <div className="ops-config-managed-ca-grid">
+              <div className="ops-config-managed-ca-item">
+                <span>默认 Root CA 证书</span>
+                <code>{managedCAHint.defaultCACertFile}</code>
+              </div>
+              <div className="ops-config-managed-ca-item">
+                <span>默认 Root CA 私钥</span>
+                <code>{managedCAHint.defaultCAKeyFile}</code>
+              </div>
+              <div className="ops-config-managed-ca-item">
+                <span>预计自动 SAN DNS</span>
+                <code>{managedCAHint.suggestedSANDNS}</code>
+              </div>
+              <div className="ops-config-managed-ca-item">
+                <span>预计自动 SAN IP / CN</span>
+                <code>{managedCAHint.suggestedSANIPsAndCN}</code>
+              </div>
+              <div className="ops-config-managed-ca-item">
+                <span>当前表单状态</span>
+                <code>{managedCAHint.currentBehavior}</code>
+              </div>
+            </div>
+
+            <p className="ops-config-managed-ca-footnote">
+              {managedCAHint.footnote}
+            </p>
+          </article>
+        ) : null}
+
         <div className="config-section-grid">
           {opsConfigSections.map((section) => (
             <ConfigSectionCard
@@ -386,6 +457,7 @@ export function OpsPage(props: OpsPageProps) {
               section={section}
               snapshot={configSnapshot}
               draft={draftState.values}
+              editableSource={configFileSource}
               onResetToInherited={handleRestoreFieldToInherited}
               onValueChange={handleFieldChange}
               resettingFieldKey={restoringFieldKey}
@@ -479,7 +551,7 @@ export function OpsPage(props: OpsPageProps) {
               <div>
                 <h4>YAML Patch 编辑器</h4>
                 <p>
-                  提交格式为 `application/yaml`。支持嵌套结构，后端会自动按字段路径展开并写入用户目录 override 文件。
+                  提交格式为 `application/yaml`。支持嵌套结构，后端会自动按字段路径展开并写入当前可编辑配置文件。
                 </p>
               </div>
               <div className="ops-config-head-badges">
@@ -496,10 +568,10 @@ export function OpsPage(props: OpsPageProps) {
               </Button>
               <Button
                 variant="outline"
-                onClick={handleFillYAMLFromEditableUserPatch}
-                disabled={editableUserPatchRootCount === 0}
+                onClick={handleFillYAMLFromEditableConfigFilePatch}
+                disabled={editableConfigFilePatchRootCount === 0}
               >
-                回填用户目录 patch
+                回填当前文件 patch
               </Button>
               <Button variant="outline" onClick={handleResetYAMLDocument}>
                 重置 YAML 模板
@@ -536,7 +608,7 @@ export function OpsPage(props: OpsPageProps) {
             <div className="ops-yaml-toolbar">
               <div>
                 <h4>当前快照（YAML）</h4>
-                <p>这个预览展示的是当前已经合并完成的生效配置快照，不是用户 override 原文件的逐字节内容。</p>
+                <p>这个预览展示的是当前已经合并完成的生效配置快照，不是底层配置文件的逐字节原文。</p>
               </div>
             </div>
             <div className="snapshot-box ops-yaml-preview-box">
@@ -565,3 +637,101 @@ export function OpsPage(props: OpsPageProps) {
     </div>
   );
 }
+
+type ManagedCAHintInput = {
+  configFilePath: string;
+  configFileSourceLabel: string;
+  controlPlaneGRPCH2ListenAddr: string;
+  controlPlaneListenAddr: string;
+  controlPlaneQUICListenAddr: string;
+  tlsMode: string;
+  tlsCertSource: string;
+  tlsCACertFile: string;
+  tlsCAKeyFile: string;
+  tlsServerCommonName: string;
+  tlsServerSANDNS: string;
+  tlsServerSANIPs: string;
+};
+
+type ManagedCAHint = {
+  currentBehavior: string;
+  defaultCACertFile: string;
+  defaultCAKeyFile: string;
+  footnote: string;
+  suggestedSANDNS: string;
+  suggestedSANIPsAndCN: string;
+  summary: string;
+  tlsMode: string;
+};
+
+function buildManagedCAHint(input: ManagedCAHintInput): ManagedCAHint | null {
+  const tlsCertSource = input.tlsCertSource.trim().toLowerCase();
+  if (tlsCertSource !== "managed_ca") {
+    return null;
+  }
+
+  const tlsMode = input.tlsMode.trim().toLowerCase();
+  const defaultPaths = deriveManagedCAPaths(input.configFilePath);
+  const suggestedIdentity = deriveManagedCAIdentitySuggestion({
+    controlPlaneListenAddr: input.controlPlaneListenAddr,
+    controlPlaneGRPCH2ListenAddr: input.controlPlaneGRPCH2ListenAddr,
+    controlPlaneQUICListenAddr: input.controlPlaneQUICListenAddr,
+  });
+  const hasCACertFile = input.tlsCACertFile.trim() !== "";
+  const hasCAKeyFile = input.tlsCAKeyFile.trim() !== "";
+  const hasServerIdentity =
+    input.tlsServerCommonName.trim() !== "" ||
+    input.tlsServerSANDNS.trim() !== "" ||
+    input.tlsServerSANIPs.trim() !== "";
+
+  let currentBehavior = "当前会使用你手动填写的 CA 路径和证书标识。";
+  if (tlsMode === "" || tlsMode === "plaintext") {
+    currentBehavior = "当前 TLS 仍是 plaintext；切到 optional/required 后，Managed CA 才会真正参与校验与签发。";
+  } else if (hasCACertFile === false || hasCAKeyFile === false || hasServerIdentity === false) {
+    currentBehavior = `留空字段会在保存时自动补齐，并在默认${input.configFileSourceLabel}路径下初始化 Root CA 文件；按当前监听地址预计会写入 ${suggestedIdentity.behaviorSummary}。`;
+  } else {
+    currentBehavior = `当前会使用你手动填写的 CA 路径和证书标识；若重新留空，会回退到 ${suggestedIdentity.behaviorSummary}。手动指定自定义 CA 路径时，Root CA 初始化仍以 reload 或启动阶段为准。`;
+  }
+
+  return {
+    currentBehavior,
+    defaultCACertFile: defaultPaths.caCertFile,
+    defaultCAKeyFile: defaultPaths.caKeyFile,
+    footnote:
+      "如果 Bridge 需要被其他机器、域名或公网 IP 访问，请让监听地址和 SAN/CN 使用同一组真实标识，再让 Agent 按该标识校验证书。",
+    suggestedSANDNS: suggestedIdentity.sanDNS,
+    suggestedSANIPsAndCN: suggestedIdentity.sanIPsAndCN,
+    summary:
+      `首次切到 Managed CA 时，后台会为留空的 Root CA 路径与证书标识自动补默认值，并在保存后为默认${input.configFileSourceLabel}路径初始化 Root CA 文件；现在这组提示会跟着当前监听地址一起推导。`,
+    tlsMode,
+  };
+}
+
+function deriveManagedCAPaths(configFilePath: string) {
+  const normalizedPath = configFilePath.trim();
+  if (normalizedPath === "" || normalizedPath.includes("未解析到")) {
+    return {
+      caCertFile: "~/.config/devbridge/root-ca.crt",
+      caKeyFile: "~/.config/devbridge/root-ca.key",
+    };
+  }
+  const lastSlashIndex = Math.max(normalizedPath.lastIndexOf("/"), normalizedPath.lastIndexOf("\\"));
+  if (lastSlashIndex < 0) {
+    return {
+      caCertFile: "~/.config/devbridge/root-ca.crt",
+      caKeyFile: "~/.config/devbridge/root-ca.key",
+    };
+  }
+  const separator = normalizedPath[lastSlashIndex];
+  const configDirectory = normalizedPath.slice(0, lastSlashIndex);
+  return {
+    caCertFile: `${configDirectory}${separator}root-ca.crt`,
+    caKeyFile: `${configDirectory}${separator}root-ca.key`,
+  };
+}
+
+type ManagedCAIdentitySuggestion = {
+  behaviorSummary: string;
+  sanDNS: string;
+  sanIPsAndCN: string;
+};

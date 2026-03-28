@@ -333,6 +333,18 @@ pub fn spawn_agent_process(
     command.env("DEV_AGENT_CFG_BRIDGE_ADDR", &config.bridge_addr);
     command.env("DEV_AGENT_CFG_BRIDGE_TRANSPORT", &config.bridge_transport);
     command.env(
+        "DEV_AGENT_CFG_BRIDGE_TLS_ENABLED",
+        config.bridge_tls_enabled.to_string(),
+    );
+    command.env(
+        "DEV_AGENT_CFG_BRIDGE_TLS_ROOT_CA_FILE",
+        &config.bridge_tls_root_ca_file,
+    );
+    command.env(
+        "DEV_AGENT_CFG_BRIDGE_TLS_SERVER_NAME",
+        &config.bridge_tls_server_name,
+    );
+    command.env(
         "DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE",
         config.tunnel_pool_min_idle.to_string(),
     );

@@ -139,10 +139,10 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 			},
 			"admin": map[string]any{
 				"enabled":     true,
-				"listen_addr": ":39081",
+				"listen_addr": ":39080",
 			},
 			"control_plane": map[string]any{
-				"listen_addr":         ":39080",
+				"listen_addr":         ":39081",
 				"grpc_h2_listen_addr": ":39082",
 				"quic_listen_addr":    ":39083",
 				"tls_mode":            "required",
@@ -162,7 +162,7 @@ func TestBuildBridgeOverviewIncludesActiveListeners(testingObject *testing.T) {
 	if overview.Listeners[4].ListenerID != "control_plane_quic" || overview.Listeners[4].Port != "39083" {
 		testingObject.Fatalf("unexpected quic listener: %+v", overview.Listeners[4])
 	}
-	if overview.Listeners[5].ListenerID != "admin_ui_api" || overview.Listeners[5].Port != "39081" {
+	if overview.Listeners[5].ListenerID != "admin_ui_api" || overview.Listeners[5].Port != "39080" {
 		testingObject.Fatalf("unexpected admin listener: %+v", overview.Listeners[4])
 	}
 }
@@ -218,6 +218,10 @@ func TestBuildTrafficSummaryIncludesAuthAndTLSMetrics(testingObject *testing.T) 
 	metrics.IncBridgeTLSRejectPlaintextOnRequiredTotal()
 	metrics.IncBridgeTLSRejectTLSOnPlaintextTotal()
 	metrics.ObserveBridgeTunnelRecycleFailure(ltfperrors.CodeTunnelRecycleCloseAckRequired)
+	metrics.IncBridgeQUICConnectionAcceptTotal()
+	metrics.AddBridgeQUICConnectionActive(2)
+	metrics.IncBridgeQUICConnectionAuthenticatedTotal()
+	metrics.IncBridgeQUICTunnelRegisteredTotal()
 
 	summary := BuildTrafficSummary(now, metrics)
 	if summary.AuthSuccessTotal != 1 || summary.AuthFailureTotal != 1 {
@@ -231,6 +235,12 @@ func TestBuildTrafficSummaryIncludesAuthAndTLSMetrics(testingObject *testing.T) 
 	}
 	if summary.TunnelRecycleFailureTotal != 1 {
 		testingObject.Fatalf("unexpected recycle failure totals: %+v", summary)
+	}
+	if summary.QUICConnectionAcceptTotal != 1 ||
+		summary.QUICConnectionActive != 2 ||
+		summary.QUICConnectionAuthenticatedTotal != 1 ||
+		summary.QUICTunnelRegisteredTotal != 1 {
+		testingObject.Fatalf("unexpected quic metric totals: %+v", summary)
 	}
 	if summary.AuthErrorCodeTotals["auth_invalid_token"] != 1 {
 		testingObject.Fatalf("unexpected auth error code totals: %+v", summary.AuthErrorCodeTotals)

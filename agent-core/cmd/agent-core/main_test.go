@@ -10,7 +10,7 @@ import (
 // TestLoadRuntimeConfigFromEnvAppliesBridgeTLS 验证启动入口会把 Bridge TLS 环境变量接入 runtime 配置。
 func TestLoadRuntimeConfigFromEnvAppliesBridgeTLS(testingObject *testing.T) {
 	testingObject.Setenv(envBridgeTLSEnabled, "true")
-	testingObject.Setenv(envBridgeTLSRootCAFile, "/etc/devbridge/root-ca.pem")
+	testingObject.Setenv(envBridgeTLSRootCAFile, "/etc/devbridge/root-ca.crt")
 	testingObject.Setenv(envBridgeTLSServerName, "bridge.internal.example")
 
 	config, _, err := loadRuntimeConfigFromEnv(app.DefaultConfig())
@@ -20,7 +20,7 @@ func TestLoadRuntimeConfigFromEnvAppliesBridgeTLS(testingObject *testing.T) {
 	if !config.BridgeTLS.Enabled {
 		testingObject.Fatalf("expected bridge tls enabled from env")
 	}
-	if config.BridgeTLS.RootCAFile != "/etc/devbridge/root-ca.pem" {
+	if config.BridgeTLS.RootCAFile != "/etc/devbridge/root-ca.crt" {
 		testingObject.Fatalf("unexpected bridge tls root ca file: got=%s", config.BridgeTLS.RootCAFile)
 	}
 	if config.BridgeTLS.ServerName != "bridge.internal.example" {

@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | parity smoke | `make test-parity` | 运行 `codec` parity 与三种 binding 的同层语义回归 |
 | integration | `make test-integration` | `examples/interop` 握手、full-sync、publish/unpublish、health 等链路 |
-| pressure smoke | `make test-pressure` | 基准场景烟测：三种 binding 的小包/大包、空闲维持、突发 refill，以及 QUIC 的 stream limit saturation（`-benchtime=1x`） |
+| pressure smoke | `make test-pressure` | 基准场景烟测：三种 binding 的小包/大包、空闲维持、突发 refill，以及 QUIC 的 stream limit saturation、burst open streams、slow-read backpressure（`-benchtime=1x`） |
 
 说明：
 
@@ -79,6 +79,8 @@
 | `AB-PT-003` | pressure smoke | 慢读回压 | `agent-core/runtime/agent/traffic/relay_test.go:TestStreamRelayBackpressureTimeout` | PASS |
 | `AB-PT-004` | pressure smoke | 大包 relay | `agent-core/runtime/agent/traffic/relay_test.go:TestStreamRelayLargePayloadFragmentation` | PASS |
 | `AB-PT-005` | pressure smoke | QUIC stream limit saturation | `ltfp/transport/quicbinding/integration_test.go:TestTunnelProducerRespectsMaxIncomingStreams`、`ltfp/transport/quicbinding/benchmark_test.go:BenchmarkQUICStreamLimitSaturation` | PASS |
+| `AB-PT-006` | pressure smoke | QUIC 突发开 stream | `ltfp/transport/quicbinding/benchmark_test.go:BenchmarkQUICBurstOpenStreams` | PASS |
+| `AB-PT-007` | pressure smoke | QUIC 慢读回压 | `ltfp/transport/quicbinding/benchmark_test.go:BenchmarkQUICTunnelSlowReadBackpressure` | PASS |
 
 验证命令（本次执行）：
 

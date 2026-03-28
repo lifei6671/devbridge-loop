@@ -15,6 +15,7 @@ import {
 type ConfigFieldRowProps = {
   changePreview?: OpsConfigChangePreview | null;
   dirty: boolean;
+  editableSource?: string;
   field: OpsConfigField;
   isRestoringInherited?: boolean;
   onResetToInherited?: (fieldKey: string) => void;
@@ -29,6 +30,7 @@ export function ConfigFieldRow(props: ConfigFieldRowProps) {
   const {
     changePreview = null,
     dirty,
+    editableSource = "",
     field,
     isRestoringInherited = false,
     onResetToInherited,
@@ -40,7 +42,8 @@ export function ConfigFieldRow(props: ConfigFieldRowProps) {
   } = props;
   const restartBadgeText = field.restartRequired === true ? "需重启" : "即时生效";
   const restartBadgeVariant = field.restartRequired === true ? "secondary" : "success";
-  const canResetToInherited = source === "user" && typeof onResetToInherited === "function";
+  const canResetToInherited =
+    source === editableSource && typeof onResetToInherited === "function";
 
   return (
     <div className="config-field-row">
@@ -68,7 +71,7 @@ export function ConfigFieldRow(props: ConfigFieldRowProps) {
                 <Badge variant="outline">当前</Badge>
                 <code>{changePreview.currentText}</code>
                 <span className="config-field-change-arrow" aria-hidden="true">→</span>
-                <Badge variant={changePreview.nextLabel === "用户目录" ? "secondary" : "warning"}>
+                <Badge variant={getOpsConfigSourceBadgeVariant(changePreview.nextSource)}>
                   {changePreview.nextLabel}
                 </Badge>
                 <code>{changePreview.nextText}</code>

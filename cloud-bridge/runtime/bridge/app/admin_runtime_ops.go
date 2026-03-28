@@ -1,7 +1,10 @@
 package app
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/adminapi"
 	bridgecontrol "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/control"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
+	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
@@ -18,28 +22,35 @@ import (
 type adminRuntimeConfigStore struct {
 	mutex sync.RWMutex
 
-	runtimeConfig   Config
-	configFilePath  string
-	baseConfigLayer map[string]any
-	userConfigLayer map[string]any
-	saveConfigFunc  func(layer map[string]any, configFilePath string) error
-	configVersion   uint64
-	lastUpdatedAt   time.Time
-	lastOperatorID  string
+	runtimeConfig  Config
+	runtimeLayers  runtimeConfigLayerMaps
+	saveConfigFunc func(layer map[string]any, configFilePath string) error
+	configVersion  uint64
+	lastUpdatedAt  time.Time
+	lastOperatorID string
 }
 
 // newAdminRuntimeConfigStore 构建管理面配置快照存储。
 func newAdminRuntimeConfigStore(config Config) *adminRuntimeConfigStore {
 	userConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeConfigFilePath))
-	baseConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeBaseConfigFilePath))
+	systemConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeSystemConfigFilePath))
+	localConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeLocalConfigFilePath))
+	explicitConfigLayer, _ := maybeLoadRuntimeConfigLayerMap(strings.TrimSpace(config.RuntimeExplicitConfigFilePath))
 	return &adminRuntimeConfigStore{
-		runtimeConfig:   config,
-		configFilePath:  strings.TrimSpace(config.RuntimeConfigFilePath),
-		baseConfigLayer: cloneRuntimeConfigLayerMap(baseConfigLayer),
-		userConfigLayer: cloneRuntimeConfigLayerMap(userConfigLayer),
-		saveConfigFunc:  saveRuntimeConfigLayerMapToFile,
-		configVersion:   1,
-		lastUpdatedAt:   time.Now().UTC(),
+		runtimeConfig: config,
+		runtimeLayers: runtimeConfigLayerMaps{
+			systemConfigFilePath:   strings.TrimSpace(config.RuntimeSystemConfigFilePath),
+			systemLayer:            cloneRuntimeConfigLayerMap(systemConfigLayer),
+			userConfigFilePath:     strings.TrimSpace(config.RuntimeConfigFilePath),
+			userLayer:              cloneRuntimeConfigLayerMap(userConfigLayer),
+			localConfigFilePath:    strings.TrimSpace(config.RuntimeLocalConfigFilePath),
+			localLayer:             cloneRuntimeConfigLayerMap(localConfigLayer),
+			explicitConfigFilePath: strings.TrimSpace(config.RuntimeExplicitConfigFilePath),
+			explicitLayer:          cloneRuntimeConfigLayerMap(explicitConfigLayer),
+		},
+		saveConfigFunc: saveRuntimeConfigLayerMapToFile,
+		configVersion:  1,
+		lastUpdatedAt:  time.Now().UTC(),
 	}
 }
 
@@ -53,10 +64,18 @@ func (store *adminRuntimeConfigStore) snapshot() map[string]any {
 	configVersion := store.configVersion
 	lastUpdatedAt := store.lastUpdatedAt
 	lastOperatorID := store.lastOperatorID
-	baseConfigLayer := cloneRuntimeConfigLayerMap(store.baseConfigLayer)
-	userConfigLayer := cloneRuntimeConfigLayerMap(store.userConfigLayer)
+	layerMaps := runtimeConfigLayerMaps{
+		systemConfigFilePath:   store.runtimeLayers.systemConfigFilePath,
+		systemLayer:            cloneRuntimeConfigLayerMap(store.runtimeLayers.systemLayer),
+		userConfigFilePath:     store.runtimeLayers.userConfigFilePath,
+		userLayer:              cloneRuntimeConfigLayerMap(store.runtimeLayers.userLayer),
+		localConfigFilePath:    store.runtimeLayers.localConfigFilePath,
+		localLayer:             cloneRuntimeConfigLayerMap(store.runtimeLayers.localLayer),
+		explicitConfigFilePath: store.runtimeLayers.explicitConfigFilePath,
+		explicitLayer:          cloneRuntimeConfigLayerMap(store.runtimeLayers.explicitLayer),
+	}
 	store.mutex.RUnlock()
-	return buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, baseConfigLayer, userConfigLayer)
+	return buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, layerMaps)
 }
 
 // buildAdminConfigSnapshot 把配置结构转换为管理面稳定快照结构。
@@ -65,28 +84,28 @@ func buildAdminConfigSnapshot(
 	configVersion uint64,
 	lastUpdatedAt time.Time,
 	lastOperatorID string,
-	baseConfigLayer map[string]any,
-	userConfigLayer map[string]any,
+	layerMaps runtimeConfigLayerMaps,
 ) map[string]any {
 	authProviders := buildAdminAuthProviderSnapshot(configCopy.Admin.AuthProviders)
-	fieldSources, err := buildRuntimeConfigFieldSources(baseConfigLayer, userConfigLayer)
+	fieldSources, err := buildRuntimeConfigFieldSources(layerMaps)
 	if err != nil {
 		fieldSources = map[string]any{}
 	}
-	restorePreview, err := buildEditableRuntimeConfigRestorePreview(
-		strings.TrimSpace(configCopy.RuntimeBaseConfigFilePath),
-		baseConfigLayer,
-		userConfigLayer,
-	)
+	restorePreview, err := buildEditableRuntimeConfigRestorePreview(layerMaps)
 	if err != nil {
 		restorePreview = map[string]any{}
 	}
+	editableTarget, err := resolveEditableRuntimeConfigTarget(layerMaps)
+	if err != nil {
+		editableTarget = runtimeConfigEditableTarget{}
+	}
 	return map[string]any{
 		"config_version":        configVersion,
-		"config_file_path":      strings.TrimSpace(configCopy.RuntimeConfigFilePath),
+		"config_file_path":      strings.TrimSpace(editableTarget.path),
+		"config_file_source":    strings.TrimSpace(editableTarget.source),
 		"base_config_file_path": strings.TrimSpace(configCopy.RuntimeBaseConfigFilePath),
 		"field_sources":         fieldSources,
-		"editable_user_patch":   buildEditableRuntimeConfigPatch(userConfigLayer),
+		"editable_file_patch":   buildEditableRuntimeConfigPatch(editableTarget.layer),
 		"field_restore_preview": restorePreview,
 		"ingress": map[string]any{
 			"http_addr":      configCopy.Ingress.HTTPAddr,
@@ -192,29 +211,80 @@ func (store *adminRuntimeConfigStore) update(
 		)
 	}
 	configCandidate := store.runtimeConfig
-	userConfigLayerCandidate := cloneRuntimeConfigLayerMap(store.userConfigLayer)
+	editableTarget, err := resolveEditableRuntimeConfigTarget(store.runtimeLayers)
+	if err != nil {
+		return adminapi.ConfigUpdateResult{}, fmt.Errorf("resolve editable config target failed: %w", err)
+	}
+	if err := validateRuntimeConfigPatchVisibility(store.runtimeLayers, editableTarget, request.Patch); err != nil {
+		return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
+	}
+	editableLayerCandidate := cloneRuntimeConfigLayerMap(editableTarget.layer)
 	for _, patchKey := range sortedPatchKeys(request.Patch) {
 		patchValue := request.Patch[patchKey]
-		if err := applyRuntimeConfigPatch(&configCandidate, userConfigLayerCandidate, patchKey, patchValue); err != nil {
+		if err := applyRuntimeConfigPatch(
+			&configCandidate,
+			editableLayerCandidate,
+			editableTarget.path,
+			patchKey,
+			patchValue,
+		); err != nil {
 			return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 		}
 	}
-	resolvedConfig, err := buildRuntimeConfigFromLayers(
-		strings.TrimSpace(store.runtimeConfig.RuntimeBaseConfigFilePath),
-		store.baseConfigLayer,
-		strings.TrimSpace(store.configFilePath),
-		userConfigLayerCandidate,
-	)
+	layerMapsCandidate := runtimeConfigLayerMaps{
+		systemConfigFilePath:   store.runtimeLayers.systemConfigFilePath,
+		systemLayer:            cloneRuntimeConfigLayerMap(store.runtimeLayers.systemLayer),
+		userConfigFilePath:     store.runtimeLayers.userConfigFilePath,
+		userLayer:              cloneRuntimeConfigLayerMap(store.runtimeLayers.userLayer),
+		localConfigFilePath:    store.runtimeLayers.localConfigFilePath,
+		localLayer:             cloneRuntimeConfigLayerMap(store.runtimeLayers.localLayer),
+		explicitConfigFilePath: store.runtimeLayers.explicitConfigFilePath,
+		explicitLayer:          cloneRuntimeConfigLayerMap(store.runtimeLayers.explicitLayer),
+	}
+	switch editableTarget.source {
+	case runtimeConfigSourceExplicit:
+		layerMapsCandidate.explicitLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceLocal:
+		layerMapsCandidate.localLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceUser:
+		layerMapsCandidate.userLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceSystem:
+		layerMapsCandidate.systemLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	default:
+		return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: no editable config file available", adminapi.ErrAdminInvalidArgument)
+	}
+	resolvedConfig, err := buildRuntimeConfigFromLayerMaps(layerMapsCandidate)
 	if err != nil {
 		return adminapi.ConfigUpdateResult{}, fmt.Errorf("%w: %v", adminapi.ErrAdminInvalidArgument, err)
 	}
-	configFilePath := strings.TrimSpace(store.configFilePath)
-	if configFilePath != "" && store.saveConfigFunc != nil {
-		if saveErr := store.saveConfigFunc(userConfigLayerCandidate, configFilePath); saveErr != nil {
+	rollbackManagedCARootFiles, err := prepareManagedCARootFilesForConfig(resolvedConfig, editableTarget.path)
+	if err != nil {
+		return adminapi.ConfigUpdateResult{}, fmt.Errorf("initialize managed ca root files failed: %w", err)
+	}
+	if strings.TrimSpace(editableTarget.path) != "" && store.saveConfigFunc != nil {
+		if saveErr := store.saveConfigFunc(editableLayerCandidate, editableTarget.path); saveErr != nil {
+			if rollbackManagedCARootFiles != nil {
+				if rollbackErr := rollbackManagedCARootFiles(); rollbackErr != nil {
+					return adminapi.ConfigUpdateResult{}, fmt.Errorf(
+						"persist config file failed: %w (managed ca rollback failed: %v)",
+						saveErr,
+						rollbackErr,
+					)
+				}
+			}
 			return adminapi.ConfigUpdateResult{}, fmt.Errorf("persist config file failed: %w", saveErr)
 		}
 	}
-	store.userConfigLayer = cloneRuntimeConfigLayerMap(userConfigLayerCandidate)
+	switch editableTarget.source {
+	case runtimeConfigSourceExplicit:
+		store.runtimeLayers.explicitLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceLocal:
+		store.runtimeLayers.localLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceUser:
+		store.runtimeLayers.userLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	case runtimeConfigSourceSystem:
+		store.runtimeLayers.systemLayer = cloneRuntimeConfigLayerMap(editableLayerCandidate)
+	}
 	store.runtimeConfig = resolvedConfig
 	store.configVersion++
 	store.lastUpdatedAt = normalizedNow
@@ -223,14 +293,110 @@ func (store *adminRuntimeConfigStore) update(
 	configVersion := store.configVersion
 	lastUpdatedAt := store.lastUpdatedAt
 	lastOperatorID := store.lastOperatorID
-	baseConfigLayer := cloneRuntimeConfigLayerMap(store.baseConfigLayer)
-	userConfigLayer := cloneRuntimeConfigLayerMap(store.userConfigLayer)
+	layerMapsSnapshot := runtimeConfigLayerMaps{
+		systemConfigFilePath:   store.runtimeLayers.systemConfigFilePath,
+		systemLayer:            cloneRuntimeConfigLayerMap(store.runtimeLayers.systemLayer),
+		userConfigFilePath:     store.runtimeLayers.userConfigFilePath,
+		userLayer:              cloneRuntimeConfigLayerMap(store.runtimeLayers.userLayer),
+		localConfigFilePath:    store.runtimeLayers.localConfigFilePath,
+		localLayer:             cloneRuntimeConfigLayerMap(store.runtimeLayers.localLayer),
+		explicitConfigFilePath: store.runtimeLayers.explicitConfigFilePath,
+		explicitLayer:          cloneRuntimeConfigLayerMap(store.runtimeLayers.explicitLayer),
+	}
 	return adminapi.ConfigUpdateResult{
 		ConfigVersion:   configVersion,
-		Snapshot:        buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, baseConfigLayer, userConfigLayer),
+		Snapshot:        buildAdminConfigSnapshot(configCopy, configVersion, lastUpdatedAt, lastOperatorID, layerMapsSnapshot),
 		ApplyMode:       "staged_requires_restart",
 		RequiresRestart: true,
 	}, nil
+}
+
+func prepareManagedCARootFilesForConfig(runtimeConfig Config, editableConfigFilePath string) (func() error, error) {
+	caCertFile, caKeyFile, shouldEnsure, err := managedCARootFilesForConfig(runtimeConfig, editableConfigFilePath)
+	if err != nil {
+		return nil, err
+	}
+	if !shouldEnsure {
+		return nil, nil
+	}
+	caCertExisted, err := fileExists(strings.TrimSpace(caCertFile))
+	if err != nil {
+		return nil, err
+	}
+	caKeyExisted, err := fileExists(strings.TrimSpace(caKeyFile))
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureManagedCARootFilesForConfig(runtimeConfig, editableConfigFilePath); err != nil {
+		return nil, err
+	}
+	if caCertExisted || caKeyExisted {
+		return nil, nil
+	}
+	return func() error {
+		return rollbackManagedCARootFiles(caCertFile, caKeyFile)
+	}, nil
+}
+
+func ensureManagedCARootFilesForConfig(runtimeConfig Config, editableConfigFilePath string) error {
+	caCertFile, caKeyFile, shouldEnsure, err := managedCARootFilesForConfig(runtimeConfig, editableConfigFilePath)
+	if err != nil {
+		return err
+	}
+	if !shouldEnsure {
+		return nil
+	}
+	if err := apptls.EnsureManagedCARootFiles(caCertFile, caKeyFile); err != nil {
+		return err
+	}
+	logDetails := buildManagedCALogDetails(caCertFile, caKeyFile)
+	slog.Info(
+		"initialized managed ca root files from admin config update",
+		"ca_cert_directory", logDetails.caCertDirectory,
+		"ca_cert_file", logDetails.caCertFile,
+		"ca_key_directory", logDetails.caKeyDirectory,
+		"ca_key_file", logDetails.caKeyFile,
+	)
+	return nil
+}
+
+func managedCARootFilesForConfig(runtimeConfig Config, editableConfigFilePath string) (string, string, bool, error) {
+	normalizedTLSMode, err := apptls.NormalizeMode(runtimeConfig.ControlPlane.TLSMode)
+	if err != nil {
+		return "", "", false, err
+	}
+	if normalizedTLSMode == apptls.ModePlaintext {
+		return "", "", false, nil
+	}
+	normalizedCertSource, err := apptls.NormalizeCertSource(runtimeConfig.ControlPlane.TLSCertSource)
+	if err != nil {
+		return "", "", false, err
+	}
+	if normalizedCertSource != apptls.CertSourceManagedCA {
+		return "", "", false, nil
+	}
+	defaultCACertFile, defaultCAKeyFile := defaultManagedCAFilePaths(editableConfigFilePath)
+	normalizedCACertFile := strings.TrimSpace(runtimeConfig.ControlPlane.TLSCACertFile)
+	normalizedCAKeyFile := strings.TrimSpace(runtimeConfig.ControlPlane.TLSCAKeyFile)
+	if normalizedCACertFile != strings.TrimSpace(defaultCACertFile) {
+		return "", "", false, nil
+	}
+	if normalizedCAKeyFile != strings.TrimSpace(defaultCAKeyFile) {
+		return "", "", false, nil
+	}
+	return normalizedCACertFile, normalizedCAKeyFile, true, nil
+}
+
+func rollbackManagedCARootFiles(caCertFile string, caKeyFile string) error {
+	for _, filePath := range []string{strings.TrimSpace(caCertFile), strings.TrimSpace(caKeyFile)} {
+		if filePath == "" {
+			continue
+		}
+		if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // drainSessionForAdmin 把 session 标记为 DRAINING，并同步收敛 service/tunnel 状态。
@@ -400,6 +566,53 @@ func parsePatchString(rawValue any) (string, error) {
 	return normalizedValue, nil
 }
 
+// parsePatchStringList 解析配置补丁中的逗号分隔字符串列表或 YAML 字符串数组。
+func parsePatchStringList(rawValue any) ([]string, error) {
+	switch value := rawValue.(type) {
+	case string:
+		normalizedValue := strings.TrimSpace(value)
+		if normalizedValue == "" {
+			return []string{}, nil
+		}
+		rawParts := strings.Split(normalizedValue, ",")
+		normalizedParts := make([]string, 0, len(rawParts))
+		for _, rawPart := range rawParts {
+			normalizedPart := strings.TrimSpace(rawPart)
+			if normalizedPart == "" {
+				continue
+			}
+			normalizedParts = append(normalizedParts, normalizedPart)
+		}
+		return normalizedParts, nil
+	case []string:
+		normalizedParts := make([]string, 0, len(value))
+		for _, item := range value {
+			normalizedItem := strings.TrimSpace(item)
+			if normalizedItem == "" {
+				continue
+			}
+			normalizedParts = append(normalizedParts, normalizedItem)
+		}
+		return normalizedParts, nil
+	case []any:
+		normalizedParts := make([]string, 0, len(value))
+		for _, item := range value {
+			textValue, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("expect string list item, got=%T", item)
+			}
+			normalizedItem := strings.TrimSpace(textValue)
+			if normalizedItem == "" {
+				continue
+			}
+			normalizedParts = append(normalizedParts, normalizedItem)
+		}
+		return normalizedParts, nil
+	default:
+		return nil, fmt.Errorf("expect string/string list value, got=%T", rawValue)
+	}
+}
+
 // parsePatchDuration 解析配置补丁中的 duration 字符串字段（例如 30s / 1500ms）。
 func parsePatchDuration(rawValue any) (time.Duration, error) {
 	rawText, err := parsePatchString(rawValue)
@@ -488,4 +701,84 @@ func sortedPatchKeys(patch map[string]any) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func validateRuntimeConfigPatchVisibility(
+	layerMaps runtimeConfigLayerMaps,
+	editableTarget runtimeConfigEditableTarget,
+	patch map[string]any,
+) error {
+	for _, patchKey := range sortedPatchKeys(patch) {
+		if patch[patchKey] == nil {
+			continue
+		}
+		shadowingSource, shadowed := shadowingRuntimeConfigSourceForPatchKey(layerMaps, editableTarget.source, patchKey)
+		if !shadowed {
+			continue
+		}
+		return fmt.Errorf(
+			"patch key=%s is shadowed by higher-priority %s config",
+			patchKey,
+			shadowingSource,
+		)
+	}
+	return nil
+}
+
+func shadowingRuntimeConfigSourceForPatchKey(
+	layerMaps runtimeConfigLayerMaps,
+	editableSource string,
+	patchKey string,
+) (string, bool) {
+	yamlPath, ok := runtimeConfigPatchKeyYAMLPath(patchKey)
+	if !ok {
+		return "", false
+	}
+	for _, source := range higherPriorityRuntimeConfigSources(editableSource) {
+		if _, exists := readRuntimeConfigYAMLPath(runtimeConfigLayerForSource(layerMaps, source), yamlPath); exists {
+			return source, true
+		}
+	}
+	return "", false
+}
+
+func runtimeConfigPatchKeyYAMLPath(patchKey string) (string, bool) {
+	normalizedPatchKey := strings.TrimSpace(patchKey)
+	if yamlPath, ok := runtimeConfigFieldYAMLPaths[normalizedPatchKey]; ok {
+		return yamlPath, true
+	}
+	switch normalizedPatchKey {
+	case "control_plane.heartbeat_timeout":
+		return runtimeConfigFieldYAMLPaths["control_plane.heartbeat_timeout_ms"], true
+	default:
+		return "", false
+	}
+}
+
+func higherPriorityRuntimeConfigSources(editableSource string) []string {
+	switch strings.TrimSpace(editableSource) {
+	case runtimeConfigSourceLocal:
+		return []string{runtimeConfigSourceExplicit}
+	case runtimeConfigSourceUser:
+		return []string{runtimeConfigSourceExplicit, runtimeConfigSourceLocal}
+	case runtimeConfigSourceSystem:
+		return []string{runtimeConfigSourceExplicit, runtimeConfigSourceLocal, runtimeConfigSourceUser}
+	default:
+		return nil
+	}
+}
+
+func runtimeConfigLayerForSource(layerMaps runtimeConfigLayerMaps, source string) map[string]any {
+	switch strings.TrimSpace(source) {
+	case runtimeConfigSourceExplicit:
+		return layerMaps.explicitLayer
+	case runtimeConfigSourceLocal:
+		return layerMaps.localLayer
+	case runtimeConfigSourceUser:
+		return layerMaps.userLayer
+	case runtimeConfigSourceSystem:
+		return layerMaps.systemLayer
+	default:
+		return nil
+	}
 }

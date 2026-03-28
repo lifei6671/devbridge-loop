@@ -92,6 +92,12 @@ func NewLocalManagedCACertificateIssuer() ManagedCACertificateIssuer {
 	return newLocalManagedCACertificateIssuer()
 }
 
+// EnsureManagedCARootFiles 确保 managed_ca 的 Root CA 文件已落盘；若不存在则自动初始化。
+func EnsureManagedCARootFiles(caCertFile string, caKeyFile string) error {
+	_, err := loadOrInitializeManagedCARootCertificate(caCertFile, caKeyFile)
+	return err
+}
+
 // ConfigManager 管理控制面 TLS 配置加载与热更新。
 type ConfigManager interface {
 	Refresh(ctx context.Context) error
@@ -123,6 +129,11 @@ func NewTLSAwareListener(
 	metrics *obs.Metrics,
 ) net.Listener {
 	return newControlPlaneTLSAwareListener(listener, tlsMode, serverTLSConfigGetter, metrics)
+}
+
+// BuildQUICServerTLSConfig 返回 QUIC listener 使用的 TLS 配置副本。
+func BuildQUICServerTLSConfig(baseConfig *stdtls.Config) *stdtls.Config {
+	return buildControlPlaneQUICServerTLSConfig(baseConfig)
 }
 
 // RemoteAddrString 返回连接远端地址字符串。

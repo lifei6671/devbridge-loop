@@ -17,7 +17,7 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
 
-const bootstrapTestAllowedOrigin = "http://127.0.0.1:39081"
+const bootstrapTestAllowedOrigin = "http://127.0.0.1:39080"
 
 type bootstrapAuthSession struct {
 	cookies   []*http.Cookie
@@ -73,6 +73,24 @@ func TestDefaultConfigAdminEnabledByDefault(testingObject *testing.T) {
 	defaultConfig := DefaultConfig()
 	if !defaultConfig.Admin.Enabled {
 		testingObject.Fatalf("expected admin.enabled default true")
+	}
+	if defaultConfig.Admin.ListenAddr != ":39080" {
+		testingObject.Fatalf("unexpected admin listen addr: %s", defaultConfig.Admin.ListenAddr)
+	}
+	if defaultConfig.ControlPlane.ListenAddr != ":39081" {
+		testingObject.Fatalf("unexpected control plane tcp listen addr: %s", defaultConfig.ControlPlane.ListenAddr)
+	}
+	if defaultConfig.ControlPlane.GRPCH2ListenAddr != ":39082" {
+		testingObject.Fatalf("unexpected control plane grpc listen addr: %s", defaultConfig.ControlPlane.GRPCH2ListenAddr)
+	}
+	if defaultConfig.ControlPlane.QUICListenAddr != ":39083" {
+		testingObject.Fatalf("unexpected control plane quic listen addr: %s", defaultConfig.ControlPlane.QUICListenAddr)
+	}
+	if len(defaultConfig.Admin.AllowedOrigins) != 2 {
+		testingObject.Fatalf("unexpected allowed origins size: %d", len(defaultConfig.Admin.AllowedOrigins))
+	}
+	if defaultConfig.Admin.AllowedOrigins[0] != "http://127.0.0.1:39080" {
+		testingObject.Fatalf("unexpected first allowed origin: %s", defaultConfig.Admin.AllowedOrigins[0])
 	}
 }
 
@@ -589,9 +607,11 @@ func TestAdminSessionDrainEndpointAppliesLifecycleEffects(testingObject *testing
 func TestAdminConfigUpdateEnforcesIfMatchVersion(testingObject *testing.T) {
 	testingObject.Parallel()
 
+	tempDir := testingObject.TempDir()
 	config := DefaultConfig()
 	config.Admin.Enabled = true
 	config.Admin.UIEnabled = false
+	config.RuntimeConfigFilePath = filepath.Join(tempDir, "bridge.yaml")
 
 	runtime, err := Bootstrap(context.Background(), config)
 	if err != nil {

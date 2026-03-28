@@ -324,6 +324,65 @@ type authenticatedQUICControlPlaneFixture struct {
 	serverErrChannel      chan error
 }
 
+type bridgeQUICSessionTestControlChannel struct {
+	doneChannel chan struct{}
+	lastError   error
+}
+
+func (channel *bridgeQUICSessionTestControlChannel) WriteControlFrame(context.Context, transport.ControlFrame) error {
+	return nil
+}
+
+func (channel *bridgeQUICSessionTestControlChannel) ReadControlFrame(context.Context) (transport.ControlFrame, error) {
+	return transport.ControlFrame{}, nil
+}
+
+func (channel *bridgeQUICSessionTestControlChannel) Close(context.Context) error {
+	channel.lastError = transport.ErrClosed
+	if channel.doneChannel != nil {
+		select {
+		case <-channel.doneChannel:
+		default:
+			close(channel.doneChannel)
+		}
+	}
+	return nil
+}
+
+func (channel *bridgeQUICSessionTestControlChannel) Done() <-chan struct{} {
+	return channel.doneChannel
+}
+
+func (channel *bridgeQUICSessionTestControlChannel) Err() error {
+	return channel.lastError
+}
+
+type bridgeQUICSessionTestTunnelAcceptor struct{}
+
+func (acceptor *bridgeQUICSessionTestTunnelAcceptor) AcceptTunnel(context.Context) (transport.Tunnel, error) {
+	return nil, transport.ErrUnsupported
+}
+
+func (acceptor *bridgeQUICSessionTestTunnelAcceptor) Close(error) {}
+
+func (acceptor *bridgeQUICSessionTestTunnelAcceptor) Done() <-chan struct{} {
+	doneChannel := make(chan struct{})
+	close(doneChannel)
+	return doneChannel
+}
+
+func (acceptor *bridgeQUICSessionTestTunnelAcceptor) Err() error {
+	return transport.ErrClosed
+}
+
+func newAuthenticatedQUICSessionStateForTest() *controlChannelSessionState {
+	sessionState := newControlChannelSessionState("127.0.0.1:39083")
+	sessionState.setHelloContext("agent-local", 7)
+	sessionState.setSession("session-quic-transport", 7)
+	sessionState.markAuthenticated()
+	return sessionState
+}
+
 func newAuthenticatedQUICControlPlaneFixtureForTest(
 	testingObject *testing.T,
 ) *authenticatedQUICControlPlaneFixture {
@@ -460,6 +519,109 @@ func newAuthenticatedQUICControlPlaneFixtureForTest(
 		tunnelPoolReportStore: tunnelPoolReportStore,
 		cancel:                cancel,
 		serverErrChannel:      serverErrChannel,
+	}
+}
+
+func TestNewBridgeQUICTransportSession(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionState := newAuthenticatedQUICSessionStateForTest()
+	controlChannel := &bridgeQUICSessionTestControlChannel{doneChannel: make(chan struct{})}
+	tunnelAcceptor := &bridgeQUICSessionTestTunnelAcceptor{}
+
+	quicSession, err := newBridgeQUICTransportSession(sessionState, controlChannel, tunnelAcceptor)
+	if err != nil {
+		testingObject.Fatalf("new bridge quic transport session failed: %v", err)
+	}
+
+	if quicSession.State() != transport.SessionStateAuthenticated {
+		testingObject.Fatalf("unexpected quic transport session state: %s", quicSession.State())
+	}
+	if quicSession.ProtocolState() != transport.ProtocolStateActive {
+		testingObject.Fatalf("unexpected quic transport protocol state: %s", quicSession.ProtocolState())
+	}
+	if quicSession.BindingInfo().Type != transport.BindingTypeQUICNative {
+		testingObject.Fatalf("unexpected quic transport binding: %s", quicSession.BindingInfo().Type)
+	}
+	if _, err := quicSession.Control(); err != nil {
+		testingObject.Fatalf("expected quic transport control capability: %v", err)
+	}
+	if _, err := quicSession.TunnelAcceptor(); err != nil {
+		testingObject.Fatalf("expected quic transport acceptor capability: %v", err)
+	}
+	if _, err := quicSession.TunnelPool(); err != nil {
+		testingObject.Fatalf("expected quic transport pool capability: %v", err)
+	}
+	meta := quicSession.Meta()
+	if meta.SessionID != "session-quic-transport" || meta.SessionEpoch != 7 {
+		testingObject.Fatalf("unexpected quic transport meta: %+v", meta)
+	}
+	if strings.TrimSpace(meta.Labels["connector_id"]) != "agent-local" {
+		testingObject.Fatalf("unexpected quic transport connector label: %+v", meta.Labels)
+	}
+}
+
+func TestFinishBridgeQUICTransportSession(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	testCases := []struct {
+		name                string
+		serveErr            error
+		acceptErr           error
+		expectedState       transport.SessionState
+		expectedProtocol    transport.ProtocolState
+		expectedLastErrPart string
+	}{
+		{
+			name:             "close on normal shutdown",
+			expectedState:    transport.SessionStateClosed,
+			expectedProtocol: transport.ProtocolStateClosed,
+		},
+		{
+			name:                "mark failed on control channel error",
+			serveErr:            errors.New("heartbeat timeout"),
+			expectedState:       transport.SessionStateFailed,
+			expectedProtocol:    transport.ProtocolStateStale,
+			expectedLastErrPart: "heartbeat timeout",
+		},
+		{
+			name:                "mark failed on tunnel accept error",
+			acceptErr:           errors.New("accept tunnel failed"),
+			expectedState:       transport.SessionStateFailed,
+			expectedProtocol:    transport.ProtocolStateStale,
+			expectedLastErrPart: "accept tunnel failed",
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+		testingObject.Run(testCase.name, func(subTestingObject *testing.T) {
+			sessionState := newAuthenticatedQUICSessionStateForTest()
+			controlChannel := &bridgeQUICSessionTestControlChannel{doneChannel: make(chan struct{})}
+			tunnelAcceptor := &bridgeQUICSessionTestTunnelAcceptor{}
+
+			quicSession, err := newBridgeQUICTransportSession(sessionState, controlChannel, tunnelAcceptor)
+			if err != nil {
+				subTestingObject.Fatalf("new bridge quic transport session failed: %v", err)
+			}
+
+			if err := finishBridgeQUICTransportSession(quicSession, testCase.serveErr, testCase.acceptErr); err != nil {
+				subTestingObject.Fatalf("finish bridge quic transport session failed: %v", err)
+			}
+			if quicSession.State() != testCase.expectedState {
+				subTestingObject.Fatalf("unexpected quic transport session state: got=%s want=%s", quicSession.State(), testCase.expectedState)
+			}
+			if quicSession.ProtocolState() != testCase.expectedProtocol {
+				subTestingObject.Fatalf(
+					"unexpected quic transport protocol state: got=%s want=%s",
+					quicSession.ProtocolState(),
+					testCase.expectedProtocol,
+				)
+			}
+			if testCase.expectedLastErrPart != "" && !strings.Contains(strings.TrimSpace(quicSession.Err().Error()), testCase.expectedLastErrPart) {
+				subTestingObject.Fatalf("unexpected quic transport last error: %v", quicSession.Err())
+			}
+		})
 	}
 }
 
@@ -1036,6 +1198,62 @@ func TestServeQUICInboundConnectionTimesOutWithoutControlChannel(testingObject *
 		case <-time.After(300 * time.Millisecond):
 			testingObject.Fatalf("expected quic inbound serve to stop after control channel timeout")
 		}
+	}
+}
+
+func TestRunQUICUsesQUICServerTLSConfigWhenBaseConfigCarriesH2(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	serverTLSConfig, clientTLSConfig := newQUICControlPlaneTLSConfigsForTest(testingObject)
+	serverTLSConfig.NextProtos = []string{"h2"}
+	quicTransport, err := quicbinding.NewTransportWithConfig(quicbinding.TransportConfig{})
+	if err != nil {
+		testingObject.Fatalf("new quic transport failed: %v", err)
+	}
+	server := &controlPlaneServer{
+		quicListenAddr: ":0",
+		tlsMode:        apptls.ModeRequired,
+		tlsConfigManager: &stubQUICConfigManager{
+			serverTLSConfig: serverTLSConfig,
+		},
+		quicTransport: quicTransport,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: registry.NewSessionRegistry(),
+			serviceRegistry: registry.NewServiceRegistry(),
+			tunnelRegistry:  registry.NewTunnelRegistry(),
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErrChannel := make(chan error, 1)
+	go func() {
+		serverErrChannel <- server.runQUIC(ctx)
+	}()
+
+	listener := waitForQUICListenerForTest(testingObject, server)
+	clientConn, err := quicTransport.Dial(context.Background(), listener.Addr().String(), clientTLSConfig)
+	if err != nil {
+		testingObject.Fatalf("dial quic control plane failed: %v", err)
+	}
+	defer func() {
+		_ = clientConn.Close(nil)
+	}()
+
+	controlChannel, err := clientConn.OpenControlChannel(context.Background())
+	if err != nil {
+		testingObject.Fatalf("open quic control channel failed: %v", err)
+	}
+	_ = controlChannel.Close(context.Background())
+
+	cancel()
+	select {
+	case runErr := <-serverErrChannel:
+		if runErr != nil {
+			testingObject.Fatalf("run quic control plane returned error: %v", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		testingObject.Fatalf("timed out waiting for quic control plane shutdown")
 	}
 }
 
@@ -3664,6 +3882,59 @@ func TestRegisterAcceptedTunnelAmbiguousOwner(testingObject *testing.T) {
 	}
 	if !rawTunnel.closed() {
 		testingObject.Fatalf("expected ambiguous tunnel closed immediately")
+	}
+}
+
+func TestRegisterAcceptedQUICTunnelDoesNotCountMetricWhenRegistrationFails(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	sessionRegistry := registry.NewSessionRegistry()
+	tunnelRegistry := registry.NewTunnelRegistry()
+	metrics := &obs.Metrics{}
+	now := time.Now().UTC()
+	sessionRegistry.Upsert(now, registry.SessionRuntime{
+		SessionID:     "session-a",
+		ConnectorID:   "agent-local",
+		Epoch:         3,
+		State:         registry.SessionActive,
+		LastHeartbeat: now,
+		UpdatedAt:     now,
+	})
+	server := &controlPlaneServer{
+		metrics: metrics,
+		dispatcher: newControlMessageDispatcher(controlMessageDispatcherOptions{
+			sessionRegistry: sessionRegistry,
+			tunnelRegistry:  tunnelRegistry,
+		}),
+	}
+
+	occupiedTunnel := newControlPlaneInboundTestTunnel("inbound-quic-tunnel-duplicate")
+	if err := server.registerAcceptedTunnel(occupiedTunnel, transport.BindingTypeTCPFramed); err != nil {
+		testingObject.Fatalf("register initial occupied tunnel failed: %v", err)
+	}
+	defer func() {
+		_ = occupiedTunnel.Close()
+	}()
+
+	rawTunnel := newControlPlaneInboundTestTunnel("inbound-quic-tunnel-duplicate")
+	err := server.registerAcceptedTunnel(rawTunnel, transport.BindingTypeQUICNative)
+	if err == nil {
+		testingObject.Fatalf("expected duplicate quic tunnel registration failure")
+	}
+	if !errors.Is(err, registry.ErrDuplicateTunnelID) {
+		testingObject.Fatalf("unexpected duplicate quic tunnel error: %v", err)
+	}
+	if tunnelRegistry.Snapshot().TotalCount != 1 {
+		testingObject.Fatalf("expected only the occupied tunnel to remain registered")
+	}
+	if metrics.BridgeQUICTunnelRegisteredTotal() != 0 {
+		testingObject.Fatalf(
+			"expected quic tunnel metric unchanged on failed registration, got=%d",
+			metrics.BridgeQUICTunnelRegisteredTotal(),
+		)
+	}
+	if !rawTunnel.closed() {
+		testingObject.Fatalf("expected failed quic tunnel closed immediately")
 	}
 }
 

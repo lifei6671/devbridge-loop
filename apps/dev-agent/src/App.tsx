@@ -39,8 +39,16 @@ import { Toaster } from "@/components/ui/sonner";
 import { useSystemResources } from "@/features/system/use_system_resources";
 import { bytesPerSecToMiB, formatBytesToGiB } from "@/features/traffic/format";
 import { useTrafficStats } from "@/features/traffic/use_traffic_stats";
+import {
+  applyBridgeTransportSelection,
+  buildBridgeTransportAddressMemory,
+  defaultBridgeAddrForTransport,
+  rememberBridgeAddressForTransport,
+  type BridgeTransportAddressMemory,
+} from "@/bridge_transport_memory";
 import { cn } from "@/lib/utils";
 import { registerManagedListener } from "@/runtime_subscription";
+import { createPortal } from "react-dom";
 
 type DesiredState = "running" | "stopped";
 type ExitKind = "expected" | "unexpected";
@@ -83,6 +91,9 @@ interface HostConfigSnapshot {
   agent_id: string;
   bridge_addr: string;
   bridge_transport: string;
+  bridge_tls_enabled: boolean;
+  bridge_tls_root_ca_file: string;
+  bridge_tls_server_name: string;
   tunnel_pool_min_idle: number;
   tunnel_pool_max_idle: number;
   tunnel_pool_max_inflight: number;
@@ -514,6 +525,9 @@ interface HostConfigUpdateInput {
   agent_id: string;
   bridge_addr: string;
   bridge_transport: string;
+  bridge_tls_enabled: boolean;
+  bridge_tls_root_ca_file: string;
+  bridge_tls_server_name: string;
   tunnel_pool_min_idle: number;
   tunnel_pool_max_idle: number;
   tunnel_pool_max_inflight: number;
@@ -536,6 +550,9 @@ interface SettingsDraft {
   agentId: string;
   bridgeAddr: string;
   transport: string;
+  bridgeTLSEnabled: boolean;
+  bridgeTLSRootCAFile: string;
+  bridgeTLSServerName: string;
   authMode: string;
   endpoint: string;
   tunnelPoolMinIdleText: string;
@@ -550,6 +567,11 @@ interface SettingsDraft {
 interface SettingsFieldHelp {
   usage: string;
   impact: string;
+}
+
+interface BridgeTransportGuide {
+  title: string;
+  lines: string[];
 }
 
 interface NavItem {
@@ -589,16 +611,28 @@ const SETTINGS_FIELD_HELP: Record<string, SettingsFieldHelp> = {
     impact: "宿主与内核通信完全依赖该端点，配置错误会导致“已启动但无法连通”。",
   },
   bridgeTransport: {
-    usage: "选择与 Bridge 建链的传输层实现，当前支持 tcp_framed 与 grpc_h2。",
-    impact: "两端协议不一致时会出现认证/握手失败，导致无法建立 control channel。",
+    usage: "选择与 Bridge 建链的传输层实现。切换时会按 transport 自动回填默认地址，若你改过某个 transport 的地址，则会记住并在切回来时恢复。",
+    impact: "本地默认端口按 tcp=39081、grpc_h2=39082、quic=39083 回填；quic_native 仍要求 Bridge TLS、QUIC 端口和 Root CA 已就绪。",
   },
   authMode: {
     usage: "当前为 LocalRPC 的固定鉴权方案，保持只读用于展示。",
     impact: "用于防止本地未授权调用；随意改动会破坏宿主与内核的安全握手。",
   },
   bridgeAddr: {
-    usage: "填写 Bridge 的 host:port 地址，建议使用稳定可达的入口地址。",
-    impact: "决定控制通道与 tunnel 建链目标，错误时会持续重连并触发退避。",
+    usage: "填写 Bridge 的 host:port 地址；未手动设置过某个 transport 时，会自动回填对应默认监听地址。",
+    impact: "地址会按 transport 分别记忆；quic_native 必须指向 Bridge 的 QUIC 监听地址，否则会持续重连并触发退避。",
+  },
+  bridgeTLSEnabled: {
+    usage: "控制 Agent 连接 Bridge 时是否启用 TLS。quic_native 下必须开启。",
+    impact: "关闭后只能使用明文 TCP/gRPC；若 quic_native 仍关闭 TLS，保存时会被拒绝。",
+  },
+  bridgeTLSRootCAFile: {
+    usage: "填写 Bridge TLS Root CA 证书文件路径；启用 TLS 时必填，不要填写私钥路径。",
+    impact: "用于校验 Bridge 服务端证书；managed_ca 下通常应指向 Bridge 控制台日志里的 ca_cert_file / root-ca.crt，路径错误会导致握手失败或持续重连。",
+  },
+  bridgeTLSServerName: {
+    usage: "可选覆盖 TLS Server Name；留空时默认回退到 bridge_addr 的 host。",
+    impact: "用于证书名称校验；当 Bridge 证书 SAN 与访问地址不一致时可在此显式指定。",
   },
   minIdle: {
     usage: "期望常驻的最小空闲 tunnel 数，建议按并发峰值前置预热。",
@@ -711,6 +745,9 @@ function toSettingsDraft(snapshot: HostConfigSnapshot): SettingsDraft {
     agentId: snapshot.agent_id,
     bridgeAddr: snapshot.bridge_addr,
     transport: snapshot.bridge_transport,
+    bridgeTLSEnabled: snapshot.bridge_tls_enabled,
+    bridgeTLSRootCAFile: snapshot.bridge_tls_root_ca_file,
+    bridgeTLSServerName: snapshot.bridge_tls_server_name,
     authMode: authModeFromTransport(snapshot.ipc_transport),
     endpoint: snapshot.ipc_endpoint,
     tunnelPoolMinIdleText: String(snapshot.tunnel_pool_min_idle),
@@ -766,6 +803,10 @@ function parseNonNegativeSecondsToMillis(text: string, fieldLabel: string): numb
   return Math.round(parsedValue * 1000);
 }
 
+function normalizeOptionalText(value: string): string {
+  return value.trim();
+}
+
 function formatTTLSecondsText(ttlMs: number): string {
   if (!Number.isFinite(ttlMs) || ttlMs < 0) {
     return "0";
@@ -813,30 +854,21 @@ function FieldHelpTooltip(props: {
       return;
     }
     const viewportPadding = 12;
-    const horizontalGap = 4;
-    const verticalGap = 0;
+    const verticalGap = 8;
     const triggerRect = triggerRef.current.getBoundingClientRect();
     const preferredWidth = window.innerWidth >= 1024 ? 280 : 260;
     const tooltipWidth = Math.min(preferredWidth, Math.max(180, window.innerWidth - viewportPadding * 2));
-
-    const rightPreferredLeft = triggerRect.right + horizontalGap;
-    const leftPreferredLeft = triggerRect.left - tooltipWidth - horizontalGap;
-    const centerPreferredLeft = triggerRect.left + triggerRect.width / 2 - tooltipWidth / 2;
-    let left = rightPreferredLeft;
-    if (rightPreferredLeft + tooltipWidth > window.innerWidth - viewportPadding) {
-      if (leftPreferredLeft >= viewportPadding) {
-        left = leftPreferredLeft;
-      } else {
-        left = centerPreferredLeft;
-      }
-    }
+    const centeredLeft = triggerRect.left + triggerRect.width / 2 - tooltipWidth / 2;
     const maxLeft = Math.max(viewportPadding, window.innerWidth - viewportPadding - tooltipWidth);
-    left = Math.min(maxLeft, Math.max(viewportPadding, left));
+    const left = Math.min(maxLeft, Math.max(viewportPadding, centeredLeft));
 
     const measuredHeight = tooltipRef.current?.offsetHeight ?? 132;
-    const centerAlignedTop = triggerRect.top + triggerRect.height / 2 - measuredHeight / 2 + verticalGap;
+    const belowTop = triggerRect.bottom + verticalGap;
+    const aboveTop = triggerRect.top - measuredHeight - verticalGap;
     const maxTop = Math.max(viewportPadding, window.innerHeight - viewportPadding - measuredHeight);
-    const top = Math.min(maxTop, Math.max(viewportPadding, centerAlignedTop));
+    const shouldPlaceAbove = belowTop + measuredHeight > window.innerHeight - viewportPadding && aboveTop >= viewportPadding;
+    const preferredTop = shouldPlaceAbove ? aboveTop : belowTop;
+    const top = Math.min(maxTop, Math.max(viewportPadding, preferredTop));
 
     setLayout({ left, top, width: tooltipWidth });
   }, [isOpen]);
@@ -872,55 +904,62 @@ function FieldHelpTooltip(props: {
   }, [isOpen]);
 
   return (
-    <span
-      className="relative inline-flex items-center"
-      onMouseEnter={openTooltip}
-      onMouseLeave={closeTooltip}
-    >
-      <button
-        type="button"
-        ref={triggerRef}
-        aria-label={`${props.label} 配置说明`}
-        aria-describedby={tooltipId}
-        aria-expanded={isOpen}
-        onFocus={openTooltip}
-        onClick={() => {
-          if (isOpen) {
-            closeTooltip();
-          } else {
-            openTooltip();
-          }
-        }}
-        onBlur={closeTooltip}
-        className="inline-flex h-4 w-4 items-center justify-center rounded-full text-[#8a97b0] transition hover:text-[#4a5f86] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea6f3] focus-visible:ring-offset-1"
-      >
-        <CircleHelp className="h-3.5 w-3.5" aria-hidden />
-      </button>
+    <>
       <span
-        ref={tooltipRef}
-        id={tooltipId}
-        role="tooltip"
-        style={
-          layout
-            ? {
-                left: `${layout.left}px`,
-                top: `${layout.top}px`,
-                width: `${layout.width}px`,
-              }
-            : undefined
-        }
-        className={cn(
-          "pointer-events-none fixed z-20 rounded-lg border border-[#314469] bg-[#1f2d49] px-3 py-2.5 text-left shadow-xl transition",
-          layout ? "" : "left-0 top-0",
-          isOpen && layout ? "visible translate-y-0 opacity-100" : "invisible translate-y-0 opacity-0",
-        )}
+        className="relative inline-flex items-center"
+        onMouseEnter={openTooltip}
+        onMouseLeave={closeTooltip}
       >
-        <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">用法</span>
-        <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.usage}</span>
-        <span className="mt-2 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">作用</span>
-        <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.impact}</span>
+        <button
+          type="button"
+          ref={triggerRef}
+          aria-label={`${props.label} 配置说明`}
+          aria-describedby={tooltipId}
+          aria-expanded={isOpen}
+          onFocus={openTooltip}
+          onClick={() => {
+            if (isOpen) {
+              closeTooltip();
+            } else {
+              openTooltip();
+            }
+          }}
+          onBlur={closeTooltip}
+          className="inline-flex h-4 w-4 items-center justify-center rounded-full text-[#8a97b0] transition hover:text-[#4a5f86] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7ea6f3] focus-visible:ring-offset-1"
+        >
+          <CircleHelp className="h-3.5 w-3.5" aria-hidden />
+        </button>
       </span>
-    </span>
+      {typeof document !== "undefined"
+        ? createPortal(
+            <span
+              ref={tooltipRef}
+              id={tooltipId}
+              role="tooltip"
+              style={
+                layout
+                  ? {
+                      left: `${layout.left}px`,
+                      top: `${layout.top}px`,
+                      width: `${layout.width}px`,
+                    }
+                  : undefined
+              }
+              className={cn(
+                "pointer-events-none fixed z-[120] rounded-lg border border-[#314469] bg-[#1f2d49] px-3 py-2.5 text-left shadow-xl transition",
+                layout ? "" : "left-0 top-0",
+                isOpen && layout ? "visible translate-y-0 opacity-100" : "invisible translate-y-0 opacity-0",
+              )}
+            >
+              <span className="block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">用法</span>
+              <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.usage}</span>
+              <span className="mt-2 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[#9fb7e5]">作用</span>
+              <span className="mt-0.5 block text-[11px] leading-[1.5] text-[#edf2ff]">{props.help.impact}</span>
+            </span>,
+            document.body,
+          )
+        : null}
+    </>
   );
 }
 
@@ -1257,6 +1296,9 @@ function formatTransportLabel(protocol: string): string {
   if (normalized === "grpc_h2") {
     return "gRPC h2";
   }
+  if (normalized === "quic_native") {
+    return "QUIC Native";
+  }
   if (normalized === "tcp") {
     return "TCP";
   }
@@ -1267,6 +1309,27 @@ function formatTransportLabel(protocol: string): string {
     return "HTTPS";
   }
   return protocol;
+}
+
+function isQUICNativeTransport(transport: string): boolean {
+  return transport.trim().toLowerCase() === "quic_native";
+}
+
+function buildBridgeTransportGuide(transport: string, bridgeAddr: string): BridgeTransportGuide | null {
+  if (!isQUICNativeTransport(transport)) {
+    return null;
+  }
+  const normalizedBridgeAddr = bridgeAddr.trim();
+  const targetText = normalizedBridgeAddr ? `当前目标：${normalizedBridgeAddr}` : "当前目标：请填写 Bridge 的 QUIC 监听地址";
+  return {
+    title: "QUIC 联调提示",
+    lines: [
+      `${targetText}，应与 Bridge 后台里的 control_plane.quic_listen_addr 保持一致。`,
+      "Bridge 的 control_plane.tls_mode 不能是 plaintext，否则 QUIC listener 不会启动。",
+      "如果 Bridge 使用 external 证书，Agent 所在环境需要预置对应 Root CA 或信任链。",
+      "如果 Bridge 使用 managed_ca，Root CA 仍需带外分发到 Agent，本 UI 不会自动下发信任锚。",
+    ],
+  };
 }
 
 const LOG_LEVEL_RANK: Record<string, number> = {
@@ -1547,6 +1610,7 @@ export default function App(): JSX.Element {
   const [savingSettings, setSavingSettings] = useState(false);
   const [nowTsMs, setNowTsMs] = useState(() => Date.now());
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft | null>(null);
+  const [settingsBridgeAddressMemory, setSettingsBridgeAddressMemory] = useState<BridgeTransportAddressMemory>({});
   const diagnoseFilterSaveSeqRef = useRef(0);
   const diagnoseCodeDropdownRef = useRef<HTMLDivElement | null>(null);
   const shownHostLogToastKeysRef = useRef<Set<string>>(new Set());
@@ -1880,6 +1944,7 @@ export default function App(): JSX.Element {
       return;
     }
     setSettingsDraft(toSettingsDraft(hostConfig));
+    setSettingsBridgeAddressMemory(buildBridgeTransportAddressMemory(hostConfig));
     setDiagnoseCategoryFilter(diagnoseCategoryFilterFromHostConfig(hostConfig));
   }, [hostConfig]);
 
@@ -2334,6 +2399,9 @@ export default function App(): JSX.Element {
       settingsDraft.agentId.trim() !== hostConfig.agent_id ||
       settingsDraft.bridgeAddr.trim() !== hostConfig.bridge_addr ||
       settingsDraft.transport.trim() !== hostConfig.bridge_transport ||
+      settingsDraft.bridgeTLSEnabled !== hostConfig.bridge_tls_enabled ||
+      settingsDraft.bridgeTLSRootCAFile.trim() !== hostConfig.bridge_tls_root_ca_file ||
+      settingsDraft.bridgeTLSServerName.trim() !== hostConfig.bridge_tls_server_name ||
       settingsDraft.endpoint.trim() !== hostConfig.ipc_endpoint ||
       settingsDraft.tunnelPoolMinIdleText.trim() !== String(hostConfig.tunnel_pool_min_idle) ||
       settingsDraft.tunnelPoolMaxIdleText.trim() !== String(hostConfig.tunnel_pool_max_idle) ||
@@ -2344,12 +2412,48 @@ export default function App(): JSX.Element {
       settingsDraft.tunnelPoolReconcileGapMsText.trim() !== String(hostConfig.tunnel_pool_reconcile_gap_ms)
     );
   }, [hostConfig, settingsDraft]);
+  const settingsBridgeTransportGuide = useMemo(
+    () => buildBridgeTransportGuide(settingsDraft?.transport ?? "", settingsDraft?.bridgeAddr ?? ""),
+    [settingsDraft],
+  );
+  const activeBridgeTransportGuide = useMemo(
+    () => buildBridgeTransportGuide(hostConfig?.bridge_transport ?? "", hostConfig?.bridge_addr ?? ""),
+    [hostConfig],
+  );
+
+  const handleBridgeTransportChange = useCallback((nextTransport: string) => {
+    setSettingsDraft((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const nextSelection = applyBridgeTransportSelection({
+        currentTransport: prev.transport,
+        currentBridgeAddr: prev.bridgeAddr,
+        nextTransport,
+        memory: settingsBridgeAddressMemory,
+      });
+      setSettingsBridgeAddressMemory(nextSelection.memory);
+      return {
+        ...prev,
+        transport: nextTransport,
+        bridgeAddr: nextSelection.bridgeAddr,
+      };
+    });
+  }, [settingsBridgeAddressMemory]);
+
+  const handleBridgeAddrChange = useCallback((nextBridgeAddr: string) => {
+    setSettingsDraft((prev) => (prev ? { ...prev, bridgeAddr: nextBridgeAddr } : prev));
+    setSettingsBridgeAddressMemory((prevMemory) =>
+      rememberBridgeAddressForTransport(settingsDraft?.transport ?? "", nextBridgeAddr, prevMemory),
+    );
+  }, [settingsDraft?.transport]);
 
   const resetSettingsDraft = useCallback(() => {
     if (!hostConfig) {
       return;
     }
     setSettingsDraft(toSettingsDraft(hostConfig));
+    setSettingsBridgeAddressMemory(buildBridgeTransportAddressMemory(hostConfig));
   }, [hostConfig]);
 
   const saveSettings = useCallback(async () => {
@@ -2364,6 +2468,9 @@ export default function App(): JSX.Element {
         agent_id: settingsDraft.agentId.trim(),
         bridge_addr: settingsDraft.bridgeAddr.trim(),
         bridge_transport: settingsDraft.transport.trim(),
+        bridge_tls_enabled: settingsDraft.bridgeTLSEnabled,
+        bridge_tls_root_ca_file: normalizeOptionalText(settingsDraft.bridgeTLSRootCAFile),
+        bridge_tls_server_name: normalizeOptionalText(settingsDraft.bridgeTLSServerName),
         tunnel_pool_min_idle: parseNonNegativeInteger(
           settingsDraft.tunnelPoolMinIdleText,
           "tunnel_pool_min_idle",
@@ -2385,6 +2492,7 @@ export default function App(): JSX.Element {
       const snapshot = await invoke<HostConfigSnapshot>("host_config_update", { input: payload });
       setHostConfig(snapshot);
       setSettingsDraft(toSettingsDraft(snapshot));
+      setSettingsBridgeAddressMemory(buildBridgeTransportAddressMemory(snapshot));
       notify("success", "配置保存成功", "已写入本地 YAML 文件，重连/重启后生效");
       await refreshHostLogs();
     } catch (error) {
@@ -3478,20 +3586,16 @@ export default function App(): JSX.Element {
               </SettingsField>
               <SettingsField
                 label="Bridge 传输方式"
-                hint="tcp_framed 与 grpc_h2 已打通（grpc_h2 默认监听 :39082）"
                 help={SETTINGS_FIELD_HELP.bridgeTransport}
               >
                 <select
                   value={settingsDraft.transport}
                   className="h-9 w-full rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]"
-                  onChange={(event) =>
-                    setSettingsDraft((prev) =>
-                      prev ? { ...prev, transport: event.target.value } : prev,
-                    )
-                  }
+                  onChange={(event) => handleBridgeTransportChange(event.target.value)}
                 >
                   <option value="tcp_framed">tcp_framed（已支持）</option>
                   <option value="grpc_h2">grpc_h2（已支持）</option>
+                  <option value="quic_native">quic_native（已支持，需 Bridge TLS）</option>
                 </select>
               </SettingsField>
               <SettingsField label="认证方式" hint="LocalRPC 握手鉴权" help={SETTINGS_FIELD_HELP.authMode}>
@@ -3512,16 +3616,70 @@ export default function App(): JSX.Element {
               <SettingsField label="Bridge 地址" hint="必填" help={SETTINGS_FIELD_HELP.bridgeAddr}>
                 <Input
                   value={settingsDraft.bridgeAddr}
+                  onChange={(event) => handleBridgeAddrChange(event.target.value)}
+                  placeholder={defaultBridgeAddrForTransport(settingsDraft.transport)}
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <div className="space-y-1.5">
+                <div className="flex items-end justify-between gap-3">
+                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[#44516d]">
+                    Bridge TLS
+                    <FieldHelpTooltip label="Bridge TLS" help={SETTINGS_FIELD_HELP.bridgeTLSEnabled} />
+                  </span>
+                  <span className="text-[11px] text-[#8290a8]">quic_native 下必须开启</span>
+                </div>
+                <label className="flex h-9 items-center justify-between rounded-lg border border-[#d8dfeb] bg-white px-3 text-sm text-[#43506b]">
+                  <span>{settingsDraft.bridgeTLSEnabled ? "已启用 TLS" : "明文连接"}</span>
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.bridgeTLSEnabled}
+                    onChange={(event) =>
+                      setSettingsDraft((prev) =>
+                        prev ? { ...prev, bridgeTLSEnabled: event.target.checked } : prev,
+                      )
+                    }
+                  />
+                </label>
+              </div>
+              <SettingsField label="Bridge TLS Root CA" hint="TLS 开启时必填" help={SETTINGS_FIELD_HELP.bridgeTLSRootCAFile}>
+                <Input
+                  value={settingsDraft.bridgeTLSRootCAFile}
                   onChange={(event) =>
                     setSettingsDraft((prev) =>
-                      prev ? { ...prev, bridgeAddr: event.target.value } : prev,
+                      prev ? { ...prev, bridgeTLSRootCAFile: event.target.value } : prev,
                     )
                   }
-                  placeholder="例如：bridge.example.com:443"
+                  placeholder="例如：/etc/devbridge/root-ca.crt"
+                  className="h-9 rounded-lg"
+                />
+              </SettingsField>
+              <SettingsField label="Bridge TLS Server Name" hint="可选覆盖" help={SETTINGS_FIELD_HELP.bridgeTLSServerName}>
+                <Input
+                  value={settingsDraft.bridgeTLSServerName}
+                  onChange={(event) =>
+                    setSettingsDraft((prev) =>
+                      prev ? { ...prev, bridgeTLSServerName: event.target.value } : prev,
+                    )
+                  }
+                  placeholder="例如：bridge.internal.example"
                   className="h-9 rounded-lg"
                 />
               </SettingsField>
             </div>
+            {settingsBridgeTransportGuide ? (
+              <div className="rounded-2xl border border-[#cfe0ff] bg-[#f4f8ff] px-4 py-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-[#1c4d98]">
+                  <ShieldCheck size={16} />
+                  <span>{settingsBridgeTransportGuide.title}</span>
+                </div>
+                <div className="mt-2 space-y-1 text-xs leading-5 text-[#4b5d7f]">
+                  {settingsBridgeTransportGuide.lines.map((line) => (
+                    <p key={line}>{line}</p>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </section>
 
           <section className="space-y-3">
@@ -4042,6 +4200,9 @@ export default function App(): JSX.Element {
             <InfoRow label="Bridge 会话状态" value={sessionStateRaw || "--"} />
             <InfoRow label="Bridge 地址" value={hostConfig?.bridge_addr ?? "--"} valueClassName="text-[#1f67e5]" />
             <InfoRow label="连接协议" value={formatTransportLabel(hostConfig?.bridge_transport ?? "")} />
+            <InfoRow label="Bridge TLS" value={hostConfig?.bridge_tls_enabled ? "已启用" : "未启用"} />
+            <InfoRow label="Root CA" value={hostConfig?.bridge_tls_root_ca_file || "--"} />
+            <InfoRow label="TLS Server Name" value={hostConfig?.bridge_tls_server_name || "--"} />
             <InfoRow
               label="本地 RPC 延迟"
               value={`${(runtimeSnapshot?.metrics.agent_host_rpc_latency_ms ?? 0).toFixed(0)} ms`}
@@ -4062,6 +4223,19 @@ export default function App(): JSX.Element {
           {lastReconnectError ? (
             <div className="rounded-lg border border-[#f1d4d4] bg-[#fff6f6] px-3 py-2.5 text-xs text-[#ba4b4b]">
               最近重连失败原因: {lastReconnectError}
+            </div>
+          ) : null}
+          {activeBridgeTransportGuide ? (
+            <div className="rounded-lg border border-[#cfe0ff] bg-[#f4f8ff] px-3 py-2.5 text-xs text-[#35517f]">
+              <div className="mb-1 inline-flex items-center gap-1.5 font-semibold text-[#1c4d98]">
+                <ShieldCheck size={14} />
+                <span>{activeBridgeTransportGuide.title}</span>
+              </div>
+              <div className="space-y-1">
+                {activeBridgeTransportGuide.lines.map((line) => (
+                  <p key={line}>{line}</p>
+                ))}
+              </div>
             </div>
           ) : null}
           <div className="flex flex-wrap items-center gap-2">

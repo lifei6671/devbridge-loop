@@ -30,6 +30,18 @@ fn default_bridge_transport() -> String {
     "tcp_framed".to_string()
 }
 
+fn default_bridge_addr_for_transport(bridge_transport: &str) -> &'static str {
+    match bridge_transport.trim() {
+        "grpc_h2" => "127.0.0.1:39082",
+        "quic_native" => "127.0.0.1:39083",
+        _ => "127.0.0.1:39081",
+    }
+}
+
+fn is_supported_bridge_transport(bridge_transport: &str) -> bool {
+    matches!(bridge_transport, "tcp_framed" | "grpc_h2" | "quic_native")
+}
+
 fn default_diagnose_category_enabled() -> bool {
     true
 }
@@ -132,6 +144,12 @@ struct PersistedHostRuntimeConfig {
     pub bridge_addr: String,
     #[serde(default = "default_bridge_transport")]
     pub bridge_transport: String,
+    #[serde(default)]
+    pub bridge_tls_enabled: bool,
+    #[serde(default)]
+    pub bridge_tls_root_ca_file: String,
+    #[serde(default)]
+    pub bridge_tls_server_name: String,
     pub tunnel_pool_min_idle: u32,
     pub tunnel_pool_max_idle: u32,
     pub tunnel_pool_max_inflight: u32,
@@ -252,6 +270,9 @@ pub struct HostConfigSnapshot {
     pub agent_id: String,
     pub bridge_addr: String,
     pub bridge_transport: String,
+    pub bridge_tls_enabled: bool,
+    pub bridge_tls_root_ca_file: String,
+    pub bridge_tls_server_name: String,
     pub tunnel_pool_min_idle: u32,
     pub tunnel_pool_max_idle: u32,
     pub tunnel_pool_max_inflight: u32,
@@ -297,6 +318,9 @@ pub struct HostRuntimeConfig {
     pub agent_id: String,
     pub bridge_addr: String,
     pub bridge_transport: String,
+    pub bridge_tls_enabled: bool,
+    pub bridge_tls_root_ca_file: String,
+    pub bridge_tls_server_name: String,
     pub tunnel_pool_min_idle: u32,
     pub tunnel_pool_max_idle: u32,
     pub tunnel_pool_max_inflight: u32,
@@ -521,6 +545,20 @@ impl HostRuntimeConfig {
             .map_err(|err| format!("环境变量 {key} 解析为 u32 失败: {err}"))
     }
 
+    /// 读取 bool 环境变量，缺失时回落默认值，非法值直接报错。
+    fn bool_env_or_default(key: &str, default_value: bool) -> Result<bool, String> {
+        let value = std::env::var(key).unwrap_or_default();
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Ok(default_value);
+        }
+        match normalized.as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            _ => Err(format!("环境变量 {key} 解析为 bool 失败: expect true/false/1/0")),
+        }
+    }
+
     /// 读取 u64 环境变量，缺失时回落默认值，非法值直接报错。
     fn u64_env_or_default(key: &str, default_value: u64) -> Result<u64, String> {
         let value = std::env::var(key).unwrap_or_default();
@@ -582,6 +620,9 @@ impl HostRuntimeConfig {
             } else {
                 payload.bridge_transport.trim().to_string()
             },
+            bridge_tls_enabled: payload.bridge_tls_enabled,
+            bridge_tls_root_ca_file: payload.bridge_tls_root_ca_file.trim().to_string(),
+            bridge_tls_server_name: payload.bridge_tls_server_name.trim().to_string(),
             tunnel_pool_min_idle: payload.tunnel_pool_min_idle,
             tunnel_pool_max_idle: payload.tunnel_pool_max_idle,
             tunnel_pool_max_inflight: payload.tunnel_pool_max_inflight,
@@ -612,6 +653,9 @@ impl HostRuntimeConfig {
             agent_id: self.agent_id.clone(),
             bridge_addr: self.bridge_addr.clone(),
             bridge_transport: self.bridge_transport.clone(),
+            bridge_tls_enabled: self.bridge_tls_enabled,
+            bridge_tls_root_ca_file: self.bridge_tls_root_ca_file.clone(),
+            bridge_tls_server_name: self.bridge_tls_server_name.clone(),
             tunnel_pool_min_idle: self.tunnel_pool_min_idle,
             tunnel_pool_max_idle: self.tunnel_pool_max_idle,
             tunnel_pool_max_inflight: self.tunnel_pool_max_inflight,
@@ -726,8 +770,14 @@ impl HostRuntimeConfig {
         if bridge_transport.is_empty() {
             return Err("bridge_transport 不能为空".to_string());
         }
-        if !matches!(bridge_transport, "tcp_framed" | "grpc_h2") {
+        if !is_supported_bridge_transport(bridge_transport) {
             return Err(format!("bridge_transport 不支持: {bridge_transport}"));
+        }
+        if self.bridge_tls_enabled && self.bridge_tls_root_ca_file.trim().is_empty() {
+            return Err("bridge_tls.root_ca_file 不能为空".to_string());
+        }
+        if bridge_transport == "quic_native" && !self.bridge_tls_enabled {
+            return Err("bridge_transport=quic_native requires bridge_tls.enabled=true".to_string());
         }
         if self.tunnel_pool_max_idle == 0 {
             return Err("tunnel_pool_max_idle 必须大于 0".to_string());
@@ -774,17 +824,27 @@ impl HostRuntimeConfig {
             ipc_endpoint_env.trim().to_string()
         };
 
+        let bridge_transport = Self::string_env_or_default(
+            "DEV_AGENT_CFG_BRIDGE_TRANSPORT",
+            &default_bridge_transport(),
+        );
         let config = Self {
             runtime_program,
             runtime_args,
             agent_id: Self::string_env_or_default("DEV_AGENT_CFG_AGENT_ID", "agent-local"),
             bridge_addr: Self::string_env_or_default(
                 "DEV_AGENT_CFG_BRIDGE_ADDR",
-                "127.0.0.1:39080",
+                default_bridge_addr_for_transport(&bridge_transport),
             ),
-            bridge_transport: Self::string_env_or_default(
-                "DEV_AGENT_CFG_BRIDGE_TRANSPORT",
-                &default_bridge_transport(),
+            bridge_transport,
+            bridge_tls_enabled: Self::bool_env_or_default("DEV_AGENT_CFG_BRIDGE_TLS_ENABLED", false)?,
+            bridge_tls_root_ca_file: Self::string_env_or_default(
+                "DEV_AGENT_CFG_BRIDGE_TLS_ROOT_CA_FILE",
+                "",
+            ),
+            bridge_tls_server_name: Self::string_env_or_default(
+                "DEV_AGENT_CFG_BRIDGE_TLS_SERVER_NAME",
+                "",
             ),
             tunnel_pool_min_idle: Self::u32_env_or_default(
                 "DEV_AGENT_CFG_TUNNEL_POOL_MIN_IDLE",
@@ -851,6 +911,9 @@ impl HostRuntimeConfig {
             agent_id: self.agent_id.clone(),
             bridge_addr: self.bridge_addr.clone(),
             bridge_transport: self.bridge_transport.clone(),
+            bridge_tls_enabled: self.bridge_tls_enabled,
+            bridge_tls_root_ca_file: self.bridge_tls_root_ca_file.clone(),
+            bridge_tls_server_name: self.bridge_tls_server_name.clone(),
             tunnel_pool_min_idle: self.tunnel_pool_min_idle,
             tunnel_pool_max_idle: self.tunnel_pool_max_idle,
             tunnel_pool_max_inflight: self.tunnel_pool_max_inflight,
@@ -1227,8 +1290,11 @@ mod tests {
             runtime_program: PathBuf::from("/tmp/agent-core"),
             runtime_args: vec![],
             agent_id: "agent-local".to_string(),
-            bridge_addr: "127.0.0.1:39080".to_string(),
+            bridge_addr: "127.0.0.1:39081".to_string(),
             bridge_transport: "tcp_framed".to_string(),
+            bridge_tls_enabled: false,
+            bridge_tls_root_ca_file: String::new(),
+            bridge_tls_server_name: String::new(),
             tunnel_pool_min_idle: 8,
             tunnel_pool_max_idle: 32,
             tunnel_pool_max_inflight: 4,
@@ -1280,11 +1346,80 @@ mod tests {
     }
 
     #[test]
-    fn validate_agent_runtime_fields_rejects_unwired_bridge_transport() {
+    fn validate_agent_runtime_fields_accepts_quic_bridge_transport() {
         let mut runtime_config = build_valid_runtime_config();
         runtime_config.bridge_transport = "quic_native".to_string();
+        runtime_config.bridge_tls_enabled = true;
+        runtime_config.bridge_tls_root_ca_file = "/etc/devbridge/root-ca.crt".to_string();
+        let validate_result = runtime_config.validate_agent_runtime_fields();
+        assert!(validate_result.is_ok());
+    }
+
+    #[test]
+    fn validate_agent_runtime_fields_rejects_quic_without_bridge_tls() {
+        let mut runtime_config = build_valid_runtime_config();
+        runtime_config.bridge_transport = "quic_native".to_string();
+        runtime_config.bridge_tls_enabled = false;
+        runtime_config.bridge_tls_root_ca_file = String::new();
         let validate_result = runtime_config.validate_agent_runtime_fields();
         assert!(validate_result.is_err());
+    }
+
+    #[test]
+    fn validate_agent_runtime_fields_rejects_bridge_tls_without_root_ca() {
+        let mut runtime_config = build_valid_runtime_config();
+        runtime_config.bridge_tls_enabled = true;
+        runtime_config.bridge_tls_root_ca_file = String::new();
+        let validate_result = runtime_config.validate_agent_runtime_fields();
+        assert!(validate_result.is_err());
+    }
+
+    #[test]
+    fn from_env_defaults_only_uses_tcp_bridge_default_addr() {
+        std::env::set_var("DEV_AGENT_RUNTIME_BIN", "/tmp/agent-core");
+        std::env::remove_var("DEV_AGENT_RUNTIME_ARGS");
+        std::env::remove_var("DEV_AGENT_IPC_ENDPOINT");
+        std::env::remove_var("DEV_AGENT_CFG_BRIDGE_ADDR");
+        std::env::remove_var("DEV_AGENT_CFG_BRIDGE_TRANSPORT");
+
+        let runtime_config =
+            HostRuntimeConfig::from_env_defaults_only().expect("读取默认配置失败");
+        assert_eq!(runtime_config.bridge_transport, "tcp_framed");
+        assert_eq!(runtime_config.bridge_addr, "127.0.0.1:39081");
+    }
+
+    #[test]
+    fn persisted_runtime_config_round_trip_preserves_bridge_tls_fields() {
+        let mut runtime_config = build_valid_runtime_config();
+        runtime_config.bridge_transport = "quic_native".to_string();
+        runtime_config.bridge_tls_enabled = true;
+        runtime_config.bridge_tls_root_ca_file = "/etc/devbridge/root-ca.crt".to_string();
+        runtime_config.bridge_tls_server_name = "bridge.internal.example".to_string();
+
+        let persisted = runtime_config.to_persisted_file();
+        assert!(persisted.bridge_tls_enabled);
+        assert_eq!(persisted.bridge_tls_root_ca_file, "/etc/devbridge/root-ca.crt");
+        assert_eq!(persisted.bridge_tls_server_name, "bridge.internal.example");
+
+        let restored = HostRuntimeConfig::from_persisted_file(persisted)
+            .expect("持久化配置回读失败");
+        assert!(restored.bridge_tls_enabled);
+        assert_eq!(restored.bridge_tls_root_ca_file, "/etc/devbridge/root-ca.crt");
+        assert_eq!(restored.bridge_tls_server_name, "bridge.internal.example");
+        assert_eq!(restored.bridge_transport, "quic_native");
+    }
+
+    #[test]
+    fn host_runtime_snapshot_includes_bridge_tls_fields() {
+        let mut runtime_config = build_valid_runtime_config();
+        runtime_config.bridge_tls_enabled = true;
+        runtime_config.bridge_tls_root_ca_file = "/etc/devbridge/root-ca.crt".to_string();
+        runtime_config.bridge_tls_server_name = "bridge.internal.example".to_string();
+
+        let snapshot = runtime_config.to_snapshot();
+        assert!(snapshot.bridge_tls_enabled);
+        assert_eq!(snapshot.bridge_tls_root_ca_file, "/etc/devbridge/root-ca.crt");
+        assert_eq!(snapshot.bridge_tls_server_name, "bridge.internal.example");
     }
 
     #[cfg(unix)]

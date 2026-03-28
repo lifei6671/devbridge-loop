@@ -72,8 +72,14 @@ type Config struct {
 	FallbackPolicies []pb.ScopeFallbackPolicy `yaml:"fallback_policies"`
 	// RuntimeConfigFilePath 记录用户目录配置文件路径（仅运行时使用，不参与 YAML 编解码）。
 	RuntimeConfigFilePath string `yaml:"-"`
-	// RuntimeBaseConfigFilePath 记录系统/显式基础配置文件路径（仅运行时使用，不参与 YAML 编解码）。
+	// RuntimeBaseConfigFilePath 记录当前最高优先级基础配置文件路径（仅运行时使用，不参与 YAML 编解码）。
 	RuntimeBaseConfigFilePath string `yaml:"-"`
+	// RuntimeSystemConfigFilePath 记录系统目录配置文件路径（仅运行时使用，不参与 YAML 编解码）。
+	RuntimeSystemConfigFilePath string `yaml:"-"`
+	// RuntimeLocalConfigFilePath 记录程序运行目录配置文件路径（仅运行时使用，不参与 YAML 编解码）。
+	RuntimeLocalConfigFilePath string `yaml:"-"`
+	// RuntimeExplicitConfigFilePath 记录显式 -config 配置文件路径（仅运行时使用，不参与 YAML 编解码）。
+	RuntimeExplicitConfigFilePath string `yaml:"-"`
 }
 
 type IngressConfig struct {
@@ -318,7 +324,7 @@ func DefaultConfig() Config {
 		},
 		Admin: AdminConfig{
 			Enabled:             true,
-			ListenAddr:          ":39081",
+			ListenAddr:          ":39080",
 			AllowSharedListener: false,
 			BasePath:            "/admin",
 			UIEnabled:           true,
@@ -356,8 +362,8 @@ func DefaultConfig() Config {
 			CSRFCookieName:    "devbridge_admin_csrf",
 			CSRFHeaderName:    "X-CSRF-Token",
 			AllowedOrigins: []string{
-				"http://127.0.0.1:39081",
-				"http://localhost:39081",
+				"http://127.0.0.1:39080",
+				"http://localhost:39080",
 			},
 		},
 		Observability: ObservabilityConfig{
@@ -365,7 +371,7 @@ func DefaultConfig() Config {
 			LogLevel:    "info",
 		},
 		ControlPlane: ControlPlaneConfig{
-			ListenAddr:               ":39080",
+			ListenAddr:               ":39081",
 			GRPCH2ListenAddr:         ":39082",
 			QUICListenAddr:           ":39083",
 			HeartbeatTimeout:         30 * time.Second,

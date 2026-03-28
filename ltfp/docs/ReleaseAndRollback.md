@@ -46,3 +46,17 @@ LTFP_REQUIRE_CROSS_MODULE=1 ./scripts/verify_release.sh
 - 现网已发送 payload 不因字段回退导致解码失败。
 - 关键错误码语义保持稳定，不出现错误分类漂移。
 
+## QUIC 接入灰度与回退补充（跨模块）
+
+当 `ltfp` 的 `quic_native` binding 与 `agent-core` / `cloud-bridge` 联动发布时，
+补充遵循以下规则：
+
+1. 默认路径保持不变，只允许通过显式配置把单个 Agent 切到 `quic_native`。
+2. Bridge 侧先开 QUIC listener，再逐个切 Agent；不要先全量切 Agent 再补 Bridge。
+3. 快速回退优先走 Agent 侧：把 `bridge_transport` 从 `quic_native` 改回 `grpc_h2`，
+   并把目标地址切回 `grpc_h2_listen_addr`，避免为回退再改 Bridge 运行参数。
+4. 是否彻底关闭 Bridge QUIC listener 应作为单独运维动作处理，不耦合到单 Agent 回退。
+
+详细运行示例与操作步骤以
+[Agent-Bridge-QUIC-Implementation-Plan.md](../../docs/Agent-Bridge-QUIC-Implementation-Plan.md)
+中的“QUIC 配置示例”“灰度、回退与运维检查项”为准。

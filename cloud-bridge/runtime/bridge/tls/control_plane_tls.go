@@ -85,6 +85,17 @@ func buildControlPlaneServerTLSConfigFromCertificate(certificate tls.Certificate
 	}
 }
 
+// buildControlPlaneQUICServerTLSConfig 基于控制面通用 TLS 配置生成 QUIC 专用副本。
+func buildControlPlaneQUICServerTLSConfig(baseConfig *tls.Config) *tls.Config {
+	if baseConfig == nil {
+		return nil
+	}
+	clonedConfig := baseConfig.Clone()
+	// QUIC 需要由 quicbinding 注入自己的 ALPN，不能沿用 gRPC 的 h2。
+	clonedConfig.NextProtos = nil
+	return clonedConfig
+}
+
 // acceptControlPlaneConnWithTLS 根据 tls_mode 判定入站连接是否需要 TLS 握手。
 func acceptControlPlaneConnWithTLS(
 	rawConn net.Conn,

@@ -35,6 +35,7 @@ export function buildDetailSummaryRows(
     return [
       { label: "Session ID", hint: "会话唯一标识。", value: readText(record, "session_id") },
       { label: "Connector", hint: "所属连接器 ID。", value: readText(record, "connector_id") },
+      { label: "Binding", hint: "当前会话协商出的传输 binding。", value: readText(record, "binding", "--") },
       { label: "Epoch", hint: "会话代际，重建时递增。", value: readText(record, "epoch", "0") },
       { label: "State", hint: "会话当前状态。", value: readText(record, "state") },
       { label: "Last Heartbeat", hint: "最近一次心跳上报时间。", value: asPrettyTime(readNumber(record, "last_heartbeat_ms")) },
@@ -45,6 +46,7 @@ export function buildDetailSummaryRows(
     { label: "Tunnel ID", hint: "隧道实例唯一标识。", value: readTunnelID(record) },
     { label: "Connector", hint: "隧道所属连接器 ID。", value: readText(record, "connector_id") },
     { label: "Session", hint: "隧道所属会话 ID。", value: readText(record, "session_id") },
+    { label: "Binding", hint: "当前 tunnel 绑定的传输类型。", value: readText(record, "binding", "--") },
     { label: "Traffic", hint: "当前关联的流量请求 ID。", value: readText(record, "traffic_id", "--") },
     { label: "State", hint: "隧道当前状态。", value: readText(record, "state") },
     { label: "Updated", hint: "最近一次状态更新时间。", value: asPrettyTime(readNumber(record, "updated_at_ms")) },

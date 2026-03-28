@@ -37,6 +37,14 @@ const (
 	MetricBridgeTLSRejectTLSOnPlaintextTotal = "bridge_tls_reject_tls_on_plaintext_total"
 	// MetricBridgeTunnelRecycleFailureTotal 统计 tunnel recycle 失败次数。
 	MetricBridgeTunnelRecycleFailureTotal = "bridge_tunnel_recycle_failure_total"
+	// MetricBridgeQUICConnectionAcceptTotal 统计 QUIC 入站连接累计接入次数。
+	MetricBridgeQUICConnectionAcceptTotal = "bridge_quic_connection_accept_total"
+	// MetricBridgeQUICConnectionActive 表示当前活跃的 QUIC 控制连接数量。
+	MetricBridgeQUICConnectionActive = "bridge_quic_connection_active"
+	// MetricBridgeQUICConnectionAuthenticatedTotal 统计 QUIC 连接认证成功次数。
+	MetricBridgeQUICConnectionAuthenticatedTotal = "bridge_quic_connection_authenticated_total"
+	// MetricBridgeQUICTunnelRegisteredTotal 统计 QUIC tunnel 入库次数。
+	MetricBridgeQUICTunnelRegisteredTotal = "bridge_quic_tunnel_registered_total"
 	// MetricBridgeServicePublishTotal 统计服务池维度发布次数。
 	MetricBridgeServicePublishTotal = "bridge_service_publish_total"
 	// MetricBridgeServiceInstancePublishTotal 统计实例维度发布次数。
@@ -83,6 +91,10 @@ type Metrics struct {
 	bridgeTLSRejectPlaintextOnRequiredTot atomic.Uint64
 	bridgeTLSRejectTLSOnPlaintextTot      atomic.Uint64
 	bridgeTunnelRecycleFailureTot         atomic.Uint64
+	bridgeQUICConnectionAcceptTot         atomic.Uint64
+	bridgeQUICConnectionActive            atomic.Int64
+	bridgeQUICConnectionAuthenticatedTot  atomic.Uint64
+	bridgeQUICTunnelRegisteredTot         atomic.Uint64
 
 	authErrorCodeMu     sync.Mutex
 	authErrorCodeTotals map[string]uint64
@@ -391,6 +403,74 @@ func (metrics *Metrics) BridgeTunnelRecycleFailureTotal() uint64 {
 		return 0
 	}
 	return metrics.bridgeTunnelRecycleFailureTot.Load()
+}
+
+// IncBridgeQUICConnectionAcceptTotal 增加一次 QUIC 入站连接接入计数。
+func (metrics *Metrics) IncBridgeQUICConnectionAcceptTotal() {
+	if metrics == nil {
+		return
+	}
+	metrics.bridgeQUICConnectionAcceptTot.Add(1)
+}
+
+// BridgeQUICConnectionAcceptTotal 返回 QUIC 入站连接累计接入次数。
+func (metrics *Metrics) BridgeQUICConnectionAcceptTotal() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.bridgeQUICConnectionAcceptTot.Load()
+}
+
+// AddBridgeQUICConnectionActive 按增量更新当前活跃 QUIC 连接数。
+func (metrics *Metrics) AddBridgeQUICConnectionActive(delta int64) {
+	if metrics == nil || delta == 0 {
+		return
+	}
+	updatedValue := metrics.bridgeQUICConnectionActive.Add(delta)
+	if updatedValue >= 0 {
+		return
+	}
+	metrics.bridgeQUICConnectionActive.Store(0)
+}
+
+// BridgeQUICConnectionActive 返回当前活跃 QUIC 控制连接数。
+func (metrics *Metrics) BridgeQUICConnectionActive() int64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.bridgeQUICConnectionActive.Load()
+}
+
+// IncBridgeQUICConnectionAuthenticatedTotal 增加一次 QUIC 认证成功计数。
+func (metrics *Metrics) IncBridgeQUICConnectionAuthenticatedTotal() {
+	if metrics == nil {
+		return
+	}
+	metrics.bridgeQUICConnectionAuthenticatedTot.Add(1)
+}
+
+// BridgeQUICConnectionAuthenticatedTotal 返回 QUIC 认证成功累计值。
+func (metrics *Metrics) BridgeQUICConnectionAuthenticatedTotal() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.bridgeQUICConnectionAuthenticatedTot.Load()
+}
+
+// IncBridgeQUICTunnelRegisteredTotal 增加一次 QUIC tunnel 入库计数。
+func (metrics *Metrics) IncBridgeQUICTunnelRegisteredTotal() {
+	if metrics == nil {
+		return
+	}
+	metrics.bridgeQUICTunnelRegisteredTot.Add(1)
+}
+
+// BridgeQUICTunnelRegisteredTotal 返回 QUIC tunnel 入库累计值。
+func (metrics *Metrics) BridgeQUICTunnelRegisteredTotal() uint64 {
+	if metrics == nil {
+		return 0
+	}
+	return metrics.bridgeQUICTunnelRegisteredTot.Load()
 }
 
 // BridgeTunnelRecycleErrorCodeTotal 返回指定 recycle 错误码的累计值。

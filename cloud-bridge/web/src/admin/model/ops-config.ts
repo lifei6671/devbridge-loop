@@ -2,7 +2,7 @@ import { asRecord, isRecord, readNumber, readText } from "./records";
 import type { ApiRecord } from "./types";
 
 export type OpsConfigFieldKind = "text" | "boolean" | "select" | "number";
-export type OpsConfigSource = "default" | "env" | "system" | "user";
+export type OpsConfigSource = "default" | "env" | "explicit" | "local" | "system" | "user";
 export type OpsConfigSourceBadgeVariant =
   | "default"
   | "secondary"
@@ -38,6 +38,8 @@ export type OpsConfigSection = {
 const sourceLabelMap: Record<OpsConfigSource, string> = {
   default: "默认值",
   env: "环境变量",
+  explicit: "显式配置",
+  local: "程序目录",
   system: "系统目录",
   user: "用户目录",
 };
@@ -45,9 +47,26 @@ const sourceLabelMap: Record<OpsConfigSource, string> = {
 const sourceBadgeVariantMap: Record<OpsConfigSource, OpsConfigSourceBadgeVariant> = {
   default: "outline",
   env: "warning",
+  explicit: "danger",
+  local: "secondary",
   system: "secondary",
   user: "success",
 };
+
+const externalOnlyFieldKeys = new Set([
+  "control_plane.tls_cert_file",
+  "control_plane.tls_key_file",
+]);
+
+const managedCAOnlyFieldKeys = new Set([
+  "control_plane.tls_ca_cert_file",
+  "control_plane.tls_ca_key_file",
+  "control_plane.tls_server_common_name",
+  "control_plane.tls_server_san_dns",
+  "control_plane.tls_server_san_ips",
+  "control_plane.tls_server_cert_ttl_ms",
+  "control_plane.tls_server_cert_renew_before_ms",
+]);
 
 export const opsConfigSections: OpsConfigSection[] = [
   {
@@ -130,7 +149,7 @@ export const opsConfigSections: OpsConfigSection[] = [
         label: "后台监听地址",
         description: "控制管理后台监听端口。",
         impact: "修改后会影响后台访问地址，通常需要重启生效。",
-        placeholder: ":39081",
+        placeholder: ":39080",
         restartRequired: true,
       },
       {
@@ -163,7 +182,7 @@ export const opsConfigSections: OpsConfigSection[] = [
   {
     key: "control-plane",
     title: "控制面",
-    description: "Bridge 控制面监听和心跳策略。",
+    description: "Bridge 控制面监听、QUIC 入口和基础 TLS 策略。",
     fields: [
       {
         key: "control_plane.listen_addr",
@@ -171,7 +190,7 @@ export const opsConfigSections: OpsConfigSection[] = [
         label: "控制面监听地址",
         description: "控制 LTFP 控制面监听地址。",
         impact: "会影响 Agent/Bridge 建链入口，通常需要重启生效。",
-        placeholder: ":39080",
+        placeholder: ":39081",
         restartRequired: true,
       },
       {
@@ -184,12 +203,136 @@ export const opsConfigSections: OpsConfigSection[] = [
         restartRequired: true,
       },
       {
+        key: "control_plane.quic_listen_addr",
+        kind: "text",
+        label: "QUIC 监听地址",
+        description: "控制 `quic_native` 控制链路的 UDP 监听地址。",
+        impact: "会影响 Agent 通过 QUIC 接入 Bridge 的端口，通常需要重启生效。",
+        placeholder: ":39083",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_mode",
+        kind: "select",
+        label: "TLS 模式",
+        description: "控制控制面是否要求 TLS；QUIC listener 依赖非 plaintext 模式。",
+        impact: "会影响 Agent 是否必须启用 TLS，以及 QUIC listener 能否启动，通常需要重启生效。",
+        options: [
+          { label: "Plaintext only", value: "plaintext" },
+          { label: "TLS optional", value: "optional" },
+          { label: "TLS required", value: "required" },
+        ],
+        restartRequired: true,
+      },
+      {
         key: "control_plane.heartbeat_timeout_ms",
         kind: "number",
         label: "心跳超时",
         description: "控制会话失活前允许的心跳超时窗口。",
         impact: "窗口越小故障收敛越快，但误判风险也更高，通常需要重启生效。",
         placeholder: "30000",
+        restartRequired: true,
+        unit: "ms",
+      },
+    ],
+  },
+  {
+    key: "control-plane-tls",
+    title: "控制面证书",
+    description: "Bridge 控制面证书来源、签发和续签策略。",
+    fields: [
+      {
+        key: "control_plane.tls_cert_source",
+        kind: "select",
+        label: "证书来源",
+        description: "控制 TLS 证书来自外部文件还是 Bridge 自管 CA；首次切到 managed_ca 时，留空字段会自动补到当前可编辑配置文件所在目录的默认 CA 路径与本地联调 SAN。",
+        impact: "会改变控制面证书加载与续签方式，通常需要重启生效。",
+        options: [
+          { label: "External cert/key", value: "external" },
+          { label: "Managed CA", value: "managed_ca" },
+        ],
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_cert_file",
+        kind: "text",
+        label: "服务端证书文件",
+        description: "external 模式下使用的服务端证书路径。",
+        impact: "TLS 启用且 cert_source=external 时必填，通常需要重启生效。",
+        placeholder: "/etc/devbridge/bridge-server.crt",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_key_file",
+        kind: "text",
+        label: "服务端私钥文件",
+        description: "external 模式下使用的服务端私钥路径。",
+        impact: "TLS 启用且 cert_source=external 时必填，通常需要重启生效。",
+        placeholder: "/etc/devbridge/bridge-server.key",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_ca_cert_file",
+        kind: "text",
+        label: "CA 证书文件",
+        description: "managed_ca 模式下使用的根 CA 证书路径；留空时首次保存会自动补到当前可编辑配置文件同目录的 `root-ca.crt`。",
+        impact: "Bridge 自签发服务端证书时必填，通常需要重启生效。",
+        placeholder: "/etc/devbridge/root-ca.crt",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_ca_key_file",
+        kind: "text",
+        label: "CA 私钥文件",
+        description: "managed_ca 模式下使用的根 CA 私钥路径；留空时首次保存会自动补到当前可编辑配置文件同目录的 `root-ca.key`。",
+        impact: "Bridge 自签发服务端证书时必填，通常需要重启生效。",
+        placeholder: "/etc/devbridge/root-ca.key",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_server_common_name",
+        kind: "text",
+        label: "服务端证书 CN",
+        description: "managed_ca 模式下新签发服务端证书的 Common Name；留空时会优先回退到自动补齐的 SAN 标识。",
+        impact: "会影响证书主题信息；建议与管理域名或标识保持一致，通常需要重启生效。",
+        placeholder: "bridge.dev.local",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_server_san_dns",
+        kind: "text",
+        label: "服务端 SAN DNS",
+        description: "managed_ca 模式下的 DNS SAN，多个值使用逗号分隔；若 DNS/IP SAN 都留空，会自动回退到 `localhost`。",
+        impact: "Agent 按域名校验证书时依赖这里的 SAN，通常需要重启生效。",
+        placeholder: "bridge.dev.local,bridge.internal",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_server_san_ips",
+        kind: "text",
+        label: "服务端 SAN IP",
+        description: "managed_ca 模式下的 IP SAN，多个值使用逗号分隔；若 DNS/IP SAN 都留空，会自动回退到 `127.0.0.1`。",
+        impact: "Agent 按 IP 直连校验证书时依赖这里的 SAN，通常需要重启生效。",
+        placeholder: "127.0.0.1,10.0.0.5",
+        restartRequired: true,
+      },
+      {
+        key: "control_plane.tls_server_cert_ttl_ms",
+        kind: "number",
+        label: "服务端证书 TTL",
+        description: "managed_ca 模式下新签发服务端证书的有效期。",
+        impact: "值越大轮换越少，值越小续签越频繁，通常需要重启生效。",
+        placeholder: "604800000",
+        restartRequired: true,
+        unit: "ms",
+      },
+      {
+        key: "control_plane.tls_server_cert_renew_before_ms",
+        kind: "number",
+        label: "续签提前量",
+        description: "managed_ca 模式下距到期多久开始续签服务端证书。",
+        impact: "过大可能导致频繁续签，过小可能压缩故障缓冲，通常需要重启生效。",
+        placeholder: "86400000",
         restartRequired: true,
         unit: "ms",
       },
@@ -271,13 +414,31 @@ export function buildOpsConfigDraft(snapshot: ApiRecord): Record<string, unknown
   return draft;
 }
 
+export function isOpsConfigFieldVisible(
+  draft: Record<string, unknown>,
+  field: OpsConfigField
+): boolean {
+  const tlsCertSource = String(draft["control_plane.tls_cert_source"] ?? "").trim().toLowerCase();
+  if (tlsCertSource === "managed_ca" && externalOnlyFieldKeys.has(field.key)) {
+    return false;
+  }
+  if (tlsCertSource === "external" && managedCAOnlyFieldKeys.has(field.key)) {
+    return false;
+  }
+  return true;
+}
+
 export function readOpsConfigSource(snapshot: ApiRecord, fieldKey: string): string {
   const sourceRecord = asRecord(snapshot.field_sources);
   return readText(sourceRecord, fieldKey, "default");
 }
 
-export function readEditableUserPatch(snapshot: ApiRecord): Record<string, unknown> {
-  return asRecord(snapshot.editable_user_patch);
+export function readEditableConfigFilePatch(snapshot: ApiRecord): Record<string, unknown> {
+  return asRecord(snapshot.editable_file_patch);
+}
+
+export function readOpsConfigFileSource(snapshot: ApiRecord): string {
+  return readText(snapshot, "config_file_source", "user");
 }
 
 export type OpsConfigRestorePreview = {
@@ -287,6 +448,7 @@ export type OpsConfigRestorePreview = {
 
 export type OpsConfigChangePreview = {
   currentText: string;
+  nextSource: string;
   nextText: string;
   nextLabel: string;
   note: string;
@@ -316,7 +478,7 @@ export function getOpsConfigSourceBadgeVariant(source: string): OpsConfigSourceB
 
 export function getOpsConfigHelpText(field: OpsConfigField): string {
   const effectLabel = field.restartRequired === true ? "通常需要重启生效" : "通常可即时生效";
-  return `${field.description} 影响：${field.impact} 生效方式：${effectLabel} 优先级：环境变量 > 用户目录 > 系统目录 > 默认值。`;
+  return `${field.description} 影响：${field.impact} 生效方式：${effectLabel} 优先级：显式 -config > 环境变量 > 程序运行目录 > 用户目录 > 系统目录 > 默认值。`;
 }
 
 export function isOpsConfigFieldDirty(
@@ -343,6 +505,7 @@ export function buildOpsConfigPatch(
 export function buildOpsConfigChangePreview(
   field: OpsConfigField,
   source: string,
+  saveTargetSource: string,
   currentValue: unknown,
   nextValue: unknown
 ): OpsConfigChangePreview | null {
@@ -351,19 +514,22 @@ export function buildOpsConfigChangePreview(
   }
   const normalizedSource = normalizeOpsConfigSource(source);
   const normalizedNextValue = normalizeOpsConfigValue(field, nextValue);
+  const nextLabel = formatOpsConfigSource(saveTargetSource);
   if (normalizedSource === "env") {
     return {
       currentText: formatOpsConfigFieldValue(field, currentValue),
       nextText: formatOpsConfigFieldValue(field, normalizedNextValue),
-      nextLabel: "用户目录",
-      note: "环境变量仍会覆盖当前生效值，这次保存只会写入用户目录 override。",
+      nextSource: saveTargetSource,
+      nextLabel,
+      note: `环境变量仍会覆盖当前生效值，这次保存只会写入${nextLabel}配置文件。`,
     };
   }
   return {
     currentText: formatOpsConfigFieldValue(field, currentValue),
     nextText: formatOpsConfigFieldValue(field, normalizedNextValue),
-    nextLabel: "保存后",
-    note: "保存后生效值会按用户目录 override 更新。",
+    nextSource: saveTargetSource,
+    nextLabel,
+    note: `保存后生效值会按${nextLabel}配置更新。`,
   };
 }
 
@@ -456,7 +622,7 @@ function readNestedConfigValue(record: ApiRecord, dottedPath: string): unknown {
 }
 
 function normalizeOpsConfigSource(source: string): OpsConfigSource {
-  if (source === "env" || source === "system" || source === "user") {
+  if (source === "env" || source === "explicit" || source === "local" || source === "system" || source === "user") {
     return source;
   }
   return "default";
@@ -586,4 +752,3 @@ function formatYAMLKey(key: string): string {
   const safeKeyPattern = /^[A-Za-z0-9_.-]+$/;
   return safeKeyPattern.test(key) === true ? key : JSON.stringify(key);
 }
-

@@ -160,6 +160,7 @@ export function TrafficPage(props: TrafficPageProps) {
                 <th>Tunnel ID</th>
                 <th>Connector</th>
                 <th>Session</th>
+                <th>Binding</th>
                 <th>Traffic</th>
                 <th>State</th>
                 <th>Last Error</th>
@@ -182,6 +183,7 @@ export function TrafficPage(props: TrafficPageProps) {
                   <td>{readTunnelID(item)}</td>
                   <td>{readText(item, "connector_id")}</td>
                   <td>{readText(item, "session_id")}</td>
+                  <td>{readText(item, "binding", "--")}</td>
                   <td>{readText(item, "traffic_id", "--")}</td>
                   <td>
                     <StatePill label={readText(item, "state", "unknown")} />
@@ -204,7 +206,7 @@ export function TrafficPage(props: TrafficPageProps) {
               ))}
               {tunnelItems.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="empty-cell">
+                  <td colSpan={9} className="empty-cell">
                     {getEmptyTunnelMessage(props.vm)}
                   </td>
                 </tr>

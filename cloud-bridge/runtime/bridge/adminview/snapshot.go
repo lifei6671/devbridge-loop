@@ -145,6 +145,10 @@ type TrafficSummarySnapshot struct {
 	TLSRejectPlaintextOnRequiredTotal uint64            `json:"tls_reject_plaintext_on_required_total"`
 	TLSRejectTLSOnPlaintextTotal      uint64            `json:"tls_reject_tls_on_plaintext_total"`
 	TunnelRecycleFailureTotal         uint64            `json:"tunnel_recycle_failure_total"`
+	QUICConnectionAcceptTotal         uint64            `json:"quic_connection_accept_total"`
+	QUICConnectionActive              int64             `json:"quic_connection_active"`
+	QUICConnectionAuthenticatedTotal  uint64            `json:"quic_connection_authenticated_total"`
+	QUICTunnelRegisteredTotal         uint64            `json:"quic_tunnel_registered_total"`
 	AuthErrorCodeTotals               map[string]uint64 `json:"auth_error_code_totals"`
 	TunnelRecycleErrorCodeTotals      map[string]uint64 `json:"tunnel_recycle_error_code_totals"`
 	UpdatedAtMS                       uint64            `json:"updated_at_ms"`
@@ -711,6 +715,10 @@ func BuildTrafficSummary(now time.Time, metrics *obs.Metrics) TrafficSummarySnap
 		TLSRejectPlaintextOnRequiredTotal: metrics.BridgeTLSRejectPlaintextOnRequiredTotal(),
 		TLSRejectTLSOnPlaintextTotal:      metrics.BridgeTLSRejectTLSOnPlaintextTotal(),
 		TunnelRecycleFailureTotal:         metrics.BridgeTunnelRecycleFailureTotal(),
+		QUICConnectionAcceptTotal:         metrics.BridgeQUICConnectionAcceptTotal(),
+		QUICConnectionActive:              metrics.BridgeQUICConnectionActive(),
+		QUICConnectionAuthenticatedTotal:  metrics.BridgeQUICConnectionAuthenticatedTotal(),
+		QUICTunnelRegisteredTotal:         metrics.BridgeQUICTunnelRegisteredTotal(),
 		AuthErrorCodeTotals:               metrics.BridgeAuthErrorCodeTotals(),
 		TunnelRecycleErrorCodeTotals:      metrics.BridgeTunnelRecycleErrorCodeTotals(),
 		UpdatedAtMS:                       uint64(normalizedNow.UnixMilli()),

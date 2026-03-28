@@ -1727,6 +1727,17 @@ func newControlPlaneServer(
 		if err := tlsConfigManager.Refresh(context.Background()); err != nil {
 			return nil, err
 		}
+		if normalizedTLSCertSource == apptls.CertSourceManagedCA {
+			logDetails := buildManagedCALogDetails(config.TLSCACertFile, config.TLSCAKeyFile)
+			slog.Info(
+				"managed ca certificate paths ready",
+				"ca_cert_directory", logDetails.caCertDirectory,
+				"ca_cert_file", logDetails.caCertFile,
+				"ca_key_directory", logDetails.caKeyDirectory,
+				"ca_key_file", logDetails.caKeyFile,
+				"tls_mode", string(normalizedTLSMode),
+			)
+		}
 	}
 	metrics := dependencies.metrics
 	if metrics == nil {
@@ -1999,13 +2010,22 @@ func (server *controlPlaneServer) runQUIC(ctx context.Context) error {
 	if !server.quicEnabled() {
 		return nil
 	}
-	listener, err := server.quicTransport.ListenAddr(server.quicListenAddr, server.currentServerTLSConfig())
+	listener, err := server.quicTransport.ListenAddr(
+		server.quicListenAddr,
+		apptls.BuildQUICServerTLSConfig(server.currentServerTLSConfig()),
+	)
 	if err != nil {
 		return fmt.Errorf("listen quic control plane: %w", err)
 	}
 	server.mu.Lock()
 	server.quicListener = listener
 	server.mu.Unlock()
+	slog.Info(
+		"start quic control plane listener",
+		"listen_addr", server.quicListenAddr,
+		"tls_mode", string(server.tlsMode),
+		"control_channel_accept_timeout", server.effectiveQUICControlChannelAcceptTimeout().String(),
+	)
 	defer func() {
 		_ = listener.Close()
 		server.mu.Lock()
@@ -2026,10 +2046,34 @@ func (server *controlPlaneServer) runQUIC(ctx context.Context) error {
 			}
 			return fmt.Errorf("accept quic inbound connection: %w", acceptErr)
 		}
+		peerAddr := ""
+		if quicConn.RemoteAddr() != nil {
+			peerAddr = strings.TrimSpace(quicConn.RemoteAddr().String())
+		}
+		slog.Info(
+			"accept quic inbound connection",
+			"peer_addr", peerAddr,
+			"listen_addr", server.quicListenAddr,
+		)
+		if server.metrics != nil {
+			server.metrics.IncBridgeQUICConnectionAcceptTotal()
+			server.metrics.AddBridgeQUICConnectionActive(1)
+		}
 		connectionWaitGroup.Add(1)
 		go func(rawConn *quicbinding.Conn) {
 			defer connectionWaitGroup.Done()
-			_ = server.serveQUICInboundConnection(ctx, rawConn)
+			defer func() {
+				if server.metrics != nil {
+					server.metrics.AddBridgeQUICConnectionActive(-1)
+				}
+			}()
+			if serveErr := server.serveQUICInboundConnection(ctx, rawConn); serveErr != nil && ctx.Err() == nil {
+				slog.Warn(
+					"serve quic inbound connection failed",
+					"peer_addr", peerAddr,
+					"error", serveErr.Error(),
+				)
+			}
 		}(quicConn)
 	}
 }
@@ -2330,6 +2374,11 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("serve quic inbound: accept control channel: %w", err)
 	}
+	slog.Info(
+		"bridge quic control channel ready",
+		"peer_addr", peerAddr,
+		"accept_timeout", server.effectiveQUICControlChannelAcceptTimeout().String(),
+	)
 	sessionState := newControlChannelSessionState(peerAddr)
 	serveErrChannel := make(chan error, 1)
 	go func() {
@@ -2344,6 +2393,16 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 
 	select {
 	case <-sessionState.authenticatedDone():
+		if server.metrics != nil {
+			server.metrics.IncBridgeQUICConnectionAuthenticatedTotal()
+		}
+		slog.Info(
+			"bridge quic connection authenticated",
+			"peer_addr", peerAddr,
+			"connector_id", strings.TrimSpace(sessionState.connectorID),
+			"session_id", strings.TrimSpace(sessionState.sessionID),
+			"session_epoch", sessionState.sessionEpoch,
+		)
 	case serveErr := <-serveErrChannel:
 		if serveErr != nil && !isControlChannelClosedError(serveErr) {
 			return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
@@ -2366,6 +2425,27 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 		return fmt.Errorf("serve quic inbound: new tunnel acceptor: %w", err)
 	}
 	defer tunnelAcceptor.Close(transport.ErrClosed)
+	quicTransportSession, err := newBridgeQUICTransportSession(
+		sessionState,
+		controlChannel,
+		tunnelAcceptor,
+	)
+	if err != nil {
+		cancel()
+		serveErr := <-serveErrChannel
+		if serveErr != nil && !isControlChannelClosedError(serveErr) {
+			return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
+		}
+		return fmt.Errorf("serve quic inbound: open transport session: %w", err)
+	}
+	logBridgeQUICTransportSessionOpened(quicTransportSession, peerAddr, strings.TrimSpace(sessionState.connectorID))
+	slog.Info(
+		"bridge quic tunnel accept loop started",
+		"peer_addr", peerAddr,
+		"connector_id", strings.TrimSpace(sessionState.connectorID),
+		"session_id", strings.TrimSpace(sessionState.sessionID),
+		"session_epoch", sessionState.sessionEpoch,
+	)
 	acceptErrChannel := make(chan error, 1)
 	go func() {
 		acceptErrChannel <- server.runQUICTunnelAcceptLoop(connectionContext, tunnelAcceptor)
@@ -2374,6 +2454,10 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 	serveErr := <-serveErrChannel
 	cancel()
 	acceptErr := <-acceptErrChannel
+	sessionCloseErr := finishBridgeQUICTransportSession(quicTransportSession, serveErr, acceptErr)
+	if sessionCloseErr != nil {
+		return fmt.Errorf("serve quic inbound: finish transport session: %w", sessionCloseErr)
+	}
 	if serveErr != nil && !isControlChannelClosedError(serveErr) {
 		return fmt.Errorf("serve quic inbound: serve control channel: %w", serveErr)
 	}
@@ -2381,6 +2465,133 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 		return fmt.Errorf("serve quic inbound: accept tunnels: %w", acceptErr)
 	}
 	return nil
+}
+
+func newBridgeQUICTransportSession(
+	sessionState *controlChannelSessionState,
+	controlChannel transport.ControlChannel,
+	tunnelAcceptor transport.TunnelAcceptor,
+) (transport.Session, error) {
+	if sessionState == nil {
+		return nil, errors.New("new bridge quic transport session: nil session state")
+	}
+	sessionID := strings.TrimSpace(sessionState.sessionID)
+	if sessionID == "" || sessionState.sessionEpoch == 0 {
+		return nil, errors.New("new bridge quic transport session: missing authenticated session identity")
+	}
+	sessionLabels := map[string]string{
+		"connector_id": strings.TrimSpace(sessionState.connectorID),
+	}
+	if peerAddr := strings.TrimSpace(sessionState.sourceIP); peerAddr != "" {
+		sessionLabels["peer_addr"] = peerAddr
+	}
+	quicSession, err := quicbinding.NewSession(quicbinding.SessionRoleServer, quicbinding.SessionConfig{
+		Meta: transport.SessionMeta{
+			SessionID:    sessionID,
+			SessionEpoch: sessionState.sessionEpoch,
+			Labels:       sessionLabels,
+		},
+		ControlChannel: controlChannel,
+		TunnelAcceptor: tunnelAcceptor,
+		TunnelPool:     transport.NewInMemoryTunnelPool(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("new bridge quic transport session: %w", err)
+	}
+	if err := quicSession.Open(context.Background()); err != nil {
+		return nil, fmt.Errorf("open bridge quic transport session: %w", err)
+	}
+	return quicSession, nil
+}
+
+func finishBridgeQUICTransportSession(
+	quicSession transport.Session,
+	serveErr error,
+	acceptErr error,
+) error {
+	if quicSession == nil {
+		return nil
+	}
+	connErr := bridgeQUICSessionTerminalError(serveErr, acceptErr)
+	if connErr != nil {
+		if err := quicSession.MarkFailed(connErr, false, false); err != nil {
+			return fmt.Errorf("mark bridge quic transport session failed: %w", err)
+		}
+		logBridgeQUICTransportSessionClosed(quicSession, connErr, true)
+		return nil
+	}
+	if err := quicSession.Close(context.Background(), nil); err != nil {
+		return fmt.Errorf("close bridge quic transport session: %w", err)
+	}
+	logBridgeQUICTransportSessionClosed(quicSession, nil, false)
+	return nil
+}
+
+func bridgeQUICSessionTerminalError(serveErr error, acceptErr error) error {
+	if serveErr != nil && !isControlChannelClosedError(serveErr) {
+		return serveErr
+	}
+	if acceptErr == nil {
+		return nil
+	}
+	if errors.Is(acceptErr, transport.ErrClosed) || errors.Is(acceptErr, context.Canceled) {
+		return nil
+	}
+	return acceptErr
+}
+
+func logBridgeQUICTransportSessionOpened(
+	quicSession transport.Session,
+	peerAddr string,
+	connectorID string,
+) {
+	if quicSession == nil {
+		return
+	}
+	fields := transport.BuildSessionDiagnosticFieldsForSession(quicSession)
+	slog.Info(
+		"bridge quic transport session opened",
+		"peer_addr", strings.TrimSpace(peerAddr),
+		"connector_id", strings.TrimSpace(connectorID),
+		"session_id", fields.SessionID,
+		"session_epoch", fields.SessionEpoch,
+		"binding", fields.Binding,
+		"session_state", fields.State,
+		"protocol_state", fields.ProtocolState,
+	)
+}
+
+func logBridgeQUICTransportSessionClosed(
+	quicSession transport.Session,
+	cause error,
+	failed bool,
+) {
+	if quicSession == nil {
+		return
+	}
+	fields := transport.BuildSessionDiagnosticFieldsForSession(quicSession)
+	if failed {
+		slog.Warn(
+			"bridge quic transport session failed",
+			"session_id", fields.SessionID,
+			"session_epoch", fields.SessionEpoch,
+			"binding", fields.Binding,
+			"session_state", fields.State,
+			"protocol_state", fields.ProtocolState,
+			"last_error", fields.LastError,
+			"error", cause,
+		)
+		return
+	}
+	slog.Info(
+		"bridge quic transport session closed",
+		"session_id", fields.SessionID,
+		"session_epoch", fields.SessionEpoch,
+		"binding", fields.Binding,
+		"session_state", fields.State,
+		"protocol_state", fields.ProtocolState,
+		"last_error", fields.LastError,
+	)
 }
 
 // handleAcceptedTCPTunnel 将一条已判别为数据面 tunnel 的 TCP 连接登记到共享 tunnel registry。
@@ -2530,6 +2741,23 @@ func (server *controlPlaneServer) registerAcceptedTunnel(
 			"registered_tunnel_id", registeredTunnelID,
 			"tunnel_id_source", tunnelIDSource,
 		)
+	}
+	if bindingType == transport.BindingTypeQUICNative {
+		if err := server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID, registeredTunnelID); err != nil {
+			return err
+		}
+		if server.metrics != nil {
+			server.metrics.IncBridgeQUICTunnelRegisteredTotal()
+		}
+		slog.Info(
+			"bridge register quic tunnel",
+			"connector_id", connectorID,
+			"session_id", sessionID,
+			"session_epoch", sessionEpoch,
+			"raw_tunnel_id", strings.TrimSpace(rawTunnel.ID()),
+			"registered_tunnel_id", registeredTunnelID,
+		)
+		return nil
 	}
 	return server.registerAcceptedTunnelWithOwner(rawTunnel, bindingType, connectorID, sessionID, registeredTunnelID)
 }

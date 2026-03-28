@@ -28,7 +28,10 @@ func buildBridgeClientTLSConfig(bridgeTLSConfig BridgeTLSConfig, bridgeAddr stri
 	}
 	rootCAs := x509.NewCertPool()
 	if !rootCAs.AppendCertsFromPEM(rootCAPEM) {
-		return nil, fmt.Errorf("build bridge client tls config: append root ca pem failed")
+		return nil, fmt.Errorf(
+			"build bridge client tls config: append root ca pem failed: root_ca_file=%s; expected a PEM certificate (for Bridge managed_ca use ca_cert_file/root-ca.crt, not ca_key_file/root-ca.key)",
+			rootCAFile,
+		)
 	}
 	serverName, err := resolveBridgeTLSServerName(bridgeTLSConfig, bridgeAddr)
 	if err != nil {

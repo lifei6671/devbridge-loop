@@ -768,9 +768,10 @@ web/bridge-admin/
 该快照返回合并后的生效配置，并附带以下稳定字段：
 
 * `config_version`：供 `PUT /api/admin/config` 做乐观并发控制
-* `config_file_path`：当前用户目录 override 配置文件路径
-* `base_config_file_path`：当前基础层配置文件路径（系统目录或显式 `-config` 文件）
-* `field_sources`：逐字段标记当前来源，取值为 `env | user | system | default`
+* `config_file_path`：当前管理台保存会写回的配置文件路径
+* `config_file_source`：当前写回目标所属配置层，取值为 `explicit | local | user | system | default`
+* `base_config_file_path`：当前最高优先级基础配置文件路径（显式 `-config`、程序运行目录 `bridge.yaml` 或系统目录）
+* `field_sources`：逐字段标记当前来源，取值为 `explicit | env | local | user | system | default`
 
 ### Logs / Metrics
 
@@ -1042,17 +1043,18 @@ web/bridge-admin/
 
 配置分层与持久化规则（强制）：
 
-* 运行时生效配置按 `环境变量 > 用户目录 > 系统目录 > 内置默认值` 合并
-* `PUT /api/admin/config` 只将用户修改项写入用户目录 override 文件，不回写系统目录与环境变量
-* `PUT /api/admin/config` 的 patch 值支持 `null`，表示从用户目录 override 中删除该字段并恢复继承更低优先级配置
+* 运行时生效配置按 `显式 -config > 环境变量 > 程序运行目录 bridge.yaml > 用户目录 > 系统目录 > 内置默认值` 合并
+* `PUT /api/admin/config` 会把用户修改项写回“当前已加载且可编辑的最高优先级配置文件”：优先显式 `-config`，否则依次为程序运行目录、用户目录；若用户目录配置文件尚不存在，则优先创建用户目录 override，而不是直接回写系统目录；仅当用户配置路径不可用时才退回系统目录；环境变量永远不会被回写
+* 若当前写回目标低于某个仍在生效的更高优先级文件层（例如显式 `-config` 只读后退回用户目录），`PUT /api/admin/config` 必须拒绝修改那些已被更高文件层定义的字段，避免出现“已写入低优先级文件但生效值不变”的假成功
+* `PUT /api/admin/config` 的 patch 值支持 `null`，表示从当前写回目标文件中删除该字段并恢复继承更低优先级配置
 * `PUT /api/admin/config` 的 YAML 请求体支持嵌套 patch 结构，服务端会在入站时自动展平成稳定字段路径
-* `GET /api/admin/config/snapshot` 除 `config_file_path`、`base_config_file_path`、`field_sources` 外，还应返回 `editable_user_patch` 与 `field_restore_preview`，分别用于回填当前用户目录中可编辑的 override，以及展示删除 override 后会继承的来源和值
+* `GET /api/admin/config/snapshot` 除 `config_file_path`、`config_file_source`、`base_config_file_path`、`field_sources` 外，还应返回 `editable_file_patch` 与 `field_restore_preview`，分别用于回填当前写回目标文件中的可编辑字段，以及展示删除该层配置后会继承的来源和值
 * Linux 用户配置路径遵循 XDG：`$XDG_CONFIG_HOME/devbridge/bridge.yaml`，未设置时回退 `~/.config/devbridge/bridge.yaml`
 * Linux 系统配置路径为 `/etc/devbridge/bridge.yaml`
 * Windows 用户配置路径遵循 Shell Known Folders：`%APPDATA%\DevBridge\bridge.yaml`
 * Windows 系统配置路径遵循 Shell Known Folders：`%ProgramData%\DevBridge\bridge.yaml`
-* 管理台常用配置页应使用组件化表单展示，并为每个字段提供用途说明 tooltip icon、来源标签、重启提示；当字段被修改但尚未保存时，应直接展示“当前生效值 -> 保存后值”的差异预览；若当前来源为环境变量，预览需明确说明保存只会写入用户目录 override，而不会改变当前生效值；当字段来源为用户目录时，应支持“恢复继承值”按钮，并展示恢复后会继承的来源和值
-* 高级兜底入口应提供 YAML patch 编辑器和 YAML 快照预览，并支持一键回填当前 `editable_user_patch`；预览区域默认自动换行，并展示稳定行号，避免长行横向滚动时影响定位
+* 管理台常用配置页应使用组件化表单展示，并为每个字段提供用途说明 tooltip icon、来源标签、重启提示；当字段被修改但尚未保存时，应直接展示“当前生效值 -> 保存后值”的差异预览；若当前来源为环境变量，预览需明确说明保存只会写入当前写回目标文件，而不会改变当前生效值；当字段来源与当前写回目标层一致时，应支持“恢复继承值”按钮，并展示恢复后会继承的来源和值
+* 高级兜底入口应提供 YAML patch 编辑器和 YAML 快照预览，并支持一键回填当前 `editable_file_patch`；预览区域默认自动换行，并展示稳定行号，避免长行横向滚动时影响定位
 * 当前配置修改返回 `ApplyMode=staged_requires_restart`，表示已落盘但通常需要 reload 或 restart 才会完全生效
 
 ---
