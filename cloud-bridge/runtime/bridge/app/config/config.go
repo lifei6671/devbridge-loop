@@ -60,10 +60,21 @@ func normalizeControlPlaneTLSCertSource(rawSource string) (controlPlaneTLSCertSo
 	}
 }
 
+// normalizeConnectorTokenStoreDriver 归一化并校验 connector token store driver 文本。
+func normalizeConnectorTokenStoreDriver(rawDriver string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(rawDriver)) {
+	case "file", "memory":
+		return strings.ToLower(strings.TrimSpace(rawDriver)), nil
+	default:
+		return "", fmt.Errorf("unsupported connector_auth.token_store.driver=%s", rawDriver)
+	}
+}
+
 // Config defines top-level runtime settings for the bridge skeleton.
 type Config struct {
 	Ingress       IngressConfig       `yaml:"ingress"`
 	Admin         AdminConfig         `yaml:"admin"`
+	ConnectorAuth ConnectorAuthConfig `yaml:"connector_auth"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	ControlPlane  ControlPlaneConfig  `yaml:"control_plane"`
 	TunnelReuse   TunnelReuseConfig   `yaml:"tunnel_reuse"`
@@ -136,12 +147,45 @@ type AdminAuthProviderConfig struct {
 	Password AdminPasswordProviderConfig `yaml:"password"`
 }
 
+// ConnectorAuthConfig 定义 connector 认证相关配置。
+type ConnectorAuthConfig struct {
+	TokenStore ConnectorTokenStoreConfig `yaml:"token_store"`
+}
+
+// ConnectorTokenStoreConfig 定义 connector token store 配置。
+type ConnectorTokenStoreConfig struct {
+	Driver string                        `yaml:"driver"`
+	File   ConnectorTokenFileStoreConfig `yaml:"file,omitempty"`
+}
+
+// ConnectorTokenFileStoreConfig 定义 file token store 的落盘配置。
+type ConnectorTokenFileStoreConfig struct {
+	Path string `yaml:"path,omitempty"`
+}
+
+// Normalize 根据 driver 归一化 store 专属字段，避免无关配置在不同后端之间串味。
+func (c *ConnectorTokenStoreConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	normalizedDriver := strings.ToLower(strings.TrimSpace(c.Driver))
+	switch normalizedDriver {
+	case "memory":
+		c.File.Path = ""
+	case "file":
+		// file driver 保留显式配置，由 Validate 决定是否允许为空。
+	default:
+		// 未知 driver 交给 Validate 报错。
+	}
+}
+
 // NormalizeCompatibility 把旧配置字段折算到当前结构，避免升级时直接失效。
 func (c *Config) NormalizeCompatibility() {
 	if c == nil {
 		return
 	}
 	c.Admin.normalizeCompatibility()
+	c.ConnectorAuth.TokenStore.Normalize()
 }
 
 func (c *AdminConfig) normalizeCompatibility() {
@@ -366,6 +410,14 @@ func DefaultConfig() Config {
 				"http://localhost:39080",
 			},
 		},
+		ConnectorAuth: ConnectorAuthConfig{
+			TokenStore: ConnectorTokenStoreConfig{
+				Driver: "file",
+				File: ConnectorTokenFileStoreConfig{
+					Path: "./bridge.tokens.yaml",
+				},
+			},
+		},
 		Observability: ObservabilityConfig{
 			MetricsAddr: ":39090",
 			LogLevel:    "info",
@@ -477,6 +529,17 @@ func (c Config) Validate() error {
 		if err := c.validateAdminNetworkIsolation(); err != nil {
 			return err
 		}
+	}
+	normalizedTokenStoreDriver, err := normalizeConnectorTokenStoreDriver(c.ConnectorAuth.TokenStore.Driver)
+	if err != nil {
+		return fmt.Errorf("validate config: %w", err)
+	}
+	switch normalizedTokenStoreDriver {
+	case "file":
+		if strings.TrimSpace(c.ConnectorAuth.TokenStore.File.Path) == "" {
+			return fmt.Errorf("validate config: empty connector_auth.token_store.file.path when driver=file")
+		}
+	case "memory":
 	}
 	if strings.TrimSpace(c.ControlPlane.ListenAddr) == "" {
 		return fmt.Errorf("validate config: empty control plane listen addr")

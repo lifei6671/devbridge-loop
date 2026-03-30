@@ -107,8 +107,6 @@ func (manager *controlPlaneTLSConfigManager) NextReloadInterval() time.Duration 
 		baseInterval = controlPlaneTLSExternalReloadInterval
 	case controlPlaneTLSCertSourceManagedCA:
 		baseInterval = controlPlaneTLSManagedCAReloadInterval
-	default:
-		baseInterval = controlPlaneTLSReloadRetryInterval
 	}
 	if manager.certSource != controlPlaneTLSCertSourceManagedCA {
 		return baseInterval

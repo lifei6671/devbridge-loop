@@ -27,6 +27,18 @@ Tunnel 串行复用已经被正式引入。Tunnel 生命周期由 `created -> id
 
 本方案按**上线前最终态**编写。由于当前项目仍在开发阶段、尚未对外上线，本次不引入兼容迁移窗口与双栈协议兜底；实现必须在上线前一次性收敛到本文定义的最终协议与安全约束。
 
+### 当前实现收敛（2026-03-30）
+
+围绕 connector token 管理，当前实现已经收敛为以下运行模型：
+
+* Bridge 新增 `connector_auth.token_store.driver`，默认值固定为 `file`
+* `driver=file` 时，Bridge 从独立 token 文件加载并原子落盘 token 元数据；重启后仍可继续认证
+* `driver=memory` 仅保留给本地开发联调，且只在无记录时注入开发 token
+* Bridge Admin 提供 `connector-tokens` 资源接口用于创建、轮换、吊销与查询 token 元数据
+* 明文 token 仅在创建/轮换当次响应返回一次，不进入普通快照、SSE 或日志
+* Agent 后台仅保留 `session.auth_token` 手工录入能力，不再本地随机生成 token
+* Agent 配置接口对 `session.auth_token` 采用“只写不回显”语义：读取不下发旧值，提交空值不覆盖原 token
+
 ---
 
 ## 2. 设计原则
@@ -647,6 +659,19 @@ idle tunnel 的探活必须在 **传输层 / binding 层控制协议** 完成。
 
 Bridge 为指定 `connector_id` 生成 `token_id` 和高熵 `token_secret`，保存 `token_secret_hash`、状态与过期时间，并仅向 Agent 或运维展示一次明文 token。明文 token 不得二次展示，不得进入普通日志。
 
+### 12.1.1 token store 驱动与持久化
+
+Bridge 必须通过 `connector_auth.token_store.driver` 明确声明 token 存储后端。当前冻结的驱动集合为：
+
+* `file`：默认值。token 元数据写入独立文件并原子替换，适用于正常运维与重启恢复。
+* `memory`：仅用于开发联调。进程退出后 token 记录全部丢失。
+
+当前设计允许后续增加 `sqlite` 等新驱动，但不得改变：
+
+* 明文 token 仅创建/轮换时返回一次
+* Bridge 只保存 `token_secret_hash`
+* token 记录不混入普通运行配置 patch 资源
+
 ### 12.2 轮换
 
 token 轮换采用双 token 过渡：
@@ -656,6 +681,8 @@ token 轮换采用双 token 过渡：
 * 过渡窗口结束后，旧 token 自动进入 `expired` 或 `revoked`。
 
 Bridge 在认证阶段同时接受 `active` 与 `grace`。
+
+当前实现首期先采用更保守的“直接替换”语义：Bridge Admin 轮换后立即生成新的明文 token，并使旧 token 不再用于后续新建 session。`grace` 双 token 过渡窗口仍保留为后续增强项。
 
 ### 12.3 吊销类型
 

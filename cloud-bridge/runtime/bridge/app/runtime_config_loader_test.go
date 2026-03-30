@@ -131,6 +131,37 @@ observability:
 	}
 }
 
+func TestLoadRuntimeConfigResolvesConnectorTokenStoreFilePathRelativeToExplicitConfig(testingObject *testing.T) {
+	tempDir := testingObject.TempDir()
+	baseConfigDirectory := filepath.Join(tempDir, "configs")
+	baseConfigFilePath := filepath.Join(baseConfigDirectory, "bridge.yaml")
+
+	writeTestFile(
+		testingObject,
+		baseConfigFilePath,
+		[]byte(`connector_auth:
+  token_store:
+    driver: file
+    file:
+      path: ./tokens/runtime.tokens.yaml
+`),
+	)
+
+	config, err := LoadRuntimeConfig(baseConfigFilePath)
+	if err != nil {
+		testingObject.Fatalf("load runtime config failed: %v", err)
+	}
+
+	wantPath := filepath.Join(baseConfigDirectory, "tokens", "runtime.tokens.yaml")
+	if config.ConnectorAuth.TokenStore.File.Path != wantPath {
+		testingObject.Fatalf(
+			"unexpected connector token store file path: got=%s want=%s",
+			config.ConnectorAuth.TokenStore.File.Path,
+			wantPath,
+		)
+	}
+}
+
 func TestBuildRuntimeConfigFromLayerMapsAppliesExplicitLocalEnvPriority(testingObject *testing.T) {
 	testingObject.Setenv("DEV_BRIDGE_CFG_OBSERVABILITY_LOG_LEVEL", "error")
 

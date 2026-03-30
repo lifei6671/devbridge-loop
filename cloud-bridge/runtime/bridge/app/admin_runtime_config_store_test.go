@@ -322,6 +322,141 @@ func TestBuildAdminConfigSnapshotIncludesQUICListenAddr(testingObject *testing.T
 			":39083",
 		)
 	}
+
+	connectorAuthSnapshot, ok := snapshot["connector_auth"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected connector_auth snapshot object")
+	}
+	tokenStoreSnapshot, ok := connectorAuthSnapshot["token_store"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected connector_auth.token_store snapshot object")
+	}
+	if tokenStoreSnapshot["driver"] != "file" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver: got=%v want=file",
+			tokenStoreSnapshot["driver"],
+		)
+	}
+	fileSnapshot, ok := tokenStoreSnapshot["file"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected connector_auth.token_store.file snapshot object")
+	}
+	if fileSnapshot["path"] != "./bridge.tokens.yaml" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.file.path: got=%v want=%s",
+			fileSnapshot["path"],
+			"./bridge.tokens.yaml",
+		)
+	}
+
+	fieldSources, ok := snapshot["field_sources"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected field_sources map in snapshot")
+	}
+	if fieldSources["connector_auth.token_store.driver"] != "default" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver source: got=%v want=default",
+			fieldSources["connector_auth.token_store.driver"],
+		)
+	}
+	if fieldSources["connector_auth.token_store.file.path"] != "default" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.file.path source: got=%v want=default",
+			fieldSources["connector_auth.token_store.file.path"],
+		)
+	}
+}
+
+func TestBuildAdminConfigSnapshotOmitsConnectorTokenStoreFileSettingsForMemoryDriver(testingObject *testing.T) {
+	config := DefaultConfig()
+	config.ConnectorAuth.TokenStore.Driver = "memory"
+	config.ConnectorAuth.TokenStore.File.Path = ""
+
+	snapshot := buildAdminConfigSnapshot(
+		config,
+		1,
+		time.Unix(1_700_000_000, 0).UTC(),
+		"tester",
+		runtimeConfigLayerMaps{},
+	)
+
+	connectorAuthSnapshot, ok := snapshot["connector_auth"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected connector_auth snapshot object")
+	}
+	tokenStoreSnapshot, ok := connectorAuthSnapshot["token_store"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected connector_auth.token_store snapshot object")
+	}
+	if tokenStoreSnapshot["driver"] != "memory" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver: got=%v want=memory",
+			tokenStoreSnapshot["driver"],
+		)
+	}
+	if _, exists := tokenStoreSnapshot["file"]; exists {
+		testingObject.Fatalf("expected connector_auth.token_store.file to be omitted for memory driver")
+	}
+}
+
+func TestAdminRuntimeConfigStoreSnapshotTracksConnectorTokenStoreFromExplicitLayer(testingObject *testing.T) {
+	tempDir := testingObject.TempDir()
+	baseConfigFilePath := filepath.Join(tempDir, "base.yaml")
+
+	writeTestFile(
+		testingObject,
+		baseConfigFilePath,
+		[]byte(`connector_auth:
+  token_store:
+    driver: file
+    file:
+      path: "./custom.bridge.tokens.yaml"
+control_plane:
+  listen_addr: ":19080"
+  grpc_h2_listen_addr: ":19082"
+`),
+	)
+
+	config, err := LoadRuntimeConfig(baseConfigFilePath)
+	if err != nil {
+		testingObject.Fatalf("load runtime config failed: %v", err)
+	}
+	store := newAdminRuntimeConfigStore(config)
+
+	snapshot := store.snapshot()
+	fieldSources, ok := snapshot["field_sources"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected field_sources map in snapshot")
+	}
+	if fieldSources["connector_auth.token_store.driver"] != "explicit" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver source: got=%v want=explicit",
+			fieldSources["connector_auth.token_store.driver"],
+		)
+	}
+	if fieldSources["connector_auth.token_store.file.path"] != "explicit" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.file.path source: got=%v want=explicit",
+			fieldSources["connector_auth.token_store.file.path"],
+		)
+	}
+
+	editablePatch, ok := snapshot["editable_file_patch"].(map[string]any)
+	if !ok {
+		testingObject.Fatalf("expected editable_file_patch in snapshot")
+	}
+	if readYAMLPath(editablePatch, "connector_auth.token_store.driver") != nil {
+		testingObject.Fatalf(
+			"expected connector_auth.token_store.driver to stay out of editable patch, got=%v",
+			readYAMLPath(editablePatch, "connector_auth.token_store.driver"),
+		)
+	}
+	if readYAMLPath(editablePatch, "connector_auth.token_store.file.path") != nil {
+		testingObject.Fatalf(
+			"expected connector_auth.token_store.file.path to stay out of editable patch, got=%v",
+			readYAMLPath(editablePatch, "connector_auth.token_store.file.path"),
+		)
+	}
 }
 
 func TestAdminRuntimeConfigStoreUpdatePersistsControlPlaneQUICAndTLSSettings(testingObject *testing.T) {

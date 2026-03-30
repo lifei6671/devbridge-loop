@@ -94,8 +94,12 @@ func DetectConn(conn net.Conn, timeout time.Duration) (DetectResult, net.Conn, e
 
 	// 设置短超时，避免一直阻塞在首字节上。
 	if timeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
-		defer conn.SetReadDeadline(time.Time{})
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return DetectResult{}, nil, err
+		}
+		defer func() {
+			_ = conn.SetReadDeadline(time.Time{})
+		}()
 	}
 
 	buf := make([]byte, maxPeek)

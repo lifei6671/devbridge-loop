@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -50,5 +51,54 @@ func TestBootstrapWithOptionsInvalidTunnelPool(testingObject *testing.T) {
 	})
 	if err == nil {
 		testingObject.Fatalf("expected bootstrap validation error for invalid override")
+	}
+}
+
+// TestResolveRuntimeServersWebOnlySkipsLocalRPC 验证 web-only 模式不会依赖 LocalRPC 环境变量。
+func TestResolveRuntimeServersWebOnlySkipsLocalRPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.UI.Web.Enabled = true
+	config.UI.Web.ListenAddr = "127.0.0.1:39082"
+	config.UI.Web.Auth.Username = "admin"
+	config.UI.Web.Auth.Password = "change-me"
+
+	runtime, err := BootstrapWithOptions(context.Background(), config, BootstrapOptions{})
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+
+	ipcServer, httpServer, err := runtime.resolveRuntimeServers(RunOptions{
+		EnableWeb: true,
+	})
+	if err != nil {
+		testingObject.Fatalf("resolve runtime servers failed: %v", err)
+	}
+	if ipcServer != nil {
+		testingObject.Fatalf("expected localrpc server to stay disabled in web-only mode")
+	}
+	if httpServer == nil {
+		testingObject.Fatalf("expected http server in web-only mode")
+	}
+}
+
+// TestResolveRuntimeServersTauriRequiresIPC 验证 tauri/localrpc 模式下仍要求显式 IPC 启动参数。
+func TestResolveRuntimeServersTauriRequiresIPC(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	runtime, err := BootstrapWithOptions(context.Background(), DefaultConfig(), BootstrapOptions{})
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+
+	_, _, err = runtime.resolveRuntimeServers(RunOptions{
+		EnableLocalRPC: true,
+	})
+	if err == nil {
+		testingObject.Fatalf("expected localrpc env validation error")
+	}
+	if !strings.Contains(err.Error(), "DEV_AGENT_IPC_ENDPOINT") {
+		testingObject.Fatalf("unexpected localrpc env validation error: %v", err)
 	}
 }

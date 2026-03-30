@@ -149,3 +149,31 @@ func TestApplyTunnelPoolOverridePartial(testingObject *testing.T) {
 		testingObject.Fatalf("unexpected reconcile_gap after override: %v", updatedConfig.TunnelPool.ReconcileGap)
 	}
 }
+
+// TestValidateRejectsEnabledWebUIWithoutListenAddr 验证启用 Web UI 后必须显式提供监听地址。
+func TestValidateRejectsEnabledWebUIWithoutListenAddr(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.UI.Web.Enabled = true
+	config.UI.Web.ListenAddr = ""
+	config.UI.Web.Auth.Username = "admin"
+	config.UI.Web.Auth.Password = "change-me"
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for empty ui.web.listen_addr")
+	}
+}
+
+// TestValidateRejectsEnabledWebUIWithoutAuth 验证启用 Web UI 后必须提供账号密码。
+func TestValidateRejectsEnabledWebUIWithoutAuth(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.UI.Web.Enabled = true
+	config.UI.Web.ListenAddr = "127.0.0.1:39082"
+	config.UI.Web.Auth.Username = "   "
+	config.UI.Web.Auth.Password = "   "
+	if err := config.Validate(); err == nil {
+		testingObject.Fatalf("expected validate error for empty ui.web.auth credentials")
+	}
+}

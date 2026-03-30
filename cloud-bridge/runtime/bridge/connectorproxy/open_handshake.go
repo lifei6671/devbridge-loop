@@ -118,34 +118,32 @@ func (handshake *OpenHandshake) Execute(ctx context.Context, tunnel registry.Run
 	}
 	defer cancel()
 
-	for {
-		payload, err := tunnel.ReadPayload(readContext)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(readContext.Err(), context.DeadlineExceeded) {
-				cancelErr := handshake.cancelTimeoutTraffic(normalizedContext, tunnel, open)
-				// 迟到 ack 丢弃在后台执行，避免阻塞 timeout 返回路径。
-				go handshake.discardLateOpenAck(tunnel, open)
-				return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: %w", errors.Join(ErrOpenAckTimeout, cancelErr))
-			}
-			return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: read open ack: %w", err)
+	payload, err := tunnel.ReadPayload(readContext)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(readContext.Err(), context.DeadlineExceeded) {
+			cancelErr := handshake.cancelTimeoutTraffic(normalizedContext, tunnel, open)
+			// 迟到 ack 丢弃在后台执行，避免阻塞 timeout 返回路径。
+			go handshake.discardLateOpenAck(tunnel, open)
+			return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: %w", errors.Join(ErrOpenAckTimeout, cancelErr))
 		}
-		if payload.OpenAck == nil {
-			return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: %w: open_ack is required", ErrInvalidOpenAck)
-		}
-		ack := *payload.OpenAck
-		if strings.TrimSpace(ack.TrafficID) != strings.TrimSpace(open.TrafficID) {
-			return pb.TrafficOpenAck{}, fmt.Errorf(
-				"execute open handshake: %w: expected_traffic_id=%s got=%s",
-				ErrInvalidOpenAck,
-				strings.TrimSpace(open.TrafficID),
-				strings.TrimSpace(ack.TrafficID),
-			)
-		}
-		if !ack.Success {
-			return ack, &OpenRejectedError{Ack: ack}
-		}
-		return ack, nil
+		return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: read open ack: %w", err)
 	}
+	if payload.OpenAck == nil {
+		return pb.TrafficOpenAck{}, fmt.Errorf("execute open handshake: %w: open_ack is required", ErrInvalidOpenAck)
+	}
+	ack := *payload.OpenAck
+	if strings.TrimSpace(ack.TrafficID) != strings.TrimSpace(open.TrafficID) {
+		return pb.TrafficOpenAck{}, fmt.Errorf(
+			"execute open handshake: %w: expected_traffic_id=%s got=%s",
+			ErrInvalidOpenAck,
+			strings.TrimSpace(open.TrafficID),
+			strings.TrimSpace(ack.TrafficID),
+		)
+	}
+	if !ack.Success {
+		return ack, &OpenRejectedError{Ack: ack}
+	}
+	return ack, nil
 }
 
 func (handshake *OpenHandshake) cancelTimeoutTraffic(ctx context.Context, tunnel registry.RuntimeTunnel, open pb.TrafficOpen) error {

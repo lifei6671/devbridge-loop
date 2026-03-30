@@ -40,6 +40,9 @@ control_plane:
   grpc_h2_listen_addr: ":49082"
   heartbeat_timeout: 45s
   tls_mode: plaintext
+connector_auth:
+  token_store:
+    driver: memory
 observability:
   log_level: debug
 ingress:
@@ -82,6 +85,20 @@ fallback_policies:
 			"unexpected tls cert source default: got=%s want=%s",
 			config.ControlPlane.TLSCertSource,
 			apptls.CertSourceExternal,
+		)
+	}
+	if config.ConnectorAuth.TokenStore.Driver != "memory" {
+		testingObject.Fatalf(
+			"unexpected connector token store driver: got=%s want=%s",
+			config.ConnectorAuth.TokenStore.Driver,
+			"memory",
+		)
+	}
+	if config.ConnectorAuth.TokenStore.File.Path != "" {
+		testingObject.Fatalf(
+			"unexpected connector token store file path for memory driver: got=%s want=%s",
+			config.ConnectorAuth.TokenStore.File.Path,
+			"",
 		)
 	}
 	// 未在 YAML 中配置的字段应继续沿用默认值。
@@ -239,6 +256,11 @@ admin:
 control_plane:
   listen_addr: ":59080"
   grpc_h2_listen_addr: ":59082"
+connector_auth:
+  token_store:
+    driver: file
+    file:
+      path: "./custom.bridge.tokens.yaml"
 `
 	if err := os.WriteFile(configFilePath, []byte(configYAML), 0o600); err != nil {
 		testingObject.Fatalf("write temp yaml file failed: %v", err)
@@ -255,6 +277,16 @@ control_plane:
 	}
 	if config.RuntimeConfigFilePath != configFilePath {
 		testingObject.Fatalf("unexpected runtime config file path: got=%s want=%s", config.RuntimeConfigFilePath, configFilePath)
+	}
+	if config.ConnectorAuth.TokenStore.Driver != "file" {
+		testingObject.Fatalf("unexpected connector auth token store driver from yaml: got=%s want=file", config.ConnectorAuth.TokenStore.Driver)
+	}
+	if config.ConnectorAuth.TokenStore.File.Path != "./custom.bridge.tokens.yaml" {
+		testingObject.Fatalf(
+			"unexpected connector auth token store file path from yaml: got=%s want=%s",
+			config.ConnectorAuth.TokenStore.File.Path,
+			"./custom.bridge.tokens.yaml",
+		)
 	}
 }
 
@@ -291,6 +323,8 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	config.ControlPlane.TLSServerCertTTL = 72 * time.Hour
 	config.ControlPlane.TLSServerCertRenewBefore = 12 * time.Hour
 	config.Admin.BasePath = "/console"
+	config.ConnectorAuth.TokenStore.Driver = "file"
+	config.ConnectorAuth.TokenStore.File.Path = "./bridge.tokens.yaml"
 	config.Observability.LogLevel = "debug"
 	config.DefaultScope.Namespace = "tenant"
 	config.DefaultScope.Environment = "shared"
@@ -362,6 +396,20 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	if loadedConfig.Admin.BasePath != config.Admin.BasePath {
 		testingObject.Fatalf("unexpected admin.base_path: got=%s want=%s", loadedConfig.Admin.BasePath, config.Admin.BasePath)
 	}
+	if loadedConfig.ConnectorAuth.TokenStore.Driver != config.ConnectorAuth.TokenStore.Driver {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver: got=%s want=%s",
+			loadedConfig.ConnectorAuth.TokenStore.Driver,
+			config.ConnectorAuth.TokenStore.Driver,
+		)
+	}
+	if loadedConfig.ConnectorAuth.TokenStore.File.Path != config.ConnectorAuth.TokenStore.File.Path {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.file.path: got=%s want=%s",
+			loadedConfig.ConnectorAuth.TokenStore.File.Path,
+			config.ConnectorAuth.TokenStore.File.Path,
+		)
+	}
 	if loadedConfig.Observability.LogLevel != config.Observability.LogLevel {
 		testingObject.Fatalf("unexpected observability.log_level: got=%s want=%s", loadedConfig.Observability.LogLevel, config.Observability.LogLevel)
 	}
@@ -370,5 +418,71 @@ func TestSaveConfigToYAMLFileRoundTrip(testingObject *testing.T) {
 	}
 	if len(loadedConfig.FallbackPolicies) != 1 || loadedConfig.FallbackPolicies[0].PolicyID != "fallback-tenant" {
 		testingObject.Fatalf("unexpected fallback_policies round trip: %+v", loadedConfig.FallbackPolicies)
+	}
+
+	config.Observability.LogLevel = "warn"
+	config.Admin.BasePath = "/updated-console"
+	if err := SaveConfigToYAMLFile(config, configFilePath); err != nil {
+		testingObject.Fatalf("overwrite existing config yaml failed: %v", err)
+	}
+	updatedConfig, err := LoadConfigFromYAMLFile(configFilePath)
+	if err != nil {
+		testingObject.Fatalf("load overwritten config yaml failed: %v", err)
+	}
+	if updatedConfig.Observability.LogLevel != "warn" {
+		testingObject.Fatalf(
+			"unexpected overwritten observability.log_level: got=%s want=%s",
+			updatedConfig.Observability.LogLevel,
+			"warn",
+		)
+	}
+	if updatedConfig.Admin.BasePath != "/updated-console" {
+		testingObject.Fatalf(
+			"unexpected overwritten admin.base_path: got=%s want=%s",
+			updatedConfig.Admin.BasePath,
+			"/updated-console",
+		)
+	}
+}
+
+func TestSaveConfigToYAMLFileRoundTripWithMemoryTokenStore(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	configFilePath := filepath.Join(tempDir, "bridge.yaml")
+
+	config := DefaultConfig()
+	config.ConnectorAuth.TokenStore.Driver = "memory"
+	config.ConnectorAuth.TokenStore.File.Path = ""
+
+	if err := SaveConfigToYAMLFile(config, configFilePath); err != nil {
+		testingObject.Fatalf("save config yaml failed: %v", err)
+	}
+
+	rawConfigData, err := os.ReadFile(configFilePath)
+	if err != nil {
+		testingObject.Fatalf("read saved config yaml failed: %v", err)
+	}
+	if strings.Contains(string(rawConfigData), "bridge.tokens.yaml") {
+		testingObject.Fatalf("expected memory token store yaml to omit file path, got=%s", string(rawConfigData))
+	}
+
+	loadedConfig, err := LoadConfigFromYAMLFile(configFilePath)
+	if err != nil {
+		testingObject.Fatalf("load config yaml failed: %v", err)
+	}
+	if loadedConfig.ConnectorAuth.TokenStore.Driver != "memory" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.driver: got=%s want=%s",
+			loadedConfig.ConnectorAuth.TokenStore.Driver,
+			"memory",
+		)
+	}
+	if loadedConfig.ConnectorAuth.TokenStore.File.Path != "" {
+		testingObject.Fatalf(
+			"unexpected connector_auth.token_store.file.path for memory driver: got=%s want=%s",
+			loadedConfig.ConnectorAuth.TokenStore.File.Path,
+			"",
+		)
 	}
 }

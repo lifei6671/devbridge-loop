@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -26,6 +27,23 @@ type BootstrapOptions struct {
 	// TunnelPoolOverride 允许外部按字段覆盖 tunnelPool 参数。
 	// 首版仅在 Bootstrap 时生效，不支持运行时热更新。
 	TunnelPoolOverride *TunnelPoolOverride
+}
+
+// RunOptions 定义 runtime 运行时需要拉起的本地管理入口。
+type RunOptions struct {
+	EnableLocalRPC bool
+	EnableWeb      bool
+}
+
+// Validate 校验运行模式与当前配置是否匹配。
+func (options RunOptions) Validate(config Config) error {
+	if !options.EnableLocalRPC && !options.EnableWeb {
+		return errors.New("no serve target enabled: pass -tauri or enable ui.web / pass -web")
+	}
+	if options.EnableWeb && !config.UI.Web.Enabled {
+		return errors.New("web mode requires ui.web.enabled=true in config")
+	}
+	return nil
 }
 
 // Runtime wires the agent runtime subsystems together.
@@ -82,8 +100,10 @@ type Runtime struct {
 	diagnoseEvents       []runtimeDiagnoseEvent
 	diagnoseUpdatedAt    time.Time
 	metrics              *obs.Metrics
+	configStore          *agentRuntimeConfigStore
 
 	ipcServer  *localRPCServer
+	httpServer *httpAgentServer
 	shutdownCh chan struct{}
 	shutdownMu sync.Mutex
 	stopped    bool
@@ -117,14 +137,18 @@ func BootstrapWithOptions(ctx context.Context, cfg Config, options BootstrapOpti
 		tunnelAssociations: make(map[string]tunnelAssociation),
 		diagnoseEvents:     make([]runtimeDiagnoseEvent, 0, runtimeDiagnoseEventBufferSize),
 		metrics:            obs.NewMetrics(),
+		configStore:        newAgentRuntimeConfigStore(resolvedConfig),
 		shutdownCh:         make(chan struct{}),
 	}, nil
 }
 
-// Run starts the runtime and serves local IPC for Tauri host.
-func (r *Runtime) Run(ctx context.Context) error {
+// Run 根据运行选项启动 LocalRPC / HTTP 管理面。
+func (r *Runtime) Run(ctx context.Context, options RunOptions) error {
 	if r == nil {
 		return errors.New("runtime is nil")
+	}
+	if err := options.Validate(r.cfg); err != nil {
+		return err
 	}
 	r.startedAt = time.Now().UTC()
 	log.Printf(
@@ -143,12 +167,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 	if err := r.initTrafficRuntime(); err != nil {
 		return err
 	}
-	ipcServer, err := newLocalRPCServer(r)
+	ipcServer, httpServer, err := r.resolveRuntimeServers(options)
 	if err != nil {
 		return err
 	}
 	r.shutdownMu.Lock()
 	r.ipcServer = ipcServer
+	r.httpServer = httpServer
 	r.shutdownMu.Unlock()
 
 	runContext, cancelRun := context.WithCancel(ctx)
@@ -183,40 +208,117 @@ func (r *Runtime) Run(ctx context.Context) error {
 		trafficErrChan <- r.runTrafficAcceptorLoop(runContext)
 	}()
 
-	serverErrChan := make(chan error, 1)
-	go func() {
-		serverErrChan <- ipcServer.Serve(runContext)
-	}()
+	var serverErrChan chan error
+	if ipcServer != nil {
+		serverErrChan = make(chan error, 1)
+		go func() {
+			serverErrChan <- ipcServer.Serve(runContext)
+		}()
+	}
+
+	var httpErrChan chan error
+	if httpServer != nil {
+		httpErrChan = make(chan error, 1)
+		go func() {
+			httpErrChan <- httpServer.Serve(runContext)
+		}()
+	}
 
 	select {
 	case <-runContext.Done():
-		_ = ipcServer.Close()
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		return nil
 	case serverErr := <-serverErrChan:
-		_ = ipcServer.Close()
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		if errors.Is(serverErr, context.Canceled) {
 			return nil
 		}
 		return serverErr
+	case httpErr := <-httpErrChan:
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
+		if errors.Is(httpErr, context.Canceled) || errors.Is(httpErr, http.ErrServerClosed) {
+			return nil
+		}
+		return httpErr
 	case bridgeErr := <-bridgeErrChan:
-		_ = ipcServer.Close()
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		if errors.Is(bridgeErr, context.Canceled) {
 			return nil
 		}
 		return bridgeErr
 	case tunnelErr := <-tunnelErrChan:
-		_ = ipcServer.Close()
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		if errors.Is(tunnelErr, context.Canceled) {
 			return nil
 		}
 		return tunnelErr
 	case trafficErr := <-trafficErrChan:
-		_ = ipcServer.Close()
+		if ipcServer != nil {
+			_ = ipcServer.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
 		if errors.Is(trafficErr, context.Canceled) {
 			return nil
 		}
 		return trafficErr
 	}
+}
+
+func (r *Runtime) resolveRuntimeServers(options RunOptions) (*localRPCServer, *httpAgentServer, error) {
+	if r == nil {
+		return nil, nil, errors.New("runtime is nil")
+	}
+	if err := options.Validate(r.cfg); err != nil {
+		return nil, nil, err
+	}
+	var (
+		ipcServer  *localRPCServer
+		httpServer *httpAgentServer
+		err        error
+	)
+	if options.EnableLocalRPC {
+		ipcServer, err = newLocalRPCServer(r)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if options.EnableWeb {
+		httpServer, err = newHTTPServer(r)
+		if err != nil {
+			if ipcServer != nil {
+				_ = ipcServer.Close()
+			}
+			return nil, nil, err
+		}
+	}
+	return ipcServer, httpServer, nil
 }
 
 // Shutdown allows graceful teardown.
@@ -234,6 +336,9 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	close(r.shutdownCh)
 	if r.ipcServer != nil {
 		_ = r.ipcServer.Close()
+	}
+	if r.httpServer != nil {
+		_ = r.httpServer.Close()
 	}
 	r.closeCurrentControlChannel()
 	return nil

@@ -323,22 +323,21 @@ runtime/agent/
     metrics.go
     logs.go
 
-  localrpc/
-    server.go
-    listener_linux.go
-    listener_windows.go
-    frame.go
-    codec.go
-    router.go
-    subscription.go
-    auth.go
+  app/
+    localrpc_server.go
+    localrpc_listener_unix.go
+    localrpc_listener_windows.go
+    localrpc_codec.go
+    localrpc_auth.go
+    hostapi_adapter.go
 
   hostapi/
-    snapshot.go
-    lifecycle.go
-    config.go
-    diagnose.go
-    event_view.go
+    service.go
+    types.go
+
+  httpapi/
+    auth.go
+    server.go
 ```
 
 ---
@@ -350,10 +349,14 @@ runtime/agent/
 * 监听 UDS / Named Pipe
 * 建立本地连接
 * 解码帧协议
-* 路由 request
-* 推送 event
-* 管理订阅
 * 做本地握手与双向鉴权
+* 作为 transport adapter 调用 `hostapi`
+
+当前落地说明：
+
+* 真实代码暂放在 `runtime/agent/app/localrpc_*`，尚未单独拆目录
+* `localrpc_server.go` 不再直接实现业务方法，仅负责协议层与鉴权层
+* 后续若需要支持更多 transport，可继续复用同一套 `hostapi` 能力接口
 
 ---
 
@@ -366,6 +369,13 @@ runtime/agent/
 * 提供配置、诊断、指标、日志查询接口
 * 对内部状态做聚合和裁剪
 * 保持对外接口稳定
+* 通过 transport 无关 DTO 供 LocalRPC / HTTP 共同复用
+
+当前落地说明：
+
+* `runtime/agent/hostapi/service.go` 统一分发 `app/session/service/tunnel/traffic/config/diagnose` 方法
+* `runtime/agent/hostapi/types.go` 定义方法常量、请求响应 DTO 与最小运行时能力接口
+* `runtime/agent/app/hostapi_adapter.go` 负责把 `Runtime` 映射为 `hostapi.RuntimeHost`
 
 ---
 
@@ -378,6 +388,54 @@ runtime/agent/
 * Relay 注入接口
 * 内部运行时对象句柄
 * 低层状态机强制跳转接口
+
+---
+
+### 9.5 `httpapi/` 模块职责
+
+负责：
+
+* 暴露浏览器可访问的 HTTP 管理接口
+* 提供简单账号密码登录与会话 Cookie
+* 将 REST 路由映射到 `hostapi` 方法
+* 与 LocalRPC 鉴权链路保持隔离
+
+当前落地说明：
+
+* `runtime/agent/httpapi/server.go` 已提供登录、会话查询、agent/session/tunnels/services/config/traffic/diagnose 等接口
+* `runtime/agent/httpapi/sse.go` 已提供 `GET <base_path>/api/events/stream` 聚合 SSE 通道
+* `runtime/agent/httpapi/auth.go` 使用独立内存 session store 管理 HTTP 登录态
+* HTTP session 不复用 `DEV_AGENT_SESSION_SECRET`，仅 LocalRPC 继续使用 challenge-response
+* `runtime/agent/httpapi/server.go` 现在会在同一 `base_path` 下复用静态 UI 与 `/api/*` 路由
+* 裸 `base_path` 会重定向到带尾斜杠的地址，保证嵌入式前端的相对静态资源加载稳定
+* SSE 首帧会发送 `agent.ready`，随后周期推送聚合 `agent.snapshot`，并通过 `agent.heartbeat` 做连接保活
+
+---
+
+### 9.6 `agent-core/web/` 嵌入式前端职责
+
+负责：
+
+* 提供浏览器版 Agent 管理控制台
+* 消费 `httpapi` 暴露的登录、快照、服务、隧道、流量和诊断接口
+* 以嵌入式静态资源形式随 `agent-core` 一起分发
+
+当前落地说明：
+
+* `agent-core/web/` 使用 React + Vite + Tailwind 搭建，组件风格按 shadcn/ui 组织
+* `agent-core/web/embed.go` 负责内嵌 `dist/` 产物、计算 UI 版本指纹并提供 SPA fallback
+* 页面导航采用 hash 路由，避免前端构建产物和可配置 `ui.web.base_path` 形成硬编码耦合
+* 控制台数据同步已切到 `EventSource` 优先：
+  * 认证成功后优先订阅 `/api/events/stream`
+  * 浏览器不支持 SSE 或首次握手失败时回退到定时轮询
+* 控制台当前提供：
+  - 登录页
+  - 总览页
+  - 服务目录页（含新增 / 删除）
+  - 隧道页
+  - 流量页
+  - 诊断页
+  - 设置页
 
 ---
 
@@ -422,6 +480,43 @@ src-tauri/
 * 生成并注入本次启动专用 `session_secret`（用于 IPC challenge-response，进程重启后必须轮换）
 * 处理启动前检查
 * 做单实例约束判断
+
+当前实现补充：
+
+* Agent 启动入口已支持显式 `-config <yaml_path>` 加载 YAML 配置，且该配置始终保持最高优先级。
+* 未传 `-config` 时，`agent-core` 会按 Bridge 同款顺序自动查找配置：
+  * `DEV_AGENT_CFG_*` 环境变量
+  * 程序运行目录 `agent.yaml`
+  * 用户目录配置（Linux: `~/.config/devbridge/agent.yaml`；Windows: `%APPDATA%\\DevBridge\\agent.yaml`）
+  * 系统目录配置（Linux: `/etc/devbridge/agent.yaml`；Windows: `%ProgramData%\\DevBridge\\agent.yaml`）
+  * 内置默认值
+* Agent YAML 写回也与 Bridge 保持一致：自动创建父目录、继承原权限、临时文件写入后原子替换目标文件。
+* `GET /api/app/config` 现返回运行配置快照、配置来源路径和完整可编辑配置文档；`PUT /api/app/config` 可将更新后的 Agent 配置写回可编辑 YAML。
+* 当前 Web 配置保存只负责持久化配置文件和管理面快照，不直接热更新已运行的 transport / session / tunnel 参数；重启 Agent 后生效。
+* Web 设置页的可编辑字段口径已与 Tauri 对齐，仅开放共享运行字段：
+  * `agent_id`
+  * `bridge_addr`
+  * `bridge_transport`
+  * `bridge_tls_enabled` / `bridge_tls_root_ca_file` / `bridge_tls_server_name`
+  * `tunnel_pool_min_idle` / `tunnel_pool_max_idle` / `tunnel_pool_max_inflight`
+  * `tunnel_pool_ttl_ms` / `tunnel_pool_open_rate` / `tunnel_pool_open_burst` / `tunnel_pool_reconcile_gap_ms`
+* Web 侧保存时会把这组扁平字段映射回 Agent YAML 文档，其余如 `session.auth_*`、`ui.web.auth`、`observability` 保持原值不变。
+* 登录页视觉风格已按 `docs/stitch/login/code.html` 对齐为 split layout，且继续沿字体层级、留白、输入焦点态和品牌叙事块做了收口；登录行为仍保持当前 `/api/login` + Cookie 会话模型，不引入额外认证状态。
+* 为便于独立前端调样，纯静态预览场景下若未接入 Agent HTTP API，登录页会回退到匿名预览态，不再把 `/api/session` 的 HTML fallback 渲染成红色 JSON 解析错误。
+* Web 设置页现已补充字段级校验和重启引导，错误优先在对应输入框下展示；保存成功后明确提示“配置已写入，重启 Agent 后生效”。
+* Web 设置页表单已改为更接近 Stitch 原型的 tonal / no-line 分组风格，使用背景层级和节奏分区，而不是依赖硬边框切割内容。
+* Web 侧枚举字段的下拉选择已切换为 shadcn/ui 风格实现，基于 Radix Select 提供独立弹层、统一焦点态和更一致的视觉口径，不再使用原生 `<select>` 包装。
+* 服务登记页中的 `allow_export` 已切换为 shadcn/ui 风格 checkbox；备注输入区 `Textarea` 也已统一为相近的圆角、底色和焦点态，避免同一张表单里控件语言割裂。
+* 登录后的 Web 控制台壳层已改为左侧导航固定、右侧工作区独立滚动，长列表与长表单页面不会再把菜单区一并带走。
+* 总览页与服务页已继续向同一套控制台语言收口：桥接会话、运行重点、服务目录与服务登记表单已统一为中文口径，并采用与设置页相近的 tonal / sectional 视觉层次。
+* 隧道页、流量页与诊断页也已同步收口：隧道视图、流量吞吐、诊断摘要与最近运行日志等区块已统一为中文口径，并与其他页面共享更轻的卡片层级和内容密度。
+* 控制台可见状态词与品牌文案也已继续中文化：页头、侧栏、页脚统一为“Agent 控制台”，`idle / active / error / healthy / degraded` 等运行态会在前端映射为中文展示。
+* `session_secret` 仅用于 LocalRPC challenge-response，不参与 Web UI HTTP 登录态。
+* `agent-core` 现在区分运行入口：
+  - 直接启动且 `ui.web.enabled=true` 时默认进入 Web 管理面
+  - `-tauri` 显式启用 LocalRPC / 宿主模式
+  - `-tauri -web` 可同时启用两套入口
+* `apps/dev-agent` 的 launcher 会在拉起 Agent 进程时自动追加 `-tauri`，保证宿主链路兼容
 
 ---
 

@@ -699,6 +699,7 @@ web/bridge-admin/
 2. 顶栏：采用吸顶布局，展示 breadcrumb、页面标题、SSE/轮询状态与手动刷新入口；状态说明通过徽章 Tooltip 展示
 3. Dashboard：采用“总览 Hero + KPI 条带 + 趋势/隧道状态双列 + 风险分区”布局
 4. 明细页：继续以表格、过滤器、详情抽屉为主，不把运行时内部对象直接裸露到页面外观层
+5. 运维页（Ops）允许承载“Connector Token 管理”这类高权限运维卡片；优先复用既有页面，而不是为低频凭证操作单独新增一级导航
 
 后续若继续扩展页面，不应破坏这套壳层分工；新增入口优先复用现有左侧导航分组与顶部控制区。
 
@@ -773,6 +774,34 @@ web/bridge-admin/
 * `base_config_file_path`：当前最高优先级基础配置文件路径（显式 `-config`、程序运行目录 `bridge.yaml` 或系统目录）
 * `field_sources`：逐字段标记当前来源，取值为 `explicit | env | local | user | system | default`
 
+### Connector Token
+
+* `GET /api/admin/connector-tokens`
+* `GET /api/admin/connector-tokens/:tokenId`
+* `POST /api/admin/connector-tokens`
+* `POST /api/admin/connector-tokens/:tokenId/rotate`
+* `POST /api/admin/connector-tokens/:tokenId/revoke`
+
+这组接口返回 token 元数据与一次性明文签发结果，不复用 `/api/admin/config` 主配置 patch 链路。列表、详情与 SSE 聚合快照仅返回：
+
+* `connector_id`
+* `token_id`
+* `status`
+* `issued_at_ms`
+* `expires_at_ms`
+* `rotated_at_ms`
+* `metadata`
+
+禁止返回：
+
+* `plain_token` 之外的明文 secret
+* `token_secret_hash`
+
+说明：
+
+* `plain_token` 仅在 `POST create` 与 `POST rotate` 当次响应返回一次
+* `ops` 主题 SSE 快照需附带 `connector_tokens`，供运维页卡片实时回流列表元数据
+
 ### Logs / Metrics
 
 * `GET /api/admin/logs/search?from=<ts>&to=<ts>&cursor=<cursor>&limit=<n>`
@@ -819,6 +848,8 @@ web/bridge-admin/
 * 有幂等或重复执行保护
 * 配置修改必须带 `if_match_version`，版本不一致返回 `409 Conflict`
 * 诊断包与日志导出仅允许 `admin` 角色
+* connector token 的创建、轮换、吊销仅允许 `admin` 角色，且必须落审计日志
+* connector token 的写接口不允许二次回显旧明文；明文只在创建/轮换响应里返回一次
 
 ---
 

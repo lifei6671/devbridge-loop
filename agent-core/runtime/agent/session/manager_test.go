@@ -185,6 +185,7 @@ func TestManagerBlocksStateAdvanceWhileHandlerRunning(testingObject *testing.T) 
 	lockAcquired := make(chan struct{}, 1)
 	go func() {
 		sessionManager.mu.Lock()
+		_ = sessionManager.state
 		sessionManager.mu.Unlock()
 		lockAcquired <- struct{}{}
 	}()

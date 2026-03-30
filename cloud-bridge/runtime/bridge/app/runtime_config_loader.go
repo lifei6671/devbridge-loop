@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/internal/fileutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -83,6 +84,41 @@ type runtimeConfigEditableTarget struct {
 }
 
 var runtimeConfigFieldYAMLPaths = map[string]string{
+	"default_scope.namespace":                       "default_scope.namespace",
+	"default_scope.environment":                     "default_scope.environment",
+	"ingress.http_addr":                             "ingress.http_addr",
+	"ingress.grpc_addr":                             "ingress.grpc_addr",
+	"ingress.https_addr":                            "ingress.https_addr",
+	"ingress.tls_sni_addr":                          "ingress.tls_sni_addr",
+	"ingress.tcp_port_range":                        "ingress.tcp_port_range",
+	"ingress.base_domain":                           "ingress.base_domain",
+	"admin.enabled":                                 "admin.enabled",
+	"admin.listen_addr":                             "admin.listen_addr",
+	"admin.allow_shared_listener":                   "admin.allow_shared_listener",
+	"admin.base_path":                               "admin.base_path",
+	"admin.ui_enabled":                              "admin.ui_enabled",
+	"connector_auth.token_store.driver":             "connector_auth.token_store.driver",
+	"connector_auth.token_store.file.path":          "connector_auth.token_store.file.path",
+	"control_plane.listen_addr":                     "control_plane.listen_addr",
+	"control_plane.grpc_h2_listen_addr":             "control_plane.grpc_h2_listen_addr",
+	"control_plane.quic_listen_addr":                "control_plane.quic_listen_addr",
+	"control_plane.heartbeat_timeout_ms":            "control_plane.heartbeat_timeout",
+	"control_plane.tls_mode":                        "control_plane.tls_mode",
+	"control_plane.tls_cert_source":                 "control_plane.tls_cert_source",
+	"control_plane.tls_cert_file":                   "control_plane.tls_cert_file",
+	"control_plane.tls_key_file":                    "control_plane.tls_key_file",
+	"control_plane.tls_ca_cert_file":                "control_plane.tls_ca_cert_file",
+	"control_plane.tls_ca_key_file":                 "control_plane.tls_ca_key_file",
+	"control_plane.tls_server_common_name":          "control_plane.tls_server_common_name",
+	"control_plane.tls_server_san_dns":              "control_plane.tls_server_san_dns",
+	"control_plane.tls_server_san_ips":              "control_plane.tls_server_san_ips",
+	"control_plane.tls_server_cert_ttl_ms":          "control_plane.tls_server_cert_ttl",
+	"control_plane.tls_server_cert_renew_before_ms": "control_plane.tls_server_cert_renew_before",
+	"observability.log_level":                       "observability.log_level",
+	"observability.metrics_addr":                    "observability.metrics_addr",
+}
+
+var runtimeConfigEditableFieldYAMLPaths = map[string]string{
 	"default_scope.namespace":                       "default_scope.namespace",
 	"default_scope.environment":                     "default_scope.environment",
 	"ingress.http_addr":                             "ingress.http_addr",
@@ -270,11 +306,96 @@ func buildRuntimeConfigFromLayerMaps(layerMaps runtimeConfigLayerMaps) (Config, 
 	if err := applyRuntimeConfigLayerMap(&resolvedConfig, layerMaps.explicitLayer); err != nil {
 		return Config{}, err
 	}
+	resolveRuntimeConfigRelativePathsInPlace(&resolvedConfig, layerMaps)
 	resolvedConfig.NormalizeCompatibility()
 	if err := resolvedConfig.Validate(); err != nil {
 		return Config{}, err
 	}
 	return resolvedConfig, nil
+}
+
+func resolveRuntimeConfigRelativePathsInPlace(runtimeConfig *Config, layerMaps runtimeConfigLayerMaps) {
+	if runtimeConfig == nil {
+		return
+	}
+	runtimeConfig.ConnectorAuth.TokenStore.File.Path = resolveRuntimeConfigRelativeFilePathForLayerMaps(
+		strings.TrimSpace(runtimeConfig.ConnectorAuth.TokenStore.File.Path),
+		layerMaps,
+		[]string{"connector_auth", "token_store", "file", "path"},
+	)
+}
+
+func resolveRuntimeConfigRelativeFilePathForLayerMaps(
+	rawPath string,
+	layerMaps runtimeConfigLayerMaps,
+	fieldPath []string,
+) string {
+	normalizedPath := strings.TrimSpace(rawPath)
+	if normalizedPath == "" || filepath.IsAbs(normalizedPath) {
+		return normalizedPath
+	}
+	for _, layer := range []struct {
+		configFilePath string
+		layer          map[string]any
+	}{
+		{
+			configFilePath: layerMaps.explicitConfigFilePath,
+			layer:          layerMaps.explicitLayer,
+		},
+		{
+			configFilePath: layerMaps.localConfigFilePath,
+			layer:          layerMaps.localLayer,
+		},
+		{
+			configFilePath: layerMaps.userConfigFilePath,
+			layer:          layerMaps.userLayer,
+		},
+		{
+			configFilePath: layerMaps.systemConfigFilePath,
+			layer:          layerMaps.systemLayer,
+		},
+	} {
+		if _, ok := lookupRuntimeConfigStringFieldInLayer(layer.layer, fieldPath...); !ok {
+			continue
+		}
+		return resolveRuntimeConfigRelativeFilePath(normalizedPath, layer.configFilePath)
+	}
+	return resolveRuntimeConfigRelativeFilePath(normalizedPath, runtimeBaseConfigFilePathForLayerMaps(layerMaps))
+}
+
+func resolveRuntimeConfigRelativeFilePath(rawPath string, configFilePath string) string {
+	normalizedPath := strings.TrimSpace(rawPath)
+	if normalizedPath == "" || filepath.IsAbs(normalizedPath) {
+		return normalizedPath
+	}
+	normalizedConfigFilePath := strings.TrimSpace(configFilePath)
+	if normalizedConfigFilePath == "" {
+		return normalizedPath
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(normalizedConfigFilePath), normalizedPath))
+}
+
+func lookupRuntimeConfigStringFieldInLayer(layer map[string]any, path ...string) (string, bool) {
+	if len(layer) == 0 || len(path) == 0 {
+		return "", false
+	}
+	current := any(layer)
+	for _, pathSegment := range path {
+		currentMap, ok := current.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		nextValue, exists := currentMap[pathSegment]
+		if !exists {
+			return "", false
+		}
+		current = nextValue
+	}
+	stringValue, ok := current.(string)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(stringValue), true
 }
 
 func runtimeBaseConfigFilePathForLayerMaps(layerMaps runtimeConfigLayerMaps) string {
@@ -384,7 +505,7 @@ func writeRuntimeConfigBytesToFile(encodedContent []byte, configFilePath string)
 	if closeErr := tempFile.Close(); closeErr != nil {
 		return fmt.Errorf("write runtime config bytes: close temp file failed: %w", closeErr)
 	}
-	if renameErr := os.Rename(tempFilePath, absoluteConfigFilePath); renameErr != nil {
+	if renameErr := fileutil.ReplaceFile(tempFilePath, absoluteConfigFilePath); renameErr != nil {
 		return fmt.Errorf("write runtime config bytes: replace target file failed: %w", renameErr)
 	}
 	return nil
@@ -511,13 +632,13 @@ func buildEditableRuntimeConfigPatch(userLayer map[string]any) map[string]any {
 	}
 	editablePatch := map[string]any{}
 	visitedYAMLPaths := map[string]struct{}{}
-	for _, yamlPath := range runtimeConfigFieldYAMLPaths {
+	for _, yamlPath := range runtimeConfigEditableFieldYAMLPaths {
 		if _, visited := visitedYAMLPaths[yamlPath]; visited {
 			continue
 		}
 		visitedYAMLPaths[yamlPath] = struct{}{}
 		fieldValue, exists := readRuntimeConfigYAMLPath(userLayer, yamlPath)
-		if exists != true {
+		if !exists {
 			continue
 		}
 		setRuntimeConfigYAMLPath(editablePatch, yamlPath, cloneRuntimeConfigLayerValue(fieldValue))
@@ -557,8 +678,8 @@ func buildEditableRuntimeConfigRestorePreview(
 	if err != nil {
 		return nil, err
 	}
-	for fieldKey, yamlPath := range runtimeConfigFieldYAMLPaths {
-		if _, exists := readRuntimeConfigYAMLPath(editableTarget.layer, yamlPath); exists != true {
+	for fieldKey, yamlPath := range runtimeConfigEditableFieldYAMLPaths {
+		if _, exists := readRuntimeConfigYAMLPath(editableTarget.layer, yamlPath); !exists {
 			continue
 		}
 		restorePreview[fieldKey] = map[string]any{
@@ -593,6 +714,10 @@ func readRuntimeConfigFieldSnapshotValue(runtimeConfig Config, fieldKey string) 
 		return normalizeAdminUIBasePath(runtimeConfig.Admin.BasePath)
 	case "admin.ui_enabled":
 		return runtimeConfig.Admin.UIEnabled
+	case "connector_auth.token_store.driver":
+		return strings.TrimSpace(runtimeConfig.ConnectorAuth.TokenStore.Driver)
+	case "connector_auth.token_store.file.path":
+		return strings.TrimSpace(runtimeConfig.ConnectorAuth.TokenStore.File.Path)
 	case "control_plane.listen_addr":
 		return runtimeConfig.ControlPlane.ListenAddr
 	case "control_plane.grpc_h2_listen_addr":
@@ -641,7 +766,7 @@ func lookupRuntimeConfigPatchYAMLPath(patchKey string) (string, bool) {
 	if normalizedPatchKey == "control_plane.heartbeat_timeout" {
 		return "control_plane.heartbeat_timeout", true
 	}
-	yamlPath, exists := runtimeConfigFieldYAMLPaths[normalizedPatchKey]
+	yamlPath, exists := runtimeConfigEditableFieldYAMLPaths[normalizedPatchKey]
 	return yamlPath, exists
 }
 
@@ -830,7 +955,7 @@ func applyRuntimeConfigPatch(
 	normalizedPatchKey := strings.TrimSpace(patchKey)
 	if patchValue == nil {
 		yamlPath, exists := lookupRuntimeConfigPatchYAMLPath(normalizedPatchKey)
-		if exists != true {
+		if !exists {
 			return fmt.Errorf("unsupported patch key=%s", normalizedPatchKey)
 		}
 		deleteRuntimeConfigYAMLPath(editableLayer, yamlPath)
@@ -1228,7 +1353,7 @@ func setRuntimeConfigYAMLPath(record map[string]any, dottedPath string, value an
 			return
 		}
 		nextRecord, ok := current[segment].(map[string]any)
-		if ok != true {
+		if !ok {
 			nextRecord = map[string]any{}
 			current[segment] = nextRecord
 		}
@@ -1254,7 +1379,7 @@ func deleteRuntimeConfigYAMLPathSegments(record map[string]any, segments []strin
 		return len(record) == 0
 	}
 	nextRecord, ok := record[segment].(map[string]any)
-	if ok != true {
+	if !ok {
 		return len(record) == 0
 	}
 	if deleteRuntimeConfigYAMLPathSegments(nextRecord, segments[1:]) {
@@ -1271,11 +1396,11 @@ func readRuntimeConfigYAMLPath(record map[string]any, dottedPath string) (any, b
 	var current any = record
 	for _, segment := range segments {
 		currentRecord, ok := current.(map[string]any)
-		if ok != true {
+		if !ok {
 			return nil, false
 		}
 		nextValue, exists := currentRecord[segment]
-		if exists != true {
+		if !exists {
 			return nil, false
 		}
 		current = nextValue
@@ -1285,7 +1410,7 @@ func readRuntimeConfigYAMLPath(record map[string]any, dottedPath string) (any, b
 
 func lookupNonEmptyEnv(lookupEnv envLookupFn, key string) (string, bool) {
 	rawValue, exists := lookupEnv(key)
-	if exists != true {
+	if !exists {
 		return "", false
 	}
 	normalizedValue := strings.TrimSpace(rawValue)
@@ -1297,7 +1422,7 @@ func lookupNonEmptyEnv(lookupEnv envLookupFn, key string) (string, bool) {
 
 func lookupBoolEnv(lookupEnv envLookupFn, key string) (bool, bool, error) {
 	rawValue, exists := lookupEnv(key)
-	if exists != true {
+	if !exists {
 		return false, false, nil
 	}
 	normalizedValue := strings.ToLower(strings.TrimSpace(rawValue))
@@ -1332,7 +1457,7 @@ func lookupHeartbeatTimeoutEnv(lookupEnv envLookupFn) (time.Duration, bool, erro
 
 func lookupDurationEnv(lookupEnv envLookupFn, key string) (time.Duration, bool, error) {
 	rawValue, exists := lookupEnv(key)
-	if exists != true {
+	if !exists {
 		return 0, false, nil
 	}
 	normalizedValue := strings.TrimSpace(rawValue)
@@ -1351,7 +1476,7 @@ func lookupDurationEnv(lookupEnv envLookupFn, key string) (time.Duration, bool, 
 
 func commaSeparatedEnvListFromLookup(lookupEnv envLookupFn, key string) ([]string, bool) {
 	rawValue, exists := lookupEnv(key)
-	if exists != true {
+	if !exists {
 		return nil, false
 	}
 	normalizedValue := strings.TrimSpace(rawValue)

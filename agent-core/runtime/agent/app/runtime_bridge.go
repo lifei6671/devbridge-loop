@@ -1010,14 +1010,14 @@ func (r *Runtime) connectBridgeControlGRPC(ctx context.Context) error {
 	dialOptions = append(
 		dialOptions,
 		grpc.WithTransportCredentials(transportCredentials),
-		grpc.WithBlock(),
 	)
-	clientConn, err := grpc.DialContext(dialContext, r.cfg.BridgeAddr, dialOptions...)
+	clientConn, err := grpc.NewClient(r.cfg.BridgeAddr, dialOptions...)
 	if err != nil {
 		return fmt.Errorf("dial bridge grpc connection failed: %w", err)
 	}
+	clientConn.Connect()
 	client := transportgen.NewGRPCH2TransportServiceClient(clientConn)
-	controlChannel, err := r.grpcTransport.OpenControlChannel(ctx, client)
+	controlChannel, err := r.grpcTransport.OpenControlChannel(dialContext, client)
 	if err != nil {
 		_ = clientConn.Close()
 		return fmt.Errorf("open bridge grpc control channel failed: %w", err)

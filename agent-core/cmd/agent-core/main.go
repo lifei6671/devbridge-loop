@@ -3,15 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
+	"flag"
 	"log"
-	"math"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/app"
 )
@@ -40,10 +37,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	cfg := app.DefaultConfig()
-	resolvedConfig, bootstrapOptions, err := loadRuntimeConfigFromEnv(cfg)
+	resolvedConfig, bootstrapOptions, runOptions, err := loadRuntimeConfigFromArgs(os.Args[1:])
 	if err != nil {
-		log.Fatalf("load runtime config from env failed: %v", err)
+		log.Fatalf("load runtime config failed: %v", err)
 	}
 
 	// 通过 BootstrapWithOptions 应用 tunnel pool 覆盖，确保配置真实进入 runtime。
@@ -52,202 +48,63 @@ func main() {
 		log.Fatalf("agent bootstrap failed: %v", err)
 	}
 
-	if err := runtime.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := runtime.Run(ctx, runOptions); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("agent runtime stopped: %v", err)
 	}
 }
 
+func loadRuntimeConfigFromArgs(args []string) (app.Config, app.BootstrapOptions, app.RunOptions, error) {
+	flagSet := flag.NewFlagSet("agent-core", flag.ContinueOnError)
+	flagSet.SetOutput(os.Stderr)
+	configFilePathFlag := flagSet.String("config", "", "Agent YAML 配置文件路径")
+	tauriFlag := flagSet.Bool("tauri", false, "显式启用 Tauri / LocalRPC 启动模式")
+	webFlag := flagSet.Bool("web", false, "显式启用 Web 管理面启动模式")
+	if err := flagSet.Parse(args); err != nil {
+		return app.Config{}, app.BootstrapOptions{}, app.RunOptions{}, err
+	}
+	resolvedConfig, bootstrapOptions, err := loadRuntimeConfig(strings.TrimSpace(*configFilePathFlag))
+	if err != nil {
+		return app.Config{}, app.BootstrapOptions{}, app.RunOptions{}, err
+	}
+	runOptions, err := resolveRunOptions(resolvedConfig, *tauriFlag, *webFlag)
+	if err != nil {
+		return app.Config{}, app.BootstrapOptions{}, app.RunOptions{}, err
+	}
+	return resolvedConfig, bootstrapOptions, runOptions, nil
+}
+
+func loadRuntimeConfig(configFilePath string) (app.Config, app.BootstrapOptions, error) {
+	resolvedConfig, err := app.LoadRuntimeConfig(strings.TrimSpace(configFilePath))
+	if err != nil {
+		return app.Config{}, app.BootstrapOptions{}, err
+	}
+	return resolvedConfig, app.BootstrapOptions{}, nil
+}
+
+func resolveRunOptions(config app.Config, tauriEnabled bool, webEnabled bool) (app.RunOptions, error) {
+	runOptions := app.RunOptions{
+		EnableLocalRPC: tauriEnabled,
+		EnableWeb:      false,
+	}
+	switch {
+	case webEnabled:
+		runOptions.EnableWeb = true
+	case tauriEnabled:
+		runOptions.EnableWeb = false
+	default:
+		runOptions.EnableWeb = config.UI.Web.Enabled
+	}
+	if err := runOptions.Validate(config); err != nil {
+		return app.RunOptions{}, err
+	}
+	return runOptions, nil
+}
+
 // loadRuntimeConfigFromEnv 从环境变量加载 agent-core 真实配置并做启动前校验。
 func loadRuntimeConfigFromEnv(defaultConfig app.Config) (app.Config, app.BootstrapOptions, error) {
-	resolvedConfig := defaultConfig
-	resolvedConfig.AgentID = stringEnvOrDefault(envAgentID, defaultConfig.AgentID)
-	resolvedConfig.BridgeAddr = stringEnvOrDefault(envBridgeAddr, defaultConfig.BridgeAddr)
-	resolvedConfig.BridgeTransport = stringEnvOrDefault(
-		envBridgeTransport,
-		defaultConfig.BridgeTransport,
-	)
-	bridgeTLSEnabled, err := boolEnvOrDefault(envBridgeTLSEnabled, defaultConfig.BridgeTLS.Enabled)
+	resolvedConfig, err := app.ApplyRuntimeConfigEnvOverrides(defaultConfig)
 	if err != nil {
 		return app.Config{}, app.BootstrapOptions{}, err
 	}
-	resolvedConfig.BridgeTLS.Enabled = bridgeTLSEnabled
-	resolvedConfig.BridgeTLS.RootCAFile = stringEnvOrDefault(
-		envBridgeTLSRootCAFile,
-		defaultConfig.BridgeTLS.RootCAFile,
-	)
-	resolvedConfig.BridgeTLS.ServerName = stringEnvOrDefault(
-		envBridgeTLSServerName,
-		defaultConfig.BridgeTLS.ServerName,
-	)
-	resolvedConfig.Session.AuthMethod = stringEnvOrDefault(
-		envBridgeAuthMethod,
-		defaultConfig.Session.AuthMethod,
-	)
-	resolvedConfig.Session.AuthToken = stringEnvOrDefault(
-		envBridgeAuthToken,
-		defaultConfig.Session.AuthToken,
-	)
-	resolvedConfig.Session.ClientCapVersion = stringEnvOrDefault(
-		envBridgeClientCapVersion,
-		defaultConfig.Session.ClientCapVersion,
-	)
-
-	minIdle, err := intEnvOrDefault(envTunnelPoolMinIdle, defaultConfig.TunnelPool.MinIdle)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	maxIdle, err := intEnvOrDefault(envTunnelPoolMaxIdle, defaultConfig.TunnelPool.MaxIdle)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	maxInflight, err := intEnvOrDefault(envTunnelPoolMaxInflight, defaultConfig.TunnelPool.MaxInflight)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	ttlMS, err := int64EnvOrDefault(envTunnelPoolTTLMS, defaultConfig.TunnelPool.TTL.Milliseconds())
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	openRate, err := float64EnvOrDefault(envTunnelPoolOpenRate, defaultConfig.TunnelPool.OpenRate)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	openBurst, err := intEnvOrDefault(envTunnelPoolOpenBurst, defaultConfig.TunnelPool.OpenBurst)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-	reconcileGapMS, err := int64EnvOrDefault(
-		envTunnelPoolReconcileGapMS,
-		defaultConfig.TunnelPool.ReconcileGap.Milliseconds(),
-	)
-	if err != nil {
-		return app.Config{}, app.BootstrapOptions{}, err
-	}
-
-	// 先做一轮显式校验，尽量把错误信息定位到具体字段。
-	if strings.TrimSpace(resolvedConfig.AgentID) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envAgentID)
-	}
-	if strings.TrimSpace(resolvedConfig.BridgeAddr) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAddr)
-	}
-	if strings.TrimSpace(resolvedConfig.BridgeTransport) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeTransport)
-	}
-	if resolvedConfig.BridgeTLS.Enabled && strings.TrimSpace(resolvedConfig.BridgeTLS.RootCAFile) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 开启时 %s 不能为空", envBridgeTLSEnabled, envBridgeTLSRootCAFile)
-	}
-	if strings.TrimSpace(resolvedConfig.Session.AuthMethod) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAuthMethod)
-	}
-	if strings.TrimSpace(resolvedConfig.Session.AuthToken) == "" {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能为空", envBridgeAuthToken)
-	}
-	if minIdle < 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于等于 0", envTunnelPoolMinIdle)
-	}
-	if maxIdle <= 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于 0", envTunnelPoolMaxIdle)
-	}
-	if minIdle > maxIdle {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能大于 %s", envTunnelPoolMinIdle, envTunnelPoolMaxIdle)
-	}
-	if maxInflight <= 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于 0", envTunnelPoolMaxInflight)
-	}
-	if ttlMS < 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 不能小于 0", envTunnelPoolTTLMS)
-	}
-	if math.IsNaN(openRate) || math.IsInf(openRate, 0) || openRate <= 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须是有限且大于 0 的数值", envTunnelPoolOpenRate)
-	}
-	if openBurst <= 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于 0", envTunnelPoolOpenBurst)
-	}
-	if reconcileGapMS <= 0 {
-		return app.Config{}, app.BootstrapOptions{}, fmt.Errorf("%s 必须大于 0", envTunnelPoolReconcileGapMS)
-	}
-
-	tunnelPoolTTL := time.Duration(ttlMS) * time.Millisecond
-	tunnelPoolReconcileGap := time.Duration(reconcileGapMS) * time.Millisecond
-	// 通过 override 结构注入 tunnel pool，保持与设计方案一致。
-	bootstrapOptions := app.BootstrapOptions{
-		TunnelPoolOverride: &app.TunnelPoolOverride{
-			MinIdle:      &minIdle,
-			MaxIdle:      &maxIdle,
-			MaxInflight:  &maxInflight,
-			TTL:          &tunnelPoolTTL,
-			OpenRate:     &openRate,
-			OpenBurst:    &openBurst,
-			ReconcileGap: &tunnelPoolReconcileGap,
-		},
-	}
-
-	return resolvedConfig, bootstrapOptions, nil
-}
-
-// stringEnvOrDefault 读取字符串环境变量，空值时回退默认值。
-func stringEnvOrDefault(key string, defaultValue string) string {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue
-	}
-	return normalizedValue
-}
-
-// boolEnvOrDefault 读取布尔环境变量，空值时回退默认值。
-func boolEnvOrDefault(key string, defaultValue bool) (bool, error) {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue, nil
-	}
-	parsedValue, err := strconv.ParseBool(normalizedValue)
-	if err != nil {
-		return false, fmt.Errorf("解析 %s 失败: %w", key, err)
-	}
-	return parsedValue, nil
-}
-
-// intEnvOrDefault 读取 int 环境变量，空值时回退默认值。
-func intEnvOrDefault(key string, defaultValue int) (int, error) {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue, nil
-	}
-	parsedValue, err := strconv.Atoi(normalizedValue)
-	if err != nil {
-		return 0, fmt.Errorf("解析 %s 失败: %w", key, err)
-	}
-	return parsedValue, nil
-}
-
-// int64EnvOrDefault 读取 int64 环境变量，空值时回退默认值。
-func int64EnvOrDefault(key string, defaultValue int64) (int64, error) {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue, nil
-	}
-	parsedValue, err := strconv.ParseInt(normalizedValue, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("解析 %s 失败: %w", key, err)
-	}
-	return parsedValue, nil
-}
-
-// float64EnvOrDefault 读取 float64 环境变量，空值时回退默认值。
-func float64EnvOrDefault(key string, defaultValue float64) (float64, error) {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue, nil
-	}
-	parsedValue, err := strconv.ParseFloat(normalizedValue, 64)
-	if err != nil {
-		return 0, fmt.Errorf("解析 %s 失败: %w", key, err)
-	}
-	return parsedValue, nil
+	return resolvedConfig, app.BootstrapOptions{}, nil
 }

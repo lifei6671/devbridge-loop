@@ -96,11 +96,6 @@ type runtimeDataPlane struct {
 	tcpGateway    *ingress.TCPPortGateway
 }
 
-// newRuntimeDataPlane 构建 runtime 所需的 routing + connector/direct/hybrid 主路径组件。
-func newRuntimeDataPlane(cfg Config) (*runtimeDataPlane, error) {
-	return newRuntimeDataPlaneWithDependencies(cfg, runtimeDataPlaneDependencies{})
-}
-
 // newRuntimeDataPlaneWithDependencies 构建支持依赖注入的数据面组件图。
 func newRuntimeDataPlaneWithDependencies(
 	cfg Config,

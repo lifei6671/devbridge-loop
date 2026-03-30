@@ -18,11 +18,6 @@ var (
 	ErrPathExecutorDependencyMissing = errors.New("path executor dependency missing")
 )
 
-const (
-	// trafficOpenMetadataInstanceIDKey 定义 TrafficOpen 元数据中的 instance_id 键。
-	trafficOpenMetadataInstanceIDKey = "instance_id"
-)
-
 // ConnectorDispatcher 定义 connector 路径执行入口。
 type ConnectorDispatcher interface {
 	Dispatch(ctx context.Context, request connectorproxy.DispatchRequest) (connectorproxy.DispatchResult, error)

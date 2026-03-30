@@ -4,6 +4,7 @@ CARGO ?= cargo
 
 BIN_DIR := bin
 AGENT_CORE_BIN := $(BIN_DIR)/agent-core
+AGENT_WEB_DIR := agent-core/web
 CLOUD_BRIDGE_BIN := $(BIN_DIR)/cloud-bridge
 CLOUD_BRIDGE_WEB_DIR := cloud-bridge/web
 DEMO_ORDER_BIN := $(BIN_DIR)/order-service
@@ -19,11 +20,12 @@ TAURI_EXTRA_ARGS ?= --no-bundle
 UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
 IS_WINDOWS_HOST := $(if $(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)),1,0)
 
-.PHONY: help test test-go build-agent-core build-cloud-bridge-ui build-cloud-bridge build-go build-dev-agent-ui build-dev-agent-tauri build-dev-agent-tauri-cross build-demo-order build-demo-user build-demo-inventory build-demos run-demo-order run-demo-user run-demo-inventory build-win11 build-win11-go build-win11-dev-agent build-all clean
+.PHONY: help test test-go build-agent-web-ui build-agent-core build-cloud-bridge-ui build-cloud-bridge build-go build-dev-agent-ui build-dev-agent-tauri build-dev-agent-tauri-cross build-demo-order build-demo-user build-demo-inventory build-demos run-demo-order run-demo-user run-demo-inventory build-win11 build-win11-go build-win11-dev-agent build-all clean
 
 help:
 	@echo "可用命令:"
 	@echo "  make test                 # 运行 Go 单元测试"
+	@echo "  make build-agent-web-ui   # 构建 Agent Web 控制台静态资源"
 	@echo "  make build-agent-core     # 编译 agent-core"
 	@echo "  make build-cloud-bridge-ui# 构建 Bridge 管理页面静态资源"
 	@echo "  make build-cloud-bridge   # 编译 cloud-bridge"
@@ -41,12 +43,21 @@ help:
 
 test: test-go
 
-# 运行 Go 测试前先构建 Bridge UI，避免 go:embed 因缺失 dist 目录编译失败。
-test-go: build-cloud-bridge-ui
+# 运行 Go 测试前先构建前端静态资源，避免 go:embed 因缺失 dist 目录编译失败。
+test-go: build-agent-web-ui build-cloud-bridge-ui
 	cd agent-core && $(GO) test ./...
 	cd cloud-bridge && $(GO) test ./...
 
-build-agent-core:
+# 构建 Agent Web 控制台静态资源（用于 agent-core go:embed 打包）。
+build-agent-web-ui:
+	@if ! command -v $(NPM) >/dev/null 2>&1; then \
+		echo "未检测到 npm，请先安装 Node.js/npm。"; \
+		exit 1; \
+	fi
+	cd $(AGENT_WEB_DIR) && $(NPM) install
+	cd $(AGENT_WEB_DIR) && $(NPM) run build
+
+build-agent-core: build-agent-web-ui
 	@mkdir -p $(BIN_DIR)
 	cd agent-core && $(GO) build -o ../$(AGENT_CORE_BIN) ./cmd/agent-core
 
@@ -90,8 +101,8 @@ run-demo-inventory:
 
 # 在 WSL 下交叉编译 Win11 可执行文件（Go 模块 + demo 模块）。
 # 默认生成 x86_64 Windows 可执行（.exe），可通过 WIN_GOARCH 覆盖为 arm64。
-# 依赖 build-cloud-bridge-ui，确保 cloud-bridge.exe 打包最新内嵌前端静态资源。
-build-win11-go: build-cloud-bridge-ui
+# 依赖前端静态资源构建，确保 Windows 二进制打包的是最新内嵌页面。
+build-win11-go: build-agent-web-ui build-cloud-bridge-ui
 	@mkdir -p $(WIN11_BIN_DIR)
 	@echo ">> build windows binaries: GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) CGO_ENABLED=$(WIN_CGO_ENABLED)"
 	cd agent-core && CGO_ENABLED=$(WIN_CGO_ENABLED) GOOS=$(WIN_GOOS) GOARCH=$(WIN_GOARCH) $(GO) build -trimpath -ldflags="-s -w" -o ../$(WIN11_BIN_DIR)/agent-core.exe ./cmd/agent-core

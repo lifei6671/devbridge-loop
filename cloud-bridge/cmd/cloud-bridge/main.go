@@ -4,29 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/app"
-)
-
-const (
-	envControlPlaneTLSMode                  = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_MODE"
-	envControlPlaneTLSCertSource            = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_SOURCE"
-	envControlPlaneTLSCertFile              = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CERT_FILE"
-	envControlPlaneTLSKeyFile               = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_KEY_FILE"
-	envControlPlaneTLSCACertFile            = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_CERT_FILE"
-	envControlPlaneTLSCAKeyFile             = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_CA_KEY_FILE"
-	envControlPlaneTLSServerCommonName      = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_COMMON_NAME"
-	envControlPlaneTLSServerSANDNS          = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_DNS"
-	envControlPlaneTLSServerSANIPs          = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_SAN_IPS"
-	envControlPlaneTLSServerCertTTL         = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_TTL"
-	envControlPlaneTLSServerCertRenewBefore = "DEV_BRIDGE_CFG_CONTROL_PLANE_TLS_SERVER_CERT_RENEW_BEFORE"
 )
 
 func main() {
@@ -85,28 +69,4 @@ func formatLoadedRuntimeConfigPathForLog(configFilePath string) string {
 		return "<none>"
 	}
 	return configFilePath
-}
-
-// applyRuntimeConfigEnvOverrides 将环境变量覆盖到运行配置，并再次执行结构化校验。
-func applyRuntimeConfigEnvOverrides(runtimeConfig app.Config) (app.Config, error) {
-	return app.ApplyRuntimeConfigEnvOverrides(runtimeConfig)
-}
-
-// applyControlPlaneTLSEnvOverrides 处理 control_plane TLS 相关环境变量覆盖（环境变量优先）。
-func applyControlPlaneTLSEnvOverrides(runtimeConfig *app.Config) error {
-	return app.ApplyControlPlaneTLSEnvOverrides(runtimeConfig)
-}
-
-// durationEnvOrDefault 读取 duration 环境变量，空值时回退默认值。
-func durationEnvOrDefault(key string, defaultValue time.Duration) (time.Duration, error) {
-	rawValue := os.Getenv(key)
-	normalizedValue := strings.TrimSpace(rawValue)
-	if normalizedValue == "" {
-		return defaultValue, nil
-	}
-	parsedDuration, err := time.ParseDuration(normalizedValue)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s failed: %w", key, err)
-	}
-	return parsedDuration, nil
 }

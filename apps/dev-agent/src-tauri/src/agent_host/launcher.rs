@@ -311,6 +311,14 @@ pub fn generate_session_secret() -> Result<String, String> {
     generate_random_hex(32)
 }
 
+fn build_runtime_args_with_tauri_flag(runtime_args: &[String]) -> Vec<String> {
+    let mut args = runtime_args.to_vec();
+    if !args.iter().any(|arg| arg.trim() == "-tauri") {
+        args.push("-tauri".to_string());
+    }
+    args
+}
+
 /// 根据配置创建子进程命令并拉起 Agent runtime。
 pub fn spawn_agent_process(
     config: &crate::state::app_state::HostRuntimeConfig,
@@ -323,7 +331,7 @@ pub fn spawn_agent_process(
 
     validate_hex_token(session_secret, 64, "session_secret")?;
     let mut command = Command::new(&config.runtime_program);
-    command.args(&config.runtime_args);
+    command.args(build_runtime_args_with_tauri_flag(&config.runtime_args));
     // 注入会话密钥到子进程环境变量，供本地 IPC challenge-response 使用。
     command.env("DEV_AGENT_SESSION_SECRET", session_secret);
     // 保留启动时间戳字段，便于日志关联本次拉起链路。
@@ -436,7 +444,9 @@ pub fn ensure_single_instance_guard(state: &Arc<AppRuntimeState>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{default_ipc_endpoint, validate_named_pipe_endpoint};
+    use super::{
+        build_runtime_args_with_tauri_flag, default_ipc_endpoint, validate_named_pipe_endpoint,
+    };
 
     #[test]
     fn default_named_pipe_endpoint_should_use_windows_pipe_prefix() {
@@ -458,5 +468,33 @@ mod tests {
     fn named_pipe_endpoint_validation_should_reject_invalid_prefix() {
         let endpoint = r"\\server\pipe\agent-ui-test-user";
         assert!(validate_named_pipe_endpoint(endpoint).is_err());
+    }
+
+    #[test]
+    fn runtime_args_should_append_tauri_flag_once() {
+        let args =
+            build_runtime_args_with_tauri_flag(&["-config".to_string(), "agent.yaml".to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "-config".to_string(),
+                "agent.yaml".to_string(),
+                "-tauri".to_string()
+            ]
+        );
+
+        let args_with_existing_tauri = build_runtime_args_with_tauri_flag(&[
+            "-config".to_string(),
+            "agent.yaml".to_string(),
+            "-tauri".to_string(),
+        ]);
+        assert_eq!(
+            args_with_existing_tauri,
+            vec![
+                "-config".to_string(),
+                "agent.yaml".to_string(),
+                "-tauri".to_string()
+            ]
+        );
     }
 }

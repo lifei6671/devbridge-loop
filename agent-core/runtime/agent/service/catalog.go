@@ -1,10 +1,7 @@
 package service
 
 import (
-	"crypto/rand"
-	"encoding/binary"
 	"fmt"
-	"math/big"
 	"sort"
 	"strings"
 	"sync"
@@ -14,8 +11,6 @@ import (
 	"github.com/lifei6671/devbridge-loop/ltfp/adapter"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 )
-
-const ulidEncoding = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 // Record 描述 Agent 本地 service 运行态记录。
 type Record struct {
@@ -417,37 +412,4 @@ func normalizeServiceIDSegment(value string, fallback string) string {
 		}
 	}
 	return segment
-}
-
-func newULIDString(now time.Time) string {
-	normalizedNow := normalizeUpdatedAt(now)
-	timestampMillis := uint64(normalizedNow.UnixMilli())
-	var raw [16]byte
-	raw[0] = byte(timestampMillis >> 40)
-	raw[1] = byte(timestampMillis >> 32)
-	raw[2] = byte(timestampMillis >> 24)
-	raw[3] = byte(timestampMillis >> 16)
-	raw[4] = byte(timestampMillis >> 8)
-	raw[5] = byte(timestampMillis)
-	if _, err := rand.Read(raw[6:]); err != nil {
-		// 熵源异常时回退到时间戳片段，保证格式可用。
-		fallbackEntropy := uint64(time.Now().UTC().UnixNano())
-		binary.BigEndian.PutUint16(raw[6:8], uint16(fallbackEntropy>>48))
-		binary.BigEndian.PutUint64(raw[8:16], fallbackEntropy)
-	}
-	return encodeULID(raw)
-}
-
-func encodeULID(raw [16]byte) string {
-	var value big.Int
-	value.SetBytes(raw[:])
-	base := big.NewInt(32)
-	var remainder big.Int
-	encoded := make([]byte, 26)
-	for index := len(encoded) - 1; index >= 0; index-- {
-		remainder.Mod(&value, base)
-		encoded[index] = ulidEncoding[remainder.Int64()]
-		value.Div(&value, base)
-	}
-	return string(encoded)
 }

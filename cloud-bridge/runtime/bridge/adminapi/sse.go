@@ -393,10 +393,12 @@ func (server *Server) buildSSETopicPayload(topic sseTopic, query sseSnapshotQuer
 		if len(sessionItems) > sseDefaultSessionLimit {
 			sessionItems = sessionItems[:sseDefaultSessionLimit]
 		}
+		connectorTokenItems := safeListConnectorTokens(server.dependencies)
 		return map[string]any{
-			"snapshot":   configSnapshot,
-			"connectors": connectorItems,
-			"sessions":   sessionItems,
+			"snapshot":         configSnapshot,
+			"connectors":       connectorItems,
+			"connector_tokens": connectorTokenItems,
+			"sessions":         sessionItems,
 		}
 	case sseTopicObservability:
 		now := server.now()

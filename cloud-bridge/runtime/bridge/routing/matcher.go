@@ -355,13 +355,7 @@ func (matcher *Matcher) matchLookupQueries(routeQueryMatchers []pb.QueryMatcher,
 	}
 	adapted := make([]pb.HeaderMatcher, 0, len(routeQueryMatchers))
 	for _, queryMatcher := range routeQueryMatchers {
-		adapted = append(adapted, pb.HeaderMatcher{
-			Name:    queryMatcher.Name,
-			Exact:   queryMatcher.Exact,
-			Prefix:  queryMatcher.Prefix,
-			Regex:   queryMatcher.Regex,
-			Present: queryMatcher.Present,
-		})
+		adapted = append(adapted, pb.HeaderMatcher(queryMatcher))
 	}
 	return matcher.matchLookupKeyValues(adapted, requestQueries, true)
 }

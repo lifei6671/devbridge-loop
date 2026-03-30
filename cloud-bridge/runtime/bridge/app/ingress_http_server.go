@@ -24,7 +24,6 @@ import (
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/routing"
 	ltfperrors "github.com/lifei6671/devbridge-loop/ltfp/errors"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
-	"github.com/lifei6671/devbridge-loop/ltfp/transport"
 )
 
 const (
@@ -562,19 +561,6 @@ func readHTTPResponseFromTunnel(
 	return http.ReadResponse(responseReader, requestClone)
 }
 
-func writeTunnelCloseFrame(ctx context.Context, tunnel registry.RuntimeTunnel, trafficID string, reason string) error {
-	if tunnel == nil {
-		return ErrRuntimeDataPlaneDependencyMissing
-	}
-	closePayload := pb.StreamPayload{
-		Close: &pb.TrafficClose{
-			TrafficID: strings.TrimSpace(trafficID),
-			Reason:    strings.TrimSpace(reason),
-		},
-	}
-	return tunnel.WritePayload(ctx, closePayload)
-}
-
 func (runtime *Runtime) writeTunnelCloseAndAwaitAck(
 	ctx context.Context,
 	tunnel registry.RuntimeTunnel,
@@ -665,54 +651,6 @@ func isSafeHTTPMethodForRetry(method string) bool {
 	}
 }
 
-func (runtime *Runtime) recycleIngressTunnelClosed(ctx context.Context, runtimeTunnel registry.TunnelRuntime) error {
-	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil || runtimeTunnel.Tunnel == nil {
-		return ErrRuntimeDataPlaneDependencyMissing
-	}
-	nextRecycleSeq := runtimeTunnel.RecycleSeq + 1
-	if nextRecycleSeq == 0 {
-		nextRecycleSeq = 1
-	}
-	isFinal := runtimeTunnel.ReuseCount+1 >= runtime.cfg.TunnelReuse.MaxReuseCount
-	if _, err := connectorproxy.ExecuteTunnelRecycleHandshake(
-		ctx,
-		runtimeTunnel.Tunnel,
-		runtimeTunnel.TunnelID,
-		nextRecycleSeq,
-		isFinal,
-		runtime.cfg.TunnelReuse.RecycleTimeout,
-	); err != nil {
-		recycleErr := runtime.recycleIngressTunnelBroken(runtimeTunnel, err.Error())
-		if recycleErr != nil {
-			return errors.Join(err, recycleErr)
-		}
-		return err
-	}
-	if isFinal {
-		closeErr := runtimeTunnel.Tunnel.Close()
-		markClosedErr := runtime.dataPlane.tunnelRegistry.MarkClosed(time.Now().UTC(), runtimeTunnel.TunnelID)
-		_, removeErr := runtime.dataPlane.tunnelRegistry.RemoveTerminal(runtimeTunnel.TunnelID)
-		if closeErr != nil || markClosedErr != nil || removeErr != nil {
-			return errors.Join(closeErr, markClosedErr, removeErr)
-		}
-		return nil
-	}
-	return runtime.dataPlane.tunnelRegistry.MarkIdleAfterRecycle(time.Now().UTC(), runtimeTunnel.TunnelID, nextRecycleSeq)
-}
-
-func (runtime *Runtime) recycleIngressTunnelBroken(runtimeTunnel registry.TunnelRuntime, reason string) error {
-	if runtime == nil || runtime.dataPlane == nil || runtime.dataPlane.tunnelRegistry == nil || runtimeTunnel.Tunnel == nil {
-		return ErrRuntimeDataPlaneDependencyMissing
-	}
-	closeErr := runtimeTunnel.Tunnel.Close()
-	markBrokenErr := runtime.dataPlane.tunnelRegistry.MarkBroken(time.Now().UTC(), runtimeTunnel.TunnelID, strings.TrimSpace(reason))
-	_, removeErr := runtime.dataPlane.tunnelRegistry.RemoveTerminal(runtimeTunnel.TunnelID)
-	if closeErr != nil || markBrokenErr != nil || removeErr != nil {
-		return errors.Join(closeErr, markBrokenErr, removeErr)
-	}
-	return nil
-}
-
 func copyHTTPHeaders(destination http.Header, source http.Header) {
 	for headerName, values := range source {
 		if len(values) == 0 {
@@ -730,20 +668,6 @@ func detachedPostCommitContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return context.WithoutCancel(ctx)
-}
-
-func isGRPCBridgeRuntimeTunnel(tunnel registry.RuntimeTunnel) bool {
-	if tunnel == nil {
-		return false
-	}
-	type bindingTypeAware interface {
-		BindingType() transport.BindingType
-	}
-	awareTunnel, ok := tunnel.(bindingTypeAware)
-	if !ok {
-		return false
-	}
-	return awareTunnel.BindingType() == transport.BindingTypeGRPCH2
 }
 
 type tunnelTrafficReader struct {
@@ -860,16 +784,6 @@ func resolveIngressAuthority(request *http.Request) string {
 	}
 	if request.URL != nil {
 		return strings.TrimSpace(request.URL.Host)
-	}
-	return ""
-}
-
-func firstNonEmptyHeader(headers http.Header, keys ...string) string {
-	for _, key := range keys {
-		value := strings.TrimSpace(headers.Get(key))
-		if value != "" {
-			return value
-		}
 	}
 	return ""
 }

@@ -152,9 +152,7 @@ func (resolver *Resolver) Resolve(request ingress.RouteLookupRequest) (ResolveRe
 	for scopeIndex := 0; scopeIndex <= maxScopeIndex; scopeIndex++ {
 		scopeCandidates := filterScopedRouteCandidatesByIndex(scopedCandidates, scopeIndex)
 		connectorCandidates, externalCandidates := partitionScopedRouteCandidatesByTarget(scopeCandidates)
-		for _, externalCandidate := range externalCandidates {
-			externalFallbackCandidates = append(externalFallbackCandidates, externalCandidate)
-		}
+		externalFallbackCandidates = append(externalFallbackCandidates, externalCandidates...)
 		for len(connectorCandidates) > 0 {
 			routeCandidates := extractRoutesFromScopedCandidates(connectorCandidates)
 			route, selected := resolver.selector.Select(routeCandidates)
@@ -503,33 +501,6 @@ func normalizeRouteTargetType(target pb.RouteTarget) pb.RouteTargetType {
 	default:
 		return normalizedType
 	}
-}
-
-func filterRoutesByScope(routes []pb.Route, scope pb.Scope) []pb.Route {
-	if len(routes) == 0 {
-		return nil
-	}
-	filtered := make([]pb.Route, 0, len(routes))
-	for _, route := range routes {
-		if scopesEqual(route.Scope, scope) {
-			filtered = append(filtered, route)
-		}
-	}
-	return filtered
-}
-
-func removeRouteByID(routes []pb.Route, routeID string) []pb.Route {
-	normalizedRouteID := strings.TrimSpace(routeID)
-	if normalizedRouteID == "" || len(routes) == 0 {
-		return routes
-	}
-	for index, route := range routes {
-		if strings.TrimSpace(route.RouteID) != normalizedRouteID {
-			continue
-		}
-		return append(routes[:index], routes[index+1:]...)
-	}
-	return routes
 }
 
 func shouldContinueScopeFallback(err error) bool {

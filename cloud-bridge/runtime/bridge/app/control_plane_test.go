@@ -2278,6 +2278,7 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	//nolint:staticcheck // bufconn 测试场景下仍用 DialContext 建立阻塞式内存连接，直到迁移到等价稳定方案。
 	clientConn, err := grpc.DialContext(
 		ctx,
 		"bufnet",
@@ -2285,6 +2286,7 @@ func TestServeGRPCControlChannelReplyHeartbeatPong(testingObject *testing.T) {
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			return listener.Dial()
 		}),
+		grpc.WithBlock(),
 	)
 	if err != nil {
 		testingObject.Fatalf("dial grpc server failed: %v", err)

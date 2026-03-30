@@ -127,6 +127,7 @@ func buildAdminConfigSnapshot(
 			"csrf_header_name":      strings.TrimSpace(configCopy.Admin.CSRFHeaderName),
 			"allowed_origins":       append([]string(nil), configCopy.Admin.AllowedOrigins...),
 		},
+		"connector_auth": buildAdminConnectorAuthSnapshot(configCopy.ConnectorAuth),
 		"control_plane": map[string]any{
 			"listen_addr":                     configCopy.ControlPlane.ListenAddr,
 			"grpc_h2_listen_addr":             configCopy.ControlPlane.GRPCH2ListenAddr,
@@ -156,6 +157,24 @@ func buildAdminConfigSnapshot(
 		"updated_at_ms":     uint64(lastUpdatedAt.UnixMilli()),
 		"updated_by":        strings.TrimSpace(lastOperatorID),
 	}
+}
+
+func buildAdminConnectorAuthSnapshot(connectorAuth ConnectorAuthConfig) map[string]any {
+	return map[string]any{
+		"token_store": buildAdminConnectorTokenStoreSnapshot(connectorAuth.TokenStore),
+	}
+}
+
+func buildAdminConnectorTokenStoreSnapshot(tokenStore ConnectorTokenStoreConfig) map[string]any {
+	snapshot := map[string]any{
+		"driver": strings.TrimSpace(tokenStore.Driver),
+	}
+	if strings.EqualFold(strings.TrimSpace(tokenStore.Driver), "file") {
+		snapshot["file"] = map[string]any{
+			"path": strings.TrimSpace(tokenStore.File.Path),
+		}
+	}
+	return snapshot
 }
 
 // reload 模拟配置重载动作并推进配置版本号，便于审计与并发控制验证。
@@ -436,8 +455,6 @@ func drainSessionForAdmin(
 		currentState = registry.SessionDraining
 		resultLabel = "already_draining"
 	case registry.SessionStale, registry.SessionFailed, registry.SessionClosed:
-		currentState = sessionRuntime.State
-		resultLabel = "already_terminal"
 	default:
 		currentState = registry.SessionDraining
 		resultLabel = "drained"
@@ -744,12 +761,12 @@ func shadowingRuntimeConfigSourceForPatchKey(
 
 func runtimeConfigPatchKeyYAMLPath(patchKey string) (string, bool) {
 	normalizedPatchKey := strings.TrimSpace(patchKey)
-	if yamlPath, ok := runtimeConfigFieldYAMLPaths[normalizedPatchKey]; ok {
+	if yamlPath, ok := runtimeConfigEditableFieldYAMLPaths[normalizedPatchKey]; ok {
 		return yamlPath, true
 	}
 	switch normalizedPatchKey {
 	case "control_plane.heartbeat_timeout":
-		return runtimeConfigFieldYAMLPaths["control_plane.heartbeat_timeout_ms"], true
+		return runtimeConfigEditableFieldYAMLPaths["control_plane.heartbeat_timeout_ms"], true
 	default:
 		return "", false
 	}

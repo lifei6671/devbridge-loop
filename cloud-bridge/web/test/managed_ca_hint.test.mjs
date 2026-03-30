@@ -1,24 +1,25 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import { describe, expect, it } from "vitest";
 
 import {
   deriveManagedCAIdentitySuggestion,
   parseManagedCAHostFromListenAddr,
 } from "../src/admin/model/managed_ca_hint.js";
 
-test("parseManagedCAHostFromListenAddr splits bare host:port without keeping the port", () => {
-  assert.equal(parseManagedCAHostFromListenAddr("bridge:39081"), "bridge");
-  assert.equal(parseManagedCAHostFromListenAddr("127.0.0.1:39081"), "127.0.0.1");
-  assert.equal(parseManagedCAHostFromListenAddr("[::1]:39083"), "::1");
-});
-
-test("deriveManagedCAIdentitySuggestion keeps SAN DNS free of bare host ports", () => {
-  const suggestion = deriveManagedCAIdentitySuggestion({
-    controlPlaneListenAddr: "bridge:39081",
-    controlPlaneGRPCH2ListenAddr: "",
-    controlPlaneQUICListenAddr: "",
+describe("managed CA hint helpers", () => {
+  it("splits bare host:port without keeping the port", () => {
+    expect(parseManagedCAHostFromListenAddr("bridge:39081")).toBe("bridge");
+    expect(parseManagedCAHostFromListenAddr("127.0.0.1:39081")).toBe("127.0.0.1");
+    expect(parseManagedCAHostFromListenAddr("[::1]:39083")).toBe("::1");
   });
 
-  assert.equal(suggestion.sanDNS, "bridge");
-  assert.equal(suggestion.sanIPsAndCN, "- / CN=bridge");
+  it("keeps SAN DNS free of bare host ports", () => {
+    const suggestion = deriveManagedCAIdentitySuggestion({
+      controlPlaneListenAddr: "bridge:39081",
+      controlPlaneGRPCH2ListenAddr: "",
+      controlPlaneQUICListenAddr: "",
+    });
+
+    expect(suggestion.sanDNS).toBe("bridge");
+    expect(suggestion.sanIPsAndCN).toBe("- / CN=bridge");
+  });
 });

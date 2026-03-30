@@ -1,0 +1,169 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 17% 97%;
+  --foreground: 210 13% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 210 13% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 210 13% 12%;
+  --primary: 211 100% 37%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 16% 95%;
+  --secondary-foreground: 210 13% 20%;
+  --muted: 210 14% 93%;
+  --muted-foreground: 215 10% 36%;
+  --accent: 214 79% 51%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 77% 56%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 20% 84%;
+  --input: 220 20% 84%;
+  --ring: 211 100% 37%;
+  --surface-low: 210 14% 95%;
+  --surface-high: 210 10% 91%;
+  --surface-lowest: 0 0% 100%;
+  --outline-soft: 220 24% 84%;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.96) 0%, transparent 26%),
+    radial-gradient(circle at top right, rgba(216, 226, 255, 0.72) 0%, transparent 24%),
+    linear-gradient(180deg, #f8f9fa 0%, #f1f3f5 100%);
+  color: hsl(var(--foreground));
+  font-family: Inter, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.58), transparent 42%),
+    radial-gradient(circle at 20% 20%, rgba(0, 91, 191, 0.04), transparent 24%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(65, 71, 84, 0.18);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+@layer components {
+  .shell-grid {
+    @apply grid min-h-screen gap-4 p-3 sm:p-4 lg:h-screen lg:grid-cols-[280px_minmax(0,1fr)] lg:gap-5 lg:overflow-hidden lg:p-5;
+  }
+
+  .shell-sidebar {
+    @apply flex min-h-0 flex-col gap-4 rounded-[28px] border border-[hsl(var(--border)/0.14)] bg-[rgba(255,255,255,0.82)] p-4 shadow-ambient backdrop-blur sm:p-5 lg:sticky lg:top-4 lg:h-[calc(100vh-2rem)] lg:min-h-[calc(100vh-2rem)] lg:gap-6 lg:overflow-hidden;
+  }
+
+  .shell-main {
+    @apply flex min-w-0 flex-col gap-5 lg:gap-6 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto lg:pr-1;
+  }
+
+  .shell-topbar {
+    @apply z-20 rounded-[28px] border border-[hsl(var(--border)/0.14)] bg-[rgba(255,255,255,0.84)] px-4 py-4 shadow-ambient backdrop-blur sm:px-5 lg:sticky lg:top-4;
+  }
+
+  .panel-soft {
+    @apply rounded-[28px] border border-[hsl(var(--border)/0.14)] bg-[rgba(255,255,255,0.82)] shadow-ambient backdrop-blur;
+  }
+
+  .label-kicker {
+    @apply text-[11px] font-semibold uppercase tracking-[0.24em] text-[hsl(var(--muted-foreground))];
+  }
+
+  .metric-display {
+    @apply font-display text-4xl font-semibold tracking-[-0.04em] text-[hsl(var(--foreground))] md:text-5xl;
+  }
+
+  .nav-pill {
+    @apply flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition duration-150 hover:bg-[rgba(255,255,255,0.72)] sm:px-4 lg:items-start;
+  }
+
+  .nav-pill-active {
+    @apply bg-[rgba(255,255,255,0.92)] shadow-[0_10px_24px_rgba(25,28,29,0.05)];
+  }
+
+  .glass-sheet {
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(12px);
+  }
+
+  .executive-shell {
+    @apply rounded-[24px] bg-[hsl(var(--surface-low))] shadow-[0_8px_32px_rgba(25,28,29,0.06)];
+  }
+
+  .executive-surface {
+    @apply rounded-[24px] bg-[hsl(var(--surface-lowest))];
+  }
+
+  .executive-section {
+    @apply rounded-[24px] bg-[rgba(255,255,255,0.74)] backdrop-blur;
+  }
+
+  .executive-field {
+    @apply gap-2;
+  }
+
+  .executive-field-label {
+    @apply ml-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-[hsl(var(--muted-foreground))];
+  }
+
+  .executive-input {
+    @apply h-14 rounded-lg border-0 border-b-2 border-transparent bg-[rgba(231,232,233,0.92)] px-4 text-[15px] shadow-none focus:border-b-[hsl(var(--primary))] focus:bg-[hsl(var(--surface-lowest))] focus:ring-0;
+  }
+
+  .executive-input-error {
+    @apply border-b-[rgb(185,28,28)] bg-[rgba(254,242,242,0.96)] focus:border-b-[rgb(185,28,28)];
+  }
+
+  .executive-muted-divider {
+    @apply border-0 border-t border-[hsl(var(--outline-soft)/0.3)];
+  }
+
+  .executive-note {
+    @apply rounded-[18px] bg-[rgba(255,255,255,0.72)] px-4 py-4;
+  }
+}

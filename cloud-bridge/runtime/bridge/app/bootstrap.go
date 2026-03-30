@@ -42,6 +42,10 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	connectorAuthRuntime, err := buildConnectorAuthRuntime(cfg, dataPlane.sessionRegistry, sharedMetrics)
+	if err != nil {
+		return nil, err
+	}
 	// 保存 Agent tunnel 池上报快照，供 Admin 观测页展示“Agent 视角池状态”。
 	tunnelPoolReportStore := bridgecontrol.NewTunnelPoolReportStore()
 	var adminServer *http.Server
@@ -184,6 +188,39 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 				) (adminapi.ConfigUpdateResult, error) {
 					return adminConfigStore.update(now, request, actor)
 				},
+				ListConnectorTokens: func() ([]adminapi.ConnectorTokenRecord, error) {
+					return listConnectorTokensForAdmin(connectorAuthRuntime.tokenAdmin)
+				},
+				GetConnectorToken: func(tokenID string) (adminapi.ConnectorTokenRecord, bool, error) {
+					return getConnectorTokenForAdmin(connectorAuthRuntime.tokenAdmin, tokenID)
+				},
+				CreateConnectorToken: func(
+					now time.Time,
+					request adminapi.ConnectorTokenCreateRequest,
+					actor string,
+				) (adminapi.ConnectorTokenIssueResult, error) {
+					_ = now
+					_ = actor
+					return createConnectorTokenForAdmin(connectorAuthRuntime.tokenAdmin, request)
+				},
+				RotateConnectorToken: func(
+					now time.Time,
+					tokenID string,
+					actor string,
+				) (adminapi.ConnectorTokenIssueResult, error) {
+					_ = now
+					_ = actor
+					return rotateConnectorTokenForAdmin(connectorAuthRuntime.tokenAdmin, tokenID)
+				},
+				RevokeConnectorToken: func(
+					now time.Time,
+					tokenID string,
+					actor string,
+				) (adminapi.ConnectorTokenRecord, error) {
+					_ = now
+					_ = actor
+					return revokeConnectorTokenForAdmin(connectorAuthRuntime.tokenAdmin, tokenID)
+				},
 			},
 			AuthProviders:     buildAdminAuthProviders(cfg.Admin.AuthProviders),
 			SessionCookieName: cfg.Admin.SessionCookieName,
@@ -207,6 +244,7 @@ func Bootstrap(ctx context.Context, cfg Config) (*Runtime, error) {
 		routeRegistry:         dataPlane.routeRegistry,
 		tunnelRegistry:        dataPlane.tunnelRegistry,
 		tunnelPoolReportStore: tunnelPoolReportStore,
+		authCoordinator:       connectorAuthRuntime.coordinator,
 		metrics:               sharedMetrics,
 		hostDerivationDomain:  cfg.Ingress.BaseDomain,
 	})

@@ -10,41 +10,52 @@ import (
 
 // Config defines top-level runtime settings for the agent skeleton.
 type Config struct {
-	AgentID         string
-	BridgeAddr      string
-	BridgeTransport string
-	BridgeTLS       BridgeTLSConfig
-	Session         SessionConfig
-	TunnelPool      TunnelPoolConfig
-	Observability   ObservabilityConfig
-	ControlChannel  ControlChannelConfig
+	AgentID         string               `yaml:"agent_id"`
+	BridgeAddr      string               `yaml:"bridge_addr"`
+	BridgeTransport string               `yaml:"bridge_transport"`
+	BridgeTLS       BridgeTLSConfig      `yaml:"bridge_tls"`
+	Session         SessionConfig        `yaml:"session"`
+	TunnelPool      TunnelPoolConfig     `yaml:"tunnel_pool"`
+	Observability   ObservabilityConfig  `yaml:"observability"`
+	ControlChannel  ControlChannelConfig `yaml:"control_channel"`
+	UI              LocalUIConfig        `yaml:"ui"`
+	// RuntimeConfigFilePath 记录用户目录配置文件路径，仅运行时使用，不参与 YAML 编解码。
+	RuntimeConfigFilePath string `yaml:"-"`
+	// RuntimeBaseConfigFilePath 记录当前最高优先级基础配置文件路径，仅运行时使用，不参与 YAML 编解码。
+	RuntimeBaseConfigFilePath string `yaml:"-"`
+	// RuntimeSystemConfigFilePath 记录系统级配置文件路径，仅运行时使用，不参与 YAML 编解码。
+	RuntimeSystemConfigFilePath string `yaml:"-"`
+	// RuntimeLocalConfigFilePath 记录程序工作目录配置文件路径，仅运行时使用，不参与 YAML 编解码。
+	RuntimeLocalConfigFilePath string `yaml:"-"`
+	// RuntimeExplicitConfigFilePath 记录 -config 显式传入的配置文件路径，仅运行时使用，不参与 YAML 编解码。
+	RuntimeExplicitConfigFilePath string `yaml:"-"`
 }
 
 // BridgeTLSConfig 描述 Agent 连接 Bridge 时使用的 TLS 参数。
 type BridgeTLSConfig struct {
-	Enabled    bool
-	RootCAFile string
-	ServerName string
+	Enabled    bool   `yaml:"enabled"`
+	RootCAFile string `yaml:"root_ca_file"`
+	ServerName string `yaml:"server_name"`
 }
 
 type SessionConfig struct {
-	HeartbeatInterval time.Duration
-	AuthTimeout       time.Duration
-	AuthMethod        string
-	AuthToken         string
-	ClientCapVersion  string
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+	AuthTimeout       time.Duration `yaml:"auth_timeout"`
+	AuthMethod        string        `yaml:"auth_method"`
+	AuthToken         string        `yaml:"auth_token"`
+	ClientCapVersion  string        `yaml:"client_cap_version"`
 }
 
 type TunnelPoolConfig struct {
-	MinIdle      int
-	MaxIdle      int
-	MaxInflight  int
-	TTL          time.Duration
-	MaxReuse     int
-	RecycleAckTO time.Duration
-	OpenRate     float64
-	OpenBurst    int
-	ReconcileGap time.Duration
+	MinIdle      int           `yaml:"min_idle"`
+	MaxIdle      int           `yaml:"max_idle"`
+	MaxInflight  int           `yaml:"max_inflight"`
+	TTL          time.Duration `yaml:"ttl"`
+	MaxReuse     int           `yaml:"max_reuse"`
+	RecycleAckTO time.Duration `yaml:"recycle_ack_timeout"`
+	OpenRate     float64       `yaml:"open_rate"`
+	OpenBurst    int           `yaml:"open_burst"`
+	ReconcileGap time.Duration `yaml:"reconcile_gap"`
 }
 
 // TunnelPoolOverride 用于外部按字段覆盖 tunnelPool 参数。
@@ -65,12 +76,29 @@ type TunnelPoolOverride struct {
 }
 
 type ObservabilityConfig struct {
-	MetricsAddr string
-	LogLevel    string
+	MetricsAddr string `yaml:"metrics_addr"`
+	LogLevel    string `yaml:"log_level"`
 }
 
 type ControlChannelConfig struct {
-	DialTimeout time.Duration
+	DialTimeout time.Duration `yaml:"dial_timeout"`
+}
+
+type LocalUIConfig struct {
+	Web WebUIConfig `yaml:"web"`
+}
+
+type WebUIConfig struct {
+	Enabled           bool            `yaml:"enabled"`
+	ListenAddr        string          `yaml:"listen_addr"`
+	BasePath          string          `yaml:"base_path"`
+	SessionCookieName string          `yaml:"session_cookie_name"`
+	Auth              WebUIAuthConfig `yaml:"auth"`
+}
+
+type WebUIAuthConfig struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 // DefaultConfig returns a runnable baseline configuration.
@@ -107,7 +135,36 @@ func DefaultConfig() Config {
 		ControlChannel: ControlChannelConfig{
 			DialTimeout: 5 * time.Second,
 		},
+		UI: LocalUIConfig{
+			Web: WebUIConfig{
+				BasePath:          "/agent",
+				SessionCookieName: "devbridge_agent_session",
+			},
+		},
 	}
+}
+
+// Normalize 对配置中的可归一化字段做默认值回填与格式整理。
+func (c Config) Normalize() Config {
+	normalizedConfig := c
+	normalizedBasePath := strings.TrimSpace(normalizedConfig.UI.Web.BasePath)
+	if normalizedBasePath == "" {
+		normalizedBasePath = DefaultConfig().UI.Web.BasePath
+	}
+	if !strings.HasPrefix(normalizedBasePath, "/") {
+		normalizedBasePath = "/" + normalizedBasePath
+	}
+	normalizedConfig.UI.Web.BasePath = normalizedBasePath
+
+	normalizedSessionCookieName := strings.TrimSpace(normalizedConfig.UI.Web.SessionCookieName)
+	if normalizedSessionCookieName == "" {
+		normalizedSessionCookieName = DefaultConfig().UI.Web.SessionCookieName
+	}
+	normalizedConfig.UI.Web.SessionCookieName = normalizedSessionCookieName
+	normalizedConfig.UI.Web.ListenAddr = strings.TrimSpace(normalizedConfig.UI.Web.ListenAddr)
+	normalizedConfig.UI.Web.Auth.Username = strings.TrimSpace(normalizedConfig.UI.Web.Auth.Username)
+	normalizedConfig.UI.Web.Auth.Password = strings.TrimSpace(normalizedConfig.UI.Web.Auth.Password)
+	return normalizedConfig
 }
 
 // Validate ensures required config fields are present.
@@ -189,6 +246,17 @@ func (c Config) Validate() error {
 	if c.TunnelPool.ReconcileGap <= 0 {
 		// 纠偏间隔必须为正数。
 		return fmt.Errorf("validate config: invalid tunnel_pool.reconcile_gap=%v", c.TunnelPool.ReconcileGap)
+	}
+	if c.UI.Web.Enabled {
+		if strings.TrimSpace(c.UI.Web.ListenAddr) == "" {
+			return fmt.Errorf("validate config: empty ui.web.listen_addr when web ui is enabled")
+		}
+		if strings.TrimSpace(c.UI.Web.Auth.Username) == "" {
+			return fmt.Errorf("validate config: empty ui.web.auth.username when web ui is enabled")
+		}
+		if strings.TrimSpace(c.UI.Web.Auth.Password) == "" {
+			return fmt.Errorf("validate config: empty ui.web.auth.password when web ui is enabled")
+		}
 	}
 	return nil
 }

@@ -55,9 +55,41 @@ type TokenStore interface {
 	LookupByTokenID(tokenID string) (TokenRecord, bool, error)
 }
 
+// ManagedTokenStore 定义 token 管理能力。
+type ManagedTokenStore interface {
+	TokenStore
+	List() ([]TokenRecord, error)
+	Get(tokenID string) (TokenRecord, bool, error)
+	Upsert(record TokenRecord) error
+	Delete(tokenID string) error
+	ReplaceAll(records []TokenRecord) error
+	Save() error
+	Reload() error
+}
+
 // NewInMemoryTokenStore 根据 token 记录构建内存索引。
 func NewInMemoryTokenStore(records []TokenRecord) TokenStore {
 	return newInMemoryConnectorTokenStore(records)
+}
+
+// DefaultDevTokenRecords 返回仅供本地联调使用的默认开发 token 记录。
+func DefaultDevTokenRecords() []TokenRecord {
+	return defaultConnectorTokenRecords()
+}
+
+// NewManagedInMemoryTokenStore 根据 token 记录构建可管理的内存 token store。
+func NewManagedInMemoryTokenStore(records []TokenRecord) ManagedTokenStore {
+	return newInMemoryConnectorTokenStore(records)
+}
+
+// NewDefaultDevManagedTokenStore 创建带默认开发 token 的内存 store。
+func NewDefaultDevManagedTokenStore() ManagedTokenStore {
+	return newInMemoryConnectorTokenStore(defaultConnectorTokenRecords())
+}
+
+// NewFileTokenStore 创建基于 YAML 文件持久化的 token store。
+func NewFileTokenStore(path string) (ManagedTokenStore, error) {
+	return newFileConnectorTokenStore(path)
 }
 
 // MustHashTokenSecretArgon2ID 计算 token secret 的 argon2id 哈希，失败直接 panic。
@@ -68,6 +100,21 @@ func MustHashTokenSecretArgon2ID(tokenSecret string) string {
 // VerifyTokenSecret 校验 token secret 与 argon2id 哈希是否匹配。
 func VerifyTokenSecret(tokenSecret string, encodedHash string) (bool, error) {
 	return verifyConnectorTokenSecret(tokenSecret, encodedHash)
+}
+
+// TokenAdmin 定义 token 后台管理能力。
+type TokenAdmin interface {
+	List() ([]TokenRecord, error)
+	Get(tokenID string) (TokenRecord, bool, error)
+	Create(request TokenCreateRequest) (TokenIssueResult, error)
+	Rotate(request TokenRotateRequest) (TokenIssueResult, error)
+	Revoke(tokenID string) (TokenRecord, error)
+	Reload() error
+}
+
+// NewTokenAdmin 创建 token 管理服务。
+func NewTokenAdmin(store ManagedTokenStore) TokenAdmin {
+	return newTokenAdminService(tokenAdminServiceOptions{store: store})
 }
 
 // Request 表示一次 ConnectorAuth 请求参数。

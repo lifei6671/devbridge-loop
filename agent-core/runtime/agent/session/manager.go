@@ -149,10 +149,8 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 
 		// 已连接成功，等待上层取消或重连触发。
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		<-ctx.Done()
+		return ctx.Err()
 	}
 }
 

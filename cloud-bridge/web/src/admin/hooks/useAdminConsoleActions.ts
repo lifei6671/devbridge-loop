@@ -55,6 +55,7 @@ export function useAdminConsoleActions(params: UseAdminConsoleActionsParams) {
   return {
     applySSESnapshot,
     clearTrafficOwnershipLookup: trafficActions.clearTrafficOwnershipLookup,
+    createConnectorToken: opsActions.createConnectorToken,
     handleDetailRowKeyDown,
     isActiveDetailRow,
     login,
@@ -69,6 +70,8 @@ export function useAdminConsoleActions(params: UseAdminConsoleActionsParams) {
     quickDrainFromDetail: opsActions.quickDrainFromDetail,
     refreshAuthSession,
     refreshPageData,
+    revokeConnectorToken: opsActions.revokeConnectorToken,
+    rotateConnectorToken: opsActions.rotateConnectorToken,
     submitConfigPatch: opsActions.submitConfigPatch,
     submitConfigPatchDocument: opsActions.submitConfigPatchDocument,
   };

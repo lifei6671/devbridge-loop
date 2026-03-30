@@ -25,9 +25,9 @@ use commands::{
     agent_crash_inject, agent_restart, agent_snapshot, agent_start, agent_stop, app_bootstrap,
     app_confirm_exit, app_hide_to_tray, app_shutdown, diagnose_logs_snapshot, diagnose_snapshot,
     host_config_snapshot, host_config_update, host_config_update_diagnose_filter,
-    host_logs_snapshot, service_add, service_delete,
-    service_list_snapshot, session_drain, session_reconnect, session_snapshot,
-    system_resource_snapshot, traffic_stats_snapshot, tunnel_list_snapshot,
+    host_logs_snapshot, service_add, service_delete, service_list_snapshot, session_drain,
+    session_reconnect, session_snapshot, system_resource_snapshot, traffic_stats_snapshot,
+    tunnel_list_snapshot,
 };
 use state::app_state::{now_ms, push_host_log, AppRuntimeState, HostRuntimeConfig};
 

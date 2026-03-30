@@ -24,6 +24,11 @@ type SubmitConfigPatchOptions = {
   successMessage?: string;
 };
 
+type ConnectorTokenCreateInput = {
+  connectorID: string;
+  note?: string;
+};
+
 export type SubmitConfigPatchFn = (
   patch: Record<string, unknown>,
   options?: SubmitConfigPatchOptions
@@ -300,7 +305,85 @@ export function useAdminOpsActions(params: UseAdminOpsActionsParams) {
     }
   }, [requestAdmin, setExportDownloadURL]);
 
+  const createConnectorToken = useCallback(
+    async (input: ConnectorTokenCreateInput) => {
+      const normalizedConnectorID = input.connectorID.trim();
+      if (normalizedConnectorID === "") {
+        toast.error("请先填写 Connector ID");
+        return null;
+      }
+      try {
+        const response = await requestAdmin("/api/admin/connector-tokens", {
+          method: "POST",
+          body: JSON.stringify({
+            connector_id: normalizedConnectorID,
+            metadata: input.note?.trim()
+              ? {
+                  note: input.note.trim(),
+                }
+              : undefined,
+          }),
+        });
+        const result = asRecord(response.result);
+        await refreshPageData("ops", { silentError: true });
+        toast.success(`已为 ${normalizedConnectorID} 创建 token，明文仅本次可见。`);
+        return result;
+      } catch (error) {
+        toast.error(normalizeOperationError(error));
+        return null;
+      }
+    },
+    [refreshPageData, requestAdmin]
+  );
+
+  const rotateConnectorToken = useCallback(
+    async (tokenID: string) => {
+      const normalizedTokenID = tokenID.trim();
+      if (normalizedTokenID === "") {
+        toast.error("未识别到可轮换的 token_id");
+        return null;
+      }
+      try {
+        const response = await requestAdmin(`/api/admin/connector-tokens/${normalizedTokenID}/rotate`, {
+          method: "POST",
+        });
+        const result = asRecord(response.result);
+        await refreshPageData("ops", { silentError: true });
+        toast.success(`已轮换 token ${normalizedTokenID}，旧 token 已失效。`);
+        return result;
+      } catch (error) {
+        toast.error(normalizeOperationError(error));
+        return null;
+      }
+    },
+    [refreshPageData, requestAdmin]
+  );
+
+  const revokeConnectorToken = useCallback(
+    async (tokenID: string) => {
+      const normalizedTokenID = tokenID.trim();
+      if (normalizedTokenID === "") {
+        toast.error("未识别到可吊销的 token_id");
+        return null;
+      }
+      try {
+        const response = await requestAdmin(`/api/admin/connector-tokens/${normalizedTokenID}/revoke`, {
+          method: "POST",
+        });
+        const result = asRecord(response.result);
+        await refreshPageData("ops", { silentError: true });
+        toast.success(`已吊销 token ${normalizedTokenID}。`);
+        return result;
+      } catch (error) {
+        toast.error(normalizeOperationError(error));
+        return null;
+      }
+    },
+    [refreshPageData, requestAdmin]
+  );
+
   return {
+    createConnectorToken,
     performConfigPatch,
     performDrainConnector,
     performDrainSession,
@@ -308,6 +391,8 @@ export function useAdminOpsActions(params: UseAdminOpsActionsParams) {
     performReload,
     prefillOpsFromDetail,
     quickDrainFromDetail,
+    revokeConnectorToken,
+    rotateConnectorToken,
     submitConfigPatch,
     submitConfigPatchDocument,
   };

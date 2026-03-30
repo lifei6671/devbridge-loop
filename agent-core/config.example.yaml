@@ -1,0 +1,17 @@
+agent_id: agent-local
+bridge_addr: 127.0.0.1:39081
+bridge_transport: tcp_framed
+
+session:
+  auth_method: token
+  auth_token: replace-me
+
+ui:
+  web:
+    enabled: true
+    listen_addr: 127.0.0.1:39082
+    base_path: /agent
+    session_cookie_name: devbridge_agent_session
+    auth:
+      username: admin
+      password: change-me

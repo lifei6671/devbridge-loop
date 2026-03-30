@@ -5,4 +5,5 @@ export * from "./model/records";
 export * from "./model/metrics";
 export * from "./model/details";
 export * from "./model/ops-config";
+export * from "./model/connector-tokens";
 export * from "./model/managed_ca_hint.js";

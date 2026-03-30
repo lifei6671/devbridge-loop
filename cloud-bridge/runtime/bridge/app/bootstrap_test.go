@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	appauth "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/auth"
 	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/registry"
 	apptls "github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/tls"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
@@ -63,6 +64,170 @@ func applyBootstrapSession(request *http.Request, session bootstrapAuthSession) 
 	if request != nil && request.Method != http.MethodGet && session.csrfToken != "" {
 		request.Header.Set("Origin", bootstrapTestAllowedOrigin)
 		request.Header.Set("X-CSRF-Token", session.csrfToken)
+	}
+}
+
+// TestBuildConnectorAuthRuntimeUsesMemoryDriverWithDevFallback
+// 验证 memory driver 会显式注入开发 token，保持本地联调链路可用。
+func TestBuildConnectorAuthRuntimeUsesMemoryDriverWithDevFallback(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ConnectorAuth.TokenStore.Driver = "memory"
+	config.ConnectorAuth.TokenStore.File.Path = ""
+
+	sessionRegistry := registry.NewSessionRegistry()
+	authRuntime, err := buildConnectorAuthRuntime(config, sessionRegistry, nil)
+	if err != nil {
+		testingObject.Fatalf("build connector auth runtime failed: %v", err)
+	}
+	if authRuntime.tokenStore == nil || authRuntime.coordinator == nil || authRuntime.tokenAdmin == nil {
+		testingObject.Fatalf("expected non-nil auth runtime members")
+	}
+
+	tokenRecords, err := authRuntime.tokenStore.List()
+	if err != nil {
+		testingObject.Fatalf("list token records failed: %v", err)
+	}
+	if len(tokenRecords) != 1 {
+		testingObject.Fatalf("unexpected token count: got=%d want=1", len(tokenRecords))
+	}
+	if tokenRecords[0].TokenID != "agent-local" {
+		testingObject.Fatalf("unexpected default dev token id: got=%s want=agent-local", tokenRecords[0].TokenID)
+	}
+
+	result := authRuntime.coordinator.AuthenticateAndCommit(
+		appauth.Request{
+			ConnectorID:          "agent-local",
+			AssignedSessionEpoch: 1,
+			AuthMethod:           "token",
+			Token:                "dbt_agent-local.agent-dev-secret",
+		},
+		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			sessionRegistry.CommitAuthoritative(now, sessionRuntime)
+			return nil
+		},
+	)
+	if !result.Success {
+		testingObject.Fatalf("expected memory driver dev token auth success, got error_code=%s error_message=%s", result.ErrorCode, result.ErrorMessage)
+	}
+}
+
+// TestBuildConnectorAuthRuntimeUsesFileDriverWithoutDevFallback
+// 验证 file driver 默认从文件加载 token，空文件场景下不会再自动吃开发 token。
+func TestBuildConnectorAuthRuntimeUsesFileDriverWithoutDevFallback(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	config := DefaultConfig()
+	config.ConnectorAuth.TokenStore.Driver = "file"
+	config.ConnectorAuth.TokenStore.File.Path = filepath.Join(testingObject.TempDir(), "bridge.tokens.yaml")
+
+	sessionRegistry := registry.NewSessionRegistry()
+	authRuntime, err := buildConnectorAuthRuntime(config, sessionRegistry, nil)
+	if err != nil {
+		testingObject.Fatalf("build connector auth runtime failed: %v", err)
+	}
+	if authRuntime.tokenStore == nil || authRuntime.coordinator == nil || authRuntime.tokenAdmin == nil {
+		testingObject.Fatalf("expected non-nil auth runtime members")
+	}
+
+	tokenRecords, err := authRuntime.tokenStore.List()
+	if err != nil {
+		testingObject.Fatalf("list token records failed: %v", err)
+	}
+	if len(tokenRecords) != 0 {
+		testingObject.Fatalf("unexpected token count: got=%d want=0", len(tokenRecords))
+	}
+
+	result := authRuntime.coordinator.AuthenticateAndCommit(
+		appauth.Request{
+			ConnectorID:          "agent-local",
+			AssignedSessionEpoch: 1,
+			AuthMethod:           "token",
+			Token:                "dbt_agent-local.agent-dev-secret",
+		},
+		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			sessionRegistry.CommitAuthoritative(now, sessionRuntime)
+			return nil
+		},
+	)
+	if result.Success {
+		testingObject.Fatalf("expected file driver dev token auth to fail")
+	}
+	if result.ErrorCode != appauth.AuthErrorInvalidToken {
+		testingObject.Fatalf("unexpected error code: got=%s want=%s", result.ErrorCode, appauth.AuthErrorInvalidToken)
+	}
+}
+
+// TestBuildConnectorAuthRuntimeFileDriverPersistsTokensAcrossRestart
+// 验证 file driver 在 Bridge 重启后仍会从 token 文件恢复记录并继续完成认证。
+func TestBuildConnectorAuthRuntimeFileDriverPersistsTokensAcrossRestart(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tokenFilePath := filepath.Join(testingObject.TempDir(), "bridge.tokens.yaml")
+
+	firstConfig := DefaultConfig()
+	firstConfig.ConnectorAuth.TokenStore.Driver = "file"
+	firstConfig.ConnectorAuth.TokenStore.File.Path = tokenFilePath
+
+	firstSessionRegistry := registry.NewSessionRegistry()
+	firstRuntime, err := buildConnectorAuthRuntime(firstConfig, firstSessionRegistry, nil)
+	if err != nil {
+		testingObject.Fatalf("build first connector auth runtime failed: %v", err)
+	}
+
+	issueResult, err := firstRuntime.tokenAdmin.Create(appauth.TokenCreateRequest{
+		ConnectorID: "agent-restart",
+		Metadata: map[string]string{
+			"note": "restart-persistence",
+		},
+	})
+	if err != nil {
+		testingObject.Fatalf("create connector token failed: %v", err)
+	}
+	if strings.TrimSpace(issueResult.PlaintextToken) == "" {
+		testingObject.Fatalf("expected plaintext token returned once")
+	}
+
+	secondConfig := DefaultConfig()
+	secondConfig.ConnectorAuth.TokenStore.Driver = "file"
+	secondConfig.ConnectorAuth.TokenStore.File.Path = tokenFilePath
+
+	secondSessionRegistry := registry.NewSessionRegistry()
+	secondRuntime, err := buildConnectorAuthRuntime(secondConfig, secondSessionRegistry, nil)
+	if err != nil {
+		testingObject.Fatalf("build second connector auth runtime failed: %v", err)
+	}
+
+	tokenRecords, err := secondRuntime.tokenStore.List()
+	if err != nil {
+		testingObject.Fatalf("list second runtime token records failed: %v", err)
+	}
+	if len(tokenRecords) != 1 {
+		testingObject.Fatalf("unexpected recovered token count: got=%d want=1", len(tokenRecords))
+	}
+	if tokenRecords[0].ConnectorID != "agent-restart" {
+		testingObject.Fatalf("unexpected recovered connector id: got=%s want=agent-restart", tokenRecords[0].ConnectorID)
+	}
+
+	authResult := secondRuntime.coordinator.AuthenticateAndCommit(
+		appauth.Request{
+			ConnectorID:          "agent-restart",
+			AssignedSessionEpoch: 1,
+			AuthMethod:           "token",
+			Token:                issueResult.PlaintextToken,
+		},
+		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
+			secondSessionRegistry.CommitAuthoritative(now, sessionRuntime)
+			return nil
+		},
+	)
+	if !authResult.Success {
+		testingObject.Fatalf(
+			"expected restarted file driver auth success, got error_code=%s error_message=%s",
+			authResult.ErrorCode,
+			authResult.ErrorMessage,
+		)
 	}
 }
 
@@ -711,6 +876,78 @@ func TestAdminConfigUpdatePersistsToRuntimeConfigFile(testingObject *testing.T) 
 			savedConfig.ControlPlane.HeartbeatTimeout,
 			45*time.Second,
 		)
+	}
+}
+
+// TestBootstrapAdminConnectorTokenAPIUsesConfiguredFileStore
+// 验证 Bridge 管理面 token API 会落到配置指定的 file store，并能在重建 runtime 后继续读出。
+func TestBootstrapAdminConnectorTokenAPIUsesConfiguredFileStore(testingObject *testing.T) {
+	testingObject.Parallel()
+
+	tempDir := testingObject.TempDir()
+	config := DefaultConfig()
+	config.Admin.Enabled = true
+	config.Admin.UIEnabled = false
+	config.RuntimeConfigFilePath = filepath.Join(tempDir, "bridge.yaml")
+	config.ConnectorAuth.TokenStore.Driver = "file"
+	config.ConnectorAuth.TokenStore.File.Path = filepath.Join(tempDir, "bridge.tokens.yaml")
+
+	runtime, err := Bootstrap(context.Background(), config)
+	if err != nil {
+		testingObject.Fatalf("bootstrap runtime failed: %v", err)
+	}
+	if runtime.adminServer == nil {
+		testingObject.Fatalf("expected admin server initialized")
+	}
+
+	adminSession := loginBootstrapUser(testingObject, runtime.adminServer.Handler, "admin", "devbridge-admin-pass")
+	createRecorder := httptest.NewRecorder()
+	createRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/admin/connector-tokens",
+		strings.NewReader(`{"connector_id":"agent-demo","metadata":{"purpose":"runtime"}}`),
+	)
+	createRequest.Header.Set("Content-Type", "application/json")
+	applyBootstrapSession(createRequest, adminSession)
+	runtime.adminServer.Handler.ServeHTTP(createRecorder, createRequest)
+	if createRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected create status: got=%d want=%d body=%s", createRecorder.Code, http.StatusOK, createRecorder.Body.String())
+	}
+
+	reloadedRuntime, err := Bootstrap(context.Background(), config)
+	if err != nil {
+		testingObject.Fatalf("bootstrap reloaded runtime failed: %v", err)
+	}
+	if reloadedRuntime.adminServer == nil {
+		testingObject.Fatalf("expected reloaded admin server initialized")
+	}
+
+	viewerSession := loginBootstrapUser(testingObject, reloadedRuntime.adminServer.Handler, "viewer", "devbridge-viewer-pass")
+	listRecorder := httptest.NewRecorder()
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/admin/connector-tokens", nil)
+	applyBootstrapSession(listRequest, viewerSession)
+	reloadedRuntime.adminServer.Handler.ServeHTTP(listRecorder, listRequest)
+	if listRecorder.Code != http.StatusOK {
+		testingObject.Fatalf("unexpected list status: got=%d want=%d body=%s", listRecorder.Code, http.StatusOK, listRecorder.Body.String())
+	}
+
+	var listResponse struct {
+		Items []struct {
+			TokenID     string `json:"token_id"`
+			ConnectorID string `json:"connector_id"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listResponse); err != nil {
+		testingObject.Fatalf("decode list response failed: %v body=%s", err, listRecorder.Body.String())
+	}
+	if len(listResponse.Items) != 1 {
+		testingObject.Fatalf("unexpected token item count: got=%d want=1 body=%s", len(listResponse.Items), listRecorder.Body.String())
+	}
+	if listResponse.Items[0].ConnectorID != "agent-demo" {
+		testingObject.Fatalf("unexpected token connector id: got=%s want=agent-demo", listResponse.Items[0].ConnectorID)
+	}
+	if strings.TrimSpace(listResponse.Items[0].TokenID) == "" {
+		testingObject.Fatalf("expected non-empty token id")
 	}
 }
 

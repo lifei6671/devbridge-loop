@@ -6,6 +6,7 @@ import { Button } from "../../../components/ui/button";
 import { Input } from "../../../components/ui/input";
 import type { AdminConsoleViewModel } from "../../hooks/useAdminConsole";
 import {
+  asRecord,
   buildConfigUpdateYAMLDocument,
   buildOpsConfigDraft,
   buildOpsConfigPatch,
@@ -14,12 +15,14 @@ import {
   formatOpsConfigSource,
   listOpsConfigFields,
   opsConfigSections,
+  readIssuedConnectorTokenRecord,
   readEditableConfigFilePatch,
   readNumber,
   readOpsConfigFileSource,
   readOpsConfigSource,
   readOpsConfigValue,
   readText,
+  toIssuedConnectorTokenView,
   validateOpsConfigPatch,
 } from "../../model";
 import { ConfigSectionCard } from "../ops/ConfigSectionCard";
@@ -44,6 +47,8 @@ type YAMLEditorState = {
 export function OpsPage(props: OpsPageProps) {
   const {
     configSnapshot,
+    connectorTokenItems,
+    createConnectorToken,
     drainConnectorID,
     drainReason,
     drainSessionID,
@@ -52,6 +57,9 @@ export function OpsPage(props: OpsPageProps) {
     performDrainSession,
     performExportDiagnose,
     performReload,
+    refreshPageData,
+    revokeConnectorToken,
+    rotateConnectorToken,
     setDrainConnectorID,
     setDrainReason,
     setDrainSessionID,
@@ -73,6 +81,11 @@ export function OpsPage(props: OpsPageProps) {
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isSavingYAML, setIsSavingYAML] = useState(false);
   const [restoringFieldKey, setRestoringFieldKey] = useState<string | null>(null);
+  const [tokenConnectorID, setTokenConnectorID] = useState("");
+  const [tokenNote, setTokenNote] = useState("");
+  const [issuedTokenResult, setIssuedTokenResult] = useState<Record<string, unknown> | null>(null);
+  const [isIssuedTokenDialogOpen, setIsIssuedTokenDialogOpen] = useState(false);
+  const [activeTokenMutationKey, setActiveTokenMutationKey] = useState("");
 
   useEffect(() => {
     if (configVersion <= 0) {
@@ -133,6 +146,11 @@ export function OpsPage(props: OpsPageProps) {
     "base_config_file_path",
     "未检测到基础配置文件"
   );
+  const connectorAuthSnapshot = asRecord(configSnapshot.connector_auth);
+  const connectorTokenStoreSnapshot = asRecord(connectorAuthSnapshot.token_store);
+  const connectorTokenStoreFileSnapshot = asRecord(connectorTokenStoreSnapshot.file);
+  const connectorTokenStoreDriver = readText(connectorTokenStoreSnapshot, "driver", "--");
+  const connectorTokenStoreFilePath = readText(connectorTokenStoreFileSnapshot, "path", "");
   const sourceSummary = {
     default: 0,
     env: 0,
@@ -345,6 +363,67 @@ export function OpsPage(props: OpsPageProps) {
       setIsSavingYAML(false);
     }
   };
+
+  const handleCreateConnectorToken = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setActiveTokenMutationKey("create");
+    try {
+      const result = await createConnectorToken({
+        connectorID: tokenConnectorID,
+        note: tokenNote,
+      });
+      if (result === null) {
+        return;
+      }
+      setIssuedTokenResult(result);
+      setIsIssuedTokenDialogOpen(true);
+      setTokenConnectorID("");
+      setTokenNote("");
+    } finally {
+      setActiveTokenMutationKey("");
+    }
+  };
+
+  const handleRotateConnectorToken = async (tokenID: string) => {
+    const normalizedTokenID = tokenID.trim();
+    if (normalizedTokenID === "") {
+      return;
+    }
+    setActiveTokenMutationKey(`rotate:${normalizedTokenID}`);
+    try {
+      const result = await rotateConnectorToken(normalizedTokenID);
+      if (result !== null) {
+        setIssuedTokenResult(result);
+        setIsIssuedTokenDialogOpen(true);
+      }
+    } finally {
+      setActiveTokenMutationKey("");
+    }
+  };
+
+  const handleRevokeConnectorToken = async (tokenID: string) => {
+    const normalizedTokenID = tokenID.trim();
+    if (normalizedTokenID === "") {
+      return;
+    }
+    if (window.confirm(`确认吊销 token ${normalizedTokenID} 吗？旧 Agent 将无法继续认证。`) === false) {
+      return;
+    }
+    setActiveTokenMutationKey(`revoke:${normalizedTokenID}`);
+    try {
+      await revokeConnectorToken(normalizedTokenID);
+      if (readText(asRecord(issuedTokenResult?.record), "token_id") === normalizedTokenID) {
+        setIssuedTokenResult(null);
+        setIsIssuedTokenDialogOpen(false);
+      }
+    } finally {
+      setActiveTokenMutationKey("");
+    }
+  };
+
+  const issuedTokenView = toIssuedConnectorTokenView(issuedTokenResult);
+  const issuedTokenRecord = readIssuedConnectorTokenRecord(issuedTokenResult);
+  const issuedPlainToken = issuedTokenView.plainToken;
   return (
     <div className="content-stack">
       <section className="panel">
@@ -463,6 +542,163 @@ export function OpsPage(props: OpsPageProps) {
               resettingFieldKey={restoringFieldKey}
             />
           ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        <header className="panel-head">
+          <div>
+            <h3>Connector Token 管理</h3>
+            <span className="panel-sub">
+              Bridge 负责签发并持久化 connector token。明文 token 只会在创建或轮换当次返回一次。
+            </span>
+          </div>
+          <div className="inline-actions">
+            <Badge variant={connectorTokenStoreDriver === "file" ? "success" : "warning"}>
+              store {connectorTokenStoreDriver}
+            </Badge>
+            <Badge variant="secondary">共 {connectorTokenItems.length} 条</Badge>
+            <Button variant="outline" size="sm" onClick={() => void refreshPageData("ops")}>
+              刷新 token
+            </Button>
+          </div>
+        </header>
+
+        <div className="ops-grid">
+          <article className="ops-card">
+            <h4>签发新 token</h4>
+            <p>创建后会立即写入 Bridge token store；请把明文 token 安全同步到对应 Agent 配置。</p>
+            <form className="field-stack" onSubmit={(event) => void handleCreateConnectorToken(event)}>
+              <label>
+                <span>Connector ID</span>
+                <Input
+                  value={tokenConnectorID}
+                  onChange={(event) => setTokenConnectorID(event.target.value)}
+                  placeholder="agent-local"
+                />
+              </label>
+              <label>
+                <span>备注（可选）</span>
+                <Input
+                  value={tokenNote}
+                  onChange={(event) => setTokenNote(event.target.value)}
+                  placeholder="例如：生产机房首批接入"
+                />
+              </label>
+              <div className="inline-actions">
+                <Button type="submit" disabled={activeTokenMutationKey === "create"}>
+                  {activeTokenMutationKey === "create" ? "签发中..." : "创建 token"}
+                </Button>
+              </div>
+            </form>
+          </article>
+
+          <article className="ops-card">
+            <h4>最近一次明文 token</h4>
+            <p>创建或轮换成功后会自动打开模态窗展示一次；刷新页面后不会再回显。</p>
+            {issuedPlainToken !== "" ? (
+              <div className="snapshot-box field-stack">
+                <p>最近一次签发对象：{issuedTokenView.connectorID}</p>
+                <p>Token ID：{issuedTokenView.tokenID}</p>
+                <div className="inline-actions">
+                  <Button size="sm" variant="outline" onClick={() => setIsIssuedTokenDialogOpen(true)}>
+                    重新查看本次明文
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setIssuedTokenResult(null);
+                      setIsIssuedTokenDialogOpen(false);
+                    }}
+                  >
+                    清除
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="snapshot-box">
+                <p>当前还没有新签发的明文 token。创建或轮换后会以模态窗形式展示一次。</p>
+              </div>
+            )}
+            {connectorTokenStoreFilePath !== "" ? (
+              <p className="panel-sub">当前 file store 路径：{connectorTokenStoreFilePath}</p>
+            ) : null}
+          </article>
+        </div>
+
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Token ID</th>
+                <th>Connector</th>
+                <th>状态</th>
+                <th>签发时间</th>
+                <th>轮换时间</th>
+                <th>备注</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {connectorTokenItems.map((item, index) => {
+                const tokenID = readText(item, "token_id", `token-${index}`);
+                const metadataRecord = asRecord(item.metadata);
+                const tokenStatus = readText(item, "status", "unknown");
+                const isRotating = activeTokenMutationKey === `rotate:${tokenID}`;
+                const isRevoking = activeTokenMutationKey === `revoke:${tokenID}`;
+                return (
+                  <tr key={`${tokenID}-${index}`}>
+                    <td><code>{tokenID}</code></td>
+                    <td>{readText(item, "connector_id", "--")}</td>
+                    <td>
+                      <Badge
+                        variant={
+                          tokenStatus === "active"
+                            ? "success"
+                            : tokenStatus === "revoked"
+                              ? "danger"
+                              : "secondary"
+                        }
+                      >
+                        {tokenStatus}
+                      </Badge>
+                    </td>
+                    <td>{readText(item, "issued_at_ms", "--")}</td>
+                    <td>{readText(item, "rotated_at_ms", "--")}</td>
+                    <td>{readText(metadataRecord, "note", "--")}</td>
+                    <td>
+                      <div className="inline-actions">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleRotateConnectorToken(tokenID)}
+                          disabled={isRotating || tokenStatus === "revoked"}
+                        >
+                          {isRotating ? "轮换中..." : "轮换"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          onClick={() => void handleRevokeConnectorToken(tokenID)}
+                          disabled={isRevoking || tokenStatus === "revoked"}
+                        >
+                          {isRevoking ? "吊销中..." : "吊销"}
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+              {connectorTokenItems.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="empty-cell">
+                    当前还没有 connector token，先为目标 Agent 创建一条即可。
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
         </div>
       </section>
 
@@ -634,6 +870,61 @@ export function OpsPage(props: OpsPageProps) {
           ) : null}
         </div>
       </section>
+
+      {isIssuedTokenDialogOpen && issuedPlainToken !== "" ? (
+        <div
+          className="auth-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="issued-token-dialog-title"
+        >
+          <div className="auth-backdrop" onClick={() => setIsIssuedTokenDialogOpen(false)} />
+          <div className="auth-dialog panel issued-token-dialog">
+            <div className="auth-dialog-head">
+              <p className="auth-kicker">Connector Token</p>
+              <h2 id="issued-token-dialog-title">一次性明文 Token</h2>
+              <p className="auth-sub">
+                该明文只在本次创建或轮换后展示一次。请立即复制到目标 Agent 的
+                <code> session.auth_token </code>
+                配置中，关闭或刷新页面后将不再回显。
+              </p>
+            </div>
+
+            <div className="field-stack">
+              <label>
+                <span>Connector</span>
+                <Input value={readText(issuedTokenRecord, "connector_id", "--")} readOnly />
+              </label>
+              <label>
+                <span>Token ID</span>
+                <Input value={readText(issuedTokenRecord, "token_id", "--")} readOnly />
+              </label>
+              <label>
+                <span>明文 token</span>
+                <Input value={issuedPlainToken} readOnly />
+              </label>
+            </div>
+
+            <div className="auth-actions issued-token-actions">
+              <Button variant="outline" onClick={() => setIsIssuedTokenDialogOpen(false)}>
+                关闭
+              </Button>
+              <Button
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(issuedPlainToken);
+                    toast.success("已复制本次签发的明文 token。");
+                  } catch {
+                    toast.error("复制失败，请手动选择后复制。");
+                  }
+                }}
+              >
+                复制 Token
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

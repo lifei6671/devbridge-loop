@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lifei6671/devbridge-loop/cloud-bridge/runtime/bridge/internal/fileutil"
 	"github.com/lifei6671/devbridge-loop/ltfp/pb"
 	"gopkg.in/yaml.v3"
 )
@@ -53,6 +54,7 @@ func ParseConfigYAML(rawConfigData []byte) (Config, error) {
 type persistedConfigYAML struct {
 	Ingress          IngressConfig            `yaml:"ingress"`
 	Admin            AdminConfig              `yaml:"admin"`
+	ConnectorAuth    ConnectorAuthConfig      `yaml:"connector_auth"`
 	Observability    ObservabilityConfig      `yaml:"observability"`
 	DefaultScope     pb.Scope                 `yaml:"default_scope"`
 	FallbackPolicies []pb.ScopeFallbackPolicy `yaml:"fallback_policies"`
@@ -95,6 +97,7 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	persisted := persistedConfigYAML{
 		Ingress:          configToPersist.Ingress,
 		Admin:            configToPersist.Admin,
+		ConnectorAuth:    configToPersist.ConnectorAuth,
 		Observability:    configToPersist.Observability,
 		DefaultScope:     configToPersist.DefaultScope,
 		FallbackPolicies: append([]pb.ScopeFallbackPolicy(nil), configToPersist.FallbackPolicies...),
@@ -149,7 +152,7 @@ func SaveConfigToYAMLFile(config Config, configFilePath string) error {
 	if closeErr := tempFile.Close(); closeErr != nil {
 		return fmt.Errorf("save config to yaml: close temp file failed: %w", closeErr)
 	}
-	if renameErr := os.Rename(tempFilePath, absoluteConfigFilePath); renameErr != nil {
+	if renameErr := fileutil.ReplaceFile(tempFilePath, absoluteConfigFilePath); renameErr != nil {
 		return fmt.Errorf("save config to yaml: replace target file failed: %w", renameErr)
 	}
 	return nil

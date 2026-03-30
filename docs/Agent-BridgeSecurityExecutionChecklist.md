@@ -100,6 +100,8 @@
 - [x] 引入抗暴力破解哈希（优先 `argon2id`）
 - [x] 支持状态机：`active/grace/revoked/expired`
 - [x] 实现 token 解析规则 `dbt_<token_id>.<token_secret>`（按第一个 `.` 分割）
+- [x] 增加 `connector_auth.token_store.driver`，支持 `memory/file` 两种后端且默认 `file`
+- [x] `file` token store 支持 YAML 加载、原子落盘与重载恢复；`memory` 模式仅保留给开发态
 
 验收标准：
 
@@ -390,7 +392,7 @@
 - [ ] 明确“会话期间 token 过期不主动中断现有 active session”的运行时语义与测试
 - [ ] 支持正常轮换场景下的新旧 token 并存窗口与平滑切换
 - [ ] 支持紧急吊销场景下对关联 active session 的强制 drain 或强制关闭路径
-- [ ] 明文 token 仅展示一次，不允许二次展示，不得进入普通日志
+- [x] 明文 token 仅在 Bridge 后台创建/轮换响应中展示一次，不允许二次展示，不得进入普通日志
 
 代码落点建议：
 
@@ -407,6 +409,8 @@
 
 ### S19. Agent 侧凭证安全存储
 
+- [x] Agent Web 去掉本地随机生成 token 的入口，避免生成 Bridge 未登记的无效凭证
+- [x] Agent HTTP 配置接口对 `session.auth_token` 采用只写不回显语义，留空不覆盖原值
 - [ ] 为桌面/主机场景接入 keyring / Secret Service / Windows DPAPI / macOS Keychain 等安全存储
 - [ ] 为容器场景明确 Secret 管理与静态存储加密方案
 - [ ] 环境变量仅保留为过渡载体，不作为长期高安全推荐方式

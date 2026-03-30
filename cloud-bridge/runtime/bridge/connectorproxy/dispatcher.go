@@ -24,8 +24,6 @@ const (
 	trafficOpenHintEndpointAddrKey = "endpoint_addr"
 	openAckActualEndpointIDKey     = "actual_endpoint_id"
 	openAckActualEndpointAddrKey   = "actual_endpoint_addr"
-	// trafficOpenMetadataInstanceIDKey 定义 TrafficOpen 元数据中的 instance_id 键。
-	trafficOpenMetadataInstanceIDKey = "instance_id"
 )
 
 // DispatchRequest 描述 connector path 执行请求。

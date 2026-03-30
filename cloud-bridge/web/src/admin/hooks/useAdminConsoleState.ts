@@ -38,6 +38,7 @@ export function useAdminConsoleState() {
   const [routeItems, setRouteItems] = useState<ApiRecord[]>([]);
   const [serviceItems, setServiceItems] = useState<ApiRecord[]>([]);
   const [connectorItems, setConnectorItems] = useState<ApiRecord[]>([]);
+  const [connectorTokenItems, setConnectorTokenItems] = useState<ApiRecord[]>([]);
   const [sessionItems, setSessionItems] = useState<ApiRecord[]>([]);
   const [tunnelSummary, setTunnelSummary] = useState<ApiRecord>({});
   const [agentPoolSummary, setAgentPoolSummary] = useState<ApiRecord>({});
@@ -84,6 +85,7 @@ export function useAdminConsoleState() {
     autoRefreshIntervalMS,
     configSnapshot,
     connectorItems,
+    connectorTokenItems,
     detailSelection,
     diagnoseSummary,
     drainConnectorID,
@@ -117,6 +119,7 @@ export function useAdminConsoleState() {
     setAuthStatus,
     setConfigSnapshot,
     setConnectorItems,
+    setConnectorTokenItems,
     setDetailSelection,
     setDiagnoseSummary,
     setDrainConnectorID,

@@ -643,6 +643,22 @@ textarea:focus {
   justify-content: flex-end;
 }
 
+.issued-token-dialog {
+  width: min(640px, 100%);
+}
+
+.issued-token-dialog code {
+  padding: 0 4px;
+  border-radius: 6px;
+  background: rgb(221 230 252 / 0.7);
+  color: var(--accent-strong);
+}
+
+.issued-token-actions {
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .auth-submit-btn {
   min-width: 120px;
 }

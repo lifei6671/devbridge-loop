@@ -117,6 +117,16 @@ type Dependencies struct {
 	DrainConnector func(now time.Time, connectorID string, reason string, actor string) (DrainResult, error)
 	// UpdateConfig 执行带版本并发控制的配置更新。
 	UpdateConfig func(now time.Time, request ConfigUpdateRequest, actor string) (ConfigUpdateResult, error)
+	// ListConnectorTokens 返回 connector token 元数据列表。
+	ListConnectorTokens func() ([]ConnectorTokenRecord, error)
+	// GetConnectorToken 返回单个 connector token 元数据。
+	GetConnectorToken func(tokenID string) (ConnectorTokenRecord, bool, error)
+	// CreateConnectorToken 创建新的 connector token，并返回一次性明文 token。
+	CreateConnectorToken func(now time.Time, request ConnectorTokenCreateRequest, actor string) (ConnectorTokenIssueResult, error)
+	// RotateConnectorToken 轮换指定 token，并返回新的明文 token。
+	RotateConnectorToken func(now time.Time, tokenID string, actor string) (ConnectorTokenIssueResult, error)
+	// RevokeConnectorToken 吊销指定 token。
+	RevokeConnectorToken func(now time.Time, tokenID string, actor string) (ConnectorTokenRecord, error)
 }
 
 // ServerOptions 定义管理后台 API 服务构造参数。
@@ -243,6 +253,8 @@ func (server *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/admin/traffic/summary", server.wrapHandler(RoleViewer, "traffic", "summary", server.handleTrafficSummary))
 	mux.Handle("/api/admin/traffic/ownership", server.wrapHandler(RoleViewer, "traffic", "ownership", server.handleTrafficOwnership))
 	mux.Handle("/api/admin/config/snapshot", server.wrapHandler(RoleViewer, "config", "snapshot", server.handleConfigSnapshot))
+	mux.Handle("/api/admin/connector-tokens", server.wrapHandler(RoleViewer, "connector_tokens", "dispatch", server.handleConnectorTokens))
+	mux.Handle("/api/admin/connector-tokens/", server.wrapHandler(RoleViewer, "connector_tokens", "dispatch", server.handleConnectorTokens))
 	mux.Handle("/api/admin/config", server.wrapHandler(RoleAdmin, "config", "update", server.handleConfigUpdate))
 	mux.Handle("/api/admin/logs/search", server.wrapHandler(RoleViewer, "logs", "search", server.handleLogsSearch))
 	mux.Handle("/api/admin/metrics/query", server.wrapHandler(RoleViewer, "metrics", "query", server.handleMetricsQuery))
@@ -489,19 +501,6 @@ func (server *Server) enforcePublicOriginSecurity(request *http.Request) error {
 		return fmt.Errorf("origin check failed: origin is not allowed")
 	}
 	return nil
-}
-
-func normalizeRole(role string) (Role, bool) {
-	switch strings.ToLower(strings.TrimSpace(role)) {
-	case string(RoleViewer):
-		return RoleViewer, true
-	case string(RoleOperator):
-		return RoleOperator, true
-	case string(RoleAdmin):
-		return RoleAdmin, true
-	default:
-		return "", false
-	}
 }
 
 func roleCanAccess(currentRole Role, requiredRole Role) bool {
@@ -1185,6 +1184,17 @@ func safeListTunnelPoolReports(dependencies Dependencies) []TunnelPoolReportSnap
 		return []TunnelPoolReportSnapshot{}
 	}
 	return dependencies.ListTunnelPoolReports()
+}
+
+func safeListConnectorTokens(dependencies Dependencies) []ConnectorTokenRecord {
+	if dependencies.ListConnectorTokens == nil {
+		return []ConnectorTokenRecord{}
+	}
+	items, err := dependencies.ListConnectorTokens()
+	if err != nil {
+		return []ConnectorTokenRecord{}
+	}
+	return items
 }
 
 func safeBuildConfigSnapshot(dependencies Dependencies) map[string]any {

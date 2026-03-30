@@ -125,6 +125,8 @@ type controlMessageDispatcher struct {
 
 // controlChannelSessionState 保存单条控制连接最近确认的 session 上下文。
 type controlChannelSessionState struct {
+	mu sync.RWMutex
+
 	sessionID    string
 	sessionEpoch uint64
 	connectorID  string
@@ -145,6 +147,18 @@ type controlChannelSessionState struct {
 	authenticatedOnce    sync.Once
 }
 
+type controlChannelSessionSnapshot struct {
+	sessionID                string
+	sessionEpoch             uint64
+	connectorID              string
+	preferredBinding         transport.BindingType
+	lifecycle                controlChannelLifecycleState
+	sourceIP                 string
+	assignedSessionEpoch     uint64
+	helloAccepted            bool
+	unauthConnectionReserved bool
+}
+
 // newControlChannelSessionState 创建控制连接上下文并预先归一化 source_ip。
 func newControlChannelSessionState(peerAddr string) *controlChannelSessionState {
 	return &controlChannelSessionState{
@@ -159,6 +173,8 @@ func (state *controlChannelSessionState) setPreferredBinding(bindingType transpo
 	if state == nil {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	state.preferredBinding = bindingType
 }
 
@@ -171,6 +187,8 @@ func (state *controlChannelSessionState) setSession(sessionID string, sessionEpo
 	if normalizedSessionID == "" || sessionEpoch == 0 {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	state.sessionID = normalizedSessionID
 	state.sessionEpoch = sessionEpoch
 }
@@ -184,15 +202,16 @@ func (state *controlChannelSessionState) setHelloContext(connectorID string, ass
 	if normalizedConnectorID == "" || assignedSessionEpoch == 0 {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	state.connectorID = normalizedConnectorID
 	state.assignedSessionEpoch = assignedSessionEpoch
 	state.helloAccepted = true
 	// 进入 hello 阶段前，连接至少已经准备好处理控制面握手消息。
-	state.markControlReady()
+	state.markControlReadyLocked()
 }
 
-// transitionLifecycle 按状态机规则推进连接生命周期。
-func (state *controlChannelSessionState) transitionLifecycle(nextState controlChannelLifecycleState) bool {
+func (state *controlChannelSessionState) transitionLifecycleLocked(nextState controlChannelLifecycleState) bool {
 	if state == nil {
 		return false
 	}
@@ -215,7 +234,13 @@ func (state *controlChannelSessionState) markConnected() {
 	if state == nil {
 		return
 	}
-	_ = state.transitionLifecycle(controlChannelStateConnected)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.markConnectedLocked()
+}
+
+func (state *controlChannelSessionState) markConnectedLocked() {
+	_ = state.transitionLifecycleLocked(controlChannelStateConnected)
 }
 
 // markControlReady 把连接状态推进到 control_ready。
@@ -223,8 +248,14 @@ func (state *controlChannelSessionState) markControlReady() {
 	if state == nil {
 		return
 	}
-	state.markConnected()
-	_ = state.transitionLifecycle(controlChannelStateControlReady)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.markControlReadyLocked()
+}
+
+func (state *controlChannelSessionState) markControlReadyLocked() {
+	state.markConnectedLocked()
+	_ = state.transitionLifecycleLocked(controlChannelStateControlReady)
 }
 
 // markAuthenticated 把连接状态推进到 authenticated。
@@ -232,8 +263,14 @@ func (state *controlChannelSessionState) markAuthenticated() {
 	if state == nil {
 		return
 	}
-	state.markControlReady()
-	_ = state.transitionLifecycle(controlChannelStateAuthenticated)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.markAuthenticatedLocked()
+}
+
+func (state *controlChannelSessionState) markAuthenticatedLocked() {
+	state.markControlReadyLocked()
+	_ = state.transitionLifecycleLocked(controlChannelStateAuthenticated)
 	state.authenticatedOnce.Do(func() {
 		if state.authenticatedChannel != nil {
 			close(state.authenticatedChannel)
@@ -246,6 +283,8 @@ func (state *controlChannelSessionState) markDraining() {
 	if state == nil {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	if state.lifecycle == controlChannelStateFailed || state.lifecycle == controlChannelStateClosed {
 		return
 	}
@@ -253,15 +292,20 @@ func (state *controlChannelSessionState) markDraining() {
 		// 只有认证后的连接才能进入 draining，未认证连接直接保持原状态。
 		return
 	}
-	_ = state.transitionLifecycle(controlChannelStateDraining)
+	_ = state.transitionLifecycleLocked(controlChannelStateDraining)
 }
 
 // markFailed 把连接状态推进到 failed。
 func (state *controlChannelSessionState) markFailed() {
-	if state == nil || state.lifecycle == controlChannelStateClosed {
+	if state == nil {
 		return
 	}
-	_ = state.transitionLifecycle(controlChannelStateFailed)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.lifecycle == controlChannelStateClosed {
+		return
+	}
+	_ = state.transitionLifecycleLocked(controlChannelStateFailed)
 }
 
 // markClosed 把连接状态推进到 closed。
@@ -269,10 +313,12 @@ func (state *controlChannelSessionState) markClosed() {
 	if state == nil {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	if state.lifecycle == controlChannelStateAuthenticated {
-		_ = state.transitionLifecycle(controlChannelStateDraining)
+		_ = state.transitionLifecycleLocked(controlChannelStateDraining)
 	}
-	_ = state.transitionLifecycle(controlChannelStateClosed)
+	_ = state.transitionLifecycleLocked(controlChannelStateClosed)
 }
 
 // isAuthenticated 判断连接是否已经完成认证并可处理业务消息。
@@ -280,6 +326,8 @@ func (state *controlChannelSessionState) isAuthenticated() bool {
 	if state == nil {
 		return false
 	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 	return state.lifecycle == controlChannelStateAuthenticated
 }
 
@@ -289,7 +337,54 @@ func (state *controlChannelSessionState) authenticatedDone() <-chan struct{} {
 		close(closedChannel)
 		return closedChannel
 	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
 	return state.authenticatedChannel
+}
+
+func (state *controlChannelSessionState) snapshot() controlChannelSessionSnapshot {
+	if state == nil {
+		return controlChannelSessionSnapshot{}
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return controlChannelSessionSnapshot{
+		sessionID:                state.sessionID,
+		sessionEpoch:             state.sessionEpoch,
+		connectorID:              state.connectorID,
+		preferredBinding:         state.preferredBinding,
+		lifecycle:                state.lifecycle,
+		sourceIP:                 state.sourceIP,
+		assignedSessionEpoch:     state.assignedSessionEpoch,
+		helloAccepted:            state.helloAccepted,
+		unauthConnectionReserved: state.unauthConnectionReserved,
+	}
+}
+
+func (state *controlChannelSessionState) tryMarkUnauthenticatedConnectionReserved() bool {
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.unauthConnectionReserved || state.lifecycle == controlChannelStateAuthenticated {
+		return false
+	}
+	state.unauthConnectionReserved = true
+	return true
+}
+
+func (state *controlChannelSessionState) clearUnauthenticatedConnectionReserved() bool {
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.unauthConnectionReserved {
+		return false
+	}
+	state.unauthConnectionReserved = false
+	return true
 }
 
 // controlMessageDispatcherOptions 定义控制面分发器依赖。
@@ -530,7 +625,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 	}
 	peerSourceIP := ""
 	if sessionState != nil {
-		peerSourceIP = strings.TrimSpace(sessionState.sourceIP)
+		peerSourceIP = strings.TrimSpace(sessionState.snapshot().sourceIP)
 	}
 	if allowed, dimension := dispatcher.allowConnectorHello(peerSourceIP, normalizedConnectorID); !allowed {
 		slog.Warn(
@@ -556,7 +651,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorHelloEnvelope(
 	}
 
 	welcomePayload := pb.ConnectorWelcome{
-		SelectedBinding:      selectWelcomeBinding(helloPayload.SupportedBindings, sessionState.preferredBinding),
+		SelectedBinding:      selectWelcomeBinding(helloPayload.SupportedBindings, sessionState.snapshot().preferredBinding),
 		VersionMajor:         envelope.VersionMajor,
 		VersionMinor:         envelope.VersionMinor,
 		HeartbeatIntervalSec: connectorHeartbeatIntervalSec,
@@ -574,12 +669,14 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	auditConnectorID := strings.TrimSpace(envelope.ConnectorID)
 	auditSessionEpoch := uint64(0)
 	auditSourceIP := ""
+	sessionSnapshot := controlChannelSessionSnapshot{}
 	if sessionState != nil {
-		if normalizedConnectorID := strings.TrimSpace(sessionState.connectorID); normalizedConnectorID != "" {
+		sessionSnapshot = sessionState.snapshot()
+		if normalizedConnectorID := strings.TrimSpace(sessionSnapshot.connectorID); normalizedConnectorID != "" {
 			auditConnectorID = normalizedConnectorID
 		}
-		auditSessionEpoch = sessionState.assignedSessionEpoch
-		auditSourceIP = strings.TrimSpace(sessionState.sourceIP)
+		auditSessionEpoch = sessionSnapshot.assignedSessionEpoch
+		auditSourceIP = strings.TrimSpace(sessionSnapshot.sourceIP)
 	}
 	var authPayload pb.ConnectorAuth
 	emitAuditReject := func(errorCode string, sessionID string, sessionEpoch uint64) {
@@ -592,7 +689,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			ErrorCode:    errorCode,
 		})
 	}
-	if sessionState == nil || !sessionState.helloAccepted {
+	if sessionState == nil || !sessionSnapshot.helloAccepted {
 		emitAuditReject(appauth.AuthErrorInternal, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
 			envelope,
@@ -614,7 +711,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 			"decode connector auth payload failed",
 		)
 	}
-	normalizedConnectorID := strings.TrimSpace(sessionState.connectorID)
+	normalizedConnectorID := strings.TrimSpace(sessionSnapshot.connectorID)
 	if normalizedConnectorID == "" {
 		emitAuditReject(appauth.AuthErrorConnectorMismatch, "", auditSessionEpoch)
 		return buildConnectorAuthAckEnvelope(
@@ -688,12 +785,12 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 	authResult := dispatcher.authCoordinator.AuthenticateAndCommit(
 		appauth.Request{
 			ConnectorID:          normalizedConnectorID,
-			AssignedSessionEpoch: sessionState.assignedSessionEpoch,
+			AssignedSessionEpoch: sessionSnapshot.assignedSessionEpoch,
 			AuthMethod:           authPayload.AuthMethod,
 			Token:                authPayload.Token,
 		},
 		func(now time.Time, sessionRuntime registry.SessionRuntime) error {
-			sessionRuntime.Binding = strings.TrimSpace(sessionState.preferredBinding.String())
+			sessionRuntime.Binding = strings.TrimSpace(sessionSnapshot.preferredBinding.String())
 			dispatcher.commitAuthenticatedSession(now, sessionRuntime, envelope.ResourceVersion)
 			return nil
 		},
@@ -715,7 +812,7 @@ func (dispatcher *controlMessageDispatcher) handleConnectorAuthEnvelope(
 		slog.Warn(
 			"connector auth rejected",
 			"connector_id", normalizedConnectorID,
-			"assigned_session_epoch", sessionState.assignedSessionEpoch,
+			"assigned_session_epoch", sessionSnapshot.assignedSessionEpoch,
 			"error_code", authResult.ErrorCode,
 			"error_message", authResult.ErrorMessage,
 			"public_error_code", publicErrorCode,
@@ -855,7 +952,8 @@ func (dispatcher *controlMessageDispatcher) reserveUnauthenticatedConnectionBudg
 	if dispatcher == nil || dispatcher.handshakeGuard == nil || sessionState == nil {
 		return true
 	}
-	if sessionState.unauthConnectionReserved || sessionState.isAuthenticated() {
+	sessionSnapshot := sessionState.snapshot()
+	if sessionSnapshot.unauthConnectionReserved || sessionSnapshot.lifecycle == controlChannelStateAuthenticated {
 		return true
 	}
 	allowed := dispatcher.handshakeGuard.TryAcquireUnauthenticatedConnection()
@@ -863,7 +961,10 @@ func (dispatcher *controlMessageDispatcher) reserveUnauthenticatedConnectionBudg
 		dispatcher.observeAuthRateLimit()
 		return false
 	}
-	sessionState.unauthConnectionReserved = true
+	if !sessionState.tryMarkUnauthenticatedConnectionReserved() {
+		dispatcher.handshakeGuard.ReleaseUnauthenticatedConnection()
+		return true
+	}
 	return true
 }
 
@@ -872,11 +973,10 @@ func (dispatcher *controlMessageDispatcher) releaseUnauthenticatedConnectionBudg
 	if dispatcher == nil || dispatcher.handshakeGuard == nil || sessionState == nil {
 		return
 	}
-	if !sessionState.unauthConnectionReserved {
+	if !sessionState.clearUnauthenticatedConnectionReserved() {
 		return
 	}
 	dispatcher.handshakeGuard.ReleaseUnauthenticatedConnection()
-	sessionState.unauthConnectionReserved = false
 }
 
 // markSessionAuthenticated 在认证成功时更新连接状态并释放未认证预算占用。
@@ -897,11 +997,12 @@ func (dispatcher *controlMessageDispatcher) markSessionFailedFromState(
 	if dispatcher == nil || sessionState == nil || !sessionState.isAuthenticated() {
 		return
 	}
+	sessionSnapshot := sessionState.snapshot()
 	sessionState.markFailed()
 	dispatcher.transitionSessionState(
 		now,
-		sessionState.sessionID,
-		sessionState.sessionEpoch,
+		sessionSnapshot.sessionID,
+		sessionSnapshot.sessionEpoch,
 		registry.SessionFailed,
 		reason,
 	)
@@ -916,12 +1017,13 @@ func (dispatcher *controlMessageDispatcher) closeSessionFromState(
 	if dispatcher == nil || sessionState == nil || !sessionState.isAuthenticated() {
 		return
 	}
+	sessionSnapshot := sessionState.snapshot()
 	sessionState.markDraining()
 	sessionState.markClosed()
 	dispatcher.transitionSessionState(
 		now,
-		sessionState.sessionID,
-		sessionState.sessionEpoch,
+		sessionSnapshot.sessionID,
+		sessionSnapshot.sessionEpoch,
 		registry.SessionClosed,
 		reason,
 	)
@@ -1390,7 +1492,8 @@ func (dispatcher *controlMessageDispatcher) refreshSessionHeartbeatFromState(
 	if dispatcher == nil || dispatcher.sessionRegistry == nil || sessionState == nil {
 		return
 	}
-	sessionID := strings.TrimSpace(sessionState.sessionID)
+	sessionSnapshot := sessionState.snapshot()
+	sessionID := strings.TrimSpace(sessionSnapshot.sessionID)
 	if sessionID == "" {
 		return
 	}
@@ -1398,7 +1501,7 @@ func (dispatcher *controlMessageDispatcher) refreshSessionHeartbeatFromState(
 	if !exists {
 		return
 	}
-	if sessionState.sessionEpoch > 0 && sessionRuntime.Epoch != sessionState.sessionEpoch {
+	if sessionSnapshot.sessionEpoch > 0 && sessionRuntime.Epoch != sessionSnapshot.sessionEpoch {
 		// 连接上下文与当前会话代际不一致时不刷新，避免跨代污染。
 		return
 	}
@@ -1667,6 +1770,7 @@ type controlPlaneDependencies struct {
 	routeRegistry         *registry.RouteRegistry
 	tunnelRegistry        *registry.TunnelRegistry
 	tunnelPoolReportStore *bridgecontrol.TunnelPoolReportStore
+	authCoordinator       appauth.Coordinator
 	metrics               *obs.Metrics
 	hostDerivationDomain  string
 	managedCAIssuer       apptls.ManagedCACertificateIssuer
@@ -1762,6 +1866,7 @@ func newControlPlaneServer(
 			serviceRegistry:       dependencies.serviceRegistry,
 			routeRegistry:         dependencies.routeRegistry,
 			tunnelRegistry:        dependencies.tunnelRegistry,
+			authCoordinator:       dependencies.authCoordinator,
 			tunnelPoolReportStore: dependencies.tunnelPoolReportStore,
 			hostDerivationDomain:  dependencies.hostDerivationDomain,
 			tlsMode:               string(normalizedTLSMode),
@@ -2181,12 +2286,6 @@ func (service *grpcControlPlaneService) TunnelStream(
 	return serveGRPCTunnelStreamWithAcceptor(stream, service.tunnelAcceptor)
 }
 
-func serveGRPCControlChannel(
-	stream grpc.BidiStreamingServer[transportgen.ControlFrameEnvelope, transportgen.ControlFrameEnvelope],
-) error {
-	return serveGRPCControlChannelWithDispatcher(stream, nil)
-}
-
 func serveGRPCControlChannelWithDispatcher(
 	stream grpc.BidiStreamingServer[transportgen.ControlFrameEnvelope, transportgen.ControlFrameEnvelope],
 	dispatcher *controlMessageDispatcher,
@@ -2261,12 +2360,6 @@ func serveGRPCControlChannelWithDispatcher(
 			return fmt.Errorf("write grpc control reply frame: %w", err)
 		}
 	}
-}
-
-func serveGRPCTunnelStream(
-	stream grpc.BidiStreamingServer[transportgen.TunnelEnvelope, transportgen.TunnelEnvelope],
-) error {
-	return serveGRPCTunnelStreamWithAcceptor(stream, nil)
 }
 
 // serveGRPCTunnelStreamWithAcceptor 处理 gRPC TunnelStream 并在可用时交由 acceptor 入队。
@@ -2393,15 +2486,16 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 
 	select {
 	case <-sessionState.authenticatedDone():
+		sessionSnapshot := sessionState.snapshot()
 		if server.metrics != nil {
 			server.metrics.IncBridgeQUICConnectionAuthenticatedTotal()
 		}
 		slog.Info(
 			"bridge quic connection authenticated",
 			"peer_addr", peerAddr,
-			"connector_id", strings.TrimSpace(sessionState.connectorID),
-			"session_id", strings.TrimSpace(sessionState.sessionID),
-			"session_epoch", sessionState.sessionEpoch,
+			"connector_id", strings.TrimSpace(sessionSnapshot.connectorID),
+			"session_id", strings.TrimSpace(sessionSnapshot.sessionID),
+			"session_epoch", sessionSnapshot.sessionEpoch,
 		)
 	case serveErr := <-serveErrChannel:
 		if serveErr != nil && !isControlChannelClosedError(serveErr) {
@@ -2438,13 +2532,14 @@ func (server *controlPlaneServer) serveQUICInboundConnection(ctx context.Context
 		}
 		return fmt.Errorf("serve quic inbound: open transport session: %w", err)
 	}
-	logBridgeQUICTransportSessionOpened(quicTransportSession, peerAddr, strings.TrimSpace(sessionState.connectorID))
+	sessionSnapshot := sessionState.snapshot()
+	logBridgeQUICTransportSessionOpened(quicTransportSession, peerAddr, strings.TrimSpace(sessionSnapshot.connectorID))
 	slog.Info(
 		"bridge quic tunnel accept loop started",
 		"peer_addr", peerAddr,
-		"connector_id", strings.TrimSpace(sessionState.connectorID),
-		"session_id", strings.TrimSpace(sessionState.sessionID),
-		"session_epoch", sessionState.sessionEpoch,
+		"connector_id", strings.TrimSpace(sessionSnapshot.connectorID),
+		"session_id", strings.TrimSpace(sessionSnapshot.sessionID),
+		"session_epoch", sessionSnapshot.sessionEpoch,
 	)
 	acceptErrChannel := make(chan error, 1)
 	go func() {
@@ -2475,20 +2570,21 @@ func newBridgeQUICTransportSession(
 	if sessionState == nil {
 		return nil, errors.New("new bridge quic transport session: nil session state")
 	}
-	sessionID := strings.TrimSpace(sessionState.sessionID)
-	if sessionID == "" || sessionState.sessionEpoch == 0 {
+	sessionSnapshot := sessionState.snapshot()
+	sessionID := strings.TrimSpace(sessionSnapshot.sessionID)
+	if sessionID == "" || sessionSnapshot.sessionEpoch == 0 {
 		return nil, errors.New("new bridge quic transport session: missing authenticated session identity")
 	}
 	sessionLabels := map[string]string{
-		"connector_id": strings.TrimSpace(sessionState.connectorID),
+		"connector_id": strings.TrimSpace(sessionSnapshot.connectorID),
 	}
-	if peerAddr := strings.TrimSpace(sessionState.sourceIP); peerAddr != "" {
+	if peerAddr := strings.TrimSpace(sessionSnapshot.sourceIP); peerAddr != "" {
 		sessionLabels["peer_addr"] = peerAddr
 	}
 	quicSession, err := quicbinding.NewSession(quicbinding.SessionRoleServer, quicbinding.SessionConfig{
 		Meta: transport.SessionMeta{
 			SessionID:    sessionID,
-			SessionEpoch: sessionState.sessionEpoch,
+			SessionEpoch: sessionSnapshot.sessionEpoch,
 			Labels:       sessionLabels,
 		},
 		ControlChannel: controlChannel,
@@ -3337,7 +3433,7 @@ func serveControlChannelWithDispatcherAndState(
 	if !effectiveDispatcher.reserveUnauthenticatedConnectionBudget(sessionState) {
 		slog.Warn(
 			"reject control channel by unauthenticated connection budget",
-			"peer_addr", strings.TrimSpace(sessionState.sourceIP),
+			"peer_addr", strings.TrimSpace(sessionState.snapshot().sourceIP),
 		)
 		return nil
 	}

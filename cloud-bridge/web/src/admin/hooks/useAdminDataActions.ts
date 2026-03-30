@@ -49,6 +49,7 @@ export function useAdminDataActions(state: AdminConsoleState) {
     setAgentPoolSummary,
     setConfigSnapshot,
     setConnectorItems,
+    setConnectorTokenItems,
     setDiagnoseSummary,
     setIsAuthenticating,
     setIsLoading,
@@ -331,13 +332,15 @@ export function useAdminDataActions(state: AdminConsoleState) {
         }
 
         if (page === "ops") {
-          const [configResponse, connectorResponse, sessionResponse] = await Promise.all([
+          const [configResponse, connectorResponse, sessionResponse, connectorTokenResponse] = await Promise.all([
             requestAdmin("/api/admin/config/snapshot"),
             requestAdmin(`/api/admin/connectors${encodeQuery({ limit: 100 })}`),
             requestAdmin(`/api/admin/sessions${encodeQuery({ limit: 100 })}`),
+            requestAdmin(`/api/admin/connector-tokens${encodeQuery({ limit: 200 })}`),
           ]);
           setConfigSnapshot(asRecord(configResponse.snapshot));
           setConnectorItems(asRecordArray(connectorResponse.items));
+          setConnectorTokenItems(asRecordArray(connectorTokenResponse.items));
           setSessionItems(asRecordArray(sessionResponse.items));
         }
 
@@ -431,6 +434,7 @@ export function useAdminDataActions(state: AdminConsoleState) {
       if (topic === "ops") {
         setConfigSnapshot(asRecord(payload.snapshot));
         setConnectorItems(asRecordArray(payload.connectors));
+        setConnectorTokenItems(asRecordArray(payload.connector_tokens));
         setSessionItems(asRecordArray(payload.sessions));
         return;
       }
@@ -444,6 +448,7 @@ export function useAdminDataActions(state: AdminConsoleState) {
       setAgentPoolSummary,
       setConfigSnapshot,
       setConnectorItems,
+      setConnectorTokenItems,
       setDiagnoseSummary,
       setLogItems,
       setMetricPoints,

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,18 @@ type connectorTokenStore interface {
 	LookupByTokenID(tokenID string) (connectorTokenRecord, bool, error)
 }
 
+// connectorManagedTokenStore 定义 token 管理读写能力。
+type connectorManagedTokenStore interface {
+	connectorTokenStore
+	List() ([]connectorTokenRecord, error)
+	Get(tokenID string) (connectorTokenRecord, bool, error)
+	Upsert(record connectorTokenRecord) error
+	Delete(tokenID string) error
+	ReplaceAll(records []connectorTokenRecord) error
+	Save() error
+	Reload() error
+}
+
 // inMemoryConnectorTokenStore 提供开发期可用的内存 token 索引实现。
 type inMemoryConnectorTokenStore struct {
 	mu        sync.RWMutex
@@ -72,16 +85,12 @@ type inMemoryConnectorTokenStore struct {
 
 // newInMemoryConnectorTokenStore 根据 token 记录构建内存索引。
 func newInMemoryConnectorTokenStore(records []connectorTokenRecord) *inMemoryConnectorTokenStore {
-	store := &inMemoryConnectorTokenStore{
-		byTokenID: make(map[string]connectorTokenRecord, len(records)),
+	normalizedRecords, err := normalizeConnectorTokenRecordSet(records)
+	if err != nil {
+		panic(fmt.Errorf("new in-memory connector token store: %w", err))
 	}
-	for _, record := range records {
-		normalizedRecord, ok := normalizeConnectorTokenRecord(record)
-		if !ok {
-			// 开发期索引构建不因为单条脏数据中断，其余合法记录仍可服务认证。
-			continue
-		}
-		store.byTokenID[normalizedRecord.TokenID] = normalizedRecord
+	store := &inMemoryConnectorTokenStore{
+		byTokenID: connectorTokenRecordSliceToMap(normalizedRecords),
 	}
 	return store
 }
@@ -101,7 +110,83 @@ func (store *inMemoryConnectorTokenStore) LookupByTokenID(tokenID string) (conne
 	if !exists {
 		return connectorTokenRecord{}, false, nil
 	}
-	return record, true, nil
+	return cloneConnectorTokenRecord(record), true, nil
+}
+
+// List 返回当前内存 token 记录快照。
+func (store *inMemoryConnectorTokenStore) List() ([]connectorTokenRecord, error) {
+	if store == nil {
+		return nil, fmt.Errorf("connector token store is nil")
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	return sortedConnectorTokenRecordsFromMap(store.byTokenID), nil
+}
+
+// Get 通过 token_id 获取 token 记录。
+func (store *inMemoryConnectorTokenStore) Get(tokenID string) (connectorTokenRecord, bool, error) {
+	return store.LookupByTokenID(tokenID)
+}
+
+// Upsert 写入或覆盖一条 token 记录。
+func (store *inMemoryConnectorTokenStore) Upsert(record connectorTokenRecord) error {
+	if store == nil {
+		return fmt.Errorf("connector token store is nil")
+	}
+	normalizedRecord, ok := normalizeConnectorTokenRecord(record)
+	if !ok {
+		return fmt.Errorf("upsert connector token record: invalid token record")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.byTokenID[normalizedRecord.TokenID] = normalizedRecord
+	return nil
+}
+
+// Delete 删除一条 token 记录。
+func (store *inMemoryConnectorTokenStore) Delete(tokenID string) error {
+	if store == nil {
+		return fmt.Errorf("connector token store is nil")
+	}
+	normalizedTokenID := strings.TrimSpace(tokenID)
+	if normalizedTokenID == "" {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	delete(store.byTokenID, normalizedTokenID)
+	return nil
+}
+
+// ReplaceAll 使用给定快照替换全部 token 记录。
+func (store *inMemoryConnectorTokenStore) ReplaceAll(records []connectorTokenRecord) error {
+	if store == nil {
+		return fmt.Errorf("connector token store is nil")
+	}
+	replacedRecords, err := normalizeConnectorTokenRecordSet(records)
+	if err != nil {
+		return fmt.Errorf("replace all connector token records: %w", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.byTokenID = connectorTokenRecordSliceToMap(replacedRecords)
+	return nil
+}
+
+// Save 对纯内存 store 为 no-op。
+func (store *inMemoryConnectorTokenStore) Save() error {
+	if store == nil {
+		return fmt.Errorf("connector token store is nil")
+	}
+	return nil
+}
+
+// Reload 对纯内存 store 为 no-op。
+func (store *inMemoryConnectorTokenStore) Reload() error {
+	if store == nil {
+		return fmt.Errorf("connector token store is nil")
+	}
+	return nil
 }
 
 // normalizeConnectorTokenRecord 归一化 token 记录，避免脏数据进入索引。
@@ -152,6 +237,71 @@ func normalizeConnectorTokenStatus(status connectorTokenStatus) connectorTokenSt
 	default:
 		return ""
 	}
+}
+
+func cloneConnectorTokenRecord(record connectorTokenRecord) connectorTokenRecord {
+	clonedRecord := record
+	clonedRecord.Metadata = cloneConnectorTokenMetadata(record.Metadata)
+	return clonedRecord
+}
+
+func cloneConnectorTokenMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	clonedMetadata := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		clonedMetadata[key] = value
+	}
+	return clonedMetadata
+}
+
+func normalizeConnectorTokenRecordSet(records []connectorTokenRecord) ([]connectorTokenRecord, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+	normalizedRecords := make([]connectorTokenRecord, 0, len(records))
+	seenTokenIDs := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		normalizedRecord, ok := normalizeConnectorTokenRecord(record)
+		if !ok {
+			return nil, fmt.Errorf("invalid connector token record token_id=%q", strings.TrimSpace(record.TokenID))
+		}
+		if _, exists := seenTokenIDs[normalizedRecord.TokenID]; exists {
+			return nil, fmt.Errorf("duplicate connector token record token_id=%q", normalizedRecord.TokenID)
+		}
+		seenTokenIDs[normalizedRecord.TokenID] = struct{}{}
+		normalizedRecords = append(normalizedRecords, normalizedRecord)
+	}
+	sort.Slice(normalizedRecords, func(leftIndex int, rightIndex int) bool {
+		return normalizedRecords[leftIndex].TokenID < normalizedRecords[rightIndex].TokenID
+	})
+	return normalizedRecords, nil
+}
+
+func connectorTokenRecordSliceToMap(records []connectorTokenRecord) map[string]connectorTokenRecord {
+	if len(records) == 0 {
+		return make(map[string]connectorTokenRecord)
+	}
+	byTokenID := make(map[string]connectorTokenRecord, len(records))
+	for _, record := range records {
+		byTokenID[record.TokenID] = cloneConnectorTokenRecord(record)
+	}
+	return byTokenID
+}
+
+func sortedConnectorTokenRecordsFromMap(byTokenID map[string]connectorTokenRecord) []connectorTokenRecord {
+	if len(byTokenID) == 0 {
+		return nil
+	}
+	records := make([]connectorTokenRecord, 0, len(byTokenID))
+	for _, record := range byTokenID {
+		records = append(records, cloneConnectorTokenRecord(record))
+	}
+	sort.Slice(records, func(leftIndex int, rightIndex int) bool {
+		return records[leftIndex].TokenID < records[rightIndex].TokenID
+	})
+	return records
 }
 
 // parseConnectorToken 解析 dbt_<token_id>.<token_secret> 结构。

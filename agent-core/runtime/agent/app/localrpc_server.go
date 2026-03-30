@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/lifei6671/devbridge-loop/ltfp/pb"
+	"github.com/lifei6671/devbridge-loop/agent-core/runtime/agent/hostapi"
 )
 
 type codedError struct {
@@ -51,6 +51,7 @@ type localRPCServer struct {
 	ipcTransport  string
 	ipcEndpoint   string
 	sessionSecret string
+	hostHandler   hostapi.Handler
 
 	listener localRPCListener
 	closeMu  sync.Mutex
@@ -88,49 +89,6 @@ type localRPCAuthCompletePayload struct {
 	ClientProof     string `json:"client_proof"`
 }
 
-type localRPCServiceAddPayload struct {
-	InstanceID             string                  `json:"instance_id"`
-	Scope                  pb.Scope                `json:"scope"`
-	ServiceName            string                  `json:"service_name"`
-	Protocol               string                  `json:"protocol"`
-	Host                   string                  `json:"host"`
-	Port                   uint32                  `json:"port"`
-	SNIName                string                  `json:"sni_name"`
-	Exposure               localRPCServiceExposure `json:"exposure"`
-	HealthCheckIntervalSec uint32                  `json:"health_check_interval_sec"`
-	HealthCheckMode        string                  `json:"health_check_mode"`
-	HealthCheckPath        string                  `json:"health_check_path"`
-	RouteHint              localRPCRouteHint       `json:"route_hint"`
-}
-
-type localRPCServiceExposure struct {
-	IngressMode string `json:"ingress_mode"`
-	Host        string `json:"host"`
-	ListenPort  uint32 `json:"listen_port"`
-	SNIName     string `json:"sni_name"`
-	PathPrefix  string `json:"path_prefix"`
-	AllowExport bool   `json:"allow_export"`
-}
-
-type localRPCMatcher struct {
-	Name    string `json:"name"`
-	Exact   string `json:"exact,omitempty"`
-	Prefix  string `json:"prefix,omitempty"`
-	Regex   string `json:"regex,omitempty"`
-	Present *bool  `json:"present,omitempty"`
-}
-
-type localRPCRouteHint struct {
-	MatchHeaders []localRPCMatcher `json:"match_headers,omitempty"`
-	MatchQueries []localRPCMatcher `json:"match_queries,omitempty"`
-	Priority     uint32            `json:"priority,omitempty"`
-}
-
-type localRPCServiceDeletePayload struct {
-	LogicalServiceID string `json:"logical_service_id"`
-	InstanceID       string `json:"instance_id"`
-}
-
 type localRPCAuthPending struct {
 	protocolVersion string
 	clientNonce     string
@@ -145,53 +103,6 @@ type localRPCConnectionAuthState struct {
 type localRPCFailure struct {
 	code    string
 	message string
-}
-
-func (matcher localRPCMatcher) toHeaderMatcher() pb.HeaderMatcher {
-	return pb.HeaderMatcher{
-		Name:    strings.TrimSpace(matcher.Name),
-		Exact:   strings.TrimSpace(matcher.Exact),
-		Prefix:  strings.TrimSpace(matcher.Prefix),
-		Regex:   strings.TrimSpace(matcher.Regex),
-		Present: matcher.Present,
-	}
-}
-
-func (matcher localRPCMatcher) toQueryMatcher() pb.QueryMatcher {
-	return pb.QueryMatcher{
-		Name:    strings.TrimSpace(matcher.Name),
-		Exact:   strings.TrimSpace(matcher.Exact),
-		Prefix:  strings.TrimSpace(matcher.Prefix),
-		Regex:   strings.TrimSpace(matcher.Regex),
-		Present: matcher.Present,
-	}
-}
-
-func (routeHint localRPCRouteHint) toPB() pb.RouteHint {
-	matchHeaders := make([]pb.HeaderMatcher, 0, len(routeHint.MatchHeaders))
-	for _, matcher := range routeHint.MatchHeaders {
-		matchHeaders = append(matchHeaders, matcher.toHeaderMatcher())
-	}
-	matchQueries := make([]pb.QueryMatcher, 0, len(routeHint.MatchQueries))
-	for _, matcher := range routeHint.MatchQueries {
-		matchQueries = append(matchQueries, matcher.toQueryMatcher())
-	}
-	return pb.RouteHint{
-		MatchHeaders: matchHeaders,
-		MatchQueries: matchQueries,
-		Priority:     routeHint.Priority,
-	}
-}
-
-func (exposure localRPCServiceExposure) toPB() pb.ServiceExposure {
-	return pb.ServiceExposure{
-		IngressMode: pb.IngressMode(strings.TrimSpace(exposure.IngressMode)),
-		Host:        strings.TrimSpace(exposure.Host),
-		ListenPort:  exposure.ListenPort,
-		SNIName:     strings.TrimSpace(exposure.SNIName),
-		PathPrefix:  strings.TrimSpace(exposure.PathPrefix),
-		AllowExport: exposure.AllowExport,
-	}
 }
 
 func newLocalRPCServer(agentRuntime *Runtime) (*localRPCServer, error) {
@@ -223,8 +134,25 @@ func newLocalRPCServer(agentRuntime *Runtime) (*localRPCServer, error) {
 		ipcTransport:  ipcTransport,
 		ipcEndpoint:   ipcEndpoint,
 		sessionSecret: sessionSecret,
+		hostHandler:   hostapi.NewService(newRuntimeHostAPI(agentRuntime, ipcTransport, ipcEndpoint)),
 		listener:      listener,
 	}, nil
+}
+
+func (server *localRPCServer) resolveHostHandler() hostapi.Handler {
+	if server == nil {
+		return nil
+	}
+	if server.hostHandler != nil {
+		return server.hostHandler
+	}
+	if server.runtime == nil {
+		return nil
+	}
+	server.hostHandler = hostapi.NewService(
+		newRuntimeHostAPI(server.runtime, server.ipcTransport, server.ipcEndpoint),
+	)
+	return server.hostHandler
 }
 
 func (server *localRPCServer) Close() error {
@@ -481,77 +409,16 @@ func (server *localRPCServer) dispatchRequest(
 		return nil, &localRPCFailure{code: "UNAUTHORIZED", message: "app.auth.begin/app.auth.complete is required"}
 	}
 
-	switch requestBody.Method {
-	case "app.bootstrap":
-		return server.runtime.agentSnapshotPayload(), nil
-	case "app.shutdown":
-		go func(runtimeInstance *Runtime) {
-			_ = runtimeInstance.Shutdown(context.Background())
-		}(server.runtime)
-		return map[string]any{
-			"accepted": true,
-		}, nil
-	case "agent.snapshot":
-		return server.runtime.agentSnapshotPayload(), nil
-	case "session.snapshot":
-		return server.runtime.sessionSnapshotPayload(), nil
-	case "session.reconnect":
-		server.runtime.requestBridgeReconnect(true)
-		return server.runtime.sessionSnapshotPayload(), nil
-	case "session.drain":
-		server.runtime.requestBridgeDrain()
-		return server.runtime.sessionSnapshotPayload(), nil
-	case "service.add":
-		servicePayload, err := decodePayload[localRPCServiceAddPayload](requestBody.Payload)
-		if err != nil {
-			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.add payload"}
-		}
-		addedPayload, addErr := server.runtime.addOrUpdateService(runtimeServiceAddInput{
-			InstanceID:             servicePayload.InstanceID,
-			Scope:                  servicePayload.Scope,
-			ServiceName:            servicePayload.ServiceName,
-			Protocol:               servicePayload.Protocol,
-			Host:                   servicePayload.Host,
-			Port:                   servicePayload.Port,
-			SNIName:                servicePayload.SNIName,
-			Exposure:               servicePayload.Exposure.toPB(),
-			HealthCheckIntervalSec: servicePayload.HealthCheckIntervalSec,
-			HealthCheckMode:        servicePayload.HealthCheckMode,
-			HealthCheckPath:        servicePayload.HealthCheckPath,
-			RouteHint:              servicePayload.RouteHint.toPB(),
-		})
-		if addErr != nil {
-			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: addErr.Error()}
-		}
-		return addedPayload, nil
-	case "service.list":
-		return server.runtime.serviceListPayload(), nil
-	case "service.delete":
-		servicePayload, err := decodePayload[localRPCServiceDeletePayload](requestBody.Payload)
-		if err != nil {
-			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: "invalid service.delete payload"}
-		}
-		deletedPayload, deleteErr := server.runtime.removeService(runtimeServiceDeleteInput{
-			LogicalServiceID: servicePayload.LogicalServiceID,
-			InstanceID:       servicePayload.InstanceID,
-		})
-		if deleteErr != nil {
-			return nil, &localRPCFailure{code: "INVALID_REQUEST", message: deleteErr.Error()}
-		}
-		return deletedPayload, nil
-	case "tunnel.list":
-		return server.runtime.tunnelListPayload(), nil
-	case "traffic.stats.snapshot":
-		// traffic 指标优先返回 runtime 数据面真实链路统计，避免占位值误导 UI。
-		return server.runtime.trafficStatsSnapshotPayload(), nil
-	case "config.snapshot":
-		return server.runtime.configSnapshotPayload(server.ipcTransport, server.ipcEndpoint), nil
-	case "diagnose.snapshot":
-		return server.runtime.diagnoseSnapshotPayload(), nil
-	case "diagnose.logs":
-		// 诊断日志返回 runtime 事件真相源，替代空占位。
-		return server.runtime.diagnoseLogsPayload(), nil
-	default:
-		return nil, &localRPCFailure{code: "METHOD_NOT_ALLOWED", message: fmt.Sprintf("method %s is not allowed", requestBody.Method)}
+	handler := server.resolveHostHandler()
+	if handler == nil {
+		return nil, &localRPCFailure{code: "INTERNAL_ERROR", message: "hostapi handler is not configured"}
 	}
+	response, failure := handler.Handle(context.Background(), hostapi.Request{
+		Method:  hostapi.Method(requestBody.Method),
+		Payload: requestBody.Payload,
+	})
+	if failure != nil {
+		return nil, &localRPCFailure{code: failure.Code, message: failure.Message}
+	}
+	return response.Payload, nil
 }

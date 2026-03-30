@@ -23,6 +23,15 @@ type AdminPasswordProviderConfig = appconfig.AdminPasswordProviderConfig
 // AdminPasswordAccountConfig 对外保持本地登录账号配置类型别名。
 type AdminPasswordAccountConfig = appconfig.AdminPasswordAccountConfig
 
+// ConnectorAuthConfig 对外保持 connector 认证配置类型别名。
+type ConnectorAuthConfig = appconfig.ConnectorAuthConfig
+
+// ConnectorTokenStoreConfig 对外保持 connector token store 配置类型别名。
+type ConnectorTokenStoreConfig = appconfig.ConnectorTokenStoreConfig
+
+// ConnectorTokenFileStoreConfig 对外保持 connector token file store 配置类型别名。
+type ConnectorTokenFileStoreConfig = appconfig.ConnectorTokenFileStoreConfig
+
 // ObservabilityConfig 对外保持观测配置类型别名。
 type ObservabilityConfig = appconfig.ObservabilityConfig
 

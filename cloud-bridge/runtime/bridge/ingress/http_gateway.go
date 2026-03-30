@@ -61,17 +61,7 @@ func NewHTTPGateway(listenPort uint32) *HTTPGateway {
 
 // BuildRouteLookupRequest 将 HTTP 请求转换为统一路由请求。
 func (gateway *HTTPGateway) BuildRouteLookupRequest(request HTTPGatewayRequest) (RouteLookupRequest, error) {
-	return buildL7RouteLookupRequest(gateway.ListenPort, "http", l7GatewayRequest{
-		Protocol:    request.Protocol,
-		Host:        request.Host,
-		Authority:   request.Authority,
-		Path:        request.Path,
-		Namespace:   request.Namespace,
-		Environment: request.Environment,
-		Metadata:    request.Metadata,
-		Headers:     request.Headers,
-		Queries:     request.Queries,
-	})
+	return buildL7RouteLookupRequest(gateway.ListenPort, "http", l7GatewayRequest(request))
 }
 
 func buildL7RouteLookupRequest(
@@ -165,9 +155,7 @@ func copyStringSliceMap(source map[string][]string) map[string][]string {
 			continue
 		}
 		normalizedValues := make([]string, 0, len(values))
-		for _, value := range values {
-			normalizedValues = append(normalizedValues, value)
-		}
+		normalizedValues = append(normalizedValues, values...)
 		copied[normalizedKey] = normalizedValues
 	}
 	if len(copied) == 0 {
